@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+.venv-export/
+env/
+.env/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# Claude Code local state (personal paths, permissions)
+.claude/
+
+# --- Model weights (shipped out-of-band, e.g. GitHub Releases — not in git) ---
+*.pt
+*.pth
+checkpoints/
+
+# --- Distribution archives (T1DMAI_models.tar.gz is ~2.7 GB; linked from the README) ---
+*.tar.gz
+
+# --- Trained-model + report artifact trees (regenerable; keep the .py tools) ---
+models/*/
+models/out/
+models/ablation/
+models_finetuned_on_ohiot1dm/
+finetune/*.csv
+
+# --- Simulator / dataset caches (regenerable) ---
+*.npz
+*_cache/
+datasets/
+
+# --- Generated figures / cards / screenshots ---
+figures/
+t1dmai_screenshot_*.png
+
+# --- Generated metrics reports (keep metrics/*.py + rebuild_all.sh) ---
+metrics/**/figures/
+metrics/time_figures/
+metrics/**/README.md
+metrics/**/stats.json
+metrics/*.json
+
+# --- Training outputs / logs / generated stats ---
+logs/
+*.log
+training_log.csv
+validation_log.csv
+training_config.json
+normalization_stats.json
+
+# --- External simulator (documented external clone; symlink is dead on a fresh clone) ---
+/T1DMSIM
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+.env
+*.local
+
+# Dev scratch / working notes
+scratch/

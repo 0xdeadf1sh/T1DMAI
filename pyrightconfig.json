@@ -1,0 +1,7 @@
+{
+    "reportPrivateImportUsage": "none",
+    "reportUnusedImport": "none",
+    "reportUnusedVariable": "none",
+    "reportUnusedExpression": "none",
+    "reportIncompatibleMethodOverride": "none"
+}
