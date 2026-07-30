@@ -240,7 +240,8 @@ def _sim_reference_metrics(checkpoint: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _finetune_reference_metrics(best: dict[str, Any]) -> dict[str, Any]:
+def _finetune_reference_metrics(best: dict[str, Any], fm: dict[str, Any] | None = None
+                                ) -> dict[str, Any]:
     """Reference metrics from a finetune checkpoint's ``finetune_meta['best_heldout']``.
 
     A finetuned checkpoint carries no ``val_history`` (finetune.py evaluates against a
@@ -249,9 +250,32 @@ def _finetune_reference_metrics(best: dict[str, Any]) -> dict[str, Any]:
     -> ``rmse_mgdl`` and ``mard`` -> ``mard_pct``. ``clarke_a_pct`` / ``coverage90`` /
     the time-probe rows stay ``None`` — the real-cohort eval reports Clarke A+B pooled,
     not zone A alone, so filling them would misstate what was measured.
+
+    A PERSONAL finetune withholds one day of one record rather than patients from a
+    cohort, so it is labelled distinctly: the numbers occupy the same slots and no
+    consumer reads ``source``, but a card that called a single day's result a
+    cohort evaluation with patients withheld would be describing something that did not
+    happen.
     """
     def per_h(key: str) -> list[float | None]:
         return [_round((best.get(str(h)) or {}).get(key)) for h in _HORIZONS_MIN]
+
+    if (fm or {}).get("dataset") == 'personal':
+        return {
+            "source": "personal-heldout-day",
+            "note": "held-out-DAY evaluation of a checkpoint finetuned on one person's own "
+                    "record (T1DMAI finetune_personal.py); one day of one record, not a "
+                    "cohort and no patient withheld; reference only, not on-device realized "
+                    "accuracy",
+            "horizons_min": list(_HORIZONS_MIN),
+            "rmse_mgdl": per_h("rmse_point"),
+            "mard_pct": per_h("mard"),
+            "clarke_a_pct": [None] * len(_HORIZONS_MIN),
+            "coverage90": [None] * len(_HORIZONS_MIN),
+            "clarke_ab_pct": None,
+            "tod_mae_h": None,
+            "tod_mae_hiconf_h": None,
+        }
 
     return {
         "source": "real-heldout",
@@ -297,7 +321,7 @@ def build_model_card(model, checkpoint: dict[str, Any]) -> dict[str, Any]:
             (checkpoint.get("val_history") or [{}])[-1].get("step", checkpoint.get("step", 0))
         ),
         "reference_metrics": (
-            _finetune_reference_metrics(best) if (best and not checkpoint.get("val_history"))
+            _finetune_reference_metrics(best, fm) if (best and not checkpoint.get("val_history"))
             else _sim_reference_metrics(checkpoint)
         ),
     }
@@ -306,7 +330,9 @@ def build_model_card(model, checkpoint: dict[str, Any]) -> dict[str, Any]:
             "dataset": fm.get("dataset"),
             "datasets": fm.get("datasets"),
             "mode": fm.get("mode"),
-            "holdout": fm.get("holdout"),
+            # A personal finetune withholds a day, recorded as val_day; without the
+            # fallback the card would report holdout: null and drop what was held out.
+            "holdout": fm.get("holdout") or fm.get("val_day"),
             "total_steps": fm.get("total_steps"),
             "lr_scale": fm.get("lr_scale"),
         }
