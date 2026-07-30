@@ -65,11 +65,19 @@ _PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 
 
 def _slice(seg: Segment, a: int, b: int) -> Segment:
-    """A sub-Segment over steps [a, b), with t0 advanced accordingly."""
+    """A sub-Segment over steps [a, b), with t0 advanced accordingly.
+
+    Every length-N array on the Segment must be named here, the optional
+    pre-resolved curves included: ``replace`` passes un-named fields through
+    verbatim, so an omitted channel would leave a full-length array on a
+    sub-Segment and silently misalign it against the sliced CGM.
+    """
     return replace(
         seg, t0=seg.t0 + timedelta(minutes=GRID_MIN * a),
         cgm=seg.cgm[a:b], carb_grams=seg.carb_grams[a:b], bolus_units=seg.bolus_units[a:b],
-        basal_rate=seg.basal_rate[a:b], exercise=seg.exercise[a:b])
+        basal_rate=seg.basal_rate[a:b], exercise=seg.exercise[a:b],
+        carb_curve=(None if seg.carb_curve is None else seg.carb_curve[a:b]),
+        insulin_curve=(None if seg.insulin_curve is None else seg.insulin_curve[a:b]))
 
 
 def split_segments(segs: list[Segment], dataset: str, cal_frac: float = 0.6):

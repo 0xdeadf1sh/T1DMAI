@@ -97,11 +97,18 @@ def load_model(device, path: str = CKPT):
 
 
 def _slice_seg(seg, a: int, b: int):
-    """A sub-Segment over steps [a, b), with t0 advanced accordingly."""
+    """A sub-Segment over steps [a, b), with t0 advanced accordingly.
+
+    Must name every length-N array, the optional pre-resolved curves included:
+    ``replace`` copies un-named fields through at full length, which would
+    misalign them against the sliced CGM.
+    """
     return replace(
         seg, t0=seg.t0 + timedelta(minutes=GRID_MIN * a),
         cgm=seg.cgm[a:b], carb_grams=seg.carb_grams[a:b], bolus_units=seg.bolus_units[a:b],
-        basal_rate=seg.basal_rate[a:b], exercise=seg.exercise[a:b])
+        basal_rate=seg.basal_rate[a:b], exercise=seg.exercise[a:b],
+        carb_curve=(None if seg.carb_curve is None else seg.carb_curve[a:b]),
+        insulin_curve=(None if seg.insulin_curve is None else seg.insulin_curve[a:b]))
 
 
 def split_segments(segs, dataset: str, cal_frac: float = 0.6):

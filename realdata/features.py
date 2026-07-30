@@ -88,8 +88,18 @@ def _convolve(amounts: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 def segment_to_channels(seg: Segment) -> dict[str, np.ndarray]:
     """Convert a Segment's raw events into the model's absorption/action channels.
 
+    A Segment carrying pre-resolved ``carb_curve`` / ``insulin_curve`` (a source
+    whose events already store the series the producer fed the model) short-circuits
+    the kernels and returns those channels as-is — the kernels below exist only to
+    reconstruct what such a source already knows.  The three published cohorts leave
+    both ``None`` and take the convolution path unchanged.
+
     Returns dict with ``carb`` (g/step absorption) and ``insulin`` (IU/step action).
     """
+    if seg.carb_curve is not None:
+        assert seg.insulin_curve is not None, "carb_curve without insulin_curve"
+        return {'carb': np.asarray(seg.carb_curve, dtype=np.float64),
+                'insulin': np.asarray(seg.insulin_curve, dtype=np.float64)}
     carb = _convolve(seg.carb_grams, CARB_KERNEL)
     rapid_delivery = seg.bolus_units + seg.basal_rate * (GRID_MIN / 60.0)
     insulin = _convolve(rapid_delivery, BOLUS_KERNEL)

@@ -75,13 +75,23 @@ def augment_segment(seg: Segment) -> Segment:
     explained?" reads the RUNNING channel (logged + previously injected events),
     so onsets within ``LOOKBACK_STEPS`` of each other are not double-filled.
 
+    Augmentation is expressed in the RAW event channels, so it only reaches the
+    model through the bridge's kernels. A Segment carrying pre-resolved
+    ``carb_curve`` / ``insulin_curve`` bypasses those kernels entirely, which would
+    make an injected event invisible and yield a report labelled augmented that is
+    not — rejected here rather than discovered in the numbers.
+
     Args:
-        seg: a real-data Segment (length ``N``).
+        seg: a real-data Segment (length ``N``) with no pre-resolved curves.
 
     Returns:
         Segment with the same ``cgm`` and an augmented ``carb_grams`` (``N,``) /
         ``bolus_units`` (``N,``).
     """
+    assert seg.carb_curve is None and seg.insulin_curve is None, (
+        f"cannot augment {seg.dataset}/{seg.patient}: the Segment carries pre-resolved "
+        "curves, which take precedence over the raw events augmentation rewrites"
+    )
     n = len(seg)
     cgm = seg.cgm
     carb = seg.carb_grams.copy()

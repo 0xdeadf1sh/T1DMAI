@@ -18,6 +18,12 @@ these raw events into those curves is the model-input bridge's job; it
 needs basal and bolus kept *separate* (different kernels), which is why this
 schema preserves them rather than pre-summing an ``insulin_combined`` channel.
 
+A source that already carries per-event curves rather than bare amounts — the
+phone's own record, whose events store the resolved series it fed the model —
+may instead supply them directly as the optional ``carb_curve`` /
+``insulin_curve`` fields, which the bridge then uses in place of its kernels.
+The three published-cohort adapters leave both ``None``.
+
 All BG is in mg/dL.  Adapters that read a mmol/L source must convert with
 ``MGDL_PER_MMOL`` before constructing a Segment.
 """
@@ -42,6 +48,11 @@ class Segment:
     All arrays share length ``N`` and are aligned to a uniform grid starting at
     ``t0`` with ``GRID_MIN``-minute spacing.  ``cgm`` is finite everywhere
     (small gaps interpolated, large gaps split into separate Segments).
+
+    ``carb_curve`` / ``insulin_curve`` are the optional pre-resolved absorption /
+    action channels described in the module docstring: supplied together or not at
+    all, and consumed by ``features.segment_to_channels`` in preference to its own
+    kernels.  Every slicing helper must carry them along (see ``run_eval._slice``).
     """
     dataset: str
     patient: str
@@ -52,12 +63,22 @@ class Segment:
     basal_rate: np.ndarray     # (N,) basal IU/hour, piecewise-constant
     exercise: np.ndarray       # (N,) activity proxy (0 if unavailable)
     split: str = ''            # 'training' | 'testing' | '' — canonical-protocol origin
+    carb_curve: np.ndarray | None = None      # (N,) g/step appearance, pre-resolved
+    insulin_curve: np.ndarray | None = None   # (N,) IU/step action, pre-resolved (basal+bolus)
 
     def __post_init__(self) -> None:
         n = len(self.cgm)
         for name in ('carb_grams', 'bolus_units', 'basal_rate', 'exercise'):
             arr = getattr(self, name)
             assert arr.shape == (n,), f"{name} length {arr.shape} != cgm length {n}"
+        assert (self.carb_curve is None) == (self.insulin_curve is None), (
+            "carb_curve and insulin_curve must be supplied together or both left None"
+        )
+        for name in ('carb_curve', 'insulin_curve'):
+            arr = getattr(self, name)
+            assert arr is None or arr.shape == (n,), (
+                f"{name} length {None if arr is None else arr.shape} != cgm length {n}"
+            )
         assert np.isfinite(self.cgm).all(), "cgm must be gap-free (interpolate/split first)"
 
     def __len__(self) -> int:
@@ -82,6 +103,8 @@ def segment_grid(
     bolus_units: np.ndarray,
     basal_rate: np.ndarray,
     exercise: np.ndarray,
+    carb_curve: np.ndarray | None = None,
+    insulin_curve: np.ndarray | None = None,
 ) -> list[Segment]:
     """Split a full uniform grid into gap-free Segments.
 
@@ -96,12 +119,21 @@ def segment_grid(
         grid_t0: timestamp of grid index 0.
         cgm: (M,) mg/dL with NaN at missing steps.
         carb_grams, bolus_units, basal_rate, exercise: (M,) event channels.
+        carb_curve, insulin_curve: optional (M,) pre-resolved absorption / action
+            channels, sliced onto each Segment alongside the event channels.
 
     Returns:
         List of Segments (possibly empty), each ≥ ``MIN_SEGMENT_STEPS`` long.
     """
     m = len(cgm)
     assert all(len(a) == m for a in (carb_grams, bolus_units, basal_rate, exercise))
+    assert (carb_curve is None) == (insulin_curve is None), (
+        "carb_curve and insulin_curve must be supplied together or both left None"
+    )
+    if carb_curve is not None and insulin_curve is not None:
+        assert len(carb_curve) == m and len(insulin_curve) == m, (
+            "pre-resolved curve length does not match the grid"
+        )
     max_gap = MAX_INTERP_GAP_MIN // GRID_MIN          # in steps
 
     finite = np.isfinite(cgm)
@@ -111,9 +143,11 @@ def segment_grid(
     # Boundaries of valid coverage: trim leading/trailing NaN.
     first, last = int(np.argmax(finite)), m - int(np.argmax(finite[::-1]))
     cgm = cgm[first:last].copy()
-    chans = {k: v[first:last].copy() for k, v in (
-        ('carb_grams', carb_grams), ('bolus_units', bolus_units),
-        ('basal_rate', basal_rate), ('exercise', exercise))}
+    named = [('carb_grams', carb_grams), ('bolus_units', bolus_units),
+             ('basal_rate', basal_rate), ('exercise', exercise)]
+    if carb_curve is not None:
+        named += [('carb_curve', carb_curve), ('insulin_curve', insulin_curve)]
+    chans = {k: v[first:last].copy() for k, v in named}
     seg_t0 = grid_t0 + timedelta(minutes=GRID_MIN * first)
     finite = np.isfinite(cgm)
 
@@ -159,6 +193,8 @@ def segment_grid(
             bolus_units=chans['bolus_units'][lo:hi],
             basal_rate=chans['basal_rate'][lo:hi],
             exercise=chans['exercise'][lo:hi],
+            carb_curve=(None if carb_curve is None else chans['carb_curve'][lo:hi]),
+            insulin_curve=(None if carb_curve is None else chans['insulin_curve'][lo:hi]),
         ))
     return segments
 

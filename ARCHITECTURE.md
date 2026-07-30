@@ -124,6 +124,15 @@ Insulin sensitivity, hepatic glucose output and exercise stay in the cache but
 never reach the model. They are internal states a real CGM cannot observe, so
 withholding them forces the model to forecast from signals deployment can supply.
 
+`carb_intake` and `insulin_combined` are **absorption and action rates**, not
+ingestion and injection instants: grams entering the blood and units acting in each
+5-minute step. Pretraining takes them from the simulator directly. Real records
+rarely store them, so `realdata/features.py` reconstructs them by convolving logged
+amounts with population-mean kernels, with the fidelity limits the README sets out.
+A record whose events already carry their resolved series instead supplies them on
+`Segment.carb_curve` / `Segment.insulin_curve`, which bypass the kernels; the
+transforms in the table above are unchanged either way.
+
 ### The index map
 
 Context patches carry all three features. In the prediction zone:
