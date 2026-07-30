@@ -239,6 +239,45 @@ every bolus, where the simulator scales duration with dose, and MDI long-acting
 analogues are approximated as rapid. Treat the real-cohort channels as a
 plausible reconstruction of absorption and action, not a measurement of it.
 
+### A record that already holds its curves
+
+One source escapes that reconstruction. A record authored by the companion
+Android app stores, per logged event, the resolved per-five-minute series the app
+itself fed the model — an explicit curve where one was built or mixed, otherwise
+the parameters that generate it, glycemic index included. `realdata/personal.py`
+reads such a record and carries those series through unchanged, so the channels
+match what the device produces at inference rather than approximating them.
+
+```bash
+python finetune/finetune_personal.py --checkpoint checkpoints/t1dmai_best.pt \
+    --db /path/to/record.db --lr-scale 0.05 --steps 400 --eval-interval 25
+```
+
+With one patient there is no patient to hold out, so a *day* is held out
+instead: the day whose coefficient of variation falls nearest the median of every
+complete day the record contains, chosen so the score reflects neither the
+calmest day nor the most turbulent. That day is withheld together with the two
+before it. Every prediction window carries a full 24 hours of context, so the day
+immediately before the scored one is read as its context and also serves as the
+calibration split for the conformal fit; the third day is the context that
+calibration split in turn reads. No step the fine-tune trained on is consumed as
+context by a scored or calibration window. The full per-day ranking is printed at
+startup, including days in shorter segments that count toward the median but
+cannot host the reservation.
+
+Because the calibration day is also the scored day's context, the residuals
+setting the conformal half-width come from the stretch the scored forecasts are
+conditioned on. `--val-day` and `--cal-day` override both choices.
+
+The database is opened read-only and never modified; `--skip-hours` (24 by
+default) drops the opening hours at load time rather than by deleting rows, which
+keeps the insulin and carbohydrate action of earlier events reaching correctly
+into what remains. A record of a few weeks yields on the order of a hundred
+training windows and a few dozen scoring windows, and windows are strided densely
+enough to overlap, which weakens the exchangeability the conformal fit assumes:
+the resulting coverage figures are indicative. A gain measured on a single day of
+a single person is evidence of adaptation to that record, not of generalisation.
+
 
 ## Inference modes
 
