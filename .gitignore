@@ -36,6 +36,11 @@ htmlcov/
 *.pth
 checkpoints/
 
+# --- Exported runtime artifacts (regenerable from a checkpoint; keep exporters/*.py) ---
+*.pte
+*.tflite
+exported/
+
 # --- Distribution archives (T1DMAI_models.tar.gz is ~2.7 GB; linked from the README) ---
 *.tar.gz
 
@@ -50,6 +55,13 @@ finetune/*.csv
 *.npz
 *_cache/
 datasets/
+
+# --- Personal records (a phone-authored sync database is patient data; never commit one) ---
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 
 # --- Generated figures / cards / screenshots ---
 figures/
