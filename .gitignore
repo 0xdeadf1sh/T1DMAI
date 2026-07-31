@@ -41,13 +41,14 @@ checkpoints/
 *.tflite
 exported/
 
-# --- Distribution archives (T1DMAI_models.tar.gz is ~2.7 GB; linked from the README) ---
+# --- Distribution archives (T1DMAI_models.tar.gz is ~1.9 GB; linked from the README) ---
 *.tar.gz
 
 # --- Trained-model + report artifact trees (regenerable; keep the .py tools) ---
 models/*/
 models/out/
 models/ablation/
+models_new/
 models_finetuned_on_ohiot1dm/
 finetune/*.csv
 
