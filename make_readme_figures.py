@@ -482,25 +482,36 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
 
     for ax, dx, bands, med, ctx_show, title in panels:
         h = len(med)
+        # t=0 is the forecast origin: the LAST CONTEXT step, index origin-1, whose BG is
+        # the model's own last_bg anchor (data._build_sample takes bg[pred_start-1]).
+        # Prediction step k is index origin+k, at (k+1)*5 min. Each future series is
+        # therefore prepended with the anchor, so it leaves the observed line instead of
+        # starting one step clear of it. For the bands that join is not cosmetic: the
+        # head decodes a delta from last_bg, so the fan has zero width at the origin.
         tc = np.arange(-ctx_show, 1) * 5.0 / 60.0
-        tf = (np.arange(h) + 1) * 5.0 / 60.0
+        tf = np.arange(h + 1) * 5.0 / 60.0
         x0, x1 = tc[0], tf[-1]
+        anchor = bg[origin - 1]
+        ctx_bg = bg[origin - 1 - ctx_show:origin]
+        fut_bg = np.concatenate([[anchor], bg[origin:origin + h]])
+        fut_med = np.concatenate([[anchor], med])
+        fut_bands = np.vstack([np.full((1, bands.shape[1]), anchor), bands])
 
         ax.set_facecolor(t.paper)
         ax.axhspan(70, 180, color=t.fill(t.SAGE), zorder=0)
         ax.axhline(70, color=t.muted, lw=0.7, ls=(0, (4, 4)), zorder=1)
         ax.axhline(180, color=t.muted, lw=0.7, ls=(0, (4, 4)), zorder=1)
         for lo, hi, alpha in ((0, 6, 0.16), (1, 5, 0.24), (2, 4, 0.34)):
-            ax.fill_between(tf, bands[:, lo], bands[:, hi], color=t.TEAL,
+            ax.fill_between(tf, fut_bands[:, lo], fut_bands[:, hi], color=t.TEAL,
                             alpha=alpha, lw=0, zorder=2)
-        ax.plot(tc, bg[origin - ctx_show:origin + 1], color=t.ink, lw=1.6,
+        ax.plot(tc, ctx_bg, color=t.ink, lw=1.6,
                 zorder=5, label="observed CGM")
-        ax.plot(tf, bg[origin:origin + h], color=t.ink, lw=1.6, ls=(0, (4, 3)),
+        ax.plot(tf, fut_bg, color=t.ink, lw=1.6, ls=(0, (4, 3)),
                 zorder=5, label="true future CGM")
-        ax.plot(tf, med, color=t.CLAY, lw=2.1, zorder=6, label="forecast median")
+        ax.plot(tf, fut_med, color=t.CLAY, lw=2.1, zorder=6, label="forecast median")
         ax.axvline(0.0, color=t.muted, lw=1.0, zorder=3)
 
-        seen = np.concatenate([bg[origin - ctx_show:origin + h], bands[:, 5], med])
+        seen = np.concatenate([ctx_bg, fut_bg, fut_bands[:, 5], fut_med])
         top = min(400.0, max(220.0, float(np.nanmax(seen)) * 1.07))
         bot = max(40.0, min(85.0, float(np.nanmin(seen)) * 0.90))
         ax.set_xlim(x0, x1)
@@ -513,8 +524,8 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
         ax.spines["bottom"].set_visible(False)
 
         # announced plan, on its own strip
-        sl = slice(origin - ctx_show, origin + h)
-        td = np.arange(-ctx_show, h) * 5.0 / 60.0
+        sl = slice(origin - 1 - ctx_show, origin + h)
+        td = np.arange(-ctx_show, h + 1) * 5.0 / 60.0
         c_max = max(float(carb[sl].max()), 1e-6)
         i_max = max(float(ins[sl].max()), 1e-6)
         dx.set_facecolor(t.paper)
