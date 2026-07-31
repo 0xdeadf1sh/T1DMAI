@@ -363,12 +363,16 @@ Twelve checkpoints — four capacities crossed with three training variants
 (`sim`, `ohio`, `multi`) — ship out of band with their training logs, per-model
 evaluation output and figures. They are not in git.
 
-**Download:** [`T1DMAI_models.tar.gz`](https://drive.google.com/file/d/1jCPNCr3Myb6slMCKZPfy67I5zzAe71m_/view?usp=sharing)
+**Download:** [`T1DMAI_models.tar.gz`](https://drive.google.com/file/d/1B8SHxyxyHTddify6783j8n1g6z1ua_pa/view?usp=sharing) (1.9 GB)
 
 Unpack into `models/`. `models/compare.py` reads all twelve and writes a
 cross-model comparison; `models/README.md` documents the layout, the reporting
 bases and every figure it produces. All twelve were pretrained on
 [`cache_balanced`](#simulator-cache).
+
+Each model ships with the two formal reports, the probes and the scripts that
+produced them. The augmentation regime (`metrics_*/augmented/`) is not bundled;
+`metrics/augmented/build_report.py` rebuilds it from a checkpoint.
 
 ```bash
 tar xzf T1DMAI_models.tar.gz

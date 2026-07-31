@@ -24,7 +24,6 @@ models/
 │   └── metrics_sim/  metrics_ohio/  metrics_multi/
 │       ├── real/               evaluation on the three real cohorts
 │       ├── sim/                evaluation on the simulator
-│       ├── augmented/          evaluation under augmentation
 │       └── *.json  *.py        probe results and the scripts that produced them
 └── comparison/                 written by compare.py
     ├── figures/                27 PNG figures at 300 dpi
@@ -143,7 +142,9 @@ into that comparison.
 
 ### Not included in the comparison
 
-The CGM 15-minute shift probe (`shift15.json`) and the augmentation material
-(`augexp.json` and the `augmented/` evaluation regime) are present in the per-model
-metric directories but are not read by `compare.py`. `index.json` records the
-exclusion.
+The CGM 15-minute shift probe (`shift15.json`) and the augmentation bound
+(`augexp.json`) are present in the per-model metric directories but are not read by
+`compare.py`. `index.json` records the exclusion.
+
+The `augmented/` evaluation regime is not part of this tree. `metrics/augmented/build_report.py`
+in the repository rebuilds it from a checkpoint.
