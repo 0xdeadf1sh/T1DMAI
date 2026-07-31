@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 import config  # loss-schema fallbacks (DILATE_ALPHA/GAMMA, QUANTILE_LEVELS) absent from the checkpoint's serialized config; every structural flag is derived from the weights via _derive_arch
+from make_figures import CGEGA_COLUMNS_TRUSTWORTHY  # the single gate on the validation log's cgega_* columns; see the constant's comment for why and what flips it
 
 import numpy as np
 import matplotlib as mpl
@@ -1031,45 +1032,14 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
 
 
 def card_metrics_card(val: dict[str, np.ndarray]) -> None:
-    # Tall card: the metric table carries five sections plus the curve/event-match
-    # block (~32 rows + 6 eyebrows), so the row pitch is tightened and the figure
-    # stretched to keep it inside ax [0, 1].
-    fig, ax = _setup_card((13.0, 17.5))
-    ROW = 0.0145   # per-row vertical pitch (axes fraction)
-    SEC_PAD = 0.003  # trailing gap after each section
-    y = _header(ax, "Validation metrics",
-                "Headline results",
-                "Best-over-run (with the step where it was achieved) and mean over the "
-                "last 10 validation rows. Future carb/insulin are announced (conditioned).")
-
-    def _tight_section(yy: float, lab: str, color=NAVY) -> float:
-        """Section eyebrow with a tighter gap than the shared _section (this card
-        packs five sections plus two analysis blocks, so it can't afford 0.040
-        per heading)."""
-        ax.text(0.025, yy, lab.upper(), fontsize=8.5, color=color,
-                family=FONT_BODY, weight="bold", transform=ax.transAxes)
-        return yy - 0.026
-
-    def _col(col: str) -> np.ndarray:
-        """Column accessor tolerant of an absent column (older CSV schema)."""
-        if col in val:
-            return val[col]
-        return np.full_like(val["step"], np.nan, dtype=float)
-
-    def stat(col: str, higher_is_better: bool):
-        yv = _col(col); sv = val["step"]
-        mask = np.isfinite(yv); yy, ss = yv[mask], sv[mask]
-        if yy.size == 0:
-            return float("nan"), 0, float("nan")
-        idx = int(np.argmax(yy) if higher_is_better else np.argmin(yy))
-        # Mean over the last 10 *actual* validation rows (nan-tolerant), not the
-        # last 10 finite cells of this column — a sparsely-populated column would
-        # otherwise reach back arbitrarily far and mislabel the window.
-        last10 = float(np.nanmean(yv[-10:])) if np.isfinite(yv[-10:]).any() else float("nan")
-        return yy[idx], int(ss[idx]), last10
-
-    def _fmt(v: float, fmt: str) -> str:
-        return fmt.format(v) if np.isfinite(v) else "—"
+    # Tall card: the metric table carries several sections plus the curve-match
+    # block (~32 rows + 6 eyebrows at full strength), so the row pitch is tightened
+    # and the figure stretched to keep it inside ax [0, 1].
+    ROW = 0.0145      # per-row vertical pitch (axes fraction)
+    BAND = 0.014      # alternating row-shade height (axes fraction)
+    SEC_PAD = 0.003   # trailing gap after each section
+    SEC_HEAD = 0.026  # gap between a section eyebrow and its first row
+    CARD_H = 17.5     # inches, sized for the full section set below
 
     sections = [
         ("Loss & overall accuracy", NAVY,
@@ -1092,14 +1062,6 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
           ("hypo_precision",  True, "hypo precision",                 "{:.3f}", "{:.3f}"),
           ("hyper_recall",    True, f"hyper recall  (BG > {config.BG_HYPER_THRESHOLD:.0f} mg/dL)", "{:.3f}", "{:.3f}"),
           ("hyper_precision", True, "hyper precision",                "{:.3f}", "{:.3f}")]),
-        # CG-EGA (Kovatchev 2004): %AP higher better, %EP lower better, per region.
-        ("CG-EGA clinical accuracy", PLUM,
-         [("cgega_ap_hypo",  True,  "%AP hypo  (accurate, higher better)",    "{:.3f}", "{:.3f}"),
-          ("cgega_ep_hypo",  False, "%EP hypo  (erroneous, lower better)",    "{:.3f}", "{:.3f}"),
-          ("cgega_ap_eu",    True,  "%AP euglycemic  (higher better)",        "{:.3f}", "{:.3f}"),
-          ("cgega_ep_eu",    False, "%EP euglycemic  (lower better)",         "{:.3f}", "{:.3f}"),
-          ("cgega_ap_hyper", True,  "%AP hyper  (higher better)",             "{:.3f}", "{:.3f}"),
-          ("cgega_ep_hyper", False, "%EP hyper  (lower better)",              "{:.3f}", "{:.3f}")]),
         # Marginal coverage of the 90% quantile band (τ 0.05–0.95), per horizon;
         # target = 0.90.  Higher-is-better is ambiguous (over- and under-coverage
         # both miss), so these track toward 0.90 — flagged as lower-distance, the
@@ -1109,6 +1071,67 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
           ("coverage90@60",  True, "coverage @60m",  "{:.3f}", "{:.3f}"),
           ("coverage90@120", True, "coverage @120m", "{:.3f}", "{:.3f}")]),
     ]
+
+    # CG-EGA (Kovatchev 2004): %AP higher better, %EP lower better, per region.
+    # Read straight out of validation_log.csv, so the section stands or falls with
+    # CGEGA_COLUMNS_TRUSTWORTHY. When it is False the six rows are withheld and
+    # the canvas is shortened by exactly the space they would have occupied, so
+    # the physical row pitch and every font size are unchanged and the table just
+    # ends one section earlier.
+    cgega_section = (
+        "CG-EGA clinical accuracy", PLUM,
+        [("cgega_ap_hypo",  True,  "%AP hypo  (accurate, higher better)",    "{:.3f}", "{:.3f}"),
+         ("cgega_ep_hypo",  False, "%EP hypo  (erroneous, lower better)",    "{:.3f}", "{:.3f}"),
+         ("cgega_ap_eu",    True,  "%AP euglycemic  (higher better)",        "{:.3f}", "{:.3f}"),
+         ("cgega_ep_eu",    False, "%EP euglycemic  (lower better)",         "{:.3f}", "{:.3f}"),
+         ("cgega_ap_hyper", True,  "%AP hyper  (higher better)",             "{:.3f}", "{:.3f}"),
+         ("cgega_ep_hyper", False, "%EP hyper  (lower better)",              "{:.3f}", "{:.3f}")])
+    if CGEGA_COLUMNS_TRUSTWORTHY:
+        sections.insert(3, cgega_section)
+        h_scale = 1.0
+    else:
+        h_scale = 1.0 - (SEC_HEAD + SEC_PAD + len(cgega_section[2]) * ROW)
+        ROW /= h_scale
+        BAND /= h_scale
+        SEC_PAD /= h_scale
+        SEC_HEAD /= h_scale
+        print("  · card_08_metrics: CG-EGA section omitted "
+              "(CGEGA_COLUMNS_TRUSTWORTHY is False)")
+
+    fig, ax = _setup_card((13.0, CARD_H * h_scale))
+    y = _header(ax, "Validation metrics",
+                "Headline results",
+                "Best-over-run (with the step where it was achieved) and mean over the "
+                "last 10 validation rows. Future carb/insulin are announced (conditioned).")
+
+    def _tight_section(yy: float, lab: str, color=NAVY) -> float:
+        """Section eyebrow with a tighter gap than the shared _section (this card
+        packs every metric section plus the curve-match block, so it can't afford
+        0.040 per heading)."""
+        ax.text(0.025, yy, lab.upper(), fontsize=8.5, color=color,
+                family=FONT_BODY, weight="bold", transform=ax.transAxes)
+        return yy - SEC_HEAD
+
+    def _col(col: str) -> np.ndarray:
+        """Column accessor tolerant of an absent column (older CSV schema)."""
+        if col in val:
+            return val[col]
+        return np.full_like(val["step"], np.nan, dtype=float)
+
+    def stat(col: str, higher_is_better: bool):
+        yv = _col(col); sv = val["step"]
+        mask = np.isfinite(yv); yy, ss = yv[mask], sv[mask]
+        if yy.size == 0:
+            return float("nan"), 0, float("nan")
+        idx = int(np.argmax(yy) if higher_is_better else np.argmin(yy))
+        # Mean over the last 10 *actual* validation rows (nan-tolerant), not the
+        # last 10 finite cells of this column — a sparsely-populated column would
+        # otherwise reach back arbitrarily far and mislabel the window.
+        last10 = float(np.nanmean(yv[-10:])) if np.isfinite(yv[-10:]).any() else float("nan")
+        return yy[idx], int(ss[idx]), last10
+
+    def _fmt(v: float, fmt: str) -> str:
+        return fmt.format(v) if np.isfinite(v) else "—"
 
     # Column headers
     ax.text(0.045, y - 0.005, "METRIC", fontsize=8.5, color=DIMMED, weight="bold", transform=ax.transAxes)
@@ -1122,7 +1145,7 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
         cur = _tight_section(cur, title, color=color)
         for i, (col, hib, label, bf, lf) in enumerate(rows):
             if i % 2 == 1:
-                ax.add_patch(Rectangle((0.025, cur - 0.007), 0.95, 0.014,
+                ax.add_patch(Rectangle((0.025, cur - BAND / 2), 0.95, BAND,
                                         fc=SOFT_RULE, ec="none", transform=ax.transAxes))
             best, step, l10 = stat(col, hib)
             ax.text(0.045, cur, label, fontsize=9.0, color=INK, family=FONT_BODY,
@@ -1145,7 +1168,7 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
     ]
     for i, (col, label, fmt) in enumerate(match_rows):
         if i % 2 == 1:
-            ax.add_patch(Rectangle((0.025, cur - 0.007), 0.95, 0.014,
+            ax.add_patch(Rectangle((0.025, cur - BAND / 2), 0.95, BAND,
                                     fc=SOFT_RULE, ec="none", transform=ax.transAxes))
         best, step, l10 = stat(col, True)
         ax.text(0.045, cur, label, fontsize=9.0, color=INK, family=FONT_BODY, transform=ax.transAxes)

@@ -22,6 +22,18 @@ REPO = Path(__file__).resolve().parent
 LOG_DIR = REPO / "logs"
 OUT_DIR = REPO / "figures"
 
+# Every cgega_* column in logs/validation_log.csv (and in each checkpoint's
+# val_history) was written by train.py with the CG-EGA arguments transposed, so
+# each stored value scores (true, pred) instead of (pred, true). They cannot be
+# recomputed: they record a training run that no longer exists to re-score. This
+# flag is the single gate on every consumer of those columns — here and in
+# make_card.py, which imports it — so the panels are suppressed rather than
+# deleted. Flip it to True once a retrain has regenerated the columns under the
+# fixed argument order and every suppressed panel returns unchanged. It governs
+# ONLY the validation-log columns; metrics/ and realdata/ recompute CG-EGA from
+# stored forecasts and are unaffected.
+CGEGA_COLUMNS_TRUSTWORTHY = False
+
 # Architecture label shown in figure suptitles, derived from the resolved
 # config at run time (set by run()).
 _ARCH_LABEL = ""
@@ -178,32 +190,35 @@ def fig_bg_rmse_horizons(val, outdir: Path) -> None:
 
 
 def fig_clinical(val, outdir: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(13.6, 4.6))
+    # (column, colour, higher_is_better, annotation, y-label, title). The CG-EGA
+    # panel is appended only when its source column is trustworthy; the figure is
+    # then laid out over however many panels survive, so a suppressed one leaves
+    # a narrower figure rather than an empty axis.
+    panels = [
+        ("evalfix_mard@30", "#1f4e8c", False, "best {val:.2f}% @ {step}",
+         "MARD @30m  [%]", "Mean Absolute Relative Difference (@30 min)"),
+        ("evalfix_clarke_A@30", "#2a8a3e", True, "best {val:.2f}% @ {step}",
+         "Clarke A @30m  [%]", "Clarke Error-Grid zone A (@30 min)"),
+    ]
+    if CGEGA_COLUMNS_TRUSTWORTHY:
+        panels.append(
+            ("cgega_ap_eu", "#8e44ad", True, "best {val:.3f} @ {step}",
+             "CG-EGA %AP (eu)", "CG-EGA clinical accuracy (euglycemic %AP)"))
+    else:
+        print("  · fig05_clinical: CG-EGA panel omitted "
+              "(CGEGA_COLUMNS_TRUSTWORTHY is False)")
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.53 * len(panels), 4.6),
+                             squeeze=False)
     s = val["step"]
+    for ax, (col, color, higher, fmt, ylabel, title) in zip(axes[0], panels):
+        y = val[col]
+        ax.plot(s, y, color=color, linewidth=1.4)
+        _annotate_best(ax, s, y, fmt, higher_is_better=higher, color=color)
+        ax.set_xlabel("training step"); ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.locator_params(axis="x", nbins=5)
 
-    ax = axes[0]
-    y = val["evalfix_mard@30"]
-    ax.plot(s, y, color="#1f4e8c", linewidth=1.4)
-    _annotate_best(ax, s, y, "best {val:.2f}% @ {step}", color="#1f4e8c")
-    ax.set_xlabel("training step"); ax.set_ylabel("MARD @30m  [%]")
-    ax.set_title("Mean Absolute Relative Difference (@30 min)")
-
-    ax = axes[1]
-    y = val["evalfix_clarke_A@30"]
-    ax.plot(s, y, color="#2a8a3e", linewidth=1.4)
-    _annotate_best(ax, s, y, "best {val:.2f}% @ {step}", higher_is_better=True, color="#2a8a3e")
-    ax.set_xlabel("training step"); ax.set_ylabel("Clarke A @30m  [%]")
-    ax.set_title("Clarke Error-Grid zone A (@30 min)")
-
-    ax = axes[2]
-    y = val["cgega_ap_eu"]
-    ax.plot(s, y, color="#8e44ad", linewidth=1.4)
-    _annotate_best(ax, s, y, "best {val:.3f} @ {step}", higher_is_better=True, color="#8e44ad")
-    ax.set_xlabel("training step"); ax.set_ylabel("CG-EGA %AP (eu)")
-    ax.set_title("CG-EGA clinical accuracy (euglycemic %AP)")
-
-    for a in axes:
-        a.locator_params(axis="x", nbins=5)
     _suptitle(fig, "Clinical-style metrics")
     fig.tight_layout()
     fig.savefig(outdir / "fig05_clinical.png")
@@ -414,7 +429,16 @@ def fig_trend_quality(val, outdir: Path) -> None:
 
 
 def fig_cgega_regions(val, outdir: Path) -> None:
-    """CG-EGA per region: %AP (accurate, higher better), %EP (erroneous, lower better)."""
+    """CG-EGA per region: %AP (accurate, higher better), %EP (erroneous, lower better).
+
+    Every series on this figure comes from a cgega_* validation column, so when
+    those columns are untrustworthy nothing is left to draw: the PNG is skipped
+    outright rather than written empty.
+    """
+    if not CGEGA_COLUMNS_TRUSTWORTHY:
+        print("  · fig13_cgega_regions: skipped, no PNG written "
+              "(CGEGA_COLUMNS_TRUSTWORTHY is False)")
+        return
     regions = [("hypo", "#1f4e8c"), ("eu", "#2a8a3e"), ("hyper", "#c5343c")]
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.4))
     s = val["step"]
@@ -673,10 +697,26 @@ def run() -> None:
         "fig04_bg_rmse_horizons.png", "fig05_clinical.png", "fig06_excursion.png",
         "fig07_calibration.png", "fig08_optim.png", "fig09_summary.png",
         "fig11_curve_match.png", "fig12_trend_quality.png",
-        "fig13_cgega_regions.png", "fig14_clarke_zones.png", "fig15_tir.png",
+        "fig14_clarke_zones.png", "fig15_tir.png",
     ]
+    if CGEGA_COLUMNS_TRUSTWORTHY:
+        figures.insert(10, "fig13_cgega_regions.png")
     if _tod_present(val):
         figures.append("fig16_time_of_day.png")
+
+    # Best-over-training CG-EGA. Withheld with the rest of the cgega_* readers —
+    # a best-over-run taken from a transposed column would sit in summary.json
+    # beside corrected metrics/ numbers and contradict them.
+    cgega_best = {}
+    if CGEGA_COLUMNS_TRUSTWORTHY:
+        cgega_best = {
+            "cgega_ap_eu": _best("cgega_ap_eu", higher=True),
+            "cgega_ap_hypo": _best("cgega_ap_hypo", higher=True),
+            "cgega_ap_hyper": _best("cgega_ap_hyper", higher=True),
+        }
+    else:
+        print("  · summary.json: cgega_ap_{eu,hypo,hyper} omitted "
+              "(CGEGA_COLUMNS_TRUSTWORTHY is False)")
 
     summary = {
         "arch_label": _ARCH_LABEL,
@@ -689,15 +729,13 @@ def run() -> None:
             "val_loss_step": _best_step("val_loss_total", higher=False),
             "mard_30m": _best("evalfix_mard@30", higher=False),
             "clarke_A_30m": _best("evalfix_clarke_A@30", higher=True),
-            "cgega_ap_eu": _best("cgega_ap_eu", higher=True),
             "hypo_recall": _best("hypo_recall", higher=True),
             "hyper_recall": _best("hyper_recall", higher=True),
             "bg_curve_corr": _best("bg_curve_corr", higher=True),
             "roc_corr": _best("roc_corr", higher=True),
             "roc_rmse": _best("roc_rmse", higher=False),
             "trend_amp_ratio": _best("trend_amp_ratio", higher=True),
-            "cgega_ap_hypo": _best("cgega_ap_hypo", higher=True),
-            "cgega_ap_hyper": _best("cgega_ap_hyper", higher=True),
+            **cgega_best,
             "clarke_AB_pct": _best("clarke_AB_pct", higher=True),
             "tir_err_abs": (None if val.get("tir_err") is None or not np.isfinite(val["tir_err"]).any()
                             else float(np.nanmin(np.abs(val["tir_err"])))),
