@@ -255,6 +255,52 @@ def test_band_scoring_does_not_disturb_the_alarm_edges():
           f"{res[120]['hyper']['n_pred']}/{res_n[120]['hyper']['n_pred']} ✓")
 
 
+def test_cgega_region_totals_depend_only_on_the_truth():
+    """Hold the truth and the window set fixed, vary only the forecast: the three
+    CG-EGA per-region totals must not move.
+
+    A point's glycemic region is that of its TRUE glucose, so ``ap+be+ep`` per region is
+    a function of the truth and the window set alone — the forecast may only redistribute
+    each total across AP/BE/EP. Score the forecast as the reference instead and the
+    region follows the forecast, so the denominators shift between two runs over
+    identical truth and the per-region percentages are no longer comparable.
+
+    Both forecasts here sit far outside their own band, so the projected series is
+    displaced ~51 mg/dL below the truth in one run and ~51 above it in the other — well
+    across both the 70 and the 180 mg/dL region boundaries for a large share of points.
+    """
+    rng = np.random.default_rng(17)
+    n = 40
+    true = np.clip(
+        rng.uniform(60.0, 280.0, n)[:, None]
+        + np.cumsum(rng.standard_normal((n, PRED_STEPS)) * 5.0, axis=1),
+        40.0, 400.0)
+    last_bg = true[:, 0] - rng.standard_normal(n) * 5.0
+    pats = [f"p{i % 4}" for i in range(n)]
+
+    low = np.clip(true - 55.0, 40.0, 400.0)
+    high = np.clip(true + 55.0, 40.0, 400.0)
+    res_lo = compute_suite(low, true, last_bg, pats, bands=_fan(low, 8.0))
+    res_hi = compute_suite(high, true, last_bg, pats, bands=_fan(high, 8.0))
+
+    def _tot(res, reg):
+        c = res['cgega']['counts']
+        return c[f'ap_{reg}'] + c[f'be_{reg}'] + c[f'ep_{reg}']
+
+    for reg in ('hypo', 'eu', 'hyper'):
+        assert _tot(res_lo, reg) == _tot(res_hi, reg), (
+            f"CG-EGA {reg} denominator moved with the forecast: "
+            f"{_tot(res_lo, reg)} vs {_tot(res_hi, reg)} — the region is being binned "
+            f"on the forecast, not the truth"
+        )
+    # not vacuous: the two forecasts genuinely score differently inside those totals
+    assert res_lo['cgega']['counts'] != res_hi['cgega']['counts']
+    assert sum(res_lo['cgega']['counts'].values()) == true.size
+    print(f"[DUMP] region totals invariant to the forecast: "
+          f"{[(r, _tot(res_lo, r)) for r in ('hypo', 'eu', 'hyper')]} "
+          f"== {[(r, _tot(res_hi, r)) for r in ('hypo', 'eu', 'hyper')]} ✓")
+
+
 # ----------------------------- conformal basis ------------------------------ #
 def test_conformal_intervals_on_the_projected_basis_is_tighter():
     """Fed the band-projected arrays, the conformal half-width shrinks.

@@ -210,11 +210,12 @@ def compute_suite(pred: np.ndarray, true: np.ndarray, last_bg: np.ndarray,
         row['hyper'] = _excursion(pred_hi_k, tk, BG_HYPER_THRESHOLD, 'hyper')
         row['n_windows'] = len(tk)
         out[h] = row
-    # CG-EGA clinical accuracy (Kovatchev 2004) over the FULL forecast window
-    # (all PRED_STEPS, not a single horizon) — per-region %AP/%BE/%EP, anchored
-    # at last_bg for the t=0 rate. GRID_MIN = 5 min per step. Its rate-of-change term
-    # inherits the truth's derivative wherever the truth lies inside the band.
-    cg_counts = cg_ega.cg_ega_counts(pred_eff, true, last_bg, freq_min=5.0)
+    # CG-EGA clinical accuracy over the FULL forecast window (all PRED_STEPS, not a
+    # single horizon) — per-region %AP/%BE/%EP, anchored at last_bg for the t=0 rate.
+    # GRID_MIN = 5 min per step. The TRUTH is the reference on every axis (region,
+    # acceptance band, mod widening, R-EGA abscissa); the band-projected forecast is
+    # the scored series, and where the truth lies inside the band the two coincide.
+    cg_counts = cg_ega.cg_ega_counts(true, pred_eff, last_bg, freq_min=5.0)
     cg_fr = cg_ega.cg_ega_fractions(cg_counts)
     out['cgega'] = {
         f'{m}_{reg}': (None if cg_fr[f'{m}_{reg}'] is None

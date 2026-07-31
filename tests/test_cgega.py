@@ -143,6 +143,39 @@ def test_large_point_error_is_erroneous():
     print(f"[DUMP] large-point-error counts={counts}  pmarks={pm}  rmarks={marks['r_mark']}")
 
 
+def test_counts_are_asymmetric_in_the_two_trajectories():
+    """Swapping the two trajectories must change the table.
+
+    ``cg_ega_counts(y_true, y_pred, ...)`` takes the FIRST argument as the reference on
+    every axis — the glycemic region, the ±20% acceptance denominator, the zone-D
+    excursion gates and the rate-dependent ``mod`` widening. Nothing else in this file
+    can see that: the load-bearing perfect-prediction case passes ``(y, y)`` and is
+    invariant under the swap, and every other test calls in the documented order. A
+    caller that reverses the two arguments therefore produces a well-formed table of a
+    different statistic and no test notices. Pin the asymmetry itself.
+    """
+    T = 8
+    last = np.array([120.0, 300.0])
+    a = np.stack([np.linspace(115.0, 60.0, T),        # eu -> hypo
+                  np.full(T, 300.0)])                 # stable hyper
+    b = np.stack([np.full(T, 190.0),                  # stable hyper
+                  np.linspace(295.0, 150.0, T)])      # hyper -> eu
+    fwd = cg_ega.cg_ega_counts(a, b, last)
+    rev = cg_ega.cg_ega_counts(b, a, last)
+
+    def _tot(c, reg):
+        return c[f"ap_{reg}"] + c[f"be_{reg}"] + c[f"ep_{reg}"]
+
+    assert fwd != rev, f"transposing the trajectories left the table unchanged: {fwd}"
+    assert any(_tot(fwd, r) != _tot(rev, r) for r in ("hypo", "eu", "hyper")), (
+        f"region DENOMINATORS did not move under transposition: "
+        f"{[(r, _tot(fwd, r), _tot(rev, r)) for r in ('hypo', 'eu', 'hyper')]}"
+    )
+    # the point count is conserved either way — only its distribution over regions moves
+    assert sum(fwd.values()) == sum(rev.values()) == a.size
+    print(f"[DUMP] asymmetry: fwd={fwd}\n[DUMP]            rev={rev}")
+
+
 def test_port_equivalence_against_reference_conditions():
     """For a random batch, the cg_ega P/R marks must equal the oracle marks
     re-derived straight from the reference boolean conditions."""

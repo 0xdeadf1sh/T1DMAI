@@ -445,11 +445,13 @@ def compute_learning_metrics(
         _stage(f'hyper_recall_hit@{_h}', (_yt & _yp).sum())
         _stage(f'hyper_prec_hit@{_h}', (_yp & (_yt | _cpy)).sum())
 
-    # CG-EGA (Kovatchev 2004; dotXem adaptation to PREDICTION). Per-region
-    # AP/BE/EP counts, accumulated across batches then finalized to fractions.
+    # CG-EGA (dotXem's grid, adapting Kovatchev 2004 to PREDICTION — see cg_ega.py
+    # for where it departs from the publication). Per-region AP/BE/EP counts,
+    # accumulated across batches then finalized to fractions. true_bg FIRST: it is
+    # the reference on every axis, including the rate-dependent mod widening.
     cg = cg_ega.cg_ega_counts(
-        pred_bg.detach().cpu().numpy(),
         true_bg.detach().cpu().numpy(),
+        pred_bg.detach().cpu().numpy(),
         last_bg.detach().cpu().numpy(),
         freq_min=dt,
     )

@@ -38,6 +38,12 @@ in the AR/BE/EP filter matrices and reduced to one of:
 Region is assigned by the TRUE BG of each point: hypo ``y_true <= 70``,
 eu ``70 < y_true <= 180``, hyper ``y_true > 180`` (mg/dL).
 
+``y_true`` is the reference on EVERY axis — that region binning, the ±20% acceptance
+band, the zone-D excursion gates, the rate-dependent ``mod`` widening and the R-EGA
+abscissa all read it. The argument order is therefore load-bearing: transposing the
+two trajectories re-buckets points between the regions, so every denominator moves
+and the result is a well-formed table of a different statistic.
+
 All public functions take and return mg/dL; rates are mg/dL/min.
 """
 from __future__ import annotations

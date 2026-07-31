@@ -628,8 +628,11 @@ forecasters. It reports numbers only and draws no judgement of relative quality.
   rather than against a single line: the scored forecast is the true value clipped to that
   band, so the reported error is the distance from the truth to the nearer band edge, and is
   zero whenever the truth falls inside the band. RMSE, MAE, MARD, the Clarke grid and CG-EGA
-  all read that projected series; CG-EGA's rate-of-change term therefore follows the truth's
-  own derivative wherever the truth lies inside the band. The same metrics computed on the
+  all read that projected series as the FORECAST; the truth stays the reference on every
+  axis, so a CG-EGA point's glycaemic region and its rate-dependent acceptance widening are
+  the truth's own throughout. Wherever the truth lies inside the band the projection equals
+  it, so the scored series carries the truth's derivative there and the rate grid registers
+  an error only where the band actually missed. The same metrics computed on the
   quantile median alone are kept in `stats.json` under `metrics[h]["median_line"]` and carry
   the published-peer and literature tables.
 - **RMSE — point (pt):** error at the single step exactly PH minutes ahead.
@@ -889,8 +892,11 @@ _SIM_METRIC_DEFS = f"""## Metric definitions
   between τ={METRIC_BAND_TAU_LO:.2f} and τ={METRIC_BAND_TAU_HI:.2f}: the scored forecast is
   the true value clipped to that band, so the reported error is the distance from the truth to
   the nearer band edge and is zero whenever the truth falls inside the band. RMSE, MAE, MARD,
-  the Clarke grid and CG-EGA all read that projected series; CG-EGA's rate-of-change term
-  therefore follows the truth's own derivative wherever the truth lies inside the band. The
+  the Clarke grid and CG-EGA all read that projected series as the FORECAST; the truth stays
+  the reference on every axis, so a CG-EGA point's glycaemic region and its rate-dependent
+  acceptance widening are the truth's own throughout. Wherever the truth lies inside the band
+  the projection equals it, so the scored series carries the truth's derivative there and the
+  rate grid registers an error only where the band actually missed. The
   same metrics on the quantile median alone are kept in `stats.json` under
   `metrics[h]["median_line"]`.
 - **RMSE — point (pt) / window-mean (wm):** error at the single PH-ahead step, and RMSE
