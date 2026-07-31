@@ -3,9 +3,21 @@ Continuous Glucose-Error Grid Analysis (CG-EGA).
 
 Vectorized numpy port of the dotXem/CG-EGA reference implementation
 (https://github.com/dotXem/CG-EGA), which adapts the Continuous Glucose-EGA of
-Kovatchev et al. 2004 (Diabetes Care 27(8):1922) to glucose PREDICTION. The
-zone/matrix definitions follow that paper's Continuous Glucose-Error Grid
-Analysis (Point-Error and Rate-Error grids combined per region).
+Kovatchev et al. 2004 (Diabetes Care 27(8):1922) to glucose PREDICTION.
+
+The zone boundaries and the AP/BE/EP filter matrices below are that
+reimplementation's, NOT the published paper's, and the two differ on three points:
+the rate widening ``mod`` is applied to both bounds rather than only to the one the
+published grid widens; the hyperglycemia benign filter marks its ``lD`` cell benign
+where the published grid marks it erroneous; and the upper-C boundary carries the
+``22/17`` slope below rather than the published ``1.03``. Two of the three
+under-report danger. Transcribing dotXem is deliberate — it is what makes this table
+and T1DMDROID's Rust port one statistic — but no figure produced here may be quoted
+against a published CG-EGA value without stating the departures. They are enumerated,
+with their safety direction, in T1DMCOMMON's ``SPEC/invariants.md`` §6.3, which counts
+four rather than three: its fourth is the shared ``last_bg`` anchoring fixed there and
+used below, a considered choice rather than a grid transcription error, and so not one
+of the three enumerated here.
 
 CG-EGA grades a forecast on TWO axes at once and combines them into a single
 clinical verdict per point:
