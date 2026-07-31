@@ -565,7 +565,9 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
     ap.add_argument("--checkpoint", default="models/large/weights_multi.pt")
-    ap.add_argument("--seed", type=int, default=11)
+    # The seed the committed screenshots/ figures were drawn from; a rerun that
+    # changes it silently replaces the README's patient with a different one.
+    ap.add_argument("--seed", type=int, default=14)
     ap.add_argument("--skip-forecast", action="store_true",
                     help="draw only the two diagrams (no torch, no checkpoint)")
     args = ap.parse_args()
