@@ -209,6 +209,64 @@ def test_skip_consuming_the_record_is_rejected(tmp_path):
         load_personal(db, skip_hours=48.0)
 
 
+# ------------------------------- exclusion -------------------------------- #
+def test_exclude_splits_the_record_and_keeps_event_action(tmp_path):
+    """An excluded range reads as a CGM outage; events inside it keep their curves.
+
+    The dose sits INSIDE the hole, so a filter that dropped event rows rather than
+    readings would erase its action from the segment that follows — the same miscount
+    the ``skip_hours`` tail rule exists to prevent.
+    """
+    n = DAY_STEPS * 3
+    db = _build_db(tmp_path / 'r.db', n_steps=n, doses=[
+        {'ts': _T0 + (DAY_STEPS + 30) * STEP_MS, 'kind': 'basal', 'units': 14.0,
+         'duration_min': 1440.0, 'ka_per_hour': 0.3, 'ke_per_hour': 0.07}])
+    t0_local = _utc_naive(_T0) + timedelta(minutes=TZ)
+    lo = t0_local + timedelta(days=1)
+    hi = lo + timedelta(days=1)
+
+    segs = load_personal(db, skip_hours=0.0, exclude=[(lo, hi)])
+    assert len(segs) == 2, "a day-long hole must break the record in two"
+    assert segs[0].t0 == t0_local
+    assert segs[1].t0 == hi
+    assert segs[1].insulin_curve.sum() > 0.0, "the excluded dose lost its tail"
+
+
+def test_exclude_leaves_retained_readings_bit_identical(tmp_path):
+    """Excluding a range must not perturb a single retained sample or channel value."""
+    n = DAY_STEPS * 3
+    rng = np.random.default_rng(0)
+    bg = 120.0 + 30.0 * np.sin(np.arange(n) / 17.0) + rng.normal(0, 2.0, n)
+    db = _build_db(tmp_path / 'r.db', n_steps=n, bg=bg, meals=[
+        {'ts': _T0 + 5 * STEP_MS, 'grams': 40.0, 'k': 2.0, 'theta': 15.0,
+         'duration_min': 120.0}])
+    t0_local = _utc_naive(_T0) + timedelta(minutes=TZ)
+    lo = t0_local + timedelta(days=2)
+
+    full = load_personal(db, skip_hours=0.0)[0]
+    cut = load_personal(db, skip_hours=0.0, exclude=[(lo, lo + timedelta(days=1))])[0]
+    assert cut.t0 == full.t0
+    for name in ('cgm', 'carb_curve', 'insulin_curve'):
+        kept = getattr(cut, name)
+        np.testing.assert_array_equal(kept, getattr(full, name)[:len(kept)])
+
+
+def test_exclude_consuming_the_record_is_rejected(tmp_path):
+    db = _build_db(tmp_path / 'r.db', n_steps=DAY_STEPS)
+    t0_local = _utc_naive(_T0) + timedelta(minutes=TZ)
+    with pytest.raises(AssertionError, match="no record left"):
+        load_personal(db, skip_hours=0.0, exclude=[
+            (t0_local - timedelta(days=1), t0_local + timedelta(days=2))])
+
+
+def test_inverted_exclude_range_is_rejected(tmp_path):
+    db = _build_db(tmp_path / 'r.db', n_steps=DAY_STEPS)
+    t0_local = _utc_naive(_T0) + timedelta(minutes=TZ)
+    with pytest.raises(AssertionError, match="empty or inverted"):
+        load_personal(db, skip_hours=0.0,
+                      exclude=[(t0_local + timedelta(hours=2), t0_local)])
+
+
 # ------------------------------- timestamps ------------------------------- #
 def test_t0_is_local_wall_clock(tmp_path):
     """``t0`` (and so the time-of-day probe target) carries the record's tz_offset."""

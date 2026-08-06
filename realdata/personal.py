@@ -50,12 +50,24 @@ that precedes the cut still has action reaching past it — a long-acting basal 
 full day, a rapid bolus some six hours — so the channels are built across the whole
 grid and only then trimmed.  Dropping the rows first would open the retained window
 with no insulin or carbohydrate on board.
+
+**``exclude`` drops readings, not rows.**  A range listed there removes the CGM
+samples inside it and nothing else: the meal and dose rows stay, so their curves are
+still laid down and still reach past the cut, exactly as a pre-``skip_hours`` event
+keeps its tail.  The hole then reads as an ordinary CGM outage and ``segment_grid``
+applies its own rules to it — bridged if it is short enough, a split if it is not,
+and the runt either side dropped.  This is how a stretch whose *event log* is wrong
+is kept out of training: a long-acting basal taken but never recorded leaves the
+insulin channel reading near-zero while the patient was in fact covered, so those
+hours cannot be trusted as targets even though every CGM reading in them is sound.
+Excluding them states that; nothing about the record is rewritten to hide it.
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -172,6 +184,7 @@ def load(
     root_dir: str,
     skip_hours: float = DEFAULT_SKIP_HOURS,
     patient: str = DEFAULT_PATIENT,
+    exclude: Sequence[tuple[datetime, datetime]] | None = None,
 ) -> list[Segment]:
     """Load a personal sync database into Segments carrying pre-resolved curves.
 
@@ -182,6 +195,9 @@ def load(
         skip_hours: hours discarded from the START of the record, applied after the
             curves are laid down so pre-cut events keep contributing their tails.
         patient: provenance label written onto every Segment.
+        exclude: half-open ``[start, end)`` LOCAL wall-clock ranges whose CGM
+            readings are dropped before the grid is built. Events are untouched, so
+            the ranges read as CGM outages and are resolved by ``segment_grid``.
 
     Returns:
         List of Segments (possibly empty), gap-split by the canonical rules, each
@@ -189,6 +205,8 @@ def load(
     """
     assert os.path.exists(root_dir), f"personal database not found: {root_dir}"
     assert skip_hours >= 0.0, f"skip_hours must be non-negative, got {skip_hours}"
+    for lo, hi in (exclude or ()):
+        assert lo < hi, f"exclude range {lo} .. {hi} is empty or inverted"
 
     conn = sqlite3.connect(f"file:{os.path.abspath(root_dir)}?mode=ro", uri=True)
     try:
@@ -215,6 +233,15 @@ def load(
         "change — split the record per offset before loading"
     )
     tz_offset = bearing[0][2]
+
+    if exclude:
+        kept = [row for row in bearing
+                if not any(lo <= _local_naive(row[0], tz_offset) < hi for lo, hi in exclude)]
+        assert len(kept) >= 2, (
+            f"the excluded ranges leave {len(kept)} reading(s) of {len(bearing)}; there "
+            "is no record left to lay on a grid"
+        )
+        bearing = kept
 
     grid_t0_ms = min(ts for ts, _, _ in bearing)
     grid_end_ms = max(ts for ts, _, _ in bearing)
