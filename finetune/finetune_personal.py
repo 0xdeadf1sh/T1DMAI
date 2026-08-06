@@ -19,8 +19,18 @@ the day before that. Reserving the held-out day alone would leave both contexts
 inside the training span, so the reservation is three consecutive days:
 
     [ ctx day ][ cal day ][ val day ]
-       context    conformal   selection + reporting
+       context    conformal      reporting
                   calibration
+                  + step selection
+
+**The step is selected on the calibration day, never on the reported one.** A
+fine-tune is evaluated every ``--eval-interval`` steps and the best snapshot kept;
+keeping the minimum of dozens of noisy scores and then quoting that same score is
+selection on the test set, and it biases the reported gain by an unknown amount. The
+scored day is therefore never read by the selector: the checkpoint is chosen on the
+calibration day's point error and the validation day is scored once per eval for
+reporting only. The two are adjacent and so correlated — this bounds the leak rather
+than eliminating it, which one record of a fortnight cannot do.
 
 Training draws only from the record either side of that block, so no step the model
 trained on is ever read as context by a calibration or scoring window. Windows are
@@ -44,7 +54,7 @@ import hashlib
 import math
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,8 +66,9 @@ from torch.utils.data import DataLoader
 
 import finetune as F                   # also prepends REPO_ROOT to sys.path
 
+from realdata.calibrate import collect_windows
 from realdata.personal import DEFAULT_SKIP_HOURS, load as load_personal
-from realdata.run_eval import _slice
+from realdata.run_eval import _slice, evaluate_from_windows
 from realdata.schema import GRID_MIN, Segment
 
 # ---------------------------------------------------------------------------- #
@@ -176,6 +187,20 @@ def choose_validation_day(
     return day, lo, hi
 
 
+def _host_for_day(segs: list[Segment], wanted: date) -> Segment | None:
+    """The segment in which ``wanted`` is a complete local day, or None.
+
+    A record broken by a CGM outage has complete days in more than one segment, and
+    the reservation has to be placed in whichever one holds the requested day — the
+    longest-segment default can only ever score days in that one run, which for a
+    leave-one-day-out sweep silently caps the fold set at the host's own days.
+    """
+    for seg in segs:
+        if any(day == wanted for day, _lo, _hi in day_spans(seg)):
+            return seg
+    return None
+
+
 def _find_day(ranked: list[tuple[date, int, int, float]], wanted: date
               ) -> tuple[date, int, int]:
     for day, lo, hi, _ in ranked:
@@ -196,8 +221,9 @@ def build_splits(
 ) -> dict[str, Any]:
     """Reserve the calibration and validation days, and train on what is left.
 
-    The longest segment hosts the reservation (a personal record is normally one
-    contiguous run; any other segment is training data in full). Each reserved day
+    The segment holding ``val_day`` hosts the reservation; absent a request, the
+    longest one does (a personal record is normally one contiguous run). Any other
+    segment is training data in full. Each reserved day
     is withheld together with the day before it, which its windows read as context —
     so the reserved index set is a 2-day block per role, coincident when the
     calibration day immediately precedes the validation day (the default).
@@ -211,7 +237,17 @@ def build_splits(
         ``val_day``/``cal_day``, and the reserved spans.
     """
     assert segs, "no segments to split"
-    host = max(segs, key=len)
+    if val_day is None:
+        host = max(segs, key=len)
+    else:
+        found = _host_for_day(segs, val_day)
+        if found is None:
+            raise SystemExit(
+                f"--val-day {val_day} is not a complete local day in any segment; "
+                f"complete days are "
+                f"{[str(d) for s in segs for d, _lo, _hi in day_spans(s)]}"
+            )
+        host = found
     others = [s for s in segs if s is not host]
 
     ranked = rank_days(host, metric)
@@ -276,6 +312,41 @@ def build_splits(
     }
 
 
+def _eval_report_and_select(
+    model: Any, ema: Any, stats: dict[str, Any],
+    cal_segs: list[Segment], test_segs: list[Segment], device: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Score the validation day for REPORTING and the calibration day for SELECTION.
+
+    Windows are collected once under the EMA shadow and scored twice with the roles
+    swapped, so the two suites cost one set of forward passes rather than two.
+
+    The selector reads only the point metric ``F.SELECTION_METRIC`` off the returned
+    selection suite, which is computed on the median line and does not depend on the
+    conformal fit — so it is immaterial that the swapped call fits that suite's bands
+    on the validation windows. What matters is the converse: the REPORTED suite is
+    scored on windows no checkpoint decision ever looked at.
+
+    Returns:
+        ``(report, select)`` — ``evaluate_from_windows`` results for the validation
+        and calibration blocks respectively.
+    """
+    with ema.apply_to(model):
+        model.eval()
+        cal_w = collect_windows(
+            model, stats, cal_segs, device,
+            stride_patches=F.FINETUNE_EVAL_CAL_STRIDE_PATCHES,
+            max_per_patient=F.FINETUNE_EVAL_MAX_PER_PATIENT)
+        test_w = collect_windows(
+            model, stats, test_segs, device,
+            stride_patches=F.FINETUNE_EVAL_TEST_STRIDE_PATCHES,
+            max_per_patient=F.FINETUNE_EVAL_MAX_PER_PATIENT)
+        report = evaluate_from_windows(cal_w, test_w)
+        select = evaluate_from_windows(test_w, cal_w)
+        model.train()
+    return report, select
+
+
 def _db_fingerprint(path: str) -> dict[str, Any]:
     """Basename, size and sha256 of the source record.
 
@@ -302,6 +373,11 @@ def _parse_args() -> argparse.Namespace:
                    help="path to the personal sync database (read-only; never modified)")
     p.add_argument('--skip-hours', type=float, default=DEFAULT_SKIP_HOURS,
                    help="hours dropped from the START of the record at load time")
+    p.add_argument('--exclude-range', nargs=2, action='append', default=None,
+                   metavar=('START', 'END'),
+                   help="drop the CGM readings in this half-open LOCAL wall-clock range "
+                        "(ISO, e.g. 2026-07-30T11:10 2026-07-31T08:10); events keep their "
+                        "curves, so the range reads as a CGM outage. Repeatable.")
     p.add_argument('--val-day', default=None,
                    help="ISO date to hold out (default: the day nearest median variability)")
     p.add_argument('--cal-day', default=None,
@@ -346,8 +422,10 @@ def main() -> None:
     F.FINETUNE_EVAL_TEST_STRIDE_PATCHES = stride
 
     # --- Record ----------------------------------------------------------- #
+    exclude = [(datetime.fromisoformat(lo), datetime.fromisoformat(hi))
+               for lo, hi in (args.exclude_range or [])]
     segs_all = load_personal(args.db, skip_hours=float(args.skip_hours),
-                             patient=str(args.patient))
+                             patient=str(args.patient), exclude=exclude)
     assert len(segs_all) > 0, (
         f"no segments loaded from {args.db} — the record may be shorter than "
         f"--skip-hours, or every run shorter than the minimum segment length"
@@ -372,6 +450,9 @@ def main() -> None:
 
     print(f"[personal] db={os.path.basename(args.db)} skip_hours={args.skip_hours} "
           f"device={device.type} metric={args.chaos_metric}")
+    for lo, hi in exclude:
+        print(f"[personal] excluded readings: {lo} .. {hi} "
+              f"({(hi - lo).total_seconds() / 3600:.2f} h)")
     print(f"[personal] record: {len(segs_all)} segment(s), host {split['host_steps']} steps "
           f"({split['host_steps'] * GRID_MIN / 60:.1f} h)")
     print(f"[personal] per-day {args.chaos_metric} (* = eligible to hold out; "
@@ -424,7 +505,8 @@ def main() -> None:
     log_writer = csv.writer(log_file)
     header = ['step', 'loss_ema']
     for h in F.EVAL_HORIZONS:
-        header += [f'rmse_point_{h}', f'mard_{h}', f'clarke_AB_{h}', f'hypo_recall_{h}']
+        header += [f'rmse_point_{h}', f'mae_point_{h}', f'mard_{h}', f'skill_point_{h}',
+                   f'clarke_AB_{h}', f'hypo_recall_{h}']
     log_writer.writerow(header)
     log_file.flush()
 
@@ -456,6 +538,7 @@ def main() -> None:
             'finetune_meta': {
                 'dataset': 'personal', 'mode': 'personalize',
                 'source_db': db_fp, 'skip_hours': float(args.skip_hours),
+                'excluded_ranges': [[lo.isoformat(), hi.isoformat()] for lo, hi in exclude],
                 'chaos_metric': args.chaos_metric,
                 'val_day': str(split['val_day']), 'cal_day': str(split['cal_day']),
                 'eval_stride_patches': stride,
@@ -473,24 +556,35 @@ def main() -> None:
 
     loss_ema: float | None = None
 
-    def _log_eval(step: int, res: dict[str, Any]) -> None:
+    def _log_eval(step: int, res: dict[str, Any], sel_res: dict[str, Any]) -> None:
+        """Log the REPORTED (validation-day) suite; ``sel_res`` supplies the selector's own scalar.
+
+        The console carries the four point metrics — RMSE, MAE, MARD and skill against
+        persistence — because they are the ones this held-out set can actually resolve.
+        Clarke A+B and hypo recall stay in the CSV but off the console: one validation
+        day gives 45 heavily overlapping windows and two distinct excursions below
+        70 mg/dL, so recall moves in steps of 0.5 and Clarke in steps of 1/45. Printing
+        them each eval invites reading a coin flip as a trend.
+        """
         row: list[Any] = [step, '' if loss_ema is None else f"{loss_ema:.4f}"]
         cells: list[str] = []
         for h in F.EVAL_HORIZONS:
-            rmse = F._metric(res, h, 'rmse_point'); mard = F._metric(res, h, 'mard')
+            rmse = F._metric(res, h, 'rmse_point'); mae = F._metric(res, h, 'mae_point')
+            mard = F._metric(res, h, 'mard'); skill = F._metric(res, h, 'skill_point')
             cab = F._metric(res, h, 'clarke_AB'); hyp = F._metric(res, h, 'hypo', 'recall')
-            row += ['' if v is None else f"{v:.6f}" for v in (rmse, mard, cab, hyp)]
-            cells.append(f"h{h} rmse={F._fmt(rmse)} mard={F._fmt(mard)} AB={F._fmt(cab)} "
-                         f"hypoR={F._fmt(hyp)}")
+            row += ['' if v is None else f"{v:.6f}"
+                    for v in (rmse, mae, mard, skill, cab, hyp)]
+            cells.append(f"h{h} rmse={F._fmt(rmse)} mae={F._fmt(mae)} "
+                         f"mard={F._fmt(mard)} skill={F._fmt(skill)}")
         log_writer.writerow(row); log_file.flush()
-        sel = F._selection_scalar(res)
+        sel = F._selection_scalar(sel_res)
         tag = 'baseline' if step == 0 else f"step {step}"
         print(f"[eval {tag}] loss_ema={F._fmt(loss_ema)} n_test={res.get('n_test_windows')} "
-              f"sel={F._fmt(sel)} | " + " | ".join(cells))
+              f"sel_cal={F._fmt(sel)} | " + " | ".join(cells))
 
-    def _maybe_select(step: int, res: dict[str, Any]) -> None:
+    def _maybe_select(step: int, res: dict[str, Any], sel_res: dict[str, Any]) -> None:
         nonlocal best_sel, best_step, best_model_sd, best_ema_sd, best_weighting_sd, best_summ
-        sel = F._selection_scalar(res)
+        sel = F._selection_scalar(sel_res)
         if sel is None:
             return
         if best_sel is None or sel < best_sel:
@@ -501,14 +595,14 @@ def main() -> None:
             best_summ = F._summarize_heldout(res)
             _write_output()
             print(f"  [best] new minimum {F.SELECTION_METRIC}@{F.SELECTION_HORIZON}={sel:.3f} "
-                  f"at step {step} -> wrote {out_path}")
+                  f"on the CAL day at step {step} -> wrote {out_path}")
 
     try:
         # --- Baseline (pre-finetune) eval at step 0 ----------------------- #
-        res0 = F.eval_heldout(model, ema, stats, cal_segs, test_segs, device)
+        res0, sel0 = _eval_report_and_select(model, ema, stats, cal_segs, test_segs, device)
         baseline_summ = F._summarize_heldout(res0)
-        _log_eval(0, res0)
-        _maybe_select(0, res0)
+        _log_eval(0, res0, sel0)
+        _maybe_select(0, res0, sel0)
 
         # --- Fine-tune loop ----------------------------------------------- #
         data_iter = iter(loader)
@@ -666,14 +760,16 @@ def main() -> None:
                       f"loss_tod={F._fmt(_tod_loss_val)} "
                       f"lr_muon={muon_opt.param_groups[0]['lr']:.2e}")
             if step % eval_interval == 0 and step < total_steps:
-                res = F.eval_heldout(model, ema, stats, cal_segs, test_segs, device)
-                _log_eval(step, res)
-                _maybe_select(step, res)
+                res, sel_res = _eval_report_and_select(
+                    model, ema, stats, cal_segs, test_segs, device)
+                _log_eval(step, res, sel_res)
+                _maybe_select(step, res, sel_res)
 
         # --- Final eval --------------------------------------------------- #
-        res_final = F.eval_heldout(model, ema, stats, cal_segs, test_segs, device)
-        _log_eval(total_steps, res_final)
-        _maybe_select(total_steps, res_final)
+        res_final, sel_final = _eval_report_and_select(
+            model, ema, stats, cal_segs, test_segs, device)
+        _log_eval(total_steps, res_final, sel_final)
+        _maybe_select(total_steps, res_final, sel_final)
     finally:
         log_file.close()
 
@@ -685,16 +781,19 @@ def main() -> None:
     print("=" * 72)
     print(f"output checkpoint: {out_path}")
     print(f"best step: {best_step}  ({F.SELECTION_METRIC}@{F.SELECTION_HORIZON}="
-          f"{F._fmt(best_sel)})")
-    print(f"held-out day: {split['val_day']}  (conformal fit on {split['cal_day']}, "
-          f"{args.chaos_metric} nearest the record median)")
+          f"{F._fmt(best_sel)} on the CAL day {split['cal_day']})")
+    print(f"held-out day: {split['val_day']}  (never read by the selector; conformal fit "
+          f"on {split['cal_day']}, {args.chaos_metric} nearest the record median)")
     print("per-horizon held-out  baseline -> best (Δ):")
+    _REPORTED = (('rmse_point', 'rmse'), ('mae_point', 'mae'),
+                 ('mard', 'mard'), ('skill_point', 'skill'))
     for h in F.EVAL_HORIZONS:
-        base = None if baseline_summ is None else baseline_summ[str(h)]['rmse_point']
-        best = None if best_summ is None else best_summ[str(h)]['rmse_point']
-        delta = (None if (base is None or best is None) else best - base)
-        print(f"  h{h:>3} rmse_point: {F._fmt(base)} -> {F._fmt(best)}"
-              + ("" if delta is None else f"  (Δ {delta:+.3f})"))
+        for key, label in _REPORTED:
+            base = None if baseline_summ is None else baseline_summ[str(h)].get(key)
+            best = None if best_summ is None else best_summ[str(h)].get(key)
+            delta = (None if (base is None or best is None) else best - base)
+            print(f"  h{h:>3} {label:<6}: {F._fmt(base):>8} -> {F._fmt(best):>8}"
+                  + ("" if delta is None else f"  (Δ {delta:+.3f})"))
     print("-" * 72)
     print("One day of one person is a narrow test: it fixes a single day's meals, doses "
           "and sleep, so a gain here is evidence of adaptation, not of generalization. "

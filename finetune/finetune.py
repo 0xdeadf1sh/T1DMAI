@@ -466,6 +466,7 @@ def _summarize_heldout(res: dict[str, Any]) -> dict[str, Any]:
     for h in EVAL_HORIZONS:
         out[str(h)] = {
             'rmse_point': _metric(res, h, 'rmse_point'),
+            'mae_point': _metric(res, h, 'mae_point'),
             'rmse_winmean': _metric(res, h, 'rmse_winmean'),
             'mard': _metric(res, h, 'mard'),
             'clarke_AB': _metric(res, h, 'clarke_AB'),
