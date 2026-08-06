@@ -1,0 +1,7 @@
+target/
+presets/
+
+# NOT committed, deliberately. A lock generated against a T1DMDROID checkout on its
+# local-only branch enumerates that branch's dependency tree, and this repository is
+# public. The binary is a throwaway reader — pin nothing, resolve at build time.
+Cargo.lock

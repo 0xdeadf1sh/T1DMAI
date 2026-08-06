@@ -74,6 +74,8 @@ metrics/time_figures/
 metrics/**/README.md
 metrics/**/stats.json
 metrics/*.json
+# curvegen is source, not a generated report; its README is written by hand.
+!metrics/curvegen/README.md
 
 # --- Training outputs / logs / generated stats ---
 logs/

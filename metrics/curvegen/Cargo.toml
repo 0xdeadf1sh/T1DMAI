@@ -1,0 +1,16 @@
+[package]
+name = "curvegen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Read T1DMDROID's insulin preset catalogue out as JSON for the what-if probe."
+
+# Relative so the sibling checkout is found wherever the suite is cloned. Only
+# `curve.rs` is used, and it is present on T1DMDROID's public `main`; nothing from
+# that repository is vendored here.
+[dependencies]
+t1dm-core = { path = "../../../T1DMDROID/crates/t1dm-core" }
+serde_json = "1"
+
+# Own workspace: T1DMAI is a Python project with no Cargo workspace to join.
+[workspace]

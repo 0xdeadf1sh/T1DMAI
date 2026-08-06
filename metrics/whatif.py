@@ -66,11 +66,29 @@ Four blocks per cohort, from 11 forwards per window:
     baseline built by ``_future_overrides`` from the feature stack. A non-zero
     ``max_abs_dbg`` is a plumbing fault in the override path, not a model result.
 
-Runs on the live best checkpoint (checkpoints/t1dmai_best.pt). GPU if available.
-Writes metrics/whatif.json.
+Runs on the live best checkpoint (checkpoints/t1dmai_best.pt) over the three
+published cohorts, writing metrics/whatif.json. GPU if available.
+
+``--checkpoint`` / ``--dataset`` / ``--db`` / ``--out`` / ``--no-figures`` override
+each of those, and every default reproduces the no-argument behaviour. They exist
+for the comparison this probe cannot otherwise make: a fine-tune against the base
+checkpoint it came from, on the same windows. Nothing here feeds a loss or a
+checkpoint selection, so dose response is exactly the property a fine-tune can
+quietly destroy while its RMSE improves — the personal fine-tunes are the reason
+the flags were added. ``--dataset personal`` needs ``--db``, and takes the same
+``--exclude-range`` the fine-tune used, or it probes hours the fine-tune refused.
+
+The rapid-insulin curves ``--insulin-curve-json`` reads are produced by
+``metrics/curvegen``, which links ``t1dm-core`` rather than restating its exponential
+model. Carb shapes come in as the ``(k, theta, duration_min)`` a real ``meal_event``
+row stores, so the GI→gamma mapping is likewise never duplicated here.
+
+``T1DMAI()`` is built from the live ``config.py``, so align it to the checkpoint's
+capacity with ``resize_model.py`` first — as for every other script here.
 """
 from __future__ import annotations
-import os, sys, json
+import argparse, os, sys, json
+from datetime import datetime
 import numpy as np
 import torch
 
@@ -83,6 +101,7 @@ torch.set_num_threads(8)
 from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
                     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
                     CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U)
+from T1DMSIM.simulator import gamma_curve
 from realdata import load_dataset
 from realdata.features import (build_feature_stack, context_window, segment_to_channels,
                                CARB_KERNEL, BOLUS_KERNEL, _convolve)
@@ -183,8 +202,23 @@ def _frac(hits: int, n: int) -> float | None:
     return round(hits / n, 3) if n else None
 
 
-def run(model, stats: dict, device, segs: list) -> dict:
-    """Probe every strided window of ``segs``; returns the cohort's summary dict."""
+def run(model, stats: dict, device, segs: list,
+        stride: int = STRIDE, cap: int = CAP,
+        carb_kernel: np.ndarray | None = None,
+        bolus_kernel: np.ndarray | None = None) -> dict:
+    """Probe every strided window of ``segs``; returns the cohort's summary dict.
+
+    ``stride`` (steps) and ``cap`` (windows per segment) default to the published-cohort
+    settings. A personal record is a fraction of a cohort's size, and every figure below
+    is a FRACTION over windows — a sign rate off nine windows moves in steps of 0.11 and
+    says nothing — so a small record wants both loosened.
+    """
+    # A supplied kernel replaces the population default for the DOSE arms only. The
+    # empty-future arm keeps deconvolving with the same kernel it is given, so the two
+    # stay consistent within a run.
+    ck = CARB_KERNEL if carb_kernel is None else carb_kernel
+    bk = BOLUS_KERNEL if bolus_kernel is None else bolus_kernel
+
     carb_d: list[np.ndarray] = []           # per window: (L, PRED) ΔBG vs the null arm
     ins_d: list[np.ndarray] = []
     nulls: list[np.ndarray] = []            # per window: (PRED,) null-arm forecast
@@ -201,8 +235,8 @@ def run(model, stats: dict, device, segs: list) -> dict:
         carb_raw = np.clip(ch['carb'], 0.0, None)
         ins_raw = np.clip(ch['insulin'], 0.0, None)
         cnt = 0
-        for ps in range(CTX, n - PRED + 1, STRIDE):
-            if cnt >= CAP:
+        for ps in range(CTX, n - PRED + 1, stride):
+            if cnt >= cap:
                 break
             cnt += 1
             ctx = context_window(feats, ps, MAX_CONTEXT_PATCHES)
@@ -225,18 +259,18 @@ def run(model, stats: dict, device, segs: list) -> dict:
             cd = np.zeros((len(CARB_DOSES), PRED))
             for j, g in enumerate(CARB_DOSES):
                 if j != 0:
-                    cd[j] = _fc(_renorm(c_fut + _dose_curve(g, CARB_KERNEL),
+                    cd[j] = _fc(_renorm(c_fut + _dose_curve(g, ck),
                                         stats, 'carb_intake'), i_null_t) - null
             idl = np.zeros((len(INSULIN_DOSES), PRED))
             for j, u in enumerate(INSULIN_DOSES):
                 if j != 0:
-                    idl[j] = _fc(c_null_t, _renorm(i_fut + _dose_curve(u, BOLUS_KERNEL),
+                    idl[j] = _fc(c_null_t, _renorm(i_fut + _dose_curve(u, bk),
                                                    stats, 'insulin_combined')) - null
 
             # Strip only the events whose ONSET falls inside the prediction zone;
             # past-event tails and basal are physiologically un-retractable.
-            c_empty = np.clip(c_fut - _convolve(seg.carb_grams[ps:ps + PRED], CARB_KERNEL), 0.0, None)
-            i_empty = np.clip(i_fut - _convolve(seg.bolus_units[ps:ps + PRED], BOLUS_KERNEL), 0.0, None)
+            c_empty = np.clip(c_fut - _convolve(seg.carb_grams[ps:ps + PRED], ck), 0.0, None)
+            i_empty = np.clip(i_fut - _convolve(seg.bolus_units[ps:ps + PRED], bk), 0.0, None)
             empty = _fc(_renorm(c_empty, stats, 'carb_intake'),
                         _renorm(i_empty, stats, 'insulin_combined'))
 
@@ -540,27 +574,123 @@ def _fig_summary(res: dict, step) -> str:
     return F.save(fig, 'whatif_summary.png')
 
 
+def _parse_args() -> "argparse.Namespace":
+    """CLI. Every default reproduces the original no-argument behaviour exactly.
+
+    The flags exist so one probe can be pointed at a checkpoint other than the live
+    best and at a personal record — comparing a fine-tune against the base it came
+    from needs both, on the same windows. Nothing about the probe itself changes.
+    """
+    p = argparse.ArgumentParser(description="What-if dose-response probe.")
+    p.add_argument('--checkpoint', default=None,
+                   help="checkpoint to probe (default: the live checkpoints/t1dmai_best.pt)")
+    p.add_argument('--dataset', action='append', default=None, metavar='NAME',
+                   help=f"cohort to probe, repeatable (default: {' '.join(DATASETS)})")
+    p.add_argument('--db', default=None,
+                   help="record path for --dataset personal, whose location is a file")
+    p.add_argument('--exclude-range', nargs=2, action='append', default=None,
+                   metavar=('START', 'END'),
+                   help="personal only: drop CGM readings in this half-open LOCAL "
+                        "wall-clock range, matching the fine-tune's own filtering")
+    p.add_argument('--carb-gamma', nargs=3, type=float, default=None,
+                   metavar=('K', 'THETA', 'DURATION_MIN'),
+                   help="replace the population carb kernel with a gamma appearance curve "
+                        "of these parameters. Pass the (k, theta, duration_min) a real "
+                        "meal_event row stores, so the shape is the phone's own resolution "
+                        "of that GI rather than a formula restated here")
+    p.add_argument('--insulin-curve-json', default=None, metavar='FILE',
+                   help="replace the population bolus kernel with a per-5-min unit-total "
+                        "action curve read from JSON — either a bare array or an object with "
+                        "a 'curve_per_5min_unit_total' key. Generate it with "
+                        "metrics/curvegen, which links the app's own t1dm-core; the Loop "
+                        "exponential model is NOT reimplemented here")
+    p.add_argument('--arm-label', default=None,
+                   help="name recorded in _meta for this arm (e.g. 'Fiasp', 'GI-25')")
+    p.add_argument('--all-windows', action='store_true',
+                   help="probe every segment rather than only the held-out split; the "
+                        "response is measured against the model's OWN baseline, so there "
+                        "is no ground truth for an in-sample window to leak")
+    p.add_argument('--stride-patches', type=int, default=STRIDE // PATCH_SIZE,
+                   help=f"patches between window origins (default {STRIDE // PATCH_SIZE})")
+    p.add_argument('--cap', type=int, default=CAP,
+                   help=f"maximum windows per segment (default {CAP})")
+    p.add_argument('--out', default=None,
+                   help="JSON output path (default: metrics/whatif.json)")
+    p.add_argument('--no-figures', action='store_true',
+                   help="skip the PNGs; they are written to one shared directory and "
+                        "would overwrite each other across a multi-checkpoint sweep")
+    return p.parse_args()
+
+
+def _load_cohort(ds: str, args: "argparse.Namespace") -> list:
+    """Load one cohort, honouring the personal record's file location and exclusions."""
+    if ds != 'personal':
+        return load_dataset(ds)
+    assert args.db, "--dataset personal requires --db <sqlite path>"
+    from realdata.personal import load as load_personal
+    exclude = [(datetime.fromisoformat(a), datetime.fromisoformat(b))
+               for a, b in (args.exclude_range or [])]
+    return load_personal(args.db, exclude=exclude)
+
+
 def main() -> None:
+    args = _parse_args()
+    datasets = tuple(args.dataset) if args.dataset else DATASETS
+    out_path = args.out or os.path.join(HERE, 'whatif.json')
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model, stats, step = load_model(device)
+    model, stats, step = (load_model(device, args.checkpoint) if args.checkpoint
+                          else load_model(device))
     model = model.to(device); model.eval()
     print(f"[whatif] model step={step} device={device}  "
           f"kernel mass in horizon: carb {KERNEL_MASS['carb']:.2f} insulin {KERNEL_MASS['insulin']:.2f}")
     res = {'_meta': {'step': step, 'carb_doses_g': list(CARB_DOSES),
                      'insulin_doses_u': list(INSULIN_DOSES),
                      'kernel_mass_in_horizon': KERNEL_MASS,
-                     'horizon_min': list(HORIZONS), 'quiet_context_min': QUIET_CTX_MIN}}
-    for ds in DATASETS:
-        segs = load_dataset(ds)
-        _, test = split_segments(segs, ds)
-        r = run(model, stats, device, test)
+                     'horizon_min': list(HORIZONS), 'quiet_context_min': QUIET_CTX_MIN,
+                     'checkpoint': args.checkpoint, 'datasets': list(datasets),
+                     'stride_patches': int(args.stride_patches), 'cap': int(args.cap),
+                     'all_windows': bool(args.all_windows)}}
+    stride = max(1, int(args.stride_patches)) * PATCH_SIZE
+    carb_kernel = bolus_kernel = None
+    if args.carb_gamma:
+        k, theta, dur = args.carb_gamma
+        c = np.asarray(gamma_curve(1.0, k, theta, dur), dtype=np.float64)
+        carb_kernel = c / c.sum()
+        print(f"[whatif] carb kernel: gamma k={k} theta={theta} duration={dur:.0f} min "
+              f"({len(carb_kernel)} steps, mass<=120min {carb_kernel[:PRED].sum():.3f})")
+    if args.insulin_curve_json:
+        raw = json.load(open(args.insulin_curve_json))
+        if isinstance(raw, dict):
+            raw = raw['curve_per_5min_unit_total']
+        b = np.asarray(raw, dtype=np.float64)
+        assert b.ndim == 1 and b.size > 0 and b.sum() > 0, \
+            f"{args.insulin_curve_json}: not a non-empty 1-D curve"
+        bolus_kernel = b / b.sum()
+        print(f"[whatif] bolus kernel: {args.insulin_curve_json} "
+              f"({len(bolus_kernel)} steps, mass<=120min {bolus_kernel[:PRED].sum():.3f})")
+    res['_meta']['arm_label'] = args.arm_label
+    res['_meta']['carb_gamma'] = args.carb_gamma
+    res['_meta']['insulin_curve_json'] = args.insulin_curve_json
+    res['_meta']['kernel_mass_in_horizon'] = {
+        'carb': float((CARB_KERNEL if carb_kernel is None else carb_kernel)[:PRED].sum()),
+        'insulin': float((BOLUS_KERNEL if bolus_kernel is None else bolus_kernel)[:PRED].sum()),
+    }
+    for ds in datasets:
+        segs = _load_cohort(ds, args)
+        probed = segs if args.all_windows else split_segments(segs, ds)[1]
+        r = run(model, stats, device, probed, stride=stride, cap=int(args.cap),
+                carb_kernel=carb_kernel, bolus_kernel=bolus_kernel)
         res[ds] = r
         _report(ds, r)
-    with open(os.path.join(HERE, 'whatif.json'), 'w') as f:
+    with open(out_path, 'w') as f:
         json.dump(res, f, indent=2)
-    paths = [_fig_cohort(ds, res[ds], step) for ds in DATASETS if ds in res]
+    if args.no_figures:
+        print(f"\n[whatif] wrote {out_path} (figures skipped)")
+        return
+    paths = [_fig_cohort(ds, res[ds], step) for ds in datasets if ds in res]
     paths.append(_fig_summary(res, step))
-    print(f"\n[whatif] wrote whatif.json and {len(paths)} figures under "
+    print(f"\n[whatif] wrote {out_path} and {len(paths)} figures under "
           f"{os.path.dirname(paths[-1])}/")
 
 
