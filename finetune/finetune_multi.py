@@ -3,15 +3,19 @@ fine-tune, holding out one patient per cohort for an in-loop combined held-out
 score. Also usable single-cohort (e.g. ``--datasets uvapadova``).
 
 The validated single-cohort machinery in ``finetune.py`` is reused wholesale — the
-dataset builder, optimizers, LR schedule, EMA, resilient step and held-out
-evaluator are imported; only the segment pooling across cohorts is new. Defaults
-reproduce the Ohio+AZT1D+Shanghai pool with the three average holdouts
-(591 / AZ23 / 1003). UVA/Padova is resolved from its simglucose cache.
+dataset builder, optimizers, LR schedule, EMA, resilient step, held-out evaluator,
+selection scalar, admission gates and per-run logging are imported; only the
+segment pooling across cohorts is new. Defaults reproduce the Ohio+AZT1D+Shanghai
+pool with the three average holdouts (591 / AZ23 / 1003). UVA/Padova is resolved
+from its simglucose cache.
+
+Selection and the dose-response gate are ``finetune.py``'s, unchanged: the pooled
+held-out score is ranked by the strictly proper scalar and a checkpoint ships only
+if it clears every admission gate, the insulin sign gate included.
 """
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import os
 import sys
@@ -51,6 +55,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--seed', type=int, default=F.FINETUNE_SEED)
     p.add_argument('--out', default=None)
     p.add_argument('--write-best', action='store_true')
+    F.add_selection_args(p)
     return p.parse_args()
 
 
@@ -118,21 +123,20 @@ def main() -> None:
     ema = F.ModelEMA(model, decay=F.FINETUNE_EMA_DECAY).to(device)
 
     ds_label = 'multi' if len(datasets) > 1 else datasets[0]
-    log_path = os.path.join(F.REPO_ROOT, 'finetune', 'finetune_multi_log.csv')
-    log_file = open(log_path, 'w', newline='')
-    log_writer = csv.writer(log_file)
-    header = ['step', 'loss_ema']
-    for h in F.EVAL_HORIZONS:
-        header += [f'rmse_point_{h}', f'mard_{h}', f'clarke_AB_{h}', f'hypo_recall_{h}']
-    log_writer.writerow(header)
-    log_file.flush()
+    log = F.RunLog(F.run_log_path(
+        'finetune_multi', [F._output_label(args.checkpoint), ds_label, f"seed{seed}"]))
+
+    gate_cfg = F.gate_config_from_args(args)
+    selector = F.Selector(cfg=gate_cfg, patience=args.patience)
 
     print(f"[multi] datasets={datasets} holdouts={holdout_map} device={device.type}")
     print(f"[multi] ft_segs={len(ft_segs)} windows={len(dataset)} cal_pool={len(cal_pool)} "
           f"test_pool={len(test_pool)} steps={total_steps} bs={batch_size} lr_scale={lr_scale}")
+    print(f"[multi] select on {F.SELECTION_METRIC}@{F.SELECTION_HORIZON}m "
+          f"(d={F.SELECTION_D_PATCHES}, one-sided)  dose-gate={gate_cfg.mode}  "
+          f"patience={args.patience if args.patience is not None else 'unset'}")
+    print(f"[multi] log: {log.path}")
 
-    best_sel = None
-    best_step = -1
     best_model_sd = None
     best_ema_sd = None
     best_weighting_sd = None
@@ -147,7 +151,8 @@ def main() -> None:
         assert (best_model_sd is not None and best_ema_sd is not None
                 and best_weighting_sd is not None)
         save_dict = {
-            'arch_version': arch_version, 'loss_schema': loss_schema, 'step': best_step,
+            'arch_version': arch_version, 'loss_schema': loss_schema,
+            'step': selector.best_step,
             'model_state_dict': best_model_sd, 'model_ema_state_dict': best_ema_sd,
             'weighting_state_dict': best_weighting_sd,
             'normalization_stats': stats,
@@ -156,6 +161,8 @@ def main() -> None:
                 'holdout': holdout_map, 'base_checkpoint': os.path.abspath(args.checkpoint),
                 'total_steps': total_steps, 'lr_scale': lr_scale,
                 'baseline_heldout': baseline_summ, 'best_heldout': best_summ,
+                'selection': selector.meta(),
+                'log_csv': os.path.basename(log.path),
             },
         }
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -167,44 +174,53 @@ def main() -> None:
 
     loss_ema = None
 
-    def _log_eval(step, res) -> None:
-        row = [step, '' if loss_ema is None else f"{loss_ema:.4f}"]
+    def _report_eval(step, res, verdict) -> None:
+        """Log one eval to the per-run CSV; console-summarize it."""
+        log.write(step, loss_ema, res, verdict, baseline=selector.baseline)
         cells = []
         for h in F.EVAL_HORIZONS:
-            rmse = F._metric(res, h, 'rmse_point'); mard = F._metric(res, h, 'mard')
-            cab = F._metric(res, h, 'clarke_AB'); hyp = F._metric(res, h, 'hypo', 'recall')
-            row += ['' if v is None else f"{v:.6f}" for v in (rmse, mard, cab, hyp)]
-            cells.append(f"h{h} rmse={F._fmt(rmse)} mard={F._fmt(mard)} AB={F._fmt(cab)} hypoR={F._fmt(hyp)}")
-        log_writer.writerow(row); log_file.flush()
-        sel = F._selection_scalar(res)
+            cells.append(
+                f"h{h}(d{F.horizon_d_patches(h)}) {F.SELECTION_METRIC}="
+                f"{F._fmt(F._metric(res, h, F.SELECTION_METRIC))} "
+                f"rmse={F._fmt(F._metric(res, h, 'rmse_point'))} "
+                f"rmseWM={F._fmt(F._metric(res, h, 'rmse_winmean'))} "
+                f"AB={F._fmt(F._metric(res, h, 'clarke_AB'))}")
         tag = 'baseline' if step == 0 else f"step {step}"
         print(f"[eval {tag}] loss_ema={F._fmt(loss_ema)} n_test={res.get('n_test_windows')} "
-              f"sel={F._fmt(sel)} | " + " | ".join(cells))
+              f"sel={F._fmt(verdict.scalar)} | " + " | ".join(cells))
+        print(f"           gates: {F.gate_summary(verdict.gates)}")
 
-    def _maybe_select(step, res) -> None:
-        nonlocal best_sel, best_step, best_model_sd, best_ema_sd, best_weighting_sd, best_summ
-        sel = F._selection_scalar(res)
-        if sel is None:
-            return
-        if best_sel is None or sel < best_sel:
-            best_sel = sel; best_step = step
+    def _consider(step, res):
+        """Rank, gate and (if admitted) snapshot + write this candidate."""
+        nonlocal best_model_sd, best_ema_sd, best_weighting_sd, best_summ
+        verdict = selector.consider(step, res)
+        if verdict.accepted:
             best_model_sd = F._cpu_state(model.state_dict())
             best_ema_sd = F._cpu_state(ema.state_dict())
             best_weighting_sd = F._cpu_state(weighting.state_dict())
             best_summ = F._summarize_heldout(res)
             _write_output()
-            print(f"  [best] new minimum {F.SELECTION_METRIC}@{F.SELECTION_HORIZON}={sel:.3f} "
-                  f"at step {step} -> wrote {out_path}")
+            print(f"  [best] {verdict.reason} at step {step} -> wrote {out_path}")
+        elif verdict.improved and verdict.gates.get('blocking'):
+            print(f"  [gate] step {step} not selected — {verdict.reason}")
+        return verdict
 
     try:
-        res0 = F.eval_heldout(model, ema, stats, cal_pool, test_pool, device)
+        # Step 0 IS the pretrained checkpoint: it fixes the gate baseline under the
+        # same protocol every later candidate is measured under.
+        res0 = F.eval_heldout(model, ema, stats, cal_pool, test_pool, device,
+                              gate_cfg=gate_cfg, force_probe=True)
+        selector.set_baseline(res0)
+        selector.announce_baseline()
         baseline_summ = F._summarize_heldout(res0)
-        _log_eval(0, res0)
-        _maybe_select(0, res0)
+        v0 = _consider(0, res0)
+        _report_eval(0, res0, v0)
 
         data_iter = iter(loader)
         consecutive_nan = 0
         step = 0
+        stopped_early = False
+        last_eval_step = 0
         while step < total_steps:
             model.train()
             try:
@@ -215,10 +231,14 @@ def main() -> None:
 
             patches = batch['patches'].to(device, non_blocking=True)
             attn_mask = batch['attn_mask'].to(device, non_blocking=True)
-            last_bg = batch['bg_formula_data']['last_bg'].to(device).float()
-            true_bg_full = (batch['bg_formula_data']['true_bg_trajectory'][:, :F._PRED_STEPS]
-                            .to(device).float()
-                            .reshape(-1, F.config.PREDICTION_PATCHES, F.config.PATCH_SIZE))
+            _bfd = batch['bg_formula_data']
+            # The masked set, all (B, M). ``slot_valid`` is the only thing that
+            # discards a padded slot, which gathers patch 0.
+            anchor_bg = _bfd['anchor_bg'].to(device, non_blocking=True).float()   # (B, M) mg/dL
+            mask_idx = _bfd['mask_idx'].to(device, non_blocking=True)             # (B, M) int64
+            slot_valid = _bfd['valid'].to(device, non_blocking=True)              # (B, M) bool
+            slot_hour = _bfd['slot_hour'].to(device, non_blocking=True).float()   # (B, M) hours
+            targets = batch['targets'].to(device, non_blocking=True).float()      # (B, M, S) mg/dL
 
             # Cross-window probe input (window k+1) — skipped when the penalty is off.
             next_window = None
@@ -227,7 +247,11 @@ def main() -> None:
                 if _nw is not None:
                     next_window = {
                         'patches': _nw['patches'].to(device, non_blocking=True),
-                        'last_bg': _nw['last_bg'].to(device, non_blocking=True).float(),
+                        # Window k+1's own attention mask, built by collate from
+                        # window k+1's masked set.
+                        'attn_mask': _nw['attn_mask'].to(device, non_blocking=True),
+                        'anchor_bg': _nw['anchor_bg'].to(device, non_blocking=True).float(),
+                        'mask_idx': _nw['mask_idx'].to(device, non_blocking=True),
                         'valid': _nw['valid'].to(device, non_blocking=True),
                     }
 
@@ -265,23 +289,27 @@ def main() -> None:
                 loss_ema = 1.0 if loss_ema is None else 0.98 * loss_ema + 0.02 * 1.0
 
             try:
-                q_tau, median, time_pred = model(patches, attn_mask, last_bg, return_time=True)
+                q_tau, median, time_pred = model(
+                    patches, attn_mask, anchor_bg, mask_idx, return_time=True)
                 q_tau = q_tau.float()
                 median = median.float()
-                loss_total, _parts = F.risk_total_loss(q_tau, median, true_bg_full, weighting)
+                loss_total, _parts = F.risk_total_loss(
+                    q_tau, median, targets, weighting,
+                    valid=slot_valid, mask_idx=mask_idx,
+                )
                 # Time-of-day probe co-trains the shared trunk (TIME_PROBE_DETACH=False),
                 # mirroring pretraining; isolated from the logged/EMA/selection scalar.
                 _tod_extra = loss_total.new_zeros(())
                 _tod_loss_val = float('nan')
-                _psh = batch['bg_formula_data'].get('pred_start_hour')
-                if time_pred is not None and _psh is not None:
-                    P = time_pred.shape[1]
-                    adv = F.config.PATCH_SIZE * 5.0 / 60.0
-                    base = _psh.to(time_pred.device).float().reshape(-1)                       # (B,)
-                    offs = torch.arange(P, device=time_pred.device, dtype=torch.float32) * adv  # (P,)
-                    tgt_hours = (base[:, None] + offs[None, :]) % 24.0                          # (B,P)
+                if time_pred is not None:
+                    # Per-slot true clock: slot j is patch mask_idx[:, j], so a
+                    # fixed pred_start_hour + 0.5 * j is the wrong target for any
+                    # masked set but the right-edge span. Padded slots are dropped.
+                    _sel = slot_valid.reshape(-1)
                     _tod_ce = F.time_of_day_bin_ce(
-                        time_pred, tgt_hours, F.config.TIME_PROBE_N_BINS, F.config.TIME_PROBE_LABEL_SMOOTH_BINS,
+                        time_pred.reshape(-1, F.config.TIME_PROBE_N_BINS)[_sel],
+                        (slot_hour.reshape(-1)[_sel]) % 24.0,
+                        F.config.TIME_PROBE_N_BINS, F.config.TIME_PROBE_LABEL_SMOOTH_BINS,
                     )
                     _tod_loss = _tod_ce
                     _tod_loss_val = float(_tod_ce.detach())   # logged CE (pre cross-window)
@@ -296,10 +324,16 @@ def main() -> None:
                                  else max(1, math.ceil(F.config.TIME_PROBE_CROSS_WINDOW_FRACTION * B_nw)))
                         nw_valid_s = next_window['valid'][:n_sub]
                         if bool(nw_valid_s.any()):
-                            nw_mask = attn_mask[:n_sub] if attn_mask.dim() == 3 else attn_mask
+                            # The attention mask is a function of the masked set, and
+                            # window k+1's masked set is its own, so the 2nd forward
+                            # takes the mask shipped beside its patches — never window
+                            # k's, which agrees with it only when the two masked sets
+                            # happen to coincide.
                             _, _, time_pred_next = model(
-                                next_window['patches'][:n_sub], nw_mask,
-                                next_window['last_bg'][:n_sub], return_time=True,
+                                next_window['patches'][:n_sub],
+                                next_window['attn_mask'][:n_sub],
+                                next_window['anchor_bg'][:n_sub],
+                                next_window['mask_idx'][:n_sub], return_time=True,
                             )
                             _tod_xwin = F.time_cross_window_consistency_loss(
                                 time_pred[:n_sub], time_pred_next, F.config.TIME_PROBE_N_BINS,
@@ -349,31 +383,47 @@ def main() -> None:
                       f"loss_tod={F._fmt(_tod_loss_val)} "
                       f"lr_muon={muon_opt.param_groups[0]['lr']:.2e}")
             if step % eval_interval == 0 and step < total_steps:
-                res = F.eval_heldout(model, ema, stats, cal_pool, test_pool, device)
-                _log_eval(step, res)
-                _maybe_select(step, res)
+                res = F.eval_heldout(model, ema, stats, cal_pool, test_pool, device,
+                                     gate_cfg=gate_cfg, incumbent=selector.best)
+                verdict = _consider(step, res)
+                _report_eval(step, res, verdict)
+                last_eval_step = step
+                if verdict.stop:
+                    stopped_early = True
+                    print(f"[multi] patience {args.patience} exhausted at step {step} "
+                          f"(best step {selector.best_step}) — stopping early")
+                    break
 
-        res_final = F.eval_heldout(model, ema, stats, cal_pool, test_pool, device)
-        _log_eval(total_steps, res_final)
-        _maybe_select(total_steps, res_final)
+        if not stopped_early and last_eval_step != step:
+            res_final = F.eval_heldout(model, ema, stats, cal_pool, test_pool, device,
+                                       gate_cfg=gate_cfg, incumbent=selector.best)
+            verdict = _consider(step, res_final)
+            _report_eval(step, res_final, verdict)
     finally:
-        log_file.close()
+        log.close()
 
     if best_model_sd is not None:
         _write_output()
 
     print()
     print("=" * 72)
-    print(f"output checkpoint: {out_path}")
-    print(f"best step: {best_step}  ({F.SELECTION_METRIC}@{F.SELECTION_HORIZON}={F._fmt(best_sel)})")
+    print(f"output checkpoint: {out_path}" if best_model_sd is not None else
+          "NO checkpoint written: no candidate was both an improvement and admitted "
+          "by every gate. The base checkpoint is unchanged.")
+    print(f"best step: {selector.best_step}  ({F.SELECTION_METRIC}@{F.SELECTION_HORIZON}m "
+          f"[d={F.SELECTION_D_PATCHES}]={F._fmt(selector.best)})")
+    print(f"per-step log: {log.path}")
     print(f"pooled holdouts: {holdout_map}")
     print("per-horizon POOLED held-out  baseline -> best (Δ):")
     for h in F.EVAL_HORIZONS:
-        base = None if baseline_summ is None else baseline_summ[str(h)]['rmse_point']
-        best = None if best_summ is None else best_summ[str(h)]['rmse_point']
-        delta = (None if (base is None or best is None) else best - base)
-        print(f"  h{h:>3} rmse_point: {F._fmt(base)} -> {F._fmt(best)}"
-              + ("" if delta is None else f"  (Δ {delta:+.3f})"))
+        for key in (F.SELECTION_METRIC, 'rmse_point', 'rmse_winmean'):
+            base = None if baseline_summ is None else baseline_summ[str(h)].get(key)
+            best = None if best_summ is None else best_summ[str(h)].get(key)
+            delta = (None if (base is None or best is None) else best - base)
+            print(f"  h{h:>3} {key:<12}: {F._fmt(base):>8} -> {F._fmt(best):>8}"
+                  + ("" if delta is None else f"  (Δ {delta:+.3f})"))
+    if selector.best_gates is not None:
+        print(f"admission gates at the selected step: {F.gate_summary(selector.best_gates)}")
     print("=" * 72)
 
 

@@ -21,6 +21,27 @@ The held-out number printed here is the apples-to-apples generalization signal t
 compare against the all-patients average the ``metrics/`` scripts produce (those
 read the hardcoded ``checkpoints/t1dmai_best.pt`` and score ALL patients).
 
+**Selection is a strictly proper scalar under hard admission gates.** A candidate
+is admitted only if every gate holds — chiefly the dose-response gate, which
+refuses any checkpoint whose insulin correct-sign fraction has fallen below the
+pretrained model's — and the admitted candidates are then ranked by CRPS at the
+selection horizon, which is weight-free (every shipped τ enters equally) and
+strictly proper (the band cannot be widened into a better score). No gate trades
+against another and no clinical composite is weighted; RMSE keeps every CSV column
+it had and loses only the headline slot and the selection role.
+
+Every eval writes both point metrics to a PER-RUN CSV under ``finetune/logs/``, so
+two runs never overwrite each other's curve and ``rmse_point`` and ``rmse_winmean``
+can be compared step for step.
+
+The masked set every window here carries is ONE right-edge span of
+``PREDICTION_PATCHES`` — the forecast case of the general masked-BG objective,
+not a draw from ``data.sample_mask_spans`` — because the held-out score this
+script selects on is a forecast at 30/60/120 min.  It runs through the general
+machinery all the same: the head gathers ``mask_idx``, the loss discards padded
+slots by ``valid``, and the anchor is the shared one-sided rule, whose right-edge
+case is the old ``last_bg``.
+
 Runs from either ``finetune/`` or the repo root — ``REPO_ROOT`` is resolved from
 this file's location and prepended to ``sys.path``.
 """
@@ -31,7 +52,11 @@ import copy
 import csv
 import math
 import os
+import re
+import shlex
 import sys
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,16 +66,21 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+import arms
 import config
 from model import T1DMAI
 from muon import Muon
 from risk_loss import risk_total_loss, KendallGalWeighting
 from utils import ModelEMA, time_of_day_bin_ce, time_cross_window_consistency_loss
-from data import collate_fn
+from data import (
+    collate_fn, BG_MASKED_FEAT, _anchor_step_for_span, _mask_slots,
+)
 from realdata import load_dataset
 from realdata.features import build_feature_stack, smoothed_cgm
-from realdata.calibrate import collect_windows
-from realdata.run_eval import split_segments, evaluate_from_windows
+from realdata.calibrate import collect_windows, forecast_bands, forecast_windows
+from realdata.run_eval import (
+    split_segments, evaluate_from_windows, horizon_d_patches, FORECAST_D_PATCHES,
+)
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 # ---------------------------------------------------------------------------- #
@@ -73,7 +103,54 @@ FINETUNE_LOG_INTERVAL: int = 50           # training-progress console cadence
 # Held-out horizons scored to CSV/console, and the selection horizon/metric.
 EVAL_HORIZONS: tuple[int, ...] = (30, 60, 120)
 SELECTION_HORIZON: int = 60
-SELECTION_METRIC: str = 'rmse_winmean'
+# The selection scalar is CRPS at ``SELECTION_HORIZON``: weight-free, since every
+# shipped τ enters with the same weight and no clinical quantity is traded against
+# another, and strictly proper, so the score is minimized by the true predictive
+# distribution and a wider band cannot buy a better one.  A point RMSE is neither —
+# it scores one line out of the fan the alarm path actually reads, and a confidently
+# wrong forecast can beat a correctly uncertain one.  What replaces the rest of
+# RMSE's old job is the admission gates below, not a second scalar.
+#
+# It is read at ONE horizon, which is ONE ``d`` (the distance in patches to the
+# nearest visible evidence — 60 min is d = 2, one-sided, under the forecast
+# protocol).  It is never pooled across d: 98.06% of the masked-BG supervision the
+# model trains under sits at d ≤ 2, so any average over d improves for free.
+SELECTION_METRIC: str = 'crps'
+SELECTION_D_PATCHES: int = horizon_d_patches(SELECTION_HORIZON)
+
+# Patience, in EVALS without an admitted improvement, before the fine-tune stops.
+# DELIBERATELY UNSET: no run settles it.  The archived personal logs cannot — on the
+# large fit rmse_point@60 and rmse_winmean@60 disagree about the best step by 500,
+# and the medium fit left no per-step curve at all, having written to a single
+# overwritten path with no rmse_winmean column.  None = run the full step budget;
+# set --patience once a run under the per-run logging below settles a value.
+FINETUNE_PATIENCE_EVALS: int | None = None
+
+# Per-run CSV directory.  ``.gitignore:81`` (``logs/``) covers it at any depth.
+FINETUNE_LOG_DIR: str = os.path.join(REPO_ROOT, 'finetune', 'logs')
+
+# --- Admission gates -------------------------------------------------------- #
+# A candidate ships only if EVERY gate holds; the strictly proper scalar then ranks
+# the admitted candidates.  A gate is a hard yes/no, never a weighted term — the
+# hand-weighted clinical composite this replaces was removed deliberately.
+DOSE_GATE_MODE: str = 'block'             # 'block' | 'warn' | 'off'
+DOSE_GATE_SIGN_TOLERANCE: float = 0.0     # slack below the baseline sign fraction
+DOSE_GATE_STRIDE_PATCHES: int = 8         # probe window stride — a compute budget
+DOSE_GATE_MAX_WINDOWS_PER_SEG: int = 8    # probe windows per segment — a compute budget
+# The exercise sign gate runs on SIMULATOR windows only: every real adapter emits an
+# identically zero exercise column, so a probe there measures the response to a
+# session that was never announced.  It is off by default because producing those
+# windows costs a simulator run; when it is on and either half is missing — the
+# Segment-shaped source or ``metrics/whatif.py``'s exercise arm — it names which,
+# and under 'block' it refuses rather than passing silently.
+EXERCISE_GATE_ENABLED: bool = False
+EXERCISE_GATE_SIM_FACTORY: str = 'make_sim_segments'   # in metrics/sim/sim_data.py
+EXERCISE_GATE_SIM_HOURS: float = 120.0                 # per simulator patient
+EXERCISE_GATE_SIM_PATIENTS: int = 4                    # a compute budget, not a threshold
+# Absolute floors, DELIBERATELY UNSET.  No reference pretrain exists to read one
+# off, and a guessed floor would silently decide what ships.  None = not enforced.
+GATE_MIN_HYPO_RECALL: float | None = None
+GATE_MIN_BAND_COV50: float | None = None
 
 # NaN-resilience: consecutive non-finite steps before an EMA-shadow rollback.
 CONSECUTIVE_NAN_RESTORE: int = 10
@@ -173,7 +250,8 @@ def _arch_guard(ckpt: dict[str, Any]) -> None:
 
     Only keys present in ``ckpt['training_config']`` are compared (the schema does
     not persist ``bg_head_hidden``, so it is verified by the strict state-dict load
-    instead).
+    instead).  The mask-sampler arm is ``_arm_guard``'s; it changes no dimension
+    here and needs a different remedy.
     """
     tc = ckpt.get('training_config', {}) or {}
     checks = [
@@ -186,6 +264,90 @@ def _arch_guard(ckpt: dict[str, Any]) -> None:
     mismatches = [(k, tc[k], live) for k, live in checks if k in tc and tc[k] != live]
     if mismatches:
         raise SystemExit(_alignment_message(ckpt))
+
+
+def _arm_message(tc: dict[str, Any]) -> str:
+    """Build the operator-facing message for a mask-sampler arm mismatch.
+
+    Separate from ``_alignment_message`` because the remedy is: ``resize_model.py``
+    has no flag for any of the three values and no ``config.py`` edit sets them
+    either — ``config`` binds them at import from ``$T1DMAI_ARM`` (``arms.py``).
+    """
+    lengths = tc.get('mask_span_lengths')
+    stored = (
+        tuple(lengths) if lengths is not None else None,
+        tc.get('max_masked_patches'),
+        tc.get('d_balanced_loss'),
+    )
+    # Ask arms.py which name reproduces the checkpoint's VALUES rather than
+    # trusting the stored name: a table edited since the run is exactly the case
+    # where that name now selects a different sampler than the one that trained
+    # these weights, and following it would re-enter the mismatch.
+    named = [
+        name for name, arm in arms.ARMS.items()
+        if (tuple(arm['mask_span_lengths']), arm['max_masked_patches'],
+            arm['d_balanced_loss']) == stored
+    ]
+    if named:
+        fix = (
+            "Re-run under the checkpoint's arm:\n"
+            f"  {arms.ARM_ENV_VAR}={named[0]} {shlex.join(sys.argv)}"
+            + (f"\n  ({' and '.join(named)} hold the same values.)"
+               if len(named) > 1 else "")
+        )
+    else:
+        fix = (
+            f"No arm in arms.py holds those values, so {arms.ARM_ENV_VAR} cannot "
+            "select them. Restore the checkpoint's arm in arms.py, or fine-tune a "
+            "checkpoint trained under an arm the table still holds."
+        )
+    return (
+        "Mask-sampler arm mismatch: the live arm is not the one the checkpoint was "
+        "trained under.\n"
+        f"  checkpoint: arm={tc.get('sampler_arm')!r} mask_span_lengths={stored[0]} "
+        f"max_masked_patches={stored[1]} d_balanced_loss={stored[2]}\n"
+        f"  live:       arm={config.SAMPLER_ARM!r} "
+        f"mask_span_lengths={tuple(config.MASK_SPAN_LENGTHS)} "
+        f"max_masked_patches={config.MAX_MASKED_PATCHES} "
+        f"d_balanced_loss={config.D_BALANCED_LOSS}\n"
+        "Nothing else catches this: no parameter shape depends on the arm, so the "
+        "strict state-dict load accepts weights from any of them. The live values "
+        "bind all the same — MAX_MASKED_PATCHES is M in this script's slot tensors, "
+        "and risk_total_loss reads D_BALANCED_LOSS and, under it, weights derived "
+        "from MASK_SPAN_LENGTHS and MAX_MASKED_PATCHES (d_balance.d_weights).\n"
+        + fix
+    )
+
+
+def _arm_guard(ckpt: dict[str, Any]) -> None:
+    """Raise ``SystemExit`` if the live mask-sampler arm is not the checkpoint's.
+
+    The three VALUES are compared, not ``sampler_arm``: ``train.py`` stamps both
+    because the name stops pinning the values the moment ``arms.py``'s table is
+    edited, and it is the values that reach the sampler, the slot tensors and the
+    loss.  A name that moved over unchanged values changes nothing and is reported
+    rather than raised on.
+
+    Only keys present in ``ckpt['training_config']`` are compared, as in
+    ``_arch_guard``.
+    """
+    tc = ckpt.get('training_config', {}) or {}
+    # ``mask_span_lengths`` is stored as a list and bound as a tuple, so both sides
+    # go through one normalizer — compared raw, every checkpoint carrying the key
+    # would mismatch.
+    checks = [
+        ('mask_span_lengths', config.MASK_SPAN_LENGTHS, tuple),
+        ('max_masked_patches', config.MAX_MASKED_PATCHES, int),
+        ('d_balanced_loss', config.D_BALANCED_LOSS, bool),
+    ]
+    if any(norm(tc[k]) != norm(live) for k, live, norm in checks if k in tc):
+        raise SystemExit(_arm_message(tc))
+
+    stored_name = tc.get('sampler_arm')
+    if stored_name is not None and stored_name != config.SAMPLER_ARM:
+        print(f"[finetune] checkpoint arm {stored_name!r} vs live arm "
+              f"{config.SAMPLER_ARM!r}; the three values are identical, so the "
+              f"name moved in arms.py and the sampler did not")
 
 
 def load_checkpoint(
@@ -209,6 +371,7 @@ def load_checkpoint(
     stats = ckpt['normalization_stats']
 
     _arch_guard(ckpt)
+    _arm_guard(ckpt)
 
     model = T1DMAI().to(device)
     try:
@@ -225,12 +388,12 @@ def load_checkpoint(
 class RealSegmentDataset(Dataset):
     """Patch-aligned training windows over real CGM segments.
 
-    Per segment the normalized 3-feature stack, the raw (bg-clamped) mg/dL CGM, and
-    the hour-of-day are precomputed once; ``__getitem__`` slices a context +
-    prediction window and assembles the same dict ``data._build_sample`` emits, so
-    ``data.collate_fn`` consumes it unchanged.  All inputs are in normalized
-    z-space (feat 0 is z(f(bg)), Kovatchev risk-space then z-score); the BG targets
-    / ``last_bg`` are mg/dL.
+    Per segment the normalized feature stack, the raw (bg-clamped) mg/dL CGM, and
+    the hour-of-day are precomputed once; ``__getitem__`` slices a window and
+    assembles the same dict ``data._build_sample`` emits, so ``data.collate_fn``
+    consumes it unchanged.  All inputs are in normalized z-space (feat 0 is
+    z(f(bg)), Kovatchev risk-space then z-score) except feat 4, the per-patch
+    ``bg_masked`` bit; the BG targets / anchors are mg/dL.
     """
 
     def __init__(self, segments: list, stats: dict[str, Any], seed: int) -> None:
@@ -264,13 +427,38 @@ class RealSegmentDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
+    def _mask_bits(self, patches: torch.Tensor, masked_rows: torch.Tensor) -> None:
+        """Withhold bg on the masked rows and announce them in feat 4, in place.
+
+        feat 4 is written from the masked set itself on every row — never
+        inherited from the feature stack, which carries no notion of a mask, so a
+        column left as it arrived announces a masked patch as observed.  The bit
+        is per PATCH and the row layout step-major, so it goes into all
+        ``PATCH_SIZE`` columns of the feature.
+        """
+        for f in config.NON_MASKABLE_FEATS:      # bg feat 0 withheld; carb/insulin/exercise kept
+            patches[masked_rows, f::config.N_INPUT_FEATURES] = 0.0
+        patches[:, BG_MASKED_FEAT::config.N_INPUT_FEATURES] = 0.0
+        patches[masked_rows, BG_MASKED_FEAT::config.N_INPUT_FEATURES] = 1.0
+
     def __getitem__(self, i: int) -> dict[str, Any]:
         """Assemble one training sample.
 
         Returns a dict with ``patches`` (n_ctx+P, PATCH_DIM) normalized,
-        ``targets`` (P, S) mg/dL, ``n_context_patches`` int, and ``bg_formula_data``
-        carrying ``last_bg`` (mg/dL), ``true_bg_trajectory`` (PRED_STEPS,) and
-        ``extended_true_bg_trajectory`` (LONG,) mg/dL, plus ``pred_start_hour``.
+        ``targets`` (M, S) mg/dL — one row per head slot — ``n_context_patches``
+        int, and ``bg_formula_data`` carrying the masked set (``mask_idx``,
+        ``valid``, ``anchor_bg``, ``d``, ``slot_hour``), ``last_bg`` (mg/dL),
+        ``true_bg_trajectory`` (PRED_STEPS,) and ``extended_true_bg_trajectory``
+        (LONG,) mg/dL, plus ``pred_start_hour``.
+
+        The masked set is ONE right-edge span of ``PREDICTION_PATCHES`` — the
+        forecast case of the general masked-BG objective — rather than a draw
+        from ``data.sample_mask_spans``: the held-out score this fine-tune
+        selects on is a forecast at 30/60/120 min, so the fine-tune distribution
+        stays the forecast.  It is expanded onto the head's ``M`` slots by
+        ``data._mask_slots`` and anchored by ``data._anchor_step_for_span``, so
+        the slot layout, the anchor and ``d`` are the pretraining definitions and
+        not a second copy of them.
         """
         seg_idx, pred_start = self._index[i]
         feats = self._feats[seg_idx]
@@ -281,31 +469,58 @@ class RealSegmentDataset(Dataset):
         hi = min(config.MAX_CONTEXT_PATCHES, pred_start // config.PATCH_SIZE)
         n_ctx = int(self._rng.integers(config.MIN_CONTEXT_PATCHES, hi + 1))
         ctx_steps = n_ctx * config.PATCH_SIZE
+        seq_len = n_ctx + config.PREDICTION_PATCHES
+        win_start = pred_start - ctx_steps
+        win_steps = seq_len * config.PATCH_SIZE
 
-        context = feats[pred_start - ctx_steps:pred_start].reshape(
-            n_ctx, config.PATCH_SIZE, config.N_INPUT_FEATURES)
-        ctx_flat = context.reshape(n_ctx, config.PATCH_DIM)
+        # The masked set: one span of PREDICTION_PATCHES ending at patch
+        # seq_len - 1.  ``anchor_step`` is window-relative, so with the span at
+        # the right edge it resolves to bg_window[n_ctx * PATCH_SIZE - 1] —
+        # byte-identical to bg_sm[pred_start - 1], the old ``last_bg``.
+        spans = [(n_ctx, config.PREDICTION_PATCHES)]
+        mask_idx, valid, mask_d, anchor_step = _mask_slots(spans, seq_len)
+        masked_rows = torch.arange(n_ctx, seq_len)
 
-        pred = feats[pred_start:pred_start + _PRED_STEPS].reshape(
-            config.PREDICTION_PATCHES, config.PATCH_SIZE, config.N_INPUT_FEATURES).copy()
-        for f in config.NON_MASKABLE_FEATS:               # bg feat0 zeroed; carb/insulin kept
-            pred[:, :, f] = 0.0
-        pred_flat = pred.reshape(config.PREDICTION_PATCHES, config.PATCH_DIM)
-
+        window = feats[win_start:win_start + win_steps]
         patches = torch.from_numpy(
-            np.concatenate([ctx_flat, pred_flat], axis=0)).float()
-        assert patches.shape[-1] == config.PATCH_DIM, (
-            f"patch width {patches.shape[-1]} != PATCH_DIM {config.PATCH_DIM}"
+            window.reshape(seq_len, config.PATCH_DIM).copy()).float()
+        self._mask_bits(patches, masked_rows)
+        assert patches.shape == (seq_len, config.PATCH_DIM), (
+            f"patch block {tuple(patches.shape)} != {(seq_len, config.PATCH_DIM)}"
+        )
+        is_masked = torch.zeros(seq_len, dtype=torch.bool)
+        is_masked[masked_rows] = True
+        _bit = patches[:, BG_MASKED_FEAT::config.N_INPUT_FEATURES]
+        assert torch.equal(_bit, is_masked[:, None].expand_as(_bit).to(_bit.dtype)), (
+            "feat 4 does not reproduce the masked set"
         )
 
-        targets = torch.from_numpy(
-            bg_sm[pred_start:pred_start + _PRED_STEPS].reshape(
-                config.PREDICTION_PATCHES, config.PATCH_SIZE).copy()).float()
+        # One target row per head slot, RAW mg/dL (the risk transform is applied
+        # once, in the loss).  Padded slots read patch 0 exactly as ``mask_idx``
+        # does; ``valid`` is what discards them.
+        bg_window = bg_sm[win_start:win_start + win_steps]
+        bg_patches = bg_window.reshape(seq_len, config.PATCH_SIZE)
+        targets = torch.from_numpy(bg_patches[mask_idx].copy()).float()   # (M, S)
 
-        last_bg = float(min(max(bg_sm[pred_start - 1], BG_CLAMP_MIN), BG_CLAMP_MAX))
+        # Per-slot anchor, one-sided and left-preferring, read off the raw mg/dL
+        # array.  Padded slots carry ``last_bg`` — an arbitrary but LEGAL mg/dL
+        # from this window, so the forward's (B, M) units tripwire never fires on
+        # a slot ``valid`` is about to discard.
+        last_bg = float(np.clip(
+            bg_window[_anchor_step_for_span(n_ctx, config.PREDICTION_PATCHES)],
+            BG_CLAMP_MIN, BG_CLAMP_MAX))
         assert last_bg >= BG_CLAMP_MIN - 1e-3, (
             f"last_bg {last_bg} below BG_CLAMP_MIN — non-mg/dL value in the anchor"
         )
+        anchor_bg = np.full(config.MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
+        anchor_bg[valid] = np.clip(
+            bg_window[anchor_step[valid]], BG_CLAMP_MIN, BG_CLAMP_MAX)
+
+        # Per-slot TRUE hour of day, at the slot's own patch.  Derived instead as
+        # pred_start_hour + 0.5 * j it is off by (mask_idx[j] - n_ctx - j) * 0.5 h
+        # whenever the masked set is not the right-edge span, with every shape
+        # still matching.
+        slot_hour = hour[win_start + mask_idx * config.PATCH_SIZE].astype(np.float32)
 
         true_bg_trajectory = bg_sm[pred_start:pred_start + _PRED_STEPS].astype(np.float32).copy()
         ext = bg_sm[pred_start:pred_start + _LONG_STEPS]
@@ -319,6 +534,12 @@ class RealSegmentDataset(Dataset):
             'targets': targets,
             'n_context_patches': int(n_ctx),
             'bg_formula_data': {
+                # The masked set and everything keyed to it, all (M,).
+                'mask_idx': mask_idx,          # (M,) int64  patch index per head slot
+                'valid': valid,                # (M,) bool
+                'anchor_bg': anchor_bg,        # (M,) float32 mg/dL
+                'd': mask_d,                   # (M,) int64  to nearest visible, EITHER side
+                'slot_hour': slot_hour,        # (M,) float32 true hour of day per slot
                 'last_bg': last_bg,
                 'true_bg_trajectory': true_bg_trajectory,
                 'extended_true_bg_trajectory': extended_true_bg_trajectory,
@@ -329,38 +550,57 @@ class RealSegmentDataset(Dataset):
         # === Cross-window (paired-window) time-of-day probe input (window k+1) ===
         # Window k shifted forward by exactly PREDICTION_PATCHES on the SAME
         # raw segment (teacher-forced re-slice, not autoregressive).
-        # Same n_ctx => identical seq_len / left-pad / attn_mask as window k, which
-        # data.collate_fn and both training loops reuse for the 2nd forward. Its
-        # pred zone keeps bg (feat 0) zeroed so no future bg leaks; carb/insulin
-        # stay announced. Gated + shape-matched exactly like data.build_sample so
-        # the shared collate batches it unchanged; when the future runs off the
+        # Same n_ctx => identical seq_len and left-pad as window k. It carries the
+        # SAME right-edge span as window k, so the slot layout (mask_idx / valid /
+        # d) is shared and only the anchors and the clock move one horizon along;
+        # data.collate_fn builds this window its own attention mask from its own
+        # masked set all the same, and that is what the 2nd forward runs under.
+        # Gated + shape-matched exactly like data._build_sample
+        # so the shared collate batches it unchanged; when the future runs off the
         # segment end it ships a masked-out zero placeholder (valid=False).
         if config.TIME_PROBE_ENABLED and config.TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0:
-            seq_len = n_ctx + config.PREDICTION_PATCHES
             next_pred_start = pred_start + _PRED_STEPS
+            next_win_start = win_start + _PRED_STEPS
             next_valid = next_pred_start + _PRED_STEPS <= feats.shape[0]
             if next_valid:
-                nxt_ctx = feats[next_pred_start - ctx_steps:next_pred_start].reshape(
-                    n_ctx, config.PATCH_SIZE, config.N_INPUT_FEATURES).reshape(
-                    n_ctx, config.PATCH_DIM)
-                nxt_pred = feats[next_pred_start:next_pred_start + _PRED_STEPS].reshape(
-                    config.PREDICTION_PATCHES, config.PATCH_SIZE, config.N_INPUT_FEATURES).copy()
-                for f in config.NON_MASKABLE_FEATS:          # bg feat0 zeroed
-                    nxt_pred[:, :, f] = 0.0
-                nxt_pred_flat = nxt_pred.reshape(config.PREDICTION_PATCHES, config.PATCH_DIM)
+                nxt_window = feats[next_win_start:next_win_start + win_steps]
                 next_patches = torch.from_numpy(
-                    np.concatenate([nxt_ctx, nxt_pred_flat], axis=0)).float()
-                next_last_bg = float(min(max(bg_sm[next_pred_start - 1], BG_CLAMP_MIN), BG_CLAMP_MAX))
+                    nxt_window.reshape(seq_len, config.PATCH_DIM).copy()).float()
+                self._mask_bits(next_patches, masked_rows)
+                next_bg_window = bg_sm[next_win_start:next_win_start + win_steps]
+                next_last_bg = float(np.clip(
+                    next_bg_window[_anchor_step_for_span(n_ctx, config.PREDICTION_PATCHES)],
+                    BG_CLAMP_MIN, BG_CLAMP_MAX))
+                next_anchor_bg = np.full(
+                    config.MAX_MASKED_PATCHES, next_last_bg, dtype=np.float32)
+                next_anchor_bg[valid] = np.clip(
+                    next_bg_window[anchor_step[valid]], BG_CLAMP_MIN, BG_CLAMP_MAX)
+                next_slot_hour = hour[
+                    next_win_start + mask_idx * config.PATCH_SIZE].astype(np.float32)
                 next_pred_start_hour = float(hour[next_pred_start])
             else:
+                # Finite placeholder, masked out downstream by ``valid``. The
+                # announcement bit is still written so the placeholder is not a
+                # window claiming every patch is observed, and the anchors reuse
+                # window k's legal mg/dL so the units tripwire never fires.
                 next_patches = torch.zeros(seq_len, config.PATCH_DIM, dtype=torch.float32)
+                next_patches[masked_rows, BG_MASKED_FEAT::config.N_INPUT_FEATURES] = 1.0
                 next_last_bg = last_bg
+                next_anchor_bg = np.full(
+                    config.MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
+                next_slot_hour = np.full(
+                    config.MAX_MASKED_PATCHES, pred_start_hour, dtype=np.float32)
                 next_pred_start_hour = pred_start_hour
             assert next_patches.shape == (seq_len, config.PATCH_DIM), (
                 f"next_window patch shape {tuple(next_patches.shape)} != {(seq_len, config.PATCH_DIM)}"
             )
             sample['next_window'] = {
                 'patches': next_patches,
+                'mask_idx': mask_idx,
+                'valid_slots': valid,
+                'anchor_bg': next_anchor_bg,
+                'd': mask_d,
+                'slot_hour': next_slot_hour,
                 'last_bg': float(next_last_bg),
                 'pred_start_hour': float(next_pred_start_hour),
                 'valid': bool(next_valid),
@@ -464,27 +704,24 @@ def _summarize_heldout(res: dict[str, Any]) -> dict[str, Any]:
         'n_patients': res.get('n_patients'),
     }
     for h in EVAL_HORIZONS:
+        # Both point metrics stay: "retire RMSE" is the headline slot and the
+        # selection role, and deletes no column.  ``exporters/descriptor.py``
+        # reads ``rmse_point`` and ``mard`` out of this block by name.
         out[str(h)] = {
+            SELECTION_METRIC: _metric(res, h, SELECTION_METRIC),
+            'd_patches': horizon_d_patches(h),
             'rmse_point': _metric(res, h, 'rmse_point'),
             'mae_point': _metric(res, h, 'mae_point'),
             'rmse_winmean': _metric(res, h, 'rmse_winmean'),
             'mard': _metric(res, h, 'mard'),
             'clarke_AB': _metric(res, h, 'clarke_AB'),
             'skill_point': _metric(res, h, 'skill_point'),
+            'band_cov50': _metric(res, h, 'band_cov50'),
+            'band_width': _metric(res, h, 'band_width'),
             'hypo_recall': _metric(res, h, 'hypo', 'recall'),
             'hyper_recall': _metric(res, h, 'hyper', 'recall'),
         }
     return out
-
-
-def _selection_scalar(res: dict[str, Any]) -> float | None:
-    """Checkpoint-selection scalar: SELECTION_HORIZON rmse_winmean, else mean rmse_point."""
-    v = _metric(res, SELECTION_HORIZON, SELECTION_METRIC)
-    if v is not None and math.isfinite(v):
-        return v
-    pts = [_metric(res, h, 'rmse_point') for h in EVAL_HORIZONS]
-    pts = [p for p in pts if p is not None and math.isfinite(p)]
-    return float(sum(pts) / len(pts)) if pts else None
 
 
 def _fmt(v: float | None) -> str:
@@ -493,11 +730,627 @@ def _fmt(v: float | None) -> str:
 
 
 # ---------------------------------------------------------------------------- #
+# The strictly proper selection scalar.
+# ---------------------------------------------------------------------------- #
+def _scoring():
+    """Import ``metrics/scoring.py`` — the single definition of the proper scoring rules.
+
+    CRPS is defined there and nowhere else: its quadrature over a 7-node fan is not
+    a neutral choice, and a second implementation here would be a second answer.
+    Lazy, so a driver that never scores a fan never imports it.
+
+    Imported as a plain submodule import.  ``from metrics import scoring`` recurses
+    forever through ``metrics/__init__.py``'s lazy ``__getattr__``, because the
+    fromlist handler probes ``hasattr(metrics, 'scoring')`` first and that probe is
+    what the hook re-enters.
+    """
+    import metrics.scoring               # noqa: PLC0415 — deliberately lazy
+    return metrics.scoring
+
+
+def fan_order_violations(bands: np.ndarray | None) -> int | None:
+    """Count descending steps in the τ fan; None when no window carried one.
+
+    Checked here rather than left to ``metrics.scoring``, whose input contract
+    asserts on it: a mid-fine-tune AssertionError would end the run, where a count
+    fails the fan-order admission gate and lets the fit continue.
+    """
+    if bands is None:
+        return None
+    from realdata.metrics import _FAN_ORDER_TOL_MGDL    # noqa: PLC0415 — the single tolerance
+    return int(np.count_nonzero(np.diff(bands, axis=-1) < -_FAN_ORDER_TOL_MGDL))
+
+
+def crps_by_d_from_windows(
+        test_w: list) -> tuple[dict[int, float], dict[int, int], int | None]:
+    """Per-``d`` CRPS in mg/dL for the fixed forecast protocol these windows run.
+
+    The scoring unit is a masked PATCH, so each window's ``(PRED_STEPS, K)`` fan is
+    reshaped into its ``PREDICTION_PATCHES`` patches and each patch carries the ``d``
+    that ``run_eval.FORECAST_D_PATCHES`` derives from ``data._mask_slots`` — one
+    definition of the slot layout, not a second.  The right-edge forecast span is
+    one-sided, so those are ``d = 1..PREDICTION_PATCHES``.
+
+    CRPS itself is ``metrics.scoring.crps_steps``; nothing about it is restated here.
+    The POOLED figure that module also returns is deliberately not read: 98.06% of
+    the training sampler's supervision sits at ``d ≤ 2``, so a pooled masked-BG
+    scalar improves as the mixture softens and must never select a checkpoint.
+
+    A fan the scorer's input contract rejects — non-ascending, non-finite, or in the
+    wrong space — is reported and scored as nothing, so that eval selects nothing and
+    the fine-tune carries on.  The message is printed rather than swallowed: it is
+    the units tripwire.
+
+    Returns:
+        ``({d: crps_mgdl}, {d: n_units}, fan_order_violations)`` — the first two empty
+        where there are no windows, no fan, or a fan the scorer refused.
+    """
+    bands = forecast_bands(test_w)
+    violations = fan_order_violations(bands)
+    if bands is None or bands.shape[0] == 0 or violations:
+        return {}, {}, violations          # the fan-order gate reports it; do not score it
+    _pred, true, _last, _pats = forecast_windows(test_w)
+    n, steps, k = bands.shape
+    p, s = config.PREDICTION_PATCHES, config.PATCH_SIZE
+    assert steps == p * s, f"window fan has {steps} steps, expected {p} × {s}"
+    d = np.tile(np.asarray(FORECAST_D_PATCHES, dtype=np.int64), n)
+    try:
+        by_d = _scoring().crps_by_d(bands.reshape(n * p, s, k), true.reshape(n * p, s), d)
+    except AssertionError as exc:
+        print(f"  [eval] metrics.scoring refused this fan: {exc}")
+        return {}, {}, violations
+    return dict(by_d.by_d), dict(by_d.n_by_d), violations
+
+
+def attach_proper_scores(res: dict[str, Any], test_w: list) -> dict[str, Any]:
+    """Insert the strictly proper per-``d`` scalar into ``res['metrics']``, in place.
+
+    When the metric suite already carries ``SELECTION_METRIC`` at every scored
+    horizon, that value is kept and nothing is recomputed — the suite is then the
+    single source and this is only the bridge.
+
+    Each horizon's value is its own ``d`` bin's CRPS, and the bin is written beside
+    it as ``d_patches``: under the forecast protocol 30 / 60 / 120 min are
+    ``d = 1 / 2 / 4`` one-sided, so no reader has to infer the difficulty from a
+    horizon label, and nothing is averaged across bins.
+    """
+    metrics = res.get('metrics', {})
+    if all(isinstance(metrics.get(str(h)), dict)
+           and metrics[str(h)].get(SELECTION_METRIC) is not None
+           for h in EVAL_HORIZONS):
+        res.setdefault('proper', {'metric': SELECTION_METRIC, 'basis': 'suite',
+                                  'n_test_windows': len(test_w),
+                                  'fan_order_violations': None})
+        return res
+
+    by_d, n_by_d, violations = crps_by_d_from_windows(test_w)
+    for h in EVAL_HORIZONS:
+        blk = metrics.get(str(h))
+        if not isinstance(blk, dict):
+            continue
+        v = by_d.get(horizon_d_patches(h))
+        blk[SELECTION_METRIC] = (None if v is None or not math.isfinite(v) else float(v))
+        blk['d_patches'] = horizon_d_patches(h)
+    res['proper'] = {'metric': SELECTION_METRIC,
+                     'basis': 'fan-by-d' if by_d else 'unavailable',
+                     'n_test_windows': len(test_w),
+                     'crps_by_d': {int(k): v for k, v in by_d.items()},
+                     'n_by_d': {int(k): v for k, v in n_by_d.items()},
+                     'fan_order_violations': violations}
+    return res
+
+
+def _selection_scalar(res: dict[str, Any]) -> float | None:
+    """The scalar the selector ranks admitted candidates by: SELECTION_METRIC@SELECTION_HORIZON.
+
+    None when the eval carries no such scalar — and the caller then selects nothing.
+    There is deliberately NO fallback to a point error: a fallback would restore the
+    selection role RMSE has been retired from, silently, and only on the runs where
+    the fan is missing.
+    """
+    v = _metric(res, SELECTION_HORIZON, SELECTION_METRIC)
+    return v if (v is not None and math.isfinite(v)) else None
+
+
+# ---------------------------------------------------------------------------- #
+# Dose-response probe (metrics/whatif.py) and the admission gates.
+# ---------------------------------------------------------------------------- #
+def _whatif():
+    """Import ``metrics/whatif.py`` — the dose-response probe.
+
+    Lazy: it pulls in matplotlib and sets ``torch.set_num_threads(8)`` at module
+    scope, and a fine-tune that gates nothing should pay either.  Imported as a
+    plain submodule import for the reason ``_scoring`` gives.
+    """
+    import metrics.whatif               # noqa: PLC0415 — deliberately lazy
+    return metrics.whatif
+
+
+@dataclass
+class GateConfig:
+    """What the admission gates enforce, and how hard.
+
+    ``mode`` 'block' refuses to ship a candidate whose probe is missing or whose sign
+    fraction has fallen; 'warn' records the same verdict and ships anyway; 'off'
+    skips the probe entirely.  ``sign_tolerance`` is slack below the pretrained
+    model's own measured fraction — 0.0 is the rule as stated ("not below"), and any
+    other value is a deliberate loosening.
+    """
+    mode: str = DOSE_GATE_MODE
+    sign_tolerance: float = DOSE_GATE_SIGN_TOLERANCE
+    stride_patches: int = DOSE_GATE_STRIDE_PATCHES
+    max_windows_per_seg: int = DOSE_GATE_MAX_WINDOWS_PER_SEG
+    exercise: bool = EXERCISE_GATE_ENABLED
+    exercise_sim_hours: float = EXERCISE_GATE_SIM_HOURS
+    exercise_sim_patients: int = EXERCISE_GATE_SIM_PATIENTS
+    min_hypo_recall: float | None = GATE_MIN_HYPO_RECALL
+    min_band_cov50: float | None = GATE_MIN_BAND_COV50
+
+    def __post_init__(self) -> None:
+        assert self.mode in ('block', 'warn', 'off'), (
+            f"dose-gate mode {self.mode!r} not one of block/warn/off")
+
+
+def dose_probe(model: T1DMAI, stats: dict[str, Any], device: torch.device,
+               segs: list, cfg: GateConfig) -> dict[str, Any] | None:
+    """Run ``metrics/whatif.py``'s counterfactual dose ladder over ``segs``.
+
+    This is the ONLY dose probe usable here.  ``train._run_counterfactual_probe``
+    requires the six ``extended_*_{norm,raw}`` keys (``train.py:1929-1931``) that
+    ``RealSegmentDataset`` never emits — the two key sets are disjoint — so it hits
+    its bare ``continue`` (``:1933``) on every sample and returns ``cf_n = 0`` with
+    every ``cf_*`` None, which reads as "ran, found nothing" rather than as a
+    failure.
+
+    ``stride``/``cap`` are compute budgets, not thresholds: the gate compares this
+    model against the pretrained one under identical settings, so the settings
+    cancel.  Returns None when the probe cannot run at all.
+    """
+    try:
+        wf = _whatif()
+    except Exception as exc:  # noqa: BLE001 — the gate reports, it does not crash the fit
+        print(f"  [gate] metrics/whatif.py did not import ({exc}); dose probe unavailable")
+        return None
+    if not segs:
+        return None
+    return wf.run(model, stats, device, segs,
+                  stride=cfg.stride_patches * config.PATCH_SIZE,
+                  cap=cfg.max_windows_per_seg)
+
+
+_SIM_GATE_SEGMENTS: dict[tuple[int, float], list] = {}
+
+
+def sim_gate_segments(cfg: GateConfig) -> tuple[list, str | None]:
+    """Simulator segments for the exercise sign gate, or ``([], reason)``.
+
+    The exercise probe is meaningless on a real record — every cohort adapter, and
+    the personal one, emits an identically zero exercise column — so this gate runs
+    on simulator windows or not at all.  It needs a ``Segment``-shaped simulator
+    source; the factory is looked up by name in ``metrics/sim/sim_data.py`` and its
+    absence is reported rather than passed over.
+
+    The seeds are that module's own CALIBRATION patients, so the gate never reads
+    the simulator patients a report is scored on, and the segments are built once
+    per process: running the simulator again at every eval would cost more than the
+    fine-tune.
+    """
+    key = (int(cfg.exercise_sim_patients), float(cfg.exercise_sim_hours))
+    if key in _SIM_GATE_SEGMENTS:
+        return _SIM_GATE_SEGMENTS[key], None
+    try:
+        import metrics.sim.sim_data as sim_data       # noqa: PLC0415 — deliberately lazy
+    except Exception as exc:  # noqa: BLE001
+        return [], f"metrics/sim/sim_data.py did not import ({exc})"
+    factory = getattr(sim_data, EXERCISE_GATE_SIM_FACTORY, None)
+    if factory is None:
+        return [], (f"metrics/sim/sim_data.py has no {EXERCISE_GATE_SIM_FACTORY}() — "
+                    "no Segment-shaped simulator source")
+    seeds = tuple(sim_data.CAL_SEEDS)[:key[0]]
+    segs = list(factory(seeds, hours=cfg.exercise_sim_hours))
+    _SIM_GATE_SEGMENTS[key] = segs
+    return segs, None
+
+
+def probe_sign_fracs(probe: dict[str, Any] | None,
+                     arm: str) -> tuple[dict[str, float | None], str | None]:
+    """Reference-dose correct-sign fraction per horizon, out of a whatif summary.
+
+    The rung read is whatif's own ``REF_IDX`` (the 1.0× rung, i.e. the ``CF_*`` dose)
+    and the quantity is whatever that arm's ``sign_gate.metric`` names, so neither is
+    a second copy.  ``sign_gate.threshold`` is null there by design — this gate's
+    threshold is the pretrained model's own measurement, not a constant.
+
+    Each horizon is a different ``d`` and they are kept apart, never averaged.
+
+    Returns:
+        ``(fracs, reason)`` — ``reason`` is why the arm produced nothing, when it did.
+    """
+    if not probe:
+        return {}, 'the dose probe did not run'
+    block = probe.get(arm)
+    if not isinstance(block, dict):
+        return {}, f"the probe carries no {arm} arm"
+    if not block.get('n'):
+        return {}, block.get('not_probed') or f"the {arm} arm scored no window"
+    key = (block.get('sign_gate') or {}).get('metric', 'correct_sign_frac')
+    ref = _whatif().REF_IDX
+    out: dict[str, float | None] = {}
+    for h in EVAL_HORIZONS:
+        row = (block.get(key) or {}).get(str(h))
+        out[str(h)] = None if row is None else row[ref]
+    return out, None
+
+
+def gate_values(res: dict[str, Any]) -> dict[str, Any]:
+    """Everything the gates read, pulled out of one eval result."""
+    probe = res.get('dose_probe')
+    ex_probe = res.get('exercise_probe')
+    insulin, insulin_why = probe_sign_fracs(probe, 'insulin')
+    carb, _carb_why = probe_sign_fracs(probe, 'carb')
+    exercise, exercise_why = probe_sign_fracs(ex_probe, 'exercise')
+    return {
+        'insulin_sign': insulin,
+        'insulin_reason': insulin_why,
+        'carb_sign': carb,
+        'exercise_sign': exercise,
+        'exercise_reason': (ex_probe or {}).get('unavailable_reason') or exercise_why,
+        'hypo_recall': {str(h): _metric(res, h, 'hypo', 'recall') for h in EVAL_HORIZONS},
+        'band_cov50': {str(h): _metric(res, h, 'band_cov50') for h in EVAL_HORIZONS},
+        'fan_order_violations': (res.get('proper') or {}).get('fan_order_violations'),
+        'probe_ran': probe is not None,
+    }
+
+
+def _sign_check(name: str, now: dict[str, float | None], base: dict[str, float | None],
+                cfg: GateConfig, reason: str | None = None) -> dict[str, Any]:
+    """One dose-sign gate: no horizon may fall below the pretrained model's fraction.
+
+    Compared per horizon, i.e. per ``d``.  A pooled sign fraction would let a gain at
+    d = 1 pay for a loss at d = 4, which is the regime the alarm path consumes.
+    """
+    pairs = [(h, now.get(h), base.get(h)) for h in sorted(set(now) | set(base), key=int)]
+    usable = [(h, v, b) for h, v, b in pairs if v is not None and b is not None]
+    if not usable:
+        return {'status': 'unavailable', 'pass': cfg.mode != 'block',
+                'detail': f"{name}: {reason or 'no comparable horizon'}"}
+    fails = [(h, v, b) for h, v, b in usable if v < b - cfg.sign_tolerance]
+    detail = ' '.join(f"h{h}={v:.3f}/{b:.3f}" for h, v, b in usable)
+    if fails:
+        worst = ' '.join(f"h{h} {v:.3f} < {b:.3f}" for h, v, b in fails)
+        return {'status': 'fail', 'pass': cfg.mode != 'block',
+                'detail': f"{name} fell below the pretrained fraction: {worst}"}
+    return {'status': 'pass', 'pass': True, 'detail': f"{name} {detail}"}
+
+
+def _floor_check(name: str, values: dict[str, float | None],
+                 floor: float | None) -> dict[str, Any]:
+    """An absolute floor, applied per horizon. ``floor`` None = the gate is not set."""
+    if floor is None:
+        return {'status': 'off', 'pass': True,
+                'detail': f"{name}: unset (no run settles a floor)"}
+    usable = {h: v for h, v in values.items() if v is not None}
+    if not usable:
+        return {'status': 'unavailable', 'pass': False,
+                'detail': f"{name}: not measured, floor {floor} cannot be checked"}
+    fails = {h: v for h, v in usable.items() if v < floor}
+    if fails:
+        return {'status': 'fail', 'pass': False,
+                'detail': f"{name} below {floor}: " +
+                          ' '.join(f"h{h}={v:.3f}" for h, v in sorted(fails, key=int))}
+    return {'status': 'pass', 'pass': True, 'detail': f"{name} >= {floor}"}
+
+
+def evaluate_gates(values: dict[str, Any], baseline: dict[str, Any] | None,
+                   cfg: GateConfig) -> dict[str, Any]:
+    """Apply every admission gate. A candidate ships only if all of them pass.
+
+    Gates are hard and independent — none trades against another, and none carries a
+    weight.  Two of them are relative to the PRETRAINED model measured in this same
+    run under the same protocol, which is why they need no threshold; the two
+    absolute floors are unset by default and simply do not apply.
+    """
+    base = baseline or {}
+    checks: dict[str, dict[str, Any]] = {}
+
+    if cfg.mode == 'off':
+        checks['dose_insulin_sign'] = {'status': 'off', 'pass': True,
+                                       'detail': 'dose gate disabled (--dose-gate off)'}
+    else:
+        checks['dose_insulin_sign'] = _sign_check(
+            'insulin correct-sign', values.get('insulin_sign', {}),
+            base.get('insulin_sign', {}), cfg, values.get('insulin_reason'))
+
+    if not cfg.exercise:
+        # Off by default: a real record's exercise column is identically zero, so
+        # this gate is only meaningful on simulator windows and costs a simulator
+        # run to produce them.
+        checks['dose_exercise_sign'] = {
+            'status': 'off', 'pass': True,
+            'detail': 'exercise sign gate off (--exercise-gate runs it on simulator '
+                      'windows)'}
+    else:
+        checks['dose_exercise_sign'] = _sign_check(
+            'exercise correct-sign', values.get('exercise_sign', {}),
+            base.get('exercise_sign', {}), cfg, values.get('exercise_reason'))
+
+    viol = values.get('fan_order_violations')
+    if viol is None:
+        checks['fan_order'] = {'status': 'unavailable', 'pass': True,
+                               'detail': 'no quantile fan captured; ordering unchecked'}
+    else:
+        checks['fan_order'] = {'status': 'pass' if viol == 0 else 'fail',
+                               'pass': viol == 0,
+                               'detail': f"{viol} descending steps in the τ fan"}
+
+    checks['min_hypo_recall'] = _floor_check(
+        'hypo recall', values.get('hypo_recall', {}), cfg.min_hypo_recall)
+    checks['min_band_cov50'] = _floor_check(
+        'band cov50', values.get('band_cov50', {}), cfg.min_band_cov50)
+
+    blocking = [k for k, c in checks.items() if not c['pass']]
+    return {'pass': not blocking, 'blocking': blocking, 'checks': checks,
+            'mode': cfg.mode}
+
+
+def gate_summary(gates: dict[str, Any]) -> str:
+    """One console line: the verdict plus every check that did not plainly pass."""
+    if gates.get('not_evaluated'):
+        return f"not evaluated ({gates['not_evaluated']})"
+    if gates.get('pass'):
+        noted = [c['detail'] for k, c in gates.get('checks', {}).items()
+                 if c['status'] in ('fail', 'unavailable')]
+        return 'admitted' + ('' if not noted else ' (' + '; '.join(noted) + ')')
+    return 'REFUSED: ' + '; '.join(gates['checks'][k]['detail'] for k in gates['blocking'])
+
+
+# ---------------------------------------------------------------------------- #
+# Selection.
+# ---------------------------------------------------------------------------- #
+@dataclass
+class Verdict:
+    """What one eval decided: the scalar, the gates, and whether to keep going."""
+    step: int
+    scalar: float | None
+    gates: dict[str, Any]
+    improved: bool
+    accepted: bool
+    reason: str
+    stop: bool = False
+
+
+@dataclass
+class Selector:
+    """Rank admitted candidates by the strictly proper scalar; stop on patience.
+
+    ``baseline`` is the PRETRAINED model's own gate values, measured at step 0 of
+    this run under exactly the protocol every later candidate is measured under.
+    Nothing is hardcoded: no reference number is carried in from another run, and a
+    candidate is compared only against a measurement made here.
+
+    ``patience`` counts consecutive evals that did not produce an admitted
+    improvement.  None disables stopping.
+    """
+    cfg: GateConfig = field(default_factory=GateConfig)
+    patience: int | None = None
+    best: float | None = None
+    best_step: int = -1
+    best_gates: dict[str, Any] | None = None
+    baseline: dict[str, Any] | None = None
+    stale_evals: int = 0
+
+    def set_baseline(self, res: dict[str, Any]) -> dict[str, Any]:
+        """Freeze the pretrained model's gate values from the step-0 eval."""
+        self.baseline = gate_values(res)
+        return self.baseline
+
+    def consider(self, step: int, res: dict[str, Any]) -> Verdict:
+        """Score one eval: improved? admitted? out of patience?
+
+        The gates are applied only to a candidate that improved on the incumbent,
+        because only such a candidate can ship — and the probe they read is run on
+        exactly the same condition.  An eval that did not improve records
+        ``not_evaluated`` rather than a refusal it was never tested for.
+        """
+        sel = _selection_scalar(res)
+        improved = sel is not None and (self.best is None or sel < self.best)
+        gates = (evaluate_gates(gate_values(res), self.baseline, self.cfg) if improved
+                 else {'pass': False, 'blocking': [], 'checks': {}, 'mode': self.cfg.mode,
+                       'not_evaluated': 'not an improvement on the incumbent'})
+        accepted = bool(improved and gates['pass'])
+        if accepted:
+            self.best, self.best_step, self.best_gates = sel, step, gates
+            self.stale_evals = 0
+            reason = f"new minimum {SELECTION_METRIC}@{SELECTION_HORIZON}={sel:.4f}"
+        else:
+            self.stale_evals += 1
+            if sel is None:
+                reason = (f"no {SELECTION_METRIC}@{SELECTION_HORIZON} in this eval — "
+                          "nothing selected (there is no point-error fallback)")
+            elif not improved:
+                reason = f"{SELECTION_METRIC} {sel:.4f} not below {self.best:.4f}"
+            else:
+                reason = gate_summary(gates)
+        stop = self.patience is not None and self.stale_evals >= self.patience
+        return Verdict(step=step, scalar=sel, gates=gates, improved=bool(improved),
+                       accepted=accepted, reason=reason, stop=stop)
+
+    def announce_baseline(self) -> None:
+        """Say at step 0 where a gate cannot be measured, not at the end.
+
+        Under 'block' an unmeasurable gate refuses every candidate — the safe
+        reading, and the one to hear once at the start rather than discover from an
+        output that was never written.
+        """
+        base = self.baseline or {}
+        if self.cfg.mode == 'off':
+            print("  [gate] dose gate off — no dose-response condition on what ships")
+            return
+        ins = base.get('insulin_sign') or {}
+        if ins:
+            print("  [gate] pretrained insulin correct-sign fraction: "
+                  + ' '.join(f"h{h}={v:.3f}" for h, v in sorted(ins.items(), key=lambda kv: int(kv[0]))
+                             if v is not None))
+        else:
+            print(f"  [gate] NO baseline insulin sign fraction — "
+                  f"{base.get('insulin_reason') or 'the probe produced none'}. Under "
+                  f"--dose-gate {self.cfg.mode} "
+                  + ("no checkpoint can be admitted until the probe can run."
+                     if self.cfg.mode == 'block' else "this is recorded, not enforced."))
+        if self.cfg.exercise and not (base.get('exercise_sign') or {}):
+            print(f"  [gate] NO baseline exercise sign fraction — "
+                  f"{base.get('exercise_reason') or 'the probe produced none'}")
+
+    def meta(self) -> dict[str, Any]:
+        """Selection provenance for ``finetune_meta``."""
+        return {
+            'metric': SELECTION_METRIC,
+            'horizon_min': SELECTION_HORIZON,
+            'd_patches': SELECTION_D_PATCHES,
+            'scalar': self.best,
+            'step': self.best_step,
+            'patience_evals': self.patience,
+            'gate_mode': self.cfg.mode,
+            'gate_sign_tolerance': self.cfg.sign_tolerance,
+            'gate_min_hypo_recall': self.cfg.min_hypo_recall,
+            'gate_min_band_cov50': self.cfg.min_band_cov50,
+            'gates': self.best_gates,
+            'gate_baseline': self.baseline,
+        }
+
+
+# ---------------------------------------------------------------------------- #
+# Per-run logging.
+# ---------------------------------------------------------------------------- #
+# Every eval logs BOTH point metrics beside the selection scalar, so a later run can
+# be asked where each of them was best instead of being asked to trust one.  RMSE
+# loses the headline slot and the selection role here, not a column.
+_LOG_METRICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (SELECTION_METRIC, (SELECTION_METRIC,)),
+    ('rmse_point', ('rmse_point',)),
+    ('rmse_winmean', ('rmse_winmean',)),
+    ('mae_point', ('mae_point',)),
+    ('mae_winmean', ('mae_winmean',)),
+    ('mard', ('mard',)),
+    ('clarke_AB', ('clarke_AB',)),
+    ('skill_point', ('skill_point',)),
+    ('hypo_recall', ('hypo', 'recall')),
+    ('band_cov50', ('band_cov50',)),
+    ('band_width', ('band_width',)),
+)
+
+
+def _slug(text: str) -> str:
+    """Filename-safe form of a run label (patient ids carry '#', dates carry ':')."""
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(text)).strip('_') or 'run'
+
+
+def run_log_path(driver: str, parts: list[Any]) -> str:
+    """A CSV path no other run writes.
+
+    One fixed path per driver is what left the medium personal fit with no per-step
+    curve at all: the next run overwrote it.  The name carries the run's own
+    identity plus a start timestamp, and the directory is gitignored.
+    """
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    name = '-'.join(_slug(p) for p in [driver, *parts, stamp] if p not in (None, ''))
+    return os.path.join(FINETUNE_LOG_DIR, name + '.csv')
+
+
+class RunLog:
+    """The per-step CSV for one fine-tune run.
+
+    ``select_split`` adds a mirrored ``sel_*`` block for drivers that report one
+    split and select on another (``finetune_personal.py``), so the log records both
+    the number that was reported and the number that actually chose the checkpoint.
+    """
+
+    def __init__(self, path: str, select_split: bool = False) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.path = path
+        self.select_split = select_split
+        self._fh = open(path, 'w', newline='')
+        self._w = csv.writer(self._fh)
+        header = ['step', 'loss_ema', 'sel', 'sel_admitted', 'gate_status']
+        for name, _p in _LOG_METRICS:
+            header += [f'{name}_{h}' for h in EVAL_HORIZONS]
+        if select_split:
+            for name, _p in _LOG_METRICS:
+                header += [f'sel_{name}_{h}' for h in EVAL_HORIZONS]
+        for arm in ('insulin', 'exercise'):
+            header += [f'{arm}_sign_{h}' for h in EVAL_HORIZONS]
+            header += [f'{arm}_sign_base_{h}' for h in EVAL_HORIZONS]
+        self._w.writerow(header)
+        self._fh.flush()
+
+    @staticmethod
+    def _cell(v: float | None) -> str:
+        return '' if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.6f}"
+
+    def write(self, step: int, loss_ema: float | None, res: dict[str, Any],
+              verdict: Verdict, sel_res: dict[str, Any] | None = None,
+              baseline: dict[str, Any] | None = None) -> None:
+        """Append one eval's row."""
+        gates = verdict.gates or {}
+        status = ('pass' if gates.get('pass') else
+                  '|'.join(gates.get('blocking', [])) or
+                  ('not_evaluated' if gates.get('not_evaluated') else 'unknown'))
+        row: list[Any] = [step, self._cell(loss_ema), self._cell(verdict.scalar),
+                          int(verdict.accepted), status]
+        for _name, path in _LOG_METRICS:
+            row += [self._cell(_metric(res, h, *path)) for h in EVAL_HORIZONS]
+        if self.select_split:
+            src = sel_res if sel_res is not None else res
+            for _name, path in _LOG_METRICS:
+                row += [self._cell(_metric(src, h, *path)) for h in EVAL_HORIZONS]
+        now = gate_values(sel_res if sel_res is not None else res)
+        base = baseline or {}
+        for arm in ('insulin', 'exercise'):
+            key = f'{arm}_sign'
+            row += [self._cell(now.get(key, {}).get(str(h))) for h in EVAL_HORIZONS]
+            row += [self._cell(base.get(key, {}).get(str(h))) for h in EVAL_HORIZONS]
+        self._w.writerow(row)
+        self._fh.flush()
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+# ---------------------------------------------------------------------------- #
 # Held-out evaluation (under the EMA shadow).
 # ---------------------------------------------------------------------------- #
+def probe_for_gates(model: T1DMAI, stats: dict[str, Any], device: torch.device,
+                    res: dict[str, Any], gate_segs: list, cfg: GateConfig | None,
+                    incumbent: float | None, force: bool) -> None:
+    """Attach the dose-response probes to ``res``, in place, if this candidate could ship.
+
+    MUST be called inside the caller's ``with ema.apply_to(model):`` block: the
+    exporter ships the EMA weights, so a probe measured outside it gates a different
+    model than the one that ships.
+
+    The probe costs eleven forward passes per window, so it runs only where its
+    verdict can change anything — the step-0 baseline, and any eval that improves on
+    the incumbent scalar.  A candidate that is not an improvement is not selected
+    whatever the probe says.
+    """
+    if cfg is None or cfg.mode == 'off' or not gate_segs:
+        return
+    sel = _selection_scalar(res)
+    if not (force or incumbent is None or (sel is not None and sel < incumbent)):
+        return
+    res['dose_probe'] = dose_probe(model, stats, device, gate_segs, cfg)
+    if not cfg.exercise:
+        return
+    sim_segs, why = sim_gate_segments(cfg)
+    res['exercise_probe'] = ({'unavailable_reason': why} if not sim_segs else
+                             dose_probe(model, stats, device, sim_segs, cfg))
+
+
 def eval_heldout(
     model: T1DMAI, ema: ModelEMA, stats: dict[str, Any],
     cal_segs: list, test_segs: list, device: torch.device,
+    gate_cfg: GateConfig | None = None, incumbent: float | None = None,
+    force_probe: bool = False,
 ) -> dict[str, Any]:
     """Score the held-out patient under the EMA shadow.
 
@@ -506,7 +1359,13 @@ def eval_heldout(
     suite.  The EMA shadow is swapped in for the duration so the score matches how
     the base models are evaluated by ``realdata.report.load_model``.
 
-    Returns the ``evaluate_from_windows`` result dict.
+    The strictly proper selection scalar and the dose-response probe are produced
+    inside that same shadow — the exporter ships EMA weights, so a probe measured
+    outside it would gate a different model than the one that ships.  The probe runs
+    on the CALIBRATION segments, never on the reported split.
+
+    Returns the ``evaluate_from_windows`` result dict, plus ``proper`` and — where
+    the gate probe ran — ``dose_probe`` / ``exercise_probe``.
     """
     with ema.apply_to(model):
         model.eval()
@@ -519,6 +1378,9 @@ def eval_heldout(
             stride_patches=FINETUNE_EVAL_TEST_STRIDE_PATCHES,
             max_per_patient=FINETUNE_EVAL_MAX_PER_PATIENT)
         res = evaluate_from_windows(cal_w, test_w)
+        attach_proper_scores(res, test_w)
+        probe_for_gates(model, stats, device, res, cal_segs, gate_cfg,
+                        incumbent, force_probe)
         model.train()
     return res
 
@@ -549,6 +1411,43 @@ def _output_label(checkpoint_path: str) -> str:
 # ---------------------------------------------------------------------------- #
 # CLI.
 # ---------------------------------------------------------------------------- #
+def add_selection_args(p: argparse.ArgumentParser) -> None:
+    """Stopping-rule and admission-gate flags, shared by all three drivers."""
+    p.add_argument('--patience', type=int, default=FINETUNE_PATIENCE_EVALS,
+                   help="stop after this many evals with no admitted improvement "
+                        "(default: unset — run the full step budget)")
+    p.add_argument('--dose-gate', choices=['block', 'warn', 'off'], default=DOSE_GATE_MODE,
+                   help="dose-response gate: block refuses to ship a checkpoint whose "
+                        "insulin correct-sign fraction fell below the pretrained model's")
+    p.add_argument('--gate-sign-tolerance', type=float, default=DOSE_GATE_SIGN_TOLERANCE,
+                   help="slack below the pretrained sign fraction (default 0.0: not below)")
+    p.add_argument('--gate-stride-patches', type=int, default=DOSE_GATE_STRIDE_PATCHES,
+                   help="dose-probe window stride, in patches (a compute budget)")
+    p.add_argument('--gate-max-windows', type=int, default=DOSE_GATE_MAX_WINDOWS_PER_SEG,
+                   help="dose-probe windows per segment (a compute budget)")
+    p.add_argument('--exercise-gate', action='store_true', default=EXERCISE_GATE_ENABLED,
+                   help="also gate the exercise sign, on SIMULATOR windows only "
+                        "(a real record's exercise column is zeros)")
+    p.add_argument('--exercise-gate-patients', type=int, default=EXERCISE_GATE_SIM_PATIENTS,
+                   help="simulator patients the exercise gate probes (a compute budget)")
+    p.add_argument('--gate-min-hypo-recall', type=float, default=GATE_MIN_HYPO_RECALL,
+                   help="absolute hypo-recall floor (default: unset, not enforced)")
+    p.add_argument('--gate-min-band-cov50', type=float, default=GATE_MIN_BAND_COV50,
+                   help="absolute band-coverage floor (default: unset, not enforced)")
+
+
+def gate_config_from_args(args: argparse.Namespace) -> GateConfig:
+    """Build the gate configuration from the shared flags."""
+    return GateConfig(
+        mode=args.dose_gate, sign_tolerance=float(args.gate_sign_tolerance),
+        stride_patches=int(args.gate_stride_patches),
+        max_windows_per_seg=int(args.gate_max_windows),
+        exercise=bool(args.exercise_gate),
+        exercise_sim_patients=int(args.exercise_gate_patients),
+        min_hypo_recall=args.gate_min_hypo_recall,
+        min_band_cov50=args.gate_min_band_cov50)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Leave-one-patient-out fine-tuning of a T1DMAI checkpoint on real CGM data.")
@@ -566,6 +1465,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--out', default=None, help="output checkpoint path (default: auto)")
     p.add_argument('--write-best', action='store_true',
                    help="also write checkpoints/t1dmai_best.pt for the metrics/ suite")
+    add_selection_args(p)
     return p.parse_args()
 
 
@@ -615,6 +1515,14 @@ def main() -> None:
     model, ckpt, stats = load_checkpoint(args.checkpoint, device)
     arch_version = ckpt.get('arch_version')
     loss_schema = ckpt.get('loss_schema')
+    # The base checkpoint's resolved config — architecture, mask-sampler arm, and
+    # what pretraining ran under. The fine-tune changes none of it, and the two
+    # guards above have just confirmed the live config agrees on every key it
+    # carries, so it travels to the output verbatim rather than being rebuilt from
+    # the live config. Without it the arm provenance ends at this script and the
+    # output cannot be guarded, exported or carded. What is specific to THIS run —
+    # steps, LR scale, dataset, holdout, selection — is finetune_meta's.
+    base_training_config = ckpt.get('training_config', {}) or {}
 
     # Learned Kendall-Gal uncertainty weighting for the pinball/DILATE combine,
     # mirroring pretraining. Constructed fresh (not resumed from the base
@@ -650,23 +1558,23 @@ def main() -> None:
     ema = ModelEMA(model, decay=FINETUNE_EMA_DECAY).to(device)
 
     # --- Logging ---------------------------------------------------------- #
-    log_path = os.path.join(REPO_ROOT, 'finetune', 'finetune_log.csv')
-    log_file = open(log_path, 'w', newline='')
-    log_writer = csv.writer(log_file)
-    header = ['step', 'loss_ema']
-    for h in EVAL_HORIZONS:
-        header += [f'rmse_point_{h}', f'mard_{h}', f'clarke_AB_{h}', f'hypo_recall_{h}']
-    log_writer.writerow(header)
-    log_file.flush()
+    log = RunLog(run_log_path('finetune', [_output_label(args.checkpoint), args.dataset,
+                                           args.mode, holdout, f"seed{seed}"]))
+
+    # --- Selection -------------------------------------------------------- #
+    gate_cfg = gate_config_from_args(args)
+    selector = Selector(cfg=gate_cfg, patience=args.patience)
 
     print(f"[finetune] dataset={args.dataset} mode={args.mode} holdout={holdout} "
           f"device={device.type}")
     print(f"[finetune] ft_segs={len(ft_segs)} windows={len(dataset)} "
           f"cal_segs={len(cal_segs)} test_segs={len(test_segs)} "
           f"steps={total_steps} bs={batch_size} lr_scale={lr_scale}")
+    print(f"[finetune] select on {SELECTION_METRIC}@{SELECTION_HORIZON}m "
+          f"(d={SELECTION_D_PATCHES}, one-sided)  dose-gate={gate_cfg.mode}  "
+          f"patience={args.patience if args.patience is not None else 'unset'}")
+    print(f"[finetune] log: {log.path}")
 
-    best_sel: float | None = None
-    best_step: int = -1
     best_model_sd: dict[str, torch.Tensor] | None = None
     best_ema_sd: dict[str, torch.Tensor] | None = None
     best_weighting_sd: dict[str, torch.Tensor] | None = None
@@ -686,16 +1594,20 @@ def main() -> None:
         save_dict = {
             'arch_version': arch_version,
             'loss_schema': loss_schema,
-            'step': best_step,
+            'step': selector.best_step,
             'model_state_dict': best_model_sd,
             'model_ema_state_dict': best_ema_sd,
             'weighting_state_dict': best_weighting_sd,
+            'training_config': base_training_config,
             'normalization_stats': stats,
             'finetune_meta': {
                 'dataset': args.dataset, 'mode': args.mode, 'holdout': holdout,
                 'base_checkpoint': os.path.abspath(args.checkpoint),
                 'total_steps': total_steps, 'lr_scale': lr_scale,
                 'baseline_heldout': baseline_summ, 'best_heldout': best_summ,
+                # How this checkpoint was chosen, and what it had to clear to ship.
+                'selection': selector.meta(),
+                'log_csv': os.path.basename(log.path),
             },
         }
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -707,51 +1619,61 @@ def main() -> None:
 
     loss_ema: float | None = None
 
-    def _log_eval(step: int, res: dict[str, Any]) -> None:
-        row: list[Any] = [step, '' if loss_ema is None else f"{loss_ema:.4f}"]
-        cells: list[str] = []
+    def _report_eval(step: int, res: dict[str, Any], verdict: Verdict) -> None:
+        """Log one eval to the per-run CSV and summarize it on the console.
+
+        The headline cell is the strictly proper scalar; both point errors go to the
+        CSV every eval, so where each of them was best is a question the log can
+        answer instead of one the operator has to trust an answer to.
+        """
+        log.write(step, loss_ema, res, verdict, baseline=selector.baseline)
+        cells = []
         for h in EVAL_HORIZONS:
-            rmse = _metric(res, h, 'rmse_point')
-            mard = _metric(res, h, 'mard')
-            cab = _metric(res, h, 'clarke_AB')
-            hyp = _metric(res, h, 'hypo', 'recall')
-            row += ['' if v is None else f"{v:.6f}" for v in (rmse, mard, cab, hyp)]
-            cells.append(f"h{h} rmse={_fmt(rmse)} mard={_fmt(mard)} AB={_fmt(cab)} "
-                         f"hypoR={_fmt(hyp)}")
-        log_writer.writerow(row)
-        log_file.flush()
-        sel = _selection_scalar(res)
+            cells.append(
+                f"h{h}(d{horizon_d_patches(h)}) {SELECTION_METRIC}="
+                f"{_fmt(_metric(res, h, SELECTION_METRIC))} "
+                f"rmse={_fmt(_metric(res, h, 'rmse_point'))} "
+                f"rmseWM={_fmt(_metric(res, h, 'rmse_winmean'))} "
+                f"AB={_fmt(_metric(res, h, 'clarke_AB'))}")
         tag = 'baseline' if step == 0 else f"step {step}"
         print(f"[eval {tag}] loss_ema={_fmt(loss_ema)} n_test={res.get('n_test_windows')} "
-              f"sel={_fmt(sel)} | " + " | ".join(cells))
+              f"sel={_fmt(verdict.scalar)} | " + " | ".join(cells))
+        print(f"           gates: {gate_summary(verdict.gates)}")
 
-    def _maybe_select(step: int, res: dict[str, Any]) -> None:
-        nonlocal best_sel, best_step, best_model_sd, best_ema_sd, best_weighting_sd, best_summ
-        sel = _selection_scalar(res)
-        if sel is None:
-            return
-        if best_sel is None or sel < best_sel:
-            best_sel = sel
-            best_step = step
+    def _consider(step: int, res: dict[str, Any]) -> Verdict:
+        """Rank, gate and (if admitted) snapshot + write this candidate."""
+        nonlocal best_model_sd, best_ema_sd, best_weighting_sd, best_summ
+        verdict = selector.consider(step, res)
+        if verdict.accepted:
             best_model_sd = _cpu_state(model.state_dict())
             best_ema_sd = _cpu_state(ema.state_dict())
             best_weighting_sd = _cpu_state(weighting.state_dict())
             best_summ = _summarize_heldout(res)
             _write_output()
-            print(f"  [best] new minimum {SELECTION_METRIC}@{SELECTION_HORIZON}={sel:.3f} "
-                  f"at step {step} -> wrote {out_path}")
+            print(f"  [best] {verdict.reason} at step {step} -> wrote {out_path}")
+        elif verdict.improved and verdict.gates.get('blocking'):
+            print(f"  [gate] step {step} not selected — {verdict.reason}")
+        return verdict
 
     try:
         # --- Baseline (pre-finetune) eval at step 0 ----------------------- #
-        res0 = eval_heldout(model, ema, stats, cal_segs, test_segs, device)
+        # The step-0 model IS the pretrained checkpoint (the EMA shadow is
+        # initialised from it), so this eval measures the gate baseline under
+        # exactly the protocol every later candidate is measured under.
+        res0 = eval_heldout(model, ema, stats, cal_segs, test_segs, device,
+                            gate_cfg=gate_cfg, force_probe=True)
+        selector.set_baseline(res0)
+        selector.announce_baseline()
         baseline_summ = _summarize_heldout(res0)
-        _log_eval(0, res0)
-        _maybe_select(0, res0)
+        v0 = _consider(0, res0)
+        _report_eval(0, res0, v0)
 
         # --- Fine-tune loop ---------------------------------------------- #
         data_iter = iter(loader)
         consecutive_nan = 0
         step = 0
+        stopped_early = False
+        last_eval_step = 0
         while step < total_steps:
             model.train()
             try:
@@ -762,12 +1684,17 @@ def main() -> None:
 
             patches = batch['patches'].to(device, non_blocking=True)
             attn_mask = batch['attn_mask'].to(device, non_blocking=True)
-            last_bg = batch['bg_formula_data']['last_bg'].to(device).float()      # (B,)
-            true_bg_full = (
-                batch['bg_formula_data']['true_bg_trajectory'][:, :_PRED_STEPS]
-                .to(device).float()
-                .reshape(-1, config.PREDICTION_PATCHES, config.PATCH_SIZE)
-            )
+            _bfd = batch['bg_formula_data']
+            # The masked set, all (B, M): the head gathers by index and the loss
+            # discards the padded slots by ``slot_valid``. Dropping the latter
+            # anywhere on the loss path supervises those slots against patch 0.
+            anchor_bg = _bfd['anchor_bg'].to(device, non_blocking=True).float()   # (B, M) mg/dL
+            mask_idx = _bfd['mask_idx'].to(device, non_blocking=True)             # (B, M) int64
+            slot_valid = _bfd['valid'].to(device, non_blocking=True)              # (B, M) bool
+            slot_hour = _bfd['slot_hour'].to(device, non_blocking=True).float()   # (B, M) hours
+            # One target row per head slot, mg/dL — not a trailing slice of the
+            # BG trajectory, which no longer indexes the supervised patches.
+            targets = batch['targets'].to(device, non_blocking=True).float()      # (B, M, S)
 
             # Cross-window probe input (window k+1) — TIME-PROBE-only overhead,
             # fully skipped when the penalty is off (collate ships the key iff
@@ -778,7 +1705,11 @@ def main() -> None:
                 if _nw is not None:
                     next_window = {
                         'patches': _nw['patches'].to(device, non_blocking=True),
-                        'last_bg': _nw['last_bg'].to(device, non_blocking=True).float(),
+                        # Window k+1's own attention mask, built by collate from
+                        # window k+1's masked set.
+                        'attn_mask': _nw['attn_mask'].to(device, non_blocking=True),
+                        'anchor_bg': _nw['anchor_bg'].to(device, non_blocking=True).float(),
+                        'mask_idx': _nw['mask_idx'].to(device, non_blocking=True),
                         'valid': _nw['valid'].to(device, non_blocking=True),
                     }
 
@@ -821,10 +1752,14 @@ def main() -> None:
                 loss_ema = 1.0 if loss_ema is None else 0.98 * loss_ema + 0.02 * 1.0
 
             try:
-                q_tau, median, time_pred = model(patches, attn_mask, last_bg, return_time=True)
+                q_tau, median, time_pred = model(
+                    patches, attn_mask, anchor_bg, mask_idx, return_time=True)
                 q_tau = q_tau.float()
                 median = median.float()
-                loss_total, _parts = risk_total_loss(q_tau, median, true_bg_full, weighting)
+                loss_total, _parts = risk_total_loss(
+                    q_tau, median, targets, weighting,
+                    valid=slot_valid, mask_idx=mask_idx,
+                )
 
                 # Time-of-day probe MSE — added to the BACKWARD tensor ONLY. It never
                 # touches loss_total / loss_ema / the CSV / selection (those stay on BG
@@ -832,15 +1767,18 @@ def main() -> None:
                 # shared trunk, co-training it exactly as pretraining does.
                 _tod_extra = loss_total.new_zeros(())
                 _tod_loss_val = float('nan')   # raw probe loss, for the per-step log line
-                _psh = batch['bg_formula_data'].get('pred_start_hour')
-                if time_pred is not None and _psh is not None:
-                    P = time_pred.shape[1]
-                    adv = config.PATCH_SIZE * 5.0 / 60.0
-                    base = _psh.to(time_pred.device).float().reshape(-1)                       # (B,)
-                    offs = torch.arange(P, device=time_pred.device, dtype=torch.float32) * adv  # (P,)
-                    tgt_hours = (base[:, None] + offs[None, :]) % 24.0                          # (B,P)
+                if time_pred is not None:
+                    # The target is the slot's OWN clock, shipped per slot: slot j
+                    # is patch mask_idx[:, j], so a fixed pred_start_hour + 0.5 * j
+                    # is off by (mask_idx[j] - n_ctx - j) * 0.5 h for any masked set
+                    # other than the right-edge span, with every shape matching.
+                    # Padded slots are dropped rather than trained against patch 0's
+                    # hour.
+                    _sel = slot_valid.reshape(-1)
                     _tod_ce = time_of_day_bin_ce(
-                        time_pred, tgt_hours, config.TIME_PROBE_N_BINS, config.TIME_PROBE_LABEL_SMOOTH_BINS,
+                        time_pred.reshape(-1, config.TIME_PROBE_N_BINS)[_sel],
+                        (slot_hour.reshape(-1)[_sel]) % 24.0,
+                        config.TIME_PROBE_N_BINS, config.TIME_PROBE_LABEL_SMOOTH_BINS,
                     )
                     _tod_loss = _tod_ce
                     _tod_loss_val = float(_tod_ce.detach())   # logged CE (pre cross-window)
@@ -859,10 +1797,19 @@ def main() -> None:
                                  else max(1, math.ceil(config.TIME_PROBE_CROSS_WINDOW_FRACTION * B_nw)))
                         nw_valid_s = next_window['valid'][:n_sub]
                         if bool(nw_valid_s.any()):
-                            nw_mask = attn_mask[:n_sub] if attn_mask.dim() == 3 else attn_mask
+                            # The attention mask is a function of the masked set, so
+                            # this forward takes the mask collate ships beside window
+                            # k+1's own patches. Window k's agrees only while the two
+                            # masked sets coincide, and the two windows share n_ctx and
+                            # so the mask SHAPE — the wrong window's mask raises nothing
+                            # and instead lets the forward attend patches its own feat-4
+                            # bit announces as withheld, which this backward carries
+                            # into the shared trunk through _tod_extra.
                             _, _, time_pred_next = model(
-                                next_window['patches'][:n_sub], nw_mask,
-                                next_window['last_bg'][:n_sub], return_time=True,
+                                next_window['patches'][:n_sub],
+                                next_window['attn_mask'][:n_sub],
+                                next_window['anchor_bg'][:n_sub],
+                                next_window['mask_idx'][:n_sub], return_time=True,
                             )
                             _tod_xwin = time_cross_window_consistency_loss(
                                 time_pred[:n_sub], time_pred_next, config.TIME_PROBE_N_BINS,
@@ -914,16 +1861,25 @@ def main() -> None:
                 print(f"  step {step}/{total_steps} loss_ema={_fmt(loss_ema)} "
                       f"loss_tod={_tod_loss_val:.4f} lr_muon={lr_now:.2e}")
             if step % eval_interval == 0 and step < total_steps:
-                res = eval_heldout(model, ema, stats, cal_segs, test_segs, device)
-                _log_eval(step, res)
-                _maybe_select(step, res)
+                res = eval_heldout(model, ema, stats, cal_segs, test_segs, device,
+                                   gate_cfg=gate_cfg, incumbent=selector.best)
+                verdict = _consider(step, res)
+                _report_eval(step, res, verdict)
+                last_eval_step = step
+                if verdict.stop:
+                    stopped_early = True
+                    print(f"[finetune] patience {args.patience} exhausted at step {step} "
+                          f"(best step {selector.best_step}) — stopping early")
+                    break
 
         # --- Final eval --------------------------------------------------- #
-        res_final = eval_heldout(model, ema, stats, cal_segs, test_segs, device)
-        _log_eval(total_steps, res_final)
-        _maybe_select(total_steps, res_final)
+        if not stopped_early and last_eval_step != step:
+            res_final = eval_heldout(model, ema, stats, cal_segs, test_segs, device,
+                                     gate_cfg=gate_cfg, incumbent=selector.best)
+            verdict = _consider(step, res_final)
+            _report_eval(step, res_final, verdict)
     finally:
-        log_file.close()
+        log.close()
 
     if best_model_sd is not None:
         _write_output()
@@ -931,17 +1887,23 @@ def main() -> None:
     # --- Final report ----------------------------------------------------- #
     print()
     print("=" * 72)
-    print(f"output checkpoint: {out_path}")
-    print(f"best step: {best_step}  ({SELECTION_METRIC}@{SELECTION_HORIZON}="
-          f"{_fmt(best_sel)})")
+    print(f"output checkpoint: {out_path}" if best_model_sd is not None else
+          "NO checkpoint written: no candidate was both an improvement and admitted "
+          "by every gate. The base checkpoint is unchanged.")
+    print(f"best step: {selector.best_step}  ({SELECTION_METRIC}@{SELECTION_HORIZON}m "
+          f"[d={SELECTION_D_PATCHES}]={_fmt(selector.best)})")
+    print(f"per-step log: {log.path}")
     print(f"held-out patient: {holdout}  (dataset={args.dataset}, mode={args.mode})")
     print("per-horizon held-out  baseline -> best (Δ):")
     for h in EVAL_HORIZONS:
-        base = None if baseline_summ is None else baseline_summ[str(h)]['rmse_point']
-        best = None if best_summ is None else best_summ[str(h)]['rmse_point']
-        delta = (None if (base is None or best is None) else best - base)
-        print(f"  h{h:>3} rmse_point: {_fmt(base)} -> {_fmt(best)}"
-              + ("" if delta is None else f"  (Δ {delta:+.3f})"))
+        for key in (SELECTION_METRIC, 'rmse_point', 'rmse_winmean'):
+            base = None if baseline_summ is None else baseline_summ[str(h)].get(key)
+            best = None if best_summ is None else best_summ[str(h)].get(key)
+            delta = (None if (base is None or best is None) else best - base)
+            print(f"  h{h:>3} {key:<12}: {_fmt(base):>8} -> {_fmt(best):>8}"
+                  + ("" if delta is None else f"  (Δ {delta:+.3f})"))
+    if selector.best_gates is not None:
+        print(f"admission gates at the selected step: {gate_summary(selector.best_gates)}")
     print("-" * 72)
     if args.write_best:
         print("checkpoints/t1dmai_best.pt was overwritten. Evaluate ALL patients with:")
