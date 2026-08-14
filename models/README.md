@@ -1,11 +1,11 @@
 # models/
 
-Trained checkpoints, their per-model evaluation output, and a script that compares
-them against one another.
+Per-model training and evaluation output, and a script that compares checkpoints
+against one another.
 
-Twelve models live here: four capacities crossed with three training variants. Each
-has its own weights, training logs and metric directories. `compare.py` reads all of
-them and writes a single cross-model comparison under `comparison/`.
+The tree holds no checkpoints. What is present under each capacity is the training
+logs, figures and metric reports of a run; `compare.py` reads a populated tree and
+writes a single cross-model comparison under `comparison/`.
 
 ## Layout
 
@@ -14,9 +14,7 @@ models/
 ├── compare.py                  cross-model comparison script
 ├── README.md                   this file
 ├── nano/  small/  medium/  large/
-│   ├── weights_sim.pt          pretrained on the simulator corpus
-│   ├── weights_ohio.pt         fine-tuned on OhioT1DM
-│   ├── weights_multi.pt        fine-tuned on OhioT1DM + AZT1D + ShanghaiT1DM
+│   ├── weights_<variant>.pt    the checkpoint compare.py reads for that cell
 │   ├── finetune_log.csv        ohio fine-tuning trace
 │   ├── finetune_multi_log.csv  multi fine-tuning trace
 │   ├── figures/                per-model training figures and summary.json
@@ -36,12 +34,22 @@ and `compare.py` respectively.
 
 ## The capacity ladder
 
-| Size | Architecture | Parameters | Pretrain hours | Peak GPU |
-| --- | --- | --- | --- | --- |
-| nano | D=32, 2L, 2H, FFN=128 | 37,879 | 2.9 | 613 MB |
-| small | D=64, 4L, 4H, FFN=256 | 278,723 | 4.5 | 2,027 MB |
-| medium | D=128, 8L, 8H, FFN=512 | 2,155,891 | 12.8 | 7,825 MB |
-| large | D=256, 16L, 16H, FFN=1024 | 16,997,171 | 48.2 | 30,065 MB |
+| Size | Architecture | Parameters | Buffers | Total |
+| --- | --- | ---: | ---: | ---: |
+| nano | D=32, 2L, 2H, FFN=128 | 38,241 | 18 | 38,259 |
+| small | D=64, 4L, 4H, FFN=256 | 279,457 | 18 | 279,475 |
+| medium | D=128, 8L, 8H, FFN=512 | 2,157,345 | 18 | 2,157,363 |
+| large | D=256, 16L, 16H, FFN=1024 | 16,999,969 | 18 | 16,999,987 |
+
+The parameter column is trainable parameters, measured at `PATCH_DIM = PATCH_SIZE ×
+N_INPUT_FEATURES = 30` by instantiating each capacity; the buffer column is the
+`step_basis`, which is fixed and carries no gradient. Each capacity is set by
+`D_MODEL`, `N_LAYERS` and `N_HEADS` alone — `FFN_DIM`, `BG_HEAD_HIDDEN` and
+`TIME_PROBE_HIDDEN` are multiples of `D_MODEL` and follow it — and `resize_model.py`
+prints the count for any of them. Wall-clock and peak-memory figures are not listed
+because none has been measured against this architecture: position is RoPE alone,
+the attention mask reaches SDPA as a bool rather than as a per-layer additive
+float, and the BG head gathers `MAX_MASKED_PATCHES` slots by index.
 
 ## The three variants
 
@@ -70,6 +78,9 @@ python compare.py --out DIR --dpi 300
 Reads the checkpoints, the metric directories, the training logs and the fine-tuning
 logs; writes figures and JSON. It produces no markdown. Palette and figure chrome come
 from `metrics/figstyle.py`, the suite's single copy.
+
+A cell whose checkpoint is absent is skipped rather than reported: its parameter
+count, architecture version and fine-tune provenance are null in `models.json`.
 
 ### Reporting basis
 
@@ -118,7 +129,7 @@ these it was measured on.
 | `fig24_finetune_curves` | fine-tuning traces on the held-out patient |
 | `fig25_transfer_delta` | held-out RMSE before and after transfer |
 | `fig26_reality_gap` | simulator accuracy against pooled real-cohort accuracy |
-| `fig27_ranking` | all twelve models ranked by pooled real-cohort RMSE |
+| `fig27_ranking` | every model in the grid ranked by pooled real-cohort RMSE |
 
 ### Data
 

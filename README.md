@@ -1,9 +1,10 @@
 # T1DMAI
 
 An encoder-only transformer that forecasts blood glucose for Type 1 Diabetes.
-It reads the three signals a phone can actually observe — CGM, logged
-carbohydrate, logged insulin — and returns the next two hours as a fan of seven
-quantiles, so every forecast carries its own uncertainty.
+It reads the four signals a phone can actually observe — CGM, logged
+carbohydrate, logged insulin, logged exercise — and returns a fan of seven
+quantiles over any withheld stretch of glucose, so every prediction carries its
+own uncertainty. The trailing case is the next two hours.
 
 Pretrained on synthetic traces from the [T1DMSIM](https://github.com/0xdeadf1sh/T1DMSIM)
 behavioural simulator, then fine-tuned on real CGM cohorts. The trained model
@@ -30,12 +31,13 @@ exports to ExecuTorch or LiteRT and runs on-device in
 ## Table of contents
 
 - [Architecture](#architecture)
+- [Masked-BG objective](#masked-bg-objective)
 - [Risk space](#risk-space)
 - [Inputs and outputs](#inputs-and-outputs)
 - [Training](#training)
 - [Fine-tuning on real CGM](#fine-tuning-on-real-cgm)
 - [Inference modes](#inference-modes)
-- [Results](#results)
+- [Capacity ladder](#capacity-ladder)
 - [Trained models](#trained-models)
 - [Evaluation harness](#evaluation-harness)
 - [Simulator cache](#simulator-cache)
@@ -60,32 +62,70 @@ exports to ExecuTorch or LiteRT and runs on-device in
 </picture>
 
 Six consecutive 5-minute samples become one 30-minute token. A pre-norm
-transformer stack attends over those tokens with rotary position embeddings,
-QK-normalisation, and a learned per-head ALiBi bias, so heads settle on
-different temporal scales. Attention is bidirectional inside the context and
-inside the horizon; the context is blocked from reading the horizon, so no
-future information flows backward.
+transformer stack attends over those tokens with rotary position embeddings and
+QK-normalisation; nothing else carries position. Every token is visible or
+masked. Visible tokens attend among themselves and are blocked from reading a
+masked one, so no prediction feeds the evidence; a masked token reads everything
+real. The mask reaches attention as a boolean, per sample, and is not a function
+of position.
 
-Two heads read the horizon tokens. The glucose head emits a few low-frequency
-coefficients per patch rather than one value per step, so a step-to-step zigzag
-is unrepresentable; the median is then projected onto a low-frequency basis
-spanning the whole horizon, which smooths across patch seams and — because a
-projection can only shrink a signal — bounds the drift away from the last
-observed reading. At initialisation the forecast is a flat persistence line.
-Spreads pass through a softplus and a floor, then accumulate, so the seven
-quantiles are strictly ordered by construction.
+Two heads read the masked tokens, gathered by index into a fixed set of slots.
+The glucose head emits a few low-frequency coefficients per patch rather than one
+value per step, so a step-to-step zigzag is unrepresentable; the median is then
+projected onto a low-frequency basis spanning one masked span, which smooths
+across patch seams and — because a projection can only shrink a signal — bounds
+the drift away from the anchor. The basis dimension scales with the span length,
+so the contraction survives at the shortest span, where a fixed dimension would
+have a column per step and do nothing. At initialisation the forecast is a flat
+persistence line. Spreads pass through a softplus and a floor, then accumulate,
+so the seven quantiles are strictly ordered by construction.
 
-The second head is a time-of-day probe: it classifies each horizon patch into
-one of twelve two-hour bins. There is no clock input, so it has to infer the
-hour from the trajectory alone. It never touches the forecast, but its gradient
-does reach the shared trunk, which pushes the same representations the glucose
-head reads to encode circadian phase.
+Every masked patch is anchored on the nearest visible reading — the last step to
+its left, or the first step to its right when the span opens the window — and
+every patch of one span shares that anchor.
+
+The second head is a time-of-day probe: it classifies each masked patch into one
+of twelve two-hour bins. There is no clock input, so it has to infer the hour
+from the trajectory alone. It never touches the forecast, but its gradient does
+reach the shared trunk, which pushes the same representations the glucose head
+reads to encode circadian phase.
 
 The model is patient-agnostic. There is no learned per-patient vector; identity
 is whatever the 8–24 hour context window implies.
 
 Every dimension lives in `config.py`, and `resize_model.py` rewrites it. The
-released capacities run from 38 k to 17 M parameters on the same code.
+capacities on the ladder run from 38 k to 17 M parameters on the same code.
+
+
+## Masked-BG objective
+
+A window is a run of patches, each visible or masked. A masked patch withholds
+its glucose and announces that it did, through a bit the model reads; the
+carbohydrate, insulin and exercise channels keep their true or announced values
+there as everywhere else. The head emits a quantile fan for every masked patch,
+and all of them are decoded in one pass.
+
+Where the span sits is the whole difference between the three cases:
+
+| Case | Masked span |
+| --- | --- |
+| forecast | ends at the last patch |
+| backcast | starts at the first patch |
+| infill | anywhere between visible patches |
+
+They are three cases of one objective, not three modes.
+
+Training re-samples the spans per window: between one and `MASK_MAX_SPANS` of
+them, each of a length drawn from the arm's length set, placed uniformly over the
+window with at least one visible patch between neighbours and a cap on the total
+masked. Nothing biases placement toward the right edge, and there is no
+curriculum or annealing — `data.sample_mask_spans` is the sampler, and `--arm`
+selects the settings it draws from.
+
+The contract this implements — the masked set, the attention rule, the anchor,
+the decode — is specified once for the whole suite in
+`T1DMCOMMON/SPEC/inference.md`; [docs/INFERENCE.md](docs/INFERENCE.md) maps it
+onto this repository.
 
 
 ## Risk space
@@ -98,8 +138,11 @@ released capacities run from 38 k to 17 M parameters on the same code.
 
 The model does not forecast mg/dL. It forecasts the Kovatchev risk transform of
 mg/dL — a warp of the glucose axis that stretches the hypoglycemic range and
-compresses the high one. Here it is re-anchored to the physical device range so
-that `f(40) = −√10` and `f(400) = +√10`, putting zero risk near 128 mg/dL.
+compresses the high one. Here it is re-anchored to the 40–400 mg/dL device range
+so that `f(40) = −√10` and `f(400) = +√10`, putting zero risk near 128 mg/dL.
+Glucose is clamped to the simulator's physical bounds before the transform, and
+those reach further below the low anchor than above the high one, so the realised
+risk range is asymmetric.
 
 The consequence is the whole point: the same absolute error is worth several
 times more loss at 60 mg/dL than at 300. Nothing in the objective mentions
@@ -111,40 +154,53 @@ one space. Only the reporting layer converts back to mg/dL.
 
 ## Inputs and outputs
 
-Three features per 5-minute step:
+Five features per 5-minute step:
 
 | Feature | Units | Transform |
 | --- | --- | --- |
 | CGM glucose | mg/dL | Kovatchev `f`, then z-score |
 | carbohydrate | g / step | `log1p`, then z-score |
 | insulin (basal + bolus) | U / step | `log1p`, then z-score |
+| exercise | g / step | `log1p`, then z-score |
+| glucose withheld | bit | none |
+
+Exercise is glucose disposal expressed as a carbohydrate equivalent, so it takes
+carbohydrate's scale and encoding exactly — never minutes, never an intensity.
 
 `log1p` is near-linear near zero, so the dense basal baseline survives while
 rare meal and bolus spikes are compressed into the bulk of the distribution.
+
+The fifth feature is a bit rather than a signal: it is written into every step
+column of a masked patch to say that the glucose slot there is blank. It carries
+no normalization statistics, so there are four normalized channels behind five
+input features. A patch is `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES` values,
+laid out step-major.
 
 Insulin sensitivity and hepatic glucose output are simulator latents. A real CGM
 cannot supply them, so they are deliberately withheld: the model only ever sees
 what deployment will give it. There are no time-of-day features either.
 
-In the prediction zone the glucose slot is blanked — it is what the model
-predicts — while the carbohydrate and insulin slots carry the upcoming meals and
-doses as their absorption and action curves, per step, in the units above.
-The model is therefore *always* conditioned on a declared plan, which is what
-makes the what-if mode a property of the forward pass rather than a separate
+At a masked patch the glucose slot is blanked — it is what the model predicts —
+while the carbohydrate, insulin and exercise slots carry the meals, doses and
+sessions as their absorption, action and disposal curves, per step, in the units
+above. The model is therefore *always* conditioned on a declared plan, which is
+what makes the what-if mode a property of the forward pass rather than a separate
 mode.
 
-The output is `(q_tau, median)` in risk space: seven quantile levels
-(5 / 10 / 25 / 50 / 75 / 90 / 95 %) at every 5-minute step, anchored on the last
-observed glucose. Inference inverts them to mg/dL.
+The output is `(q_tau, median)` in risk space: a seven-level quantile fan at
+every 5-minute step of every masked patch, each anchored on its own span's
+nearest visible reading. The levels and their ascending order belong to
+`T1DMCOMMON/SPEC/invariants.md` §6, which fixes them for the whole suite because
+every consumer indexes the fan positionally. Inference inverts it to mg/dL.
 
 
 ## Training
 
 Batches are simulated on the fly, or drawn from a pre-generated cache. Each
 sample is a fresh random window: the context length is re-rolled per sample
-between 8 and 24 hours, and the horizon may start at any patch-aligned position
-in the day, so day and night are learned by one model without a band
-restriction.
+between 8 and 24 hours, the window may start at any patch-aligned position in the
+day, so day and night are learned by one model without a band restriction, and
+the masked spans are drawn per sample.
 
 The loss combines two terms, both in risk space:
 
@@ -163,8 +219,8 @@ rather than fixed.
 Other details worth knowing:
 
 - **Muon** for every parameter with `ndim ≥ 2`, the patch-embedding matrix
-  included; AdamW for the 1-D ones — norm scales, biases, ALiBi slopes — and the
-  two loss-weighting scalars. Muon's decay on the normalised matrices is
+  included; AdamW for the 1-D ones — norm scales and biases — and the two
+  loss-weighting scalars. Muon's decay on the normalised matrices is
   schedule-corrected (AdamC), which removes the end-of-schedule gradient-norm
   rise; at peak learning rate it is identical to plain decoupled decay.
 - **Weight EMA** for evaluation. Threshold-crossing metrics like hypo recall are
@@ -183,18 +239,41 @@ Other details worth knowing:
 
 Validation runs every `VALIDATION_INTERVAL` steps and prints a single table:
 per-horizon RMSE and MARD, Clarke Error Grid zones, CG-EGA by glycemic region,
-hypo and hyper detection off the band edges, band coverage, excursion amplitude,
-nocturnal and night-onset sections, a counterfactual dose-response probe, and
-the clock probe's accuracy. The results are appended to
-`logs/validation_log.csv`.
+hypo and hyper detection off the band edges, band coverage, the
+[proper scoring rules](#scoring-rules-and-protocols) and the hypo alarm operating
+curve, the infill columns, excursion amplitude, nocturnal and night-onset
+sections, a counterfactual dose-response probe, and the clock probe's accuracy.
+The results are appended to `logs/validation_log.csv`.
+
+Each validation batch runs three forwards. The selection loss is read off the
+sample's own masked set, so the checkpoint is chosen on the validation value of
+the training objective. The other two are the
+[fixed protocols](#scoring-rules-and-protocols) — the horizon-keyed clinical
+numbers come from the forecast one, the `infill_*` columns from the other.
 
 ```bash
 # simulate on the fly
 python train.py --master-seed 42 --total-steps 100000 --batch-size 512
 
 # or from a pre-generated pool — see Simulator cache
-python train.py --cache-path cache_balanced --total-steps 100000
+python train.py --cache-path simulator_cache --total-steps 100000
 ```
+
+### Sampler arms
+
+`--arm` picks the mask sampler's settings: the span lengths it draws from, the
+number of head slots, and whether the loss is reweighted per `d`. The three move
+together, `arms.py` holds them and nothing else defines them, and the default is
+`a`. An unknown name raises before the run starts.
+
+```bash
+python arms.py                                 # the table, and what each arm is for
+python train.py --arm b --total-steps 100000
+```
+
+The arm is resolved once, at import, so it is fixed for a whole run. A checkpoint
+stamps both the name and the three values it bound, and fine-tuning refuses a
+checkpoint whose values are not the live ones.
 
 
 ## Fine-tuning on real CGM
@@ -236,8 +315,10 @@ grams are themselves estimated from free-text food weights through a coarse
 carb-by-weight table, which is the lowest-fidelity channel in the harness. The
 same flattening applies to insulin: a single rapid-action kernel stands in for
 every bolus, where the simulator scales duration with dose, and MDI long-acting
-analogues are approximated as rapid. Treat the real-cohort channels as a
-plausible reconstruction of absorption and action, not a measurement of it.
+analogues are approximated as rapid. None of the cohorts logs exercise, so that
+channel is zero throughout on real data. The real-cohort carbohydrate and
+insulin channels are therefore a reconstruction of absorption and action from
+logged events, not a measurement of either.
 
 ### A record that already holds its curves
 
@@ -288,12 +369,14 @@ suite-wide specification in
 non-PyTorch runtime implements against.
 
 **Single pass.** Given 8–24 hours of context, forecast the next two hours as
-seven quantiles per 5-minute step. Upcoming carbohydrate and insulin can be
-announced to condition the forecast.
+seven quantiles per 5-minute step. Upcoming carbohydrate, insulin and exercise
+can be announced to condition the forecast. `mask_spans` moves the masked
+patches elsewhere — a backcast or an infill — through the same call; the future
+patches stay masked whatever else is, since no glucose was ever observed there.
 
 **What-if.** The same forward pass with a different declared plan written into
-the prediction zone — "what happens if I eat 40 g at six". A baseline forecast
-with no doses is just another call.
+the masked patches' plan channels — "what happens if I eat 40 g at six". A
+baseline forecast with no doses is just another call.
 
 **Rolling.** For horizons past one window, the median forecast is fed back as
 context and the model runs again. Bands widen across roll boundaries by an
@@ -301,81 +384,43 @@ accumulated half-width, so uncertainty grows monotonically instead of resetting
 at each seam.
 
 
-## Results
+## Capacity ladder
 
-All numbers are mg/dL RMSE at the horizon point, on the point-forecast basis —
-the median line, `f⁻¹(median)` — which is the basis published forecasters report.
+Four capacities. Each is set by `D_MODEL`, `N_LAYERS` and `N_HEADS` alone:
+`FFN_DIM`, `BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are multiples of `D_MODEL`
+and follow it.
 
-**Cross-patient, on patients no fine-tune ever saw.** One patient is held out per
-cohort (OhioT1DM 591, AZT1D AZ23, ShanghaiT1DM 1003); 213 windows. Each cell is
-the pretrained model → the same checkpoint after the three-cohort fine-tune,
-scored on the identical split.
+| Model | Architecture | Parameters |
+| --- | --- | ---: |
+| nano | D=32, 2L, 2H, FFN=128 | 38,241 |
+| small | D=64, 4L, 4H, FFN=256 | 279,457 |
+| medium | D=128, 8L, 8H, FFN=512 | 2,157,345 |
+| large | D=256, 16L, 16H, FFN=1024 | 16,999,969 |
 
-| Model | Parameters | @30 | @60 | @120 |
-| --- | ---: | ---: | ---: | ---: |
-| nano | 37,879 | 26.1 → 17.8 | 32.4 → 26.5 | 45.8 → 36.6 |
-| small | 278,723 | 17.8 → 16.5 | 29.0 → 25.7 | 45.8 → 37.4 |
-| medium | 2,155,891 | 18.5 → 16.6 | 29.5 → 25.8 | 46.4 → 36.5 |
-| large | 16,997,171 | 18.6 → 16.9 | 29.3 → 25.3 | 48.2 → **34.3** |
+Trainable parameters at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 30`; the
+fixed `step_basis` buffer is excluded and is counted separately in
+`models/README.md`. `resize_model.py` instantiates a capacity and prints its
+exact count, computed from the architecture rather than targeted.
 
-**Cohort-wide, all 42 patients** (6 + 24 + 12), 1,958 windows on each cohort's
-test split — OhioT1DM's canonical one, a late temporal slice for the other two.
-Read this as an upper bound, not a generalisation estimate:
-the fine-tune pools the complete record of every non-held-out patient, so all but
-the three held-out patients' windows are in-sample for the fine-tuned rows. The
-simulator-only rows are genuinely out-of-sample — that model never saw real data.
-
-| Model | RMSE @30 | @60 | @120 | MARD @30 | Clarke A @30 | Skill @60 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| nano | 17.3 | 24.1 | 34.7 | 8.4 % | 90.2 % | 0.34 |
-| small | 17.0 | 23.9 | 35.1 | 8.2 % | 91.1 % | 0.35 |
-| medium | **16.1** | **22.1** | **30.8** | **7.8 %** | **92.4 %** | **0.40** |
-| large | 16.7 | 22.8 | 32.8 | 8.1 % | 91.4 % | 0.38 |
-| simulator only | 20.0–21.4 | 30.9–31.8 | 50.0–52.2 | 10.1–10.8 % | 86.0–87.3 % | 0.13–0.16 |
-| last-value persistence | 23.2 | 36.9 | 55.1 | — | — | — |
-
-Skill is the fractional RMSE reduction against persistence. Clarke A+B sits at
-99.1–99.3 % for every fine-tuned row, so zone A alone is shown.
-
-Two things stand out. Accuracy is flat in capacity: across a 450× spread in
-parameters the held-out numbers sit within 1.2 mg/dL of each other at 60 minutes,
-and the 38 k model is within 1.3 mg/dL of the best at 30. The fine-tune is what
-moves the needle — 1 to 14 mg/dL depending on capacity and horizon, against
-almost nothing from scaling up.
-
-On its own in-domain distribution — fresh T1DMSIM patients — the simulator-only
-models reach 13.1–14.5 mg/dL at 30 minutes and 36.8–39.5 at 120. The gap between
-that and the real-cohort numbers is the reality gap the fine-tune exists to close.
-
-Pretraining cost, one GPU, 100,000 steps at batch 512:
-
-| Model | Architecture | Wall clock | Peak GPU |
-| --- | --- | ---: | ---: |
-| nano | D=32, 2L, 2H, FFN=128 | 2.9 h | 0.6 GB |
-| small | D=64, 4L, 4H, FFN=256 | 4.5 h | 2.0 GB |
-| medium | D=128, 8L, 8H, FFN=512 | 12.8 h | 7.8 GB |
-| large | D=256, 16L, 16H, FFN=1024 | 48.2 h | 30.1 GB |
+Accuracy, wall-clock and peak-memory figures are not listed: none has been
+measured against this architecture, and this repository publishes no checkpoint
+to re-derive them from. The evaluation harness below scores a locally trained
+one, and `models/compare.py` tabulates cost and accuracy across a populated
+`models/` tree.
 
 
 ## Trained models
 
-Twelve checkpoints — four capacities crossed with three training variants
-(`sim`, `ohio`, `multi`) — ship out of band with their training logs, per-model
-evaluation output and figures. They are not in git.
+This repository ships no checkpoints and none is published. Training and
+fine-tuning write them locally, into `models/<capacity>/` beside their training
+logs, evaluation output and figures; those paths are not in git.
 
-**Download:** [`T1DMAI_models.tar.gz`](https://drive.google.com/file/d/1B8SHxyxyHTddify6783j8n1g6z1ua_pa/view?usp=sharing) (1.9 GB)
-
-Unpack into `models/`. `models/compare.py` reads all twelve and writes a
-cross-model comparison; `models/README.md` documents the layout, the reporting
-bases and every figure it produces. All twelve were pretrained on
-[`cache_balanced`](#simulator-cache).
-
-Each model ships with the two formal reports, the probes and the scripts that
-produced them. The augmentation regime (`metrics_*/augmented/`) is not bundled;
-`metrics/augmented/build_report.py` rebuilds it from a checkpoint.
+`models/compare.py` reads a populated `models/` tree and writes a cross-model
+comparison; `models/README.md` documents the layout, the reporting bases and
+every figure it produces. The augmentation regime (`metrics_*/augmented/`) is
+rebuilt from a checkpoint by `metrics/augmented/build_report.py`.
 
 ```bash
-tar xzf T1DMAI_models.tar.gz
 python models/compare.py
 ```
 
@@ -383,7 +428,7 @@ A checkpoint carries its own architecture in `training_config`, and anything tha
 builds the model refuses to load one that disagrees with the live `config.py`.
 The fine-tuning entry point prints the `resize_model.py` command that would
 align them. `models/compare.py` reads the checkpoint dictionaries only, so it
-compares all four capacities without any alignment.
+compares capacities without any alignment.
 
 
 ## Evaluation harness
@@ -414,7 +459,38 @@ published work uses. The **band** basis scores `clip(true, q₂₅, q₇₅)`, c
 zero error wherever the truth lies inside the band; it describes band geometry,
 not point accuracy. Every record names the basis it was measured on.
 
-Other tools:
+### Scoring rules and protocols
+
+`metrics/scoring.py` scores the fan itself, in mg/dL: CRPS, the Winkler interval
+score, coverage reported beside the sharpness that bought it, joint coverage over
+a whole span as distinct from per-step marginal coverage, and an alarm operating
+curve carrying detection rate, false alarms per day and the median lead time in
+minutes together.
+
+Everything is binned on `d`, the distance in patches from a masked patch to the
+nearest visible reading on either side — never on span length, which mixes
+one-sided and two-sided cases of equal difficulty. Each rule also reports a
+pooled figure, which is an average over a mask distribution rather than over a
+difficulty and is labelled as not comparable between protocols.
+
+`metrics/protocols.py` fixes the only two mask placements a run may be compared
+on:
+
+| Protocol | Masked | Baseline |
+| --- | --- | --- |
+| forecast | the trailing span | persistence |
+| infill | sampled interior spans | linear interpolation between the bracketing readings |
+
+Infill is never scored against persistence: persistence is a forecasting
+baseline, and against a two-sided task it is not a baseline at all. Infill
+columns carry their own prefix and a `d`, so the two protocols cannot be averaged
+together by accident.
+
+```bash
+python metrics/protocols.py    # sampler audit and both protocols' d histograms
+```
+
+### Other tools
 
 ```bash
 python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt
@@ -425,48 +501,52 @@ python make_figures.py && python make_card.py
 `calibrate_conformal.py` fits a per-step, per-quantile additive band correction
 on a disjoint calibration partition and stores it in the checkpoint; it holds
 the median fixed and keeps the fan monotone, and must be re-fit per target
-distribution. `model_health.py` audits each architecture knob for
-over-provisioning or saturation and prints the `resize_model.py` command each
-verdict implies.
+distribution. The fit is region-binned (`mondrian.py`): one correction per bin,
+keyed on where the median line is heading rather than on the last reading, since
+a fan bound for hypoglycemia and one bound for hyperglycemia leave residuals a
+pooled offset gets wrong in both directions. The bin edge sits inside the
+euglycemic band and not on a clinical threshold, which would split the windows
+that decide an alarm across two separate fits; a bin with too few windows to
+support its own extreme order statistic takes the marginal correction instead and
+is recorded as having done so. Only the forecast protocol's fit ships in the
+band — infill is fitted separately and marked unshipped.
+
+`model_health.py` audits each architecture knob for over-provisioning or
+saturation and prints the `resize_model.py` command each verdict implies.
 
 
 ## Simulator cache
 
 The simulator is a Python loop and starves a fast GPU. The shared generator
 pre-builds a pool of post-warmup trajectories once; training then skips the
-simulator entirely. This repository ships no cache — download one, or build your
-own.
-
-T1DMSIM publishes two, each a million trajectories of 55.5 h at 5-minute
-resolution after a 48 h warmup, about 9 GB compressed:
-[`cache_balanced`](https://drive.google.com/file/d/1pZuf6Htui-CC3Abp2NAHVvogk99X1ZR3/view?usp=sharing)
-and, with hypoglycemia oversampled,
-[`cache_hypo`](https://drive.google.com/file/d/1D1tg0GDtzLY_IzrtMkOj1foQhRj3cU9R/view?usp=sharing).
-Each unpacks to a directory of that name carrying a `DATASET.md` that describes
-what is in it. **The released checkpoints were pretrained on `cache_balanced`.**
-
-```bash
-tar xzf t1dmsim_balanced.tar.gz          # unpacks to cache_balanced/
-python train.py --cache-path cache_balanced --total-steps 100000
-```
-
-To build your own instead:
+simulator entirely. This repository ships no cache; training reads a pool built
+locally by `T1DMSIM/cache_simulator.py`. The two pools T1DMSIM publishes are the
+earlier 666-step geometry, which `data.py` rejects at load against the accepted
+1242-step one.
 
 ```bash
 python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000
 python train.py --cache-path simulator_cache --total-steps 100000
 ```
 
+The geometry the dataset accepts is 1242 steps, 103.5 h at 5-minute resolution
+after a 48 h warmup, which is what `cache_simulator.py` builds by default; a pool
+at any other geometry is rejected at load. `--hypo-oversample` weights the pool
+toward hypoglycemia. At a million trajectories a balanced pool occupies
+16.80 GB and a hypo-weighted one 16.91 GB. Each pool directory carries a
+`DATASET.md` describing what is in it and the `normalization_stats.json` fitted
+on that pool.
+
 Each channel is a chunked blosc2 array with byte-shuffle and zstd. Byte-shuffle
 groups the high-entropy mantissa bytes of each float apart from the low-entropy
 exponent bytes, which gives zstd a far more compressible stream than raw IEEE-754
-layout. On the published caches that is about 1.3–1.6× on the dense physiologic
-channels and 17–630× on the near-constant ones — hour-of-day 86×, day index
-633× — for roughly 2.3× over the pool as a whole. An uncompressed `.npy` memmap
-layout is also accepted.
+layout. On a million-row balanced pool that is about 1.3–1.7× on the dense
+physiologic channels and 27–539× on the near-constant ones — hour-of-day 309×,
+day index 539× — for roughly 2.4× over the pool as a whole. An uncompressed
+`.npy` memmap layout is also accepted.
 
 Pool reuse is benign, because every draw takes a fresh random window from its
-row: a 666-step trajectory admits about 2,112 distinct patch-aligned windows, so
+row: a 1242-step trajectory admits about 5,280 distinct patch-aligned windows, so
 a 1–3 M-row pool is ample for a 100,000-step run at batch 512. The dataset checks
 the cache's `meta.json` — format, channel list, warmup and sim hours, `dt`, the
 uniform-sample probability — and each channel's shape against the runtime config,
@@ -518,12 +598,18 @@ only, and on Vulkan only takes effect with `--write-pte`. CPU fp32 is the
 reference every other engine is measured against; the Vulkan module also reports
 how much of the graph the backend delegates versus falls back to CPU.
 
-The exported graph is cut at the raw head output. The anchor, the softplus and
-floor, the median projection, the inverse transform and the quantile assembly
-all run outside it — and the descriptor is the sole contract for that
-pre- and post-processing. **An artifact and its descriptor are one unit**: a
-graph served against a descriptor from a different architecture decodes risk
-space with the wrong constants, and nothing downstream can detect it.
+The exported graph is the right-edge case of the objective, specialised: it takes
+the trailing forecast patches as a slice instead of gathering masked patches by
+index, at one fixed sequence length, and its attention mask arrives as an
+additive float built outside the graph. That specialisation is part of the
+on-device contract in `T1DMCOMMON/SPEC/inference.md`.
+
+The graph is cut at the raw head output. The anchor, the softplus and floor, the
+median projection, the inverse transform and the quantile assembly all run
+outside it — and the descriptor is the sole contract for that pre- and
+post-processing. **An artifact and its descriptor are one unit**: a graph served
+against a descriptor from a different architecture decodes risk space with the
+wrong constants, and nothing downstream can detect it.
 
 On the ExecuTorch paths `--deploy-dir` places both into a
 [T1DMSERVER](https://github.com/0xdeadf1sh/T1DMSERVER) models directory in one
@@ -535,11 +621,12 @@ python -m exporters.executorch_xnnpack \
     --out-dir exported --deploy-dir ../T1DMSERVER/data/models
 ```
 
-The exporters need packages beyond `requirements.txt`, best kept in their own
-virtual environment: `executorch`, pinned to the version the consuming runtime
-bundles (currently 1.3.1, which publishes wheels for CPython 3.10–3.13 only),
-and `litert-torch` for the LiteRT path. The Vulkan lowering is sensitive to the
-torch patch release and wants `torch==2.12.0`, so keep it apart from the others.
+The exporters need packages beyond `requirements.txt`: `executorch`, pinned to
+the version the consuming runtime bundles (currently 1.3.1, which requires
+`torch>=2.12` and publishes wheels for CPython 3.10–3.13 only), and
+`litert-torch` for the LiteRT path. Those bounds are narrower than the training
+environment's, which `requirements.txt` puts at `torch>=2.4` on Python 3.10 or
+newer.
 
 ```bash
 python3.11 -m venv .venv-export
@@ -556,7 +643,7 @@ python gui.py --checkpoint checkpoints/t1dmai_best.pt --seed 42
 
 A pygame front end for inspecting a checkpoint one patient at a time: the median
 forecast with its quantile envelope, a draggable cursor, and a curve editor for
-painting meals and boluses into the prediction zone and re-forecasting against
+painting meals and boluses into the forecast span and re-forecasting against
 them. `F` rolls the forecast forward one horizon, `G` steps the simulator, `N`
 draws a new patient, `V` scores the current forecast against the simulator.
 Predictions run on a background thread. `--no-model` starts with random weights
@@ -666,9 +753,6 @@ alone.
 - Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., and Liu, Y. *RoFormer:
   Enhanced Transformer with Rotary Position Embedding.* Neurocomputing 568
   (2024). arXiv:2104.09864 — RoPE.
-- Press, O., Smith, N. A., and Lewis, M. *Train Short, Test Long: Attention with
-  Linear Biases Enables Input Length Extrapolation.* ICLR 2022.
-  arXiv:2108.12409 — ALiBi.
 - Shazeer, N. *GLU Variants Improve Transformer.* arXiv:2002.05202 (2020) —
   SwiGLU.
 - Zhang, B., and Sennrich, R. *Root Mean Square Layer Normalization.* NeurIPS

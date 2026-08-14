@@ -1,4 +1,8 @@
 {
+    "venvPath": ".",
+    "venv": "venv",
+    "extraPaths": [".", "metrics", "metrics/sim"],
+    "reportMissingImports": "none",
     "reportPrivateImportUsage": "none",
     "reportUnusedImport": "none",
     "reportUnusedVariable": "none",

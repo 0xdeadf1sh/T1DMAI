@@ -17,14 +17,16 @@ for the whole suite in
 [`docs/INFERENCE.md`](docs/INFERENCE.md) maps it onto this repository. Where the
 two touch, that specification is authoritative and this document defers to it.
 
-Every numeric dimension lives in `config.py`. Formulas here stay correct across a
-`resize_model.py` resize; literal values do not, so read them from the config.
+Every numeric dimension lives in `config.py`, which holds the current values.
+Formulas here stay correct across a `resize_model.py` resize; literal values do
+not.
 
 
 ## Contents
 
 - [Overview](#overview)
 - [Dimensions](#dimensions)
+- [The masked objective](#the-masked-objective)
 - [Inputs](#inputs)
 - [Encoder](#encoder)
 - [Heads](#heads)
@@ -35,15 +37,24 @@ Every numeric dimension lives in `config.py`. Formulas here stay correct across 
 - [Report metric basis](#report-metric-basis)
 - [Normalization statistics](#normalization-statistics)
 - [Simulator cache](#simulator-cache)
-- [Inference modes](#inference-modes)
+- [Inference and export](#inference-and-export)
 - [Parameter count](#parameter-count)
 
 
 ## Overview
 
-An encoder-only transformer. It reads 8–24 hours of observed history — CGM
-glucose, logged carbohydrate, logged insulin — and emits the next
-`PREDICTION_HORIZON_HOURS` as seven blood-glucose quantiles per 5-minute step.
+An encoder-only transformer over patches of CGM glucose, carbohydrate
+appearance, insulin action and exercise disposal. Every patch of a window is
+either **visible** — its glucose observed — or **masked**, its glucose withheld
+while the other three channels keep their true or announced values. The model
+emits a fan of `N_QUANTILES` blood-glucose quantiles per 5-minute step of every
+masked patch.
+
+A masked span ending at the last patch is a **forecast**, one starting at patch 0
+a **backcast**, anything between visible patches an **infill**: three cases of one
+objective, not three modes. Training samples all of them. The deployed case is
+the forecast, whose span is `PREDICTION_HORIZON_HOURS`.
+
 One model covers every hour of the day; there is no day/night split and no
 per-patient parameter.
 
@@ -56,8 +67,8 @@ loss mentions hypoglycemia, and nothing is focally reweighted. Glucose enters
 through the same transform, so input, output, target and loss share one space,
 and only the reporting layer converts back to mg/dL.
 
-The constants are re-anchored to the `[40, 400]` mg/dL device range, which puts
-zero risk near 128 mg/dL. `SPEC/invariants.md` §4 governs them and distinguishes
+The constants are re-anchored so that `f(40) = −√10` and `f(400) = +√10`. Those
+anchors are not the clamp. `SPEC/invariants.md` §4 governs both, and distinguishes
 this *model* risk space from the *clinical* LBGI/HBGI space the simulator uses.
 
 
@@ -78,90 +89,184 @@ back to the math kernel and materialises the full `T × T` matrix — and unless
 | `BG_HEAD_HIDDEN` | `--bg-head-hidden-mult k` | `k × D_MODEL`, glucose-head hidden width |
 | `PATCH_SIZE` | `--patch-size` | Timesteps per patch; `PATCH_SIZE × 5 min` is the patch span |
 | `MIN_CONTEXT_PATCHES` | `--min-context-patches` | Shortest sampled context |
-| `MAX_CONTEXT_PATCHES` | `--max-context-patches` | Longest context, and the left-pad width |
+| `MAX_CONTEXT_PATCHES` | `--max-context-patches` | Longest context, and the left-pad ceiling |
+
+Set by the sampler arm (see [The masked objective](#the-masked-objective)):
+
+| Constant | Meaning |
+| --- | --- |
+| `MASK_SPAN_LENGTHS` | The pool each masked span's length is drawn from |
+| `MAX_MASKED_PATCHES` | `M` — the sampler's cap on masked patches per sample, and the head's fixed slot count |
+| `D_BALANCED_LOSS` | Whether the loss carries per-`d` weights |
 
 Derived, not settable:
 
 | Constant | Definition |
 | --- | --- |
-| `N_INPUT_FEATURES` | 3 — `[bg_absolute, carb_intake, insulin_combined]` |
+| `N_INPUT_FEATURES` | 5 — `[bg_absolute, carb_intake, insulin_combined, exercise_equiv, bg_masked]`, of which the leading four are normalized signal channels |
 | `PATCH_DIM` | `PATCH_SIZE × N_INPUT_FEATURES` |
 | `PREDICTION_PATCHES` | `PREDICTION_HORIZON_HOURS × 60 / (PATCH_SIZE × 5)` |
 | `MAX_SEQ_LEN` | `MAX_CONTEXT_PATCHES + PREDICTION_PATCHES` |
-| `N_QUANTILES` | 7 — `QUANTILE_LEVELS = (.05, .1, .25, .5, .75, .9, .95)` |
+| `N_QUANTILES` | `len(QUANTILE_LEVELS)` — `SPEC/invariants.md` §6 fixes the levels and their ascending order for the whole suite |
 | `N_SPREADS` | 3 — spreads per side; the head emits `1 + 2·N_SPREADS` values per step |
 
 At the released defaults a patch is 30 minutes, the context runs 16–48 patches
-(8–24 h), and the horizon is 4 patches (2 h). The 8-hour floor follows the
-autocorrelation analysis in `config.py`; the 24-hour ceiling covers one full
-basal cycle and leaves enough real context for the 8-hour nocturnal roll.
+(8–24 h), and the forecast protocol's span is 4 patches (2 h). The 8-hour floor
+sits above every autocorrelation length `T1DMSIM/diff/README.md` §0.5 measures;
+the 24-hour ceiling covers one full basal cycle and leaves enough real context
+for the 8-hour nocturnal roll.
+
+
+## The masked objective
+
+A sample's window is `T` patches, `T ≤ MAX_SEQ_LEN`. `data.sample_mask_spans`
+draws its masked set:
+
+```
+n_spans   ~ U{1 .. MASK_MAX_SPANS}
+each L_i  ~ U(MASK_SPAN_LENGTHS), independently
+sum(L) > MAX_MASKED_PATCHES  ⇒  resample the WHOLE length vector
+placement:  stars-and-bars over the n_spans + 1 gaps
+```
+
+The over-budget rejection redraws the whole length vector rather than one
+element: per-element redrawing yields a different length distribution, and so a
+different `d` histogram. Placement spreads the slack uniformly over the gaps and
+is rejected on nothing — there is no right-edge quota, no curriculum and no
+annealing. One **mandatory visible separator** sits between neighbouring spans,
+so two masked spans never abut; the separator is what makes the anchor, the
+per-span median basis and the DILATE length bucket well defined per span.
+
+`data._mask_slots` expands the spans into the head's `M = MAX_MASKED_PATCHES`
+fixed slots. A sample with fewer masked patches pads the surplus; a padded slot
+gathers patch 0, so its output is a real number against a real target, and every
+loss and metric path discards it by the `(B, M)` `valid` flag.
+
+`d` — a masked patch's distance in patches to the nearest visible evidence on
+**either** side — is the difficulty axis every masked-BG metric bins on. It is
+never span length, which confounds one-sided and two-sided cases at equal
+difficulty, and never the arm. Under the forecast protocol slot `j` sits at
+`d = j + 1` one-sided, which is what makes the 30 / 60 / 90 / 120-minute columns
+`d = 1..4`.
+
+### Sampler arms
+
+`arms.py` carries three arms — `a`, `b`, `c` — each fixing `MASK_SPAN_LENGTHS`,
+`MAX_MASKED_PATCHES` and `D_BALANCED_LOSS`, with the evidence behind it and the
+denominators that evidence was measured on. `config.py` resolves one at **import**
+from `$T1DMAI_ARM`, defaulting to `a`, and republishes the name as
+`SAMPLER_ARM`; `data.py`, `risk_loss.py` and `metrics/protocols.py` bind the
+three values at their own import, so nothing rewritten on the config module
+afterwards reaches them. `train.py --arm X` works by writing the
+environment variable before `config` is imported. An unknown name raises before
+the run starts rather than falling back to the default. `python arms.py` prints
+the table `train.py --help` renders.
+
+The three values ride in every checkpoint's `training_config` beside the arm
+name, since the name alone stops pinning them the moment the table is edited.
 
 
 ## Inputs
 
-Three features per 5-minute step. There are no time-of-day features and no mask
-bits — day and night are inferred from the trajectory alone.
+Five features per 5-minute step: four signal channels and one bit. There are no
+time-of-day features — day and night are inferred from the trajectory alone.
 
 | Feature | Units | Transform before the model |
 | --- | --- | --- |
 | `bg_absolute` | mg/dL | Clamp to `[BG_CLAMP_MIN, BG_CLAMP_MAX]`, Kovatchev `f`, z-score |
 | `carb_intake` | g / step | Floor at 0, `log1p`, z-score |
 | `insulin_combined` | U / step | Floor at 0, `log1p`, z-score |
+| `exercise_equiv` | g / step, carbohydrate-equivalent | Floor at 0, `log1p`, z-score |
+| `bg_masked` | bit, one value per patch | None — it is never normalized |
 
 `log1p` is near-linear near zero, so the dense basal baseline passes through
-almost unchanged while rare meal and bolus spikes are compressed out of the
-channel's standard deviation. `normalization.py` holds the membership sets —
-`RISK_SPACE_CHANNELS` for glucose, `SPARSE_LOG1P_CHANNELS` for the other two —
+almost unchanged while rare meal, bolus and exercise spikes are compressed out of
+the channel's standard deviation. `normalization.py` holds the membership sets —
+`RISK_SPACE_CHANNELS` for glucose, `SPARSE_LOG1P_CHANNELS` for the other three —
 and every forward and inverse transform consults them, so the pipeline stays
-invertible.
+invertible. `bg_masked` is in neither set: it carries no mean, no std and no
+`log1p`, which is why `CHANNEL_NAMES` has four entries where
+`N_INPUT_FEATURES` is five.
 
-All three are the **raw post-noise** simulator signals. There is no smoother
-anywhere, on the inputs or the target. The same raw glucose is the model input,
-the forecast target and the anchor, so there is no input/target asymmetry, and a
-live CGM stream needs no on-device filter to reproduce.
+`exercise_equiv` is carbohydrate-equivalent glucose disposal in g/step — the
+quantity the simulator subtracts from the appearance term — so it takes carb's
+encoding exactly, never the Kovatchev transform and never a rescaling to an
+intensity.
 
-Insulin sensitivity, hepatic glucose output and exercise stay in the cache but
-never reach the model. They are internal states a real CGM cannot observe, so
-withholding them forces the model to forecast from signals deployment can supply.
+All four signal channels are the **raw post-noise** simulator signals. There is
+no smoother anywhere, on the inputs or the target. The same raw glucose is the
+model input, the forecast target and the anchor, so there is no input/target
+asymmetry, and a live CGM stream needs no on-device filter to reproduce.
 
-`carb_intake` and `insulin_combined` are **absorption and action rates**, not
-ingestion and injection instants: grams entering the blood and units acting in each
-5-minute step. Pretraining takes them from the simulator directly. Real records
-rarely store them, so `realdata/features.py` reconstructs them by convolving logged
+Insulin sensitivity and hepatic glucose output stay in the cache but never reach
+the model. They are internal states a real CGM cannot observe, so withholding
+them forces the model to forecast from signals deployment can supply.
+
+`carb_intake`, `insulin_combined` and `exercise_equiv` are **rates**, not
+ingestion, injection and session instants: grams entering the blood, units acting,
+and grams of carbohydrate-equivalent disposal in each 5-minute step. Pretraining
+takes them from the simulator directly. Real records rarely store carbohydrate and
+insulin that way, so `realdata/features.py` reconstructs them by convolving logged
 amounts with population-mean kernels, with the fidelity limits the README sets out.
 A record whose events already carry their resolved series instead supplies them on
 `Segment.carb_curve` / `Segment.insulin_curve`, which bypass the kernels; the
-transforms in the table above are unchanged either way.
+transforms in the table above are unchanged either way. `Segment.exercise` is
+already a resolved g/step curve, so nothing on the input path convolves it, and
+every real adapter fills it with zeros.
 
 ### The index map
 
-Context patches carry all three features. In the prediction zone:
+Every patch carries all five features, step-major, so feature `f` is the stride
+slice `[:, f::N_INPUT_FEATURES]`. On a **masked** patch:
 
-- `bg_absolute` is **always zeroed** — it is what the model predicts.
-- `carb_intake` and `insulin_combined` **always carry the future carbohydrate-
-  appearance and insulin-action curves, per 5-minute step** — not the moment of
-  eating, not the injection instant, and not a delivery schedule
-  (`SPEC/invariants.md` §5): the true values during training, the caller's
-  announcement at inference.
+- `bg_absolute` is **zeroed** — it is what the model predicts;
+- `bg_masked` is 1.0 in all `PATCH_SIZE` step-major columns of feat 4;
+- `carb_intake`, `insulin_combined` and `exercise_equiv` **still carry the
+  carbohydrate-appearance, insulin-action and exercise-disposal curves, per
+  5-minute step** — not the moment of eating, not the injection instant, not the
+  start of a session, and not a delivery schedule (`SPEC/invariants.md` §5): the
+  true values during training, the caller's announcement at inference.
 
-The model is therefore always conditioned on a declared plan. There is no masked
-regime and no conditioned/unconditioned split, which is why what-if forecasting
-is a property of the forward pass rather than a separate mode — announcing a
-different plan just writes different values into those two slots.
+The masked set is **announced, not inferred**. Masking is not a position rule,
+and `z = 0` in a withheld glucose slot decodes to an ordinary reading rather than
+a sentinel, so feat 4 is the only thing that tells the model which patches it
+must predict. `data.collate_fn` and `inference._assert_mask_announced` each assert
+that the bit reproduces the masked set — the one the attention mask was built from
+on the training path, the one the head gathers by `mask_idx` on the inference path
+— and that the bit is constant across a patch's columns.
 
-`CHANNEL_TO_FEAT = {0: 1, 1: 2}` is the single mapping from an announceable
-output channel to its input slot. Both the data pipeline and the inference
+The model is therefore always conditioned on a declared plan. There is no
+conditioned/unconditioned split, which is why what-if forecasting is a property
+of the forward pass rather than a separate mode — announcing a different plan
+just writes different values into those three slots.
+
+`config.CHANNEL_TO_FEAT` is the single mapping from an announceable output
+channel to its input feature slot. Both the data pipeline and the inference
 override path read it, so no second offset literal exists.
 
 ### The anchor
 
-`last_bg` is the last context glucose in mg/dL, at `pred_start − 1`. Training and
-inference reach it by two paths that agree in value but not in mechanism:
-training reads the raw mg/dL trajectory directly in `data.py`, while inference and
-export reconstruct the same physical value from the rightmost context cell via
-`utils.last_bg_mgdl_from_context` — un-z-score, then the inverse risk transform —
-matching to a sub-ulp round-trip difference. Neither path indexes at or past the
-prediction origin, so the anchor cannot leak the horizon's trend.
+One anchor per head slot, in mg/dL. It is **one-sided and left-preferring**: the
+last step of the span's left neighbour patch, or — when the span starts at patch
+0 and there is no left neighbour — the first step of the right neighbour. Every
+slot of a contiguous span carries the same value, and `assemble_quantiles` anchors
+that slot's median at `f(anchor_bg)`. A right-edge span reduces to the last
+visible glucose before the forecast, so no separate origin rule exists.
+
+Training and inference reach the value by two paths that agree in value but not
+in mechanism: `data._build_sample` reads the raw mg/dL trajectory at the anchor
+step, while inference and export reconstruct the same physical value from the
+context cell via `utils.last_bg_mgdl_from_context` — un-z-score, then the inverse
+risk transform — matching to a sub-ulp round-trip difference. Only a visible cell
+may be indexed: feat 0 of a masked patch is a legal-looking `z` that decodes to a
+plausible glucose, so a wrong index yields a wrong anchor rather than an error.
+
+The anchor is not the distance the metrics bin on. Ignoring the near side leaves
+the last slot of a two-sided span anchored from the far end while sitting one
+patch from visible evidence on the other, which is a large minority of
+supervision under the sampler (`data._mask_slots` carries the enumerated
+fraction). It costs no information — a masked row attends in both directions —
+and only makes the head's offset parameterisation work harder.
 
 
 ## Encoder
@@ -170,23 +275,20 @@ prediction origin, so the anchor cannot leak the horizon's trend.
 
 `PATCH_SIZE` consecutive timesteps become one token: `PATCH_DIM` raw values
 through a single `Linear(PATCH_DIM, D_MODEL)` with bias. The bias matters because
-the prediction zone's glucose slot is a hard zero, and a learned offset lets the
-model tell that apart from a genuine reading of zero.
+a masked patch's glucose slots are a hard zero — a legal reading rather than a
+sentinel — and a learned offset lets the projection use the `bg_masked` bit to
+tell the two apart.
 
 There is no patient embedding. `forward` takes no patient argument; identity is
 whatever the context window implies.
 
 ### Position
 
-Two signals, both relative:
-
-- **RoPE** on Q and K, at base frequency `ROPE_BASE`. The cosine and sine tables
-  depend only on sequence length and head dimension, so they are built once per
-  forward pass and shared across every block.
-- **ALiBi**, a per-head learnable slope added to the logits as `−|i − j| · |s_h|`.
-  Slopes initialise to the geometric series `2^(−8(h+1)/N_HEADS)`, giving each
-  head a different reach — sharply local at one end, nearly flat at the other.
-  The `.abs()` keeps the bias a penalty; a negative slope would reward distance.
+One signal, relative: **RoPE** on Q and K, at base frequency `ROPE_BASE`. The
+cosine and sine tables depend only on sequence length and head dimension, so they
+are built once per forward pass and shared across every block. Nothing else
+biases a logit by the distance between its two positions, and every head carries
+the same positional signal.
 
 ### Block
 
@@ -208,51 +310,62 @@ A final RMSNorm follows the last block.
 
 ### Attention mask
 
-Four regions, not a causal mask:
+The mask follows the visible/masked/padding labelling, not a position rule:
 
-| | to context | to horizon |
+| | to visible | to masked |
 | --- | --- | --- |
-| **from context** | attend | **blocked** |
-| **from horizon** | attend | attend |
+| **from visible** | attend | **blocked** |
+| **from masked** | attend | attend |
 
-The horizon is decoded jointly, so horizon tokens attend to each other in both
+Masked patches are decoded jointly, so they attend to each other in both
 directions. The one blocked region is what prevents a future leak: nothing the
-model must predict can influence the context representation.
+model must predict can influence the evidence's representation.
 
-Shorter contexts are left-padded to `MAX_CONTEXT_PATCHES`. Padding rows and
-columns are blocked outright; the collate function then forces the attention
-diagonal True at every position, padding included, so a padding row attends only
-to itself and its softmax is never fully masked. Padding outputs are never read —
-the heads slice the last `PREDICTION_PATCHES` tokens, and padding sits at the far
-left.
+Shorter contexts are left-padded to the batch maximum, never to `MAX_SEQ_LEN`.
+Padding rows and columns are blocked outright; the diagonal is then forced True
+at every position, padding included, so a padding row attends only to itself and
+its softmax is never fully masked. Padding outputs are never read — the heads
+gather by index, and a padded slot's output is dropped by `valid`.
+
+`utils.create_attention_mask_from_visible` builds it in four lines, all four
+load-bearing, and memoizes nothing: the masked set varies per sample, and no
+cheap key identifies it, so a memo would hand one sample's mask to another with
+no shape error. The mask reaches `scaled_dot_product_attention` as a **bool**
+(True = attend); a per-sample `(B, T, T)` mask gains the head axis in
+`T1DMAI.forward` before it gets there, since broadcasting aligns from the right
+and would otherwise put the batch axis onto the head axis. Nothing additive is
+materialised per layer.
 
 
 ## Heads
 
-Both heads read the last `PREDICTION_PATCHES` tokens after the final norm — one
-`D_MODEL` vector per horizon patch.
+Both heads read the `M` masked-patch hidden states after the final norm, gathered
+by `mask_idx` — one `D_MODEL` vector per slot. The gather is not a trailing
+slice: the masked set may sit anywhere in the sequence.
 
 ### Blood-glucose quantile head
 
 A 3-layer SiLU MLP emitting `BG_HEAD_STEP_BASIS_DIM` coefficients per channel per
-patch, where a channel is the median offset or one of the `2 · N_SPREADS`
+slot, where a channel is the median offset or one of the `2 · N_SPREADS`
 spreads. A fixed orthonormal basis then expands those coefficients across the
 patch's timesteps:
 
 ```
-coeff    = bg_head(pred).view(B, P, K, 1 + 2·N_SPREADS)
-head_raw = einsum('sk,bpkc->bpsc', step_basis, coeff)     # (B, P, S, C)
+coeff    = bg_head(pred).view(B, M, K, 1 + 2·N_SPREADS)
+head_raw = einsum('sk,bmkc->bmsc', step_basis, coeff)     # (B, M, S, C)
 ```
 
 `step_basis` is `(PATCH_SIZE, K)` — the low-frequency DCT-II modes, or orthonormal
 polynomials under `BG_HEAD_STEP_BASIS_TYPE = 'poly'`. Emitting fewer coefficients
 than the patch has steps makes the highest-frequency within-patch mode
 unrepresentable, so the head **cannot** produce an intra-patch zigzag. Setting
-`K = PATCH_SIZE` recovers a fully free per-step head.
+`K = PATCH_SIZE` recovers a fully free per-step head. `step_basis` is a
+registered buffer: it travels with the state dict and with `.to(device)`, and it
+holds no parameters.
 
 The final layer initialises at `std = BG_HEAD_INIT_SCALE`, so at step 0 the
-coefficients are near zero, the median offset is near zero, and the forecast is a
-flat persistence line at the last observed glucose.
+coefficients are near zero, the median offset is near zero, and every slot's
+forecast is a flat persistence line at its own anchor.
 
 ### Quantile assembly
 
@@ -261,26 +374,40 @@ single chokepoint — training, `predict` and `predict_rolling` all pass through
 it, so a config change propagates identically everywhere. The exact algebra is in
 `SPEC/inference.md` §8.1; what matters here is why it has the shape it does.
 
-**The median is projected, not integrated.** The per-patch median offsets are
-flattened patch-major over the whole horizon and projected onto a fixed
-low-frequency DCT-II subspace of `BG_HEAD_MEDIAN_GLOBAL_DIM` columns. A projection
-is an L2 contraction, so the offset is bounded and cannot accumulate across
-patches. That is the point: an earlier design carried each patch forward from the
-previous patch's endpoint, which is an unconstrained integrator, and it drifted —
-overshooting a single pass and biasing the level over an 8-hour roll. The
-low-pass also removes the seam sawtooth, so no separate seam penalty is needed.
-Column 0 is the constant mode, which preserves the persistence level. Exact
-seam continuity is deliberately not enforced; enforcing it is what caused the
-drift.
+**Assembly is per span.** `utils._span_layout` groups the `M` slots into
+contiguous spans from `mask_idx`, exploiting the sampler's mandatory separator:
+adjacency in `mask_idx` identifies a span exactly. Nothing accumulates or
+low-passes across the visible patches between two spans, and a padded slot falls
+out as its own singleton.
+
+**The median is projected, not integrated.** A span's per-patch median offsets
+are flattened patch-major over that span's own `L · PATCH_SIZE` steps and
+projected onto a fixed low-frequency DCT-II subspace of `G_L` columns, where
+`G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM · L / PREDICTION_PATCHES))`
+(`utils.global_median_dim`). A projection is an L2 contraction, so the offset is
+bounded and cannot accumulate across patches. Column 0 is the constant mode,
+which preserves the persistence level. The low-pass also removes the seam
+sawtooth, so no separate seam penalty is needed, and exact seam continuity is
+deliberately not enforced.
+
+`G_L` scales with the span rather than being fixed. A fixed `G` is a defect
+rather than an approximation: at `L = 1` the projection would carry as many
+columns as the span has steps — the identity — so the contraction would be
+absent, not weakened, while every assertion on the fan still passed. What `G_L`
+holds roughly constant is the fraction of a span the basis can bend, not the
+cutoff period: that is `2·L·PATCH_SIZE / G_L` steps, and it varies with `L`.
 
 `BG_HEAD_MEDIAN_MODE` selects the assembly. `'global'` is the released default and
-the one described above; `'cumulative'` and `'independent'` are kept only for
-ablation.
+the one described above; `'cumulative'` continues each patch from the previous
+patch's endpoint, an unconstrained integrator with no bound on the accumulated
+offset, and `'independent'` applies the raw per-patch offset. Both alternatives
+remain reachable and are kept for ablation.
 
 **The spreads are monotone by construction.** Each passes through a softplus and
 a floor of `BG_QUANTILE_SPREAD_MIN`, then accumulates outward from the median, so
 the fan is strictly ordered with a guaranteed minimum gap and `q_tau[..., i]`
-matches `QUANTILE_LEVELS[i]` index for index.
+matches `QUANTILE_LEVELS[i]` index for index. The spread algebra is identical
+under every median mode.
 
 `carry_spread` seeds the accumulation on both sides, but no runtime caller passes
 it — it defaults to zero everywhere. Because the assembly sits inside
@@ -291,23 +418,27 @@ rather than resetting at each seam.
 
 ### Time-of-day probe
 
-A 2-layer SiLU MLP that classifies each horizon patch's absolute hour into
+A 2-layer SiLU MLP that classifies each masked patch's absolute hour into
 `TIME_PROBE_N_BINS = round(24 / PREDICTION_HORIZON_HOURS)` circular bins — twelve
-two-hour bins at the released horizon. It runs on every horizon patch, with no
+two-hour bins at the released defaults. It runs on every gathered slot, with no
 pooling. There is no clock input, so the hour has to be inferred from the
-trajectory.
+trajectory. The bin count is a label-resolution choice, not a horizon: the
+expression is kept because it tiles 24 h exactly, with the forecast protocol's
+span entering as the reference length.
 
 The target is a wrapped-Gaussian soft label over neighbouring bins, of width
-`TIME_PROBE_LABEL_SMOOTH_BINS`, and the loss is cross-entropy against it. A second
-term couples consecutive windows: `data.py` ships window `k + 1` — the same
-trajectory shifted forward one horizon, teacher-forced, at the same context
-length so the mask is reused — and a penalty ties the two origin-phase estimates
-to exactly one horizon apart, measured in the `(cos, sin)` plane so the gradient
-is stable across the midnight wrap. Within a single window the patches share one
-forward pass and are already consistent, so no within-window term is needed.
+`TIME_PROBE_LABEL_SMOOTH_BINS`, and the loss is cross-entropy against it. Slot
+`j` is patch `mask_idx[:, j]`, so each slot's target hour follows `mask_idx`
+rather than a fixed offset from the context edge. A second term couples
+consecutive windows: `data.py` ships window `k + 1` — the same trajectory shifted
+forward one horizon, teacher-forced, at the same context length — and a penalty
+ties the two origin-phase estimates to exactly one horizon apart, measured in the
+`(cos, sin)` plane so the gradient is stable across the midnight wrap. Within a
+single window the slots share one forward pass and are already consistent, so no
+within-window term is needed.
 
 With `TIME_PROBE_DETACH = False`, the released setting, the probe's gradient
-reaches the shared trunk. That is the point of it: the per-patch representations
+reaches the shared trunk. That is the point of it: the per-slot representations
 the glucose head reads are pushed to encode circadian phase, which makes the
 forecast time-aware. The forward *value* of `q_tau` and `median` is unaffected
 either way — the probe never feeds them — and `L_tod` never enters the validation
@@ -325,28 +456,43 @@ bit-identical to a model without it.
 
 ## Loss
 
-`risk_loss.risk_total_loss(q_tau, median, true_bg_mgdl, weighting)`. The mg/dL
-target crosses into risk space exactly once, at the top, and both terms share the
-result.
+`risk_loss.risk_total_loss(q_tau, median, true_bg_mgdl, weighting, valid,
+mask_idx, d)`. The mg/dL target crosses into risk space exactly once, at the top,
+and both terms share the result. `valid` and `mask_idx` are what make the
+supervised set the masked patches rather than the head's slot axis; their
+defaults describe a single dense right-edge span.
 
 ### Pinball
 
-The check loss over every horizon step and every quantile level:
+The check loss over every supervised step and every quantile level:
 
 ```
 rho_τ(a, b) = (a − b) · (τ − 1[a < b])
-L_Q         = mean over (step, τ) of rho_τ(y_risk, q_tau)
+L_Q         = mean over (valid slot, step, τ) of rho_τ(y_risk, q_tau)
 ```
 
 It calibrates each level to its coverage. τ = 0.5 is retained deliberately as the
 pointwise level anchor, dividing labour with the term below: pinball pins the
 level, DILATE shapes the trajectory.
 
+The reduction is per masked patch. A padded slot is removed from the
+**denominator**, not merely zeroed in the numerator: zeroing alone still divides
+by `B·M·S·Q` and rescales `L_Q` against `L_D` by the padded fraction, a level
+`log_σ_Q` then absorbs while every loss curve looks unchanged.
+
+Under `D_BALANCED_LOSS` each masked patch additionally carries its per-`d` weight
+from `d_balance`, flattening `d = 1, 2, 3` and `d ≥ 4` to equal loss mass.
+Placement is untouched — this reweights the loss only — and it costs variance:
+`d_balance.effective_sample_size()` quantifies the cost at the active arm and
+belongs beside any result produced under it.
+
 ### DILATE
 
-Shape and time distortion on the median only, after reshaping median and target
-to `(B, P·S)` in patch-major order so the time axis stays monotone. Both go in
-uncentred, so the gradient carries a level component alongside the shape.
+Shape and time distortion on the median only, evaluated **once per masked span**.
+Spans are bucketed by length `L`, each bucket stacked to `(n_b, L·PATCH_SIZE)` in
+patch-major order so the time axis stays monotone, and one `dilate_loss` call
+runs per bucket. Both sequences go in uncentred, so the gradient carries a level
+component alongside the shape.
 
 ```
 L_D = DILATE_ALPHA · shape + (1 − DILATE_ALPHA) · TDI
@@ -365,12 +511,22 @@ existing backward, so no alignment matrix is materialised and no second-order
 autograd is involved. The median gradient is the exact TDI gradient to
 `O(DILATE_TDI_FD_EPS)`.
 
+Buckets combine by a **span-count-weighted mean of the per-bucket scalars**,
+never by concatenation. DILATE is not scale-free in `H = L · PATCH_SIZE`: the
+shape term grows with `H` while the normalised TDI does not track it, so `alpha`
+weights a different mixture in each bucket and `log_σ_D` absorbs the difference
+silently. The per-bucket `loss_D_L{L}` and the span-length histogram
+`n_spans_L{L}` are logged alongside the combined value, so two runs are comparable
+at an equal span-length mixture. An empty bucket is never dispatched: `dilate_loss`
+reduces with `.mean()` and would return NaN, which survives every downstream
+comparison and ends a run with no best checkpoint.
+
 The dynamic program is a batched anti-diagonal recursion in `dilate.py`, with a
 max-subtracted log-sum-exp softmin. `DILATE_GAMMA` is a softness knob, not an
-overflow guard: a single cell peaks at `(f(400) − f(40))² = 40`, the stabilised
-softmin is overflow-free in fp32 down to `γ = 1e-3`, and soft-DTW is
-1-homogeneous in `(cost, γ)`. Smaller γ approaches a hard minimum with a peakier
-gradient.
+overflow guard: a single cell peaks at
+`(f(BG_CLAMP_MAX) − f(BG_CLAMP_MIN))² = 99.6416`, the stabilised softmin is
+overflow-free in fp32 down to `γ = 1e-3`, and soft-DTW is 1-homogeneous in
+`(cost, γ)`. Smaller γ approaches a hard minimum with a peakier gradient.
 
 ### Kendall-Gal weighting
 
@@ -401,7 +557,7 @@ added to the backward separately and never enters it.
 ### Parameter split
 
 Muon takes every parameter with `ndim ≥ 2`, the patch-embedding matrix included.
-AdamW takes the 1-D parameters — norm gains, biases, ALiBi slopes — plus the two
+AdamW takes the 1-D parameters — norm gains and biases — plus the two
 Kendall-Gal scalars in their own zero-decay group. Muon orthogonalises the
 momentum buffer with a few Newton-Schulz iterations, which equalises an
 anisotropic gradient spectrum; the operation is only meaningful for matrices,
@@ -454,11 +610,12 @@ then halves the optimizer state or restores from the EMA and continues.
 
 `t1dmai_best.pt` is written whenever `val_loss_total` reaches a new minimum.
 Periodic `t1dmai_step_{N}.pt` snapshots are independent of it. Each checkpoint
-carries its architecture in `training_config`, the normalization statistics, the
-EMA shadow, the weighting module, and `arch_version` / `loss_schema` provenance
-tags. Clinical metrics stay read-only diagnostics; there is no separate
-clinically-selected checkpoint, because the risk-space loss geometry and the
-band-edge detectors already carry the clinical bias structurally.
+carries its architecture in `training_config` — including the sampler arm and the
+three values it bound — plus the normalization statistics, the EMA shadow, the
+weighting module, and `arch_version` / `loss_schema` provenance tags. Clinical
+metrics stay read-only diagnostics; there is no separate clinically-selected
+checkpoint, because the risk-space loss geometry and the band-edge detectors
+already carry the clinical bias structurally.
 
 
 ## Validation
@@ -473,12 +630,75 @@ its header.
 Because the model is always conditioned, there is one value per metric — no
 second unconditional pass, and no `uncond_*` columns.
 
+### The two protocols
+
+Training places masks uniformly, so a metric averaged over the training mask
+distribution is dominated by the easy regime and improves for free. Validation
+therefore scores exactly two fixed protocols, defined once in
+`metrics/protocols.py`:
+
+| Protocol | Mask | Columns | Baseline |
+| --- | --- | --- | --- |
+| forecast | the trailing `PREDICTION_PATCHES` patches | the existing names, per horizon | persistence |
+| infill | sampled interior spans | `infill_*`, per `d` | linear interpolation |
+
+The forecast protocol supplies exactly one masked patch at each of `d = 1..4` per
+window, which is what keeps its columns element-for-element comparable with the
+historical tables and its per-`d` calibration populated. It is rebuilt as its own
+forward: the trailing zone is masked and announced whatever the sample's own mask
+was, and a row whose context-edge patch that mask already covered is **dropped**,
+since the anchor would otherwise be read off a withheld reading. `fc_n` reports
+how many rows survived; mask placement is independent of glucose, so the
+survivors are an unbiased subsample.
+
+Infill is scored against linear interpolation between the bracketing visible
+readings and never against persistence: persistence is a forecasting baseline,
+and against a two-sided span it is a strawman. Its interior spans are drawn at a
+fixed seed, so a moving `infill_*` column is the model rather than the draw.
+
+Both protocols report per `d`. Pooling over `d` is refused —
+`metrics.protocols.column` will not name an infill column without one — because
+the sampler concentrates supervision at small `d`, so a pooled masked-BG scalar
+improves when the mixture softens and is not comparable between protocols. Every
+pooled figure `metrics/scoring.py` emits carries that warning with it, and
+nothing pooled is a selection metric.
+
+`protocols.RunReport` bundles what every report run states about its own
+conditions: the realised `d` histogram against the sampler's exactly-enumerated
+one, so a departure means the sampler changed; the `n_ctx` the figures were
+measured at; and the kept and dropped segment and window counts per cohort, so
+two context widths cannot silently evaluate different window sets.
+
+### Scoring rules
+
+`metrics/scoring.py` holds five rules, each binned on `d`, each taking and
+returning mg/dL:
+
+- **CRPS**, a strictly proper score over the whole fan;
+- **Winkler**, the interval score per nominal central level;
+- **coverage with sharpness** — the width that bought the coverage is reported
+  beside it, never apart, since any band widens to any coverage;
+- **joint coverage**, every step of the path inside the band at once, labelled
+  apart from the per-step marginal it is bounded above by;
+- the **hypo alarm operating curve**, sweeping the band-edge τ and reporting
+  detection rate, false alarms per day and **median lead time in minutes**
+  together — a detection rate bought at a two-minute lead is not a usable alarm,
+  and neither rate shows that alone.
+
+The module defines no pass/fail threshold on any of them, and
+`metrics.protocols.threshold` raises rather than return a guess.
+
+### Table sections
+
 | Section | What it carries |
 | --- | --- |
 | Training & internal losses | `val_loss_total`, the pinball and DILATE terms, the two log-σ |
 | BG forecast (RMSE) | Single-pass horizons, 30 / 60 / 120 min |
 | BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample |
 | Quantile calibration | Marginal 90 % band coverage, inner-50 % coverage, `sign_balance` |
+| Proper scoring — forecast protocol | CRPS, Winkler, marginal and joint coverage with width, per `d` |
+| Hypo alarm operating curve | Detection, false alarms per day and lead time per τ, pooled and per `d` |
+| Infill protocol | RMSE against interpolation, CRPS, Winkler and coverage, per `d` |
 | Relative error & derivative tracking | MARD, rate-of-change and trend rows, excursion amplitude, the conformal probe |
 | Clinical error grid (Clarke) | Per-horizon zone A, plus pooled A+B and D |
 | Clinical accuracy (CG-EGA) | Per-region accurate and erroneous fractions |
@@ -524,7 +744,7 @@ difference is dominated by sensor noise. `trend_amp_ratio`, the ratio of
 predicted to true ΔBG standard deviation, isolates the amplitude axis that the
 regression slope conflates with direction; it falls toward 0 when the forecast
 collapses to a flat line. `bg_curve_corr` is anchor-relative — it correlates
-`pred − last_bg` against `true − last_bg` — so it scores curve shape rather than
+`pred − anchor` against `true − anchor` — so it scores curve shape rather than
 trivial level agreement.
 
 The excursion-amplitude block is the peak-localised companion: it measures
@@ -533,25 +753,25 @@ visible, along with over- and under-shoot fractions.
 
 ### Probes
 
-**Counterfactual.** Perturbs the prediction-zone doses against a baseline
-forecast and checks the response is physiologically right: carbohydrate must
-raise glucose, insulin must lower it, a dose sweep must move it monotonically,
-and a baseline excursion should clear once the opposing dose is added. This is
+**Counterfactual.** Perturbs the doses announced over a right-edge forecast span
+against a baseline forecast and checks the response is physiologically right:
+carbohydrate must raise glucose, insulin must lower it, a dose sweep must move it
+monotonically, and the opposing dose must clear a baseline excursion. This is
 what makes the always-on what-if path trustworthy. Diagnostic only.
 
-**Conformal coverage.** Fits per-step, per-level corrections on a deterministic
-60 % of the collected validation windows and measures excursion-peak coverage on
-the disjoint 40 %, reporting raw against calibrated. It is a witness that
-recalibration restores the coverage the raw fan loses at excursions. The
-validation sample is small, so read it directionally; the deployable correction
-is fit after training by `calibrate_conformal.py`.
+**Conformal coverage.** Fits on a deterministic 60 % of the collected validation
+windows and measures excursion-peak coverage on the disjoint 40 %, reporting raw
+against calibrated with the mean band width that bought each. The fit is
+region-binned, and the marginal fit is measured on the same windows in the same
+call so the two arms are never compared across runs. The validation sample is
+small, so the figures are directional; the deployable correction is fit after
+training by `calibrate_conformal.py`.
 
 **Night onset.** Answers the bedtime question — will there be an excursion before
-morning? The prediction origin is forced to `NOCTURNAL_START_HOUR`, the forecast
-is rolled across the whole night conditioned on the announced overnight doses,
-and a per-night binary call is scored off the band edges: of the nights that
-truly go low or high, how many are flagged, and of the flagged nights, how many
-truly do.
+morning? The forecast origin is forced to `NOCTURNAL_START_HOUR`, the forecast is
+rolled across the whole night conditioned on the announced overnight doses, and a
+per-night binary call is scored off the band edges: of the nights that truly go
+low or high, how many are flagged, and of the flagged nights, how many truly do.
 
 
 ## Conformal calibration
@@ -559,27 +779,36 @@ truly do.
 The quantile bands are well-shaped but over-confident at excursions, and
 asymmetrically so — realized glucose escapes the lower edge more than the upper.
 Split-conformal recalibration corrects coverage after the fact without disturbing
-the point forecast. The layer is pure numpy in `conformal.py` and runs entirely
-in mg/dL, downstream of the inverse transform, never inside the loss or the model.
+the point forecast. The layer is pure numpy, runs entirely in mg/dL downstream of
+the inverse transform, and never enters the loss or the model.
+`SPEC/inference.md` §8.4 specifies the apply and the fit, including the side-aware
+order statistic and the exchangeability requirement; this repository implements
+them in `conformal.py` and does not restate them.
 
-`fit_quantile_conformal` fits a per-step, per-level additive correction from
-calibration residuals. Because each level is fitted from its own residuals, the
-correction is asymmetric by construction, which is what lets it correct the hypo
-side harder. The order statistic is side-aware: an upper edge uses
-`ceil((n+1)·τ)`, a lower edge `floor((n+1)·τ)`. Using `ceil` on a lower edge sits
-it one order statistic too high and lets glucose escape below it more than
-nominal — anti-conservative on exactly the clinically load-bearing edge, and
-worst at small calibration sets.
+`conformal.py` fits one correction over the whole calibration set — a marginal
+one, valid on average. `mondrian.py` re-fits it once per **region bin**, so
+coverage is restored conditional on the regime rather than only on average. The
+region is a property of the window, read from where the forecast is heading: the
+median line's mean over the final patch. `REGION_EDGES` places its single edge in
+the euglycaemic band and deliberately not at a clinical threshold, which would
+split the windows that decide the alarm across two separately-fit corrections and
+starve the low bin. Because the median is held fixed, a window's bin is the same
+before and after correction, so the binning needs no second pass.
 
-`apply_quantile_conformal` enforces three invariants, each unit-tested: the
-median column is untouched, the fan stays monotone outward from it, and an
-all-zero correction is the identity.
+A bin whose calibration count falls below `MIN_N_OWN_FIT` takes the marginal
+delta, and the fit records that it did: below that count the extreme level's own
+offset **is** its most extreme residual, an estimate that moves with a single
+outlier. Every bin reports its `n`, its distinct-patient count and its mean band
+width beside its coverage.
 
-Validity rests on calibration and test being exchangeable, so a correction is
-only valid for the distribution it was fitted on. `calibrate_conformal.py` fits
-the simulator correction on the disjoint reserved partition and stores it in the
-checkpoint; that one is valid for the simulator path only. The real-data harness
-re-fits **per cohort** from each cohort's own calibration split.
+Forecast and infill residuals are not exchangeable, so the split is by remit:
+the forecast protocol's fit is what ships in `ckpt['conformal_delta']`, and
+infill gets its own coarse fit, stored apart and marked `shipped = False`.
+
+`calibrate_conformal.py` fits the shipped correction on the disjoint reserved
+partition and stores it in the checkpoint; that one is valid for the simulator
+path only. The real-data harness re-fits **per cohort** from each cohort's own
+calibration split, and the export path ships none.
 
 
 ## Report metric basis
@@ -606,16 +835,17 @@ block per horizon: realized coverage of the band, and its mean width in mg/dL.
 
 ## Normalization statistics
 
-Three channels, one file — `normalization_stats.json`, a `{mean, std}` pair each
-for `bg_absolute`, `carb_intake` and `insulin_combined`. Glucose statistics live
-in **risk space** and the other two in **log1p space**, so a consumer must apply
-the same forward transform before normalizing and the same inverse after
-denormalizing.
+Four channels, one file — `normalization_stats.json`, a `{mean, std}` pair each
+for `bg_absolute`, `carb_intake`, `insulin_combined` and `exercise_equiv`.
+Glucose statistics live in **risk space** and the other three in **log1p space**,
+so a consumer must apply the same forward transform before normalizing and the
+same inverse after denormalizing. `bg_masked` has no entry, being a bit rather
+than a signal.
 
 The statistics can come from `python normalization.py`, which simulates a pool of
 independent patients and accumulates with Welford's algorithm, or from
 `T1DMSIM/cache_simulator.py`, which emits them beside `meta.json` when a cache is
-built. Both produce the same three pairs in the same space.
+built. Both produce the same four pairs in the same space.
 
 The pool must match the distribution the model actually trains on — the same
 skill mix and the same post-warmup window. Fitting on a different distribution
@@ -624,8 +854,10 @@ silently mis-scales every input. `normalization.py` draws seeds
 full 63-bit space, so the two are not disjoint *ranges* — a collision is merely
 astronomically unlikely, which is what keeps the fit clear of training samples.
 
-Regenerate the file after any change to the Kovatchev constants, to
-`RISK_SPACE_CHANNELS`, or to the membership of `SPARSE_LOG1P_CHANNELS`.
+The stored pairs are a function of the Kovatchev constants, of
+`RISK_SPACE_CHANNELS` and of the membership of `SPARSE_LOG1P_CHANNELS`: change any
+of the three and the file on disk describes a space the transforms no longer
+produce.
 
 
 ## Simulator cache
@@ -633,7 +865,10 @@ Regenerate the file after any change to the Kovatchev constants, to
 The simulator is a Python loop and is the dominant per-batch cost, so on a fast
 GPU it starves the device. `T1DMSIM/cache_simulator.py` pre-generates a pool of
 post-warmup trajectories once; `T1DMDataset(cache_path=...)` then reads rows
-instead of simulating. The README lists the published pools.
+instead of simulating. No pool ships with this repository; each is built locally,
+and the build writes a `DATASET.md` into the pool directory recording that pool's
+geometry, glycemic mix and per-channel storage. The two pools T1DMSIM publishes
+are the earlier 666-step geometry, which the loader rejects.
 
 **Layout.** One file per channel under `<out_dir>/`, plus a small raw `icr.npy`,
 a `normalization_stats.json`, and a `meta.json` written last as the completion
@@ -663,11 +898,12 @@ checked at all, so two pools with different glycemic mixes are both accepted.
 **Compression.** Each `.b2nd` is chunked `(rows_per_chunk, T)` with byte-shuffle
 and zstd. Byte-shuffle groups each float's high-entropy mantissa bytes apart from
 its low-entropy exponent bytes, which compresses far better than raw IEEE-754
-layout. On the published pools this runs about 1.3–1.6× on the dense physiologic
-channels and 17–633× on the near-constant ones — exercise about 19×, hour-of-day
-about 86×, the day index about 633× — for roughly 2.3× over the pool as a whole.
-Smaller chunks waste fewer decompressed bytes per single-row read but give zstd
-a smaller window; the default keeps a chunk near 85 KB per channel.
+layout. On a million-row pool at the 1242-step geometry this runs about 1.3–1.7×
+on the dense physiologic channels and 27–539× on the near-constant ones, for
+roughly 2.4× over the pool as a whole; each pool's `DATASET.md` carries its own
+measured per-channel ratios. Smaller chunks waste fewer decompressed bytes per
+single-row read but give zstd a smaller window; at the default 32 rows per chunk a
+chunk is `32 × n_timesteps × 4 B`, about 159 KB per channel at 1242 steps.
 
 **Resident memory.** Both layouts open memory-mapped, so DataLoader workers share
 the kernel page cache. They differ sharply in what stays resident. Under blosc2
@@ -690,40 +926,53 @@ number of samples the run will draw, the dataset prints a one-line reuse factor
 at construction.
 
 
-## Inference modes
+## Inference and export
 
-All three live in `inference.py`. The decode recipe is specified in
-`SPEC/inference.md` §9.
+All three inference modes live in `inference.py`, and `SPEC/inference.md` §9
+specifies the recipes they implement.
 
-**Standard.** Fill the context with observed history; zero the prediction zone's
-glucose slot and fill its dose slots with the announced future, or with the
-zero-dose baseline if none is announced; recover `last_bg`; one forward pass;
-invert the median and the fan to mg/dL. `predict` accepts an optional conformal
-correction, applied to the bands with the median untouched.
+**Standard.** `predict` runs one forward over one masked set. The default set is
+the trailing `PREDICTION_PATCHES` patches — a forecast — and `mask_spans` names
+any other: a span at patch 0 is a backcast, one between visible patches an
+infill. The masked patches carry a zeroed glucose slot, an announced `bg_masked`
+bit, and either the announced plan or the zero-dose baseline in the three plan
+slots; the anchors and their patch indices are built by the same
+`data._mask_slots` the training path uses. `predict` accepts an optional
+conformal correction, applied to the bands with the median untouched.
 
 The zero-dose baseline is `normalize(0)` per channel, **not** a literal `z = 0`.
-A literal zero decodes through the sparse log1p inverse to a phantom dose, which
-would corrupt a no-dose forecast.
+A literal zero decodes through the sparse log1p inverse to a phantom dose or a
+phantom exercise session, which would corrupt a no-dose forecast.
 
-**What-if.** The same forward pass with different values in the two dose slots. A
-baseline is simply another call.
+**What-if.** The same forward pass with different values in the three plan slots.
+A baseline is simply another call.
 
 **Rolling.** Re-feed is glucose-only: the median goes through the inverse
 transform to mg/dL, then back through normalization into the new context patches'
-glucose slot. Dose slots come from the caller's callback, or the zero-dose
-baseline. The context slides forward and drops its oldest patches at
-`MAX_CONTEXT_PATCHES`. The accumulated band half-width carries into the next
-roll, so the envelope grows monotonically rather than resetting at each seam.
-`normalization_stats` is required; without it the re-normalization cannot be
-computed.
+glucose slot, whose `bg_masked` bit is cleared — those patches are visible now.
+The plan slots come from the caller's callback, or the zero-dose baseline. The
+context slides forward and drops its oldest patches at `MAX_CONTEXT_PATCHES`. The
+accumulated band half-width carries into the next roll, so the envelope grows
+monotonically rather than resetting at each seam. `normalization_stats` is
+required; without it the re-normalization cannot be computed.
+
+**Export.** The exported graph is the **right-edge specialisation** of the masked
+objective, and `SPEC/inference.md` §3.1 documents it as such:
+`exporters/modified_forward.py` reads the trailing `PREDICTION_PATCHES` patches as
+a slice instead of gathering by `mask_idx`, takes its mask as an external additive
+float struct at the fixed `T = MAX_SEQ_LEN` with `NEG_FILL = -30000.0`, and cuts
+the graph at `head_raw` so everything downstream of it — the anchor, the assembly,
+the decode — is the consumer's. `NEG_FILL` rather than `-inf` keeps an fp16 NPU
+softmax finite, and underflows to the same zero in fp32.
 
 
 ## Parameter count
 
 The count is computed from the architecture, never targeted. Per block it is
 dominated by the FFN at `3 · D_MODEL · FFN_DIM` and attention at `4 · D_MODEL²`;
-norms and ALiBi slopes are negligible. Multiply by `N_LAYERS` and add the patch
-embedding and the two heads.
+the norms are negligible. Multiply by `N_LAYERS` and add the patch embedding and
+the two heads. `MAX_MASKED_PATCHES` sizes no weight — the head is applied per slot
+with shared weights — and `step_basis` is a buffer, so neither enters the count.
 
 `resize_model.py` with no flags instantiates the model on the `meta` device and
 prints the current architecture and its exact count.

@@ -10,9 +10,13 @@ matching one through a <picture> element:
                                2 h single-pass fan and the 8 h autoregressive roll
 
 Usage:
-    python make_readme_figures.py                       # all three
-    python make_readme_figures.py --skip-forecast       # diagrams only (no torch)
+    python make_readme_figures.py --skip-forecast       # diagrams only, no checkpoint
+    python make_readme_figures.py --checkpoint PATH     # all three
     python make_readme_figures.py --checkpoint PATH --seed N
+
+The forecast figure has no default checkpoint: the capacity ladder's weights are
+per-run artifacts under the gitignored ``models/*/``. Name one or pass
+``--skip-forecast``.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ import matplotlib as mpl
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Rectangle
+
+import config
+from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
+from utils import kovatchev_f_np as _f
 
 REPO = Path(__file__).resolve().parent
 OUT_DIR = REPO / "screenshots"
@@ -170,8 +178,9 @@ def draw_architecture(t: Theme, path: Path) -> None:
     _down(ax, t, 0.5, 0.900, 0.882)
 
     # --- observed signal ---------------------------------------------------
-    _box(ax, t, L, 0.828, W, 0.052, "Three observed channels, one 5-minute grid",
-         "CGM  mg/dL      ·      carbohydrate  g / step      ·      insulin  U / step",
+    _box(ax, t, L, 0.828, W, 0.052, "Four input channels, one 5-minute grid",
+         "CGM  mg/dL · carbohydrate  g / step · insulin  U / step"
+         " · exercise  g / step (carbohydrate-equivalent)",
          accent=t.NAVY)
     ax.text(0.5, 0.820, "insulin sensitivity and hepatic output are simulator latents — deliberately not inputs",
             ha="center", va="top", fontsize=8.0, color=t.muted, style="italic")
@@ -179,21 +188,25 @@ def draw_architecture(t: Theme, path: Path) -> None:
 
     # --- transforms --------------------------------------------------------
     tw = 0.440
-    _box(ax, t, L, 0.736, tw, 0.052, "CGM  →  Kovatchev f  →  z-score",
-         "the model reads and writes glucose in risk space", accent=t.CLAY, mono_sub=False)
-    _box(ax, t, R - tw, 0.736, tw, 0.052, "carb, insulin  →  log1p  →  z-score",
-         "keeps rare event spikes off the scale", accent=t.CLAY, mono_sub=False)
+    _box(ax, t, L, 0.736, tw, 0.052, "CGM → Kovatchev f → z-score",
+         "the model reads and writes glucose in risk space", accent=t.CLAY,
+         mono_sub=False, title_size=10.2)
+    _box(ax, t, R - tw, 0.736, tw, 0.052, "carb, insulin, exercise → log1p → z-score",
+         "keeps rare event spikes off the scale", accent=t.CLAY,
+         mono_sub=False, title_size=10.2)
     _arrow(ax, t, (L + tw / 2, 0.732), (0.5, 0.712))
     _arrow(ax, t, (R - tw / 2, 0.732), (0.5, 0.712))
     _down(ax, t, 0.5, 0.712, 0.700)
 
     # --- patching ----------------------------------------------------------
     _box(ax, t, L, 0.644, W, 0.052, "Patch embedding",
-         "6 steps × 3 features (30 min)  →  one token  →  Linear → D_MODEL",
+         f"{config.PATCH_SIZE} steps × {config.N_INPUT_FEATURES} features "
+         f"({config.PATCH_SIZE * 5} min)  →  one token  →  Linear → D_MODEL",
          accent=t.NAVY)
     ax.text(0.5, 0.636,
-            "context 16–48 patches (8–24 h)   │   horizon 4 patches (2 h): glucose blanked, "
-            "carb and insulin carry the announced plan",
+            f"window {config.MIN_CONTEXT_PATCHES + config.PREDICTION_PATCHES}–"
+            f"{config.MAX_SEQ_LEN} patches   │   the fifth feature is bg_masked, "
+            "a per-patch bit: 1 where glucose is withheld, and the head predicts it",
             ha="center", va="top", fontsize=8.0, color=t.muted, style="italic")
     _down(ax, t, 0.5, 0.626, 0.608)
 
@@ -212,7 +225,7 @@ def draw_architecture(t: Theme, path: Path) -> None:
          title_size=9.2, lw=0.9, zorder=3)
     _down(ax, t, bx + bw / 2, gy + 0.144, gy + 0.136)
     _box(ax, t, bx, gy + 0.094, bw, 0.042, "Temporal self-attention",
-         "RoPE · QK-norm · learned per-head ALiBi", accent=t.NAVY,
+         "RoPE · QK-norm", accent=t.NAVY,
          title_size=10, sub_size=8.0, mono_sub=False, zorder=3)
     _down(ax, t, bx + bw / 2, gy + 0.092, gy + 0.080)
     _box(ax, t, bx, gy + 0.054, bw, 0.026, "RMSNorm", accent=t.slate,
@@ -222,15 +235,15 @@ def draw_architecture(t: Theme, path: Path) -> None:
          title_size=9.2, lw=0.9, zorder=3)
 
     # attention-mask inset
-    mx, my, ms = 0.700, gy + 0.036, 0.146
+    mx, my, ms = 0.712, gy + 0.062, 0.118
     _mask_inset(ax, t, mx, my, ms)
 
     _down(ax, t, 0.5, gy, 0.372)
 
     # --- final norm --------------------------------------------------------
-    _box(ax, t, 0.315, 0.322, 0.370, 0.042, "Final RMSNorm",
-         "prediction-zone tokens only, from here on", accent=t.NAVY,
-         sub_size=8.0, mono_sub=False)
+    _box(ax, t, 0.290, 0.322, 0.420, 0.042, "Final RMSNorm",
+         "gathered by mask_idx — masked patches only, from here on",
+         accent=t.NAVY, sub_size=8.0, mono_sub=False)
     _arrow(ax, t, (0.5, 0.320), (0.5, 0.310))
     ax.plot([0.235, 0.765], [0.310, 0.310], color=t.muted, lw=1.2, zorder=1)
     _down(ax, t, 0.235, 0.310, 0.288)
@@ -238,18 +251,20 @@ def draw_architecture(t: Theme, path: Path) -> None:
 
     # --- heads -------------------------------------------------------------
     _box(ax, t, L, 0.230, 0.435, 0.056, "Blood-glucose quantile head",
-         "3-layer MLP → K low-frequency coefficients per patch", accent=t.TEAL,
-         sub_size=8.2, mono_sub=False)
+         "3-layer MLP → K low-frequency coefficients per masked patch",
+         accent=t.TEAL, sub_size=8.2, mono_sub=False)
     _box(ax, t, R - 0.435, 0.230, 0.435, 0.056, "Time-of-day probe",
-         "12 circular hour bins per patch · co-trains the trunk\n"
+         "12 circular hour bins per masked patch · co-trains the trunk\n"
          "reads the clock off the trajectory, with no clock input",
          accent=t.PLUM, sub_size=8.2, mono_sub=False)
     _down(ax, t, 0.2325, 0.228, 0.196)
 
     # --- assembly + decode --------------------------------------------------
     _box(ax, t, L, 0.130, 0.640, 0.064, "Quantile assembly",
-         "anchor f(last_bg)  +  global DCT median  +  softplus cumsum\n"
-         "→  7 ascending quantiles  τ = .05 .10 .25 .50 .75 .90 .95",
+         "per-slot anchor f(anchor_bg), one-sided and left-preferring "
+         " +  per-span DCT median\n"
+         " +  softplus cumsum  →  7 ascending quantiles  "
+         "τ = .05 .10 .25 .50 .75 .90 .95",
          accent=t.TEAL, sub_size=8.2, mono_sub=False)
     _arrow(ax, t, (L + 0.640, 0.162), (0.735, 0.162))
     _box(ax, t, 0.740, 0.130, R - 0.740, 0.064, "f⁻¹  →  mg/dL",
@@ -284,7 +299,12 @@ def draw_architecture(t: Theme, path: Path) -> None:
 
 
 def _mask_inset(ax, t: Theme, x: float, y: float, s: float) -> None:
-    """A 2x2 schematic of the hybrid attention mask."""
+    """A 2x2 schematic of the attention mask.
+
+    The axes are VISIBLE and MASKED, not context and prediction: a masked span
+    may end at the last patch (forecast), start at patch 0 (backcast) or sit
+    between visible patches (infill), so neither axis is a position.
+    """
     half = s / 2
     allow, block = t.fill(t.NAVY), t.paper
     cells = [((0, 1), allow), ((1, 1), block), ((0, 0), allow), ((1, 0), allow)]
@@ -292,30 +312,38 @@ def _mask_inset(ax, t: Theme, x: float, y: float, s: float) -> None:
         ax.add_patch(Rectangle((x + cx * half, y + cy * half), half, half,
                                facecolor=fc, edgecolor=t.edge(t.NAVY),
                                linewidth=0.9, zorder=3))
-    ax.text(x + half / 2, y + half * 1.5, "ctx\n↔ctx", ha="center", va="center",
+    ax.text(x + half / 2, y + half * 1.5, "vis\n↔vis", ha="center", va="center",
             fontsize=7.2, color=t.slate, zorder=4, linespacing=1.15)
     ax.text(x + half * 1.5, y + half * 1.5, "blocked", ha="center", va="center",
             fontsize=7.2, color=t.muted, zorder=4)
-    ax.text(x + half / 2, y + half / 2, "pred\n→ctx", ha="center", va="center",
+    ax.text(x + half / 2, y + half / 2, "masked\n→vis", ha="center", va="center",
             fontsize=7.2, color=t.slate, zorder=4, linespacing=1.15)
-    ax.text(x + half * 1.5, y + half / 2, "pred\n↔pred", ha="center", va="center",
+    ax.text(x + half * 1.5, y + half / 2, "masked\n↔masked", ha="center", va="center",
             fontsize=7.2, color=t.slate, zorder=4, linespacing=1.15)
     ax.text(x + half, y + s + 0.012, "attention mask", ha="center", va="bottom",
             fontsize=8.6, weight="bold", color=t.ink, zorder=4)
-    ax.text(x + half, y - 0.012, "context never sees the horizon",
-            ha="center", va="top", fontsize=7.6, color=t.muted, style="italic", zorder=4)
+    ax.text(x + half, y - 0.012,
+            "evidence never reads a prediction\n"
+            f"up to {config.MASK_MAX_SPANS} masked spans of "
+            f"{config.MASK_SPAN_LENGTHS[0]}–{config.MASK_SPAN_LENGTHS[-1]} patches, "
+            "never abutting,\nplaced anywhere in the window: forecast at the\n"
+            "last patch, backcast at patch 0, infill between",
+            ha="center", va="top", fontsize=7.2, color=t.muted, style="italic",
+            zorder=4, linespacing=1.35)
 
 
 # ------------------------------------------------------------------ risk space
 
-_K_SCALE = 2.2211457449985317
-_K_POWER = 1.084
-_K_OFFSET = 5.540076976170212
-BG_LO, BG_HI = 40.0, 400.0
+# The plotted span is the physical clamp, so the panels cover every BG the
+# simulator and the model can produce. The transform's anchors sit inside it:
+# f is solved so f(40) = -sqrt(10) and f(400) = +sqrt(10).
+BG_LO, BG_HI = BG_CLAMP_MIN, BG_CLAMP_MAX
+BG_ANCHOR_LO = 40.0
 
 
-def _f(g):
-    return _K_SCALE * (np.log(g) ** _K_POWER - _K_OFFSET)
+def _num(x: float, nd: int = 2) -> str:
+    """``x`` with the typographic minus the rest of the labels use."""
+    return f"{x:.{nd}f}".replace("-", "−")
 
 
 def draw_risk_space(t: Theme, path: Path) -> None:
@@ -339,8 +367,13 @@ def draw_risk_space(t: Theme, path: Path) -> None:
     a.plot([128.0], [0.0], "o", color=t.CLAY, ms=5, zorder=4)
     a.annotate("zero risk ≈ 128 mg/dL", (128.0, 0.0), textcoords="offset points",
                xytext=(12, -18), fontsize=8.6, color=t.slate)
-    a.annotate("f(40) = −√10", (BG_LO, _f(BG_LO)), textcoords="offset points",
-               xytext=(10, 2), fontsize=8.6, color=t.slate)
+    a.plot([BG_ANCHOR_LO], [_f(BG_ANCHOR_LO)], "o", color=t.CLAY, ms=5, zorder=4)
+    a.annotate("f(40) = −√10", (BG_ANCHOR_LO, _f(BG_ANCHOR_LO)),
+               textcoords="offset points", xytext=(10, -16), fontsize=8.6,
+               color=t.slate)
+    a.annotate(f"f({BG_LO:.0f}) = {_num(float(_f(BG_LO)))}", (BG_LO, _f(BG_LO)),
+               textcoords="offset points", xytext=(10, 3), fontsize=8.6,
+               color=t.slate)
     a.annotate("f(400) = +√10", (BG_HI, _f(BG_HI)), textcoords="offset points",
                xytext=(-8, 6), ha="right", fontsize=8.6, color=t.slate)
     a.text(125.0, -2.55, "target\nrange", fontsize=8.4, color=t.slate,
@@ -349,7 +382,7 @@ def draw_risk_space(t: Theme, path: Path) -> None:
     a.set_xlabel("blood glucose (mg/dL)")
     a.set_ylabel("risk space  f(g)")
     a.set_xlim(BG_LO, BG_HI)
-    a.set_ylim(-3.5, 3.5)
+    a.set_ylim(float(_f(BG_LO)) - 0.4, float(_f(BG_HI)) + 0.4)
     a.set_title("The transform the model forecasts in", fontsize=11.5, loc="left",
                 color=t.ink, pad=10)
     a.spines["left"].set_color(t.rule)
@@ -407,7 +440,11 @@ def _load_model(checkpoint: str, device):
 
 
 def _sim_window(seed: int, stats):
-    """One simulator patient: normalized features, raw mg/dL, carbs and insulin."""
+    """One simulator patient: normalized features and the raw channels behind them.
+
+    ``exercise`` is T1DMSIM's carbohydrate-equivalent glucose-disposal curve in
+    g/step, on the same scale as ``carb`` — never an intensity.
+    """
     import numpy as np
     from T1DMSIM.simulator import T1DMSimulator, BG_CLAMP_MIN, BG_CLAMP_MAX
     from data import simulate_discard_warmup
@@ -417,8 +454,20 @@ def _sim_window(seed: int, stats):
     bg = np.clip(raw["bg_observed"], BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.maximum(raw["total_carb"], 0.0).astype(np.float32)
     ins = np.maximum(raw["total_insulin"], 0.0).astype(np.float32)
-    feats = normalize(np.stack([bg, carb, ins], axis=-1), stats)
-    return feats, bg, carb, ins, raw["hour_of_day"].astype(np.float32)
+    exr = np.maximum(raw["total_exercise"], 0.0).astype(np.float32)
+    from data import BG_MASKED_FEAT
+
+    # Four normalized signal columns, then the bg_masked announcement bit above
+    # them. The bit is not a signal — no statistics, never through normalize — and
+    # every step here is an observed reading, so its column stays 0.0; the masked
+    # set is written into the patches downstream, by the builder that knows it.
+    cols = [bg, carb, ins, exr]
+    assert len(cols) == BG_MASKED_FEAT < config.N_INPUT_FEATURES, (
+        f"{len(cols)} raw signal columns against BG_MASKED_FEAT={BG_MASKED_FEAT}, "
+        f"N_INPUT_FEATURES={config.N_INPUT_FEATURES}")
+    feats = np.zeros((len(bg), config.N_INPUT_FEATURES), dtype=np.float32)
+    feats[:, :BG_MASKED_FEAT] = normalize(np.stack(cols, axis=-1), stats)
+    return feats, bg, carb, ins, exr, raw["hour_of_day"].astype(np.float32)
 
 
 def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
@@ -436,18 +485,24 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     n_rolls = cfg.NIGHT_LONG_HORIZON_HOURS // cfg.PREDICTION_HORIZON_HOURS
     long_steps = n_rolls * pred_steps
 
-    feats, bg, carb, ins, hour = _sim_window(seed, stats)
+    feats, bg, carb, ins, exr, hour = _sim_window(seed, stats)
     start = ((len(bg) - ctx_steps - long_steps - 12) // S) * S
     ctx_np = feats[start:start + ctx_steps].reshape(n_ctx, S, cfg.N_INPUT_FEATURES)
     context = torch.from_numpy(ctx_np.copy())
     origin = start + ctx_steps
+
+    # The whole announceable set, so the figure conditions on exactly what
+    # training conditioned on. Anything left out is silently read as "none".
+    ANNOUNCE = tuple(cfg.CHANNEL_TO_FEAT)                  # (0, 1, 2)
+    RAW_CH = {0: carb, 1: ins, 2: exr}
+    assert set(RAW_CH) == set(ANNOUNCE)
 
     def slot(ch, a, b):
         col = feats[a:b, cfg.CHANNEL_TO_FEAT[ch]].reshape(-1, S)
         return col
 
     ov = {ch: torch.from_numpy(slot(ch, origin, origin + pred_steps).copy())
-          for ch in (0, 1)}
+          for ch in ANNOUNCE}
     short = predict(model, context, normalization_stats=stats, device=device, overrides=ov)
 
     def roll_ov(roll_idx, _mu, _abs_n_ctx):
@@ -455,8 +510,8 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
         b = a + pred_steps
         if b > len(feats):
             return None
-        norm = {ch: slot(ch, a, b).copy() for ch in (0, 1)}
-        raw_ = {0: carb[a:b].reshape(-1, S).copy(), 1: ins[a:b].reshape(-1, S).copy()}
+        norm = {ch: slot(ch, a, b).copy() for ch in ANNOUNCE}
+        raw_ = {ch: RAW_CH[ch][a:b].reshape(-1, S).copy() for ch in ANNOUNCE}
         return norm, raw_
 
     long = predict_rolling(model, context, n_rolls=int(n_rolls),
@@ -482,12 +537,15 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
 
     for ax, dx, bands, med, ctx_show, title in panels:
         h = len(med)
-        # t=0 is the forecast origin: the LAST CONTEXT step, index origin-1, whose BG is
-        # the model's own last_bg anchor (data._build_sample takes bg[pred_start-1]).
-        # Prediction step k is index origin+k, at (k+1)*5 min. Each future series is
+        # t=0 is the forecast origin: the LAST VISIBLE step, index origin-1, which is
+        # this masked span's own anchor. The anchor rule is one-sided and
+        # left-preferring — every slot of a span takes the last step of the left
+        # neighbour, the first step of the right neighbour only for a span at patch 0
+        # — so a right-edge span anchors here, and every slot of it shares this value.
+        # Masked step k is index origin+k, at (k+1)*5 min. Each future series is
         # therefore prepended with the anchor, so it leaves the observed line instead of
         # starting one step clear of it. For the bands that join is not cosmetic: the
-        # head decodes a delta from last_bg, so the fan has zero width at the origin.
+        # head decodes a delta from the anchor, so the fan has zero width at the origin.
         tc = np.arange(-ctx_show, 1) * 5.0 / 60.0
         tf = np.arange(h + 1) * 5.0 / 60.0
         x0, x1 = tc[0], tf[-1]
@@ -528,10 +586,12 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
         td = np.arange(-ctx_show, h + 1) * 5.0 / 60.0
         c_max = max(float(carb[sl].max()), 1e-6)
         i_max = max(float(ins[sl].max()), 1e-6)
+        e_max = max(float(exr[sl].max()), 1e-6)
         dx.set_facecolor(t.paper)
         dx.fill_between(td, 0, carb[sl] / c_max, color=t.SAGE, alpha=0.55, lw=0,
                         zorder=2)
         dx.plot(td, ins[sl] / i_max, color=t.PLUM, lw=1.3, zorder=3)
+        dx.plot(td, exr[sl] / e_max, color=t.GOLD, lw=1.3, ls=(0, (3, 2)), zorder=3)
         dx.axvline(0.0, color=t.muted, lw=1.0, zorder=1)
         dx.set_xlim(x0, x1)
         dx.set_ylim(0, 1.45)
@@ -547,10 +607,12 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
                  transform=axes[0].transAxes, ha="right", va="top",
                  fontsize=8.8, color=t.muted)
     fig.text(0.5, 0.062,
-             "The plan strip carries the announced carbohydrate appearance (filled) and "
-             "insulin action (line), each normalised to its own peak.\n"
-             f"T1DMSIM patient, seed {seed}; the window's carbohydrate and insulin are "
-             "announced to the model, as a declared plan would be in deployment.",
+             "The plan strip carries the announced carbohydrate appearance (filled), "
+             "insulin action (solid) and exercise disposal (dashed), each normalised "
+             "to its own peak.\n"
+             f"T1DMSIM patient, seed {seed}; the window's carbohydrate, insulin and "
+             "exercise are announced to the model, as a declared plan would be in "
+             "deployment.",
              ha="center", va="top", fontsize=9.0, color=t.slate, linespacing=1.6)
 
     fig.savefig(path, facecolor=t.paper)
@@ -564,13 +626,26 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
-    ap.add_argument("--checkpoint", default="models/large/weights_multi.pt")
+    # No default: the ladder's checkpoints are per-run artifacts under the
+    # gitignored models/*/, so any baked-in path is a promise the tree cannot
+    # keep. The forecast figure names its checkpoint or is skipped.
+    ap.add_argument("--checkpoint", default=None,
+                    help="checkpoint .pt for the forecast figure; required unless "
+                         "--skip-forecast")
     # The seed the committed screenshots/ figures were drawn from; a rerun that
     # changes it silently replaces the README's patient with a different one.
     ap.add_argument("--seed", type=int, default=14)
     ap.add_argument("--skip-forecast", action="store_true",
-                    help="draw only the two diagrams (no torch, no checkpoint)")
+                    help="draw only the two diagrams (no checkpoint)")
     args = ap.parse_args()
+
+    if not args.skip_forecast:
+        if args.checkpoint is None:
+            raise SystemExit(
+                "the forecast figure needs a checkpoint: pass --checkpoint PATH, "
+                "or --skip-forecast to draw the two diagrams alone.")
+        if not Path(args.checkpoint).is_file():
+            raise SystemExit(f"no such checkpoint: {args.checkpoint}")
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
