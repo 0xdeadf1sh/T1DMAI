@@ -184,7 +184,8 @@ def _future_overrides(feats: np.ndarray, pred_start: int,
     ``predict`` overrides.
 
     ``feats`` is the normalized (N, F) input stack; output channel ``ch`` lives at
-    input feature ``CHANNEL_TO_FEAT[ch]`` (carb 0→feat 1, insulin 1→feat 2).
+    input feature ``CHANNEL_TO_FEAT[ch]`` (carb 0→feat 1, insulin 1→feat 2,
+    exercise 2→feat 3).
     Returns a ``{ch: (PREDICTION_PATCHES, PATCH_SIZE)}`` dict of the
     already-normalized future values, ready to hand to
     ``inference.predict(overrides=…)``.
@@ -201,22 +202,23 @@ def _future_overrides(feats: np.ndarray, pred_start: int,
 def collect_windows(model, stats, segments: list[Segment], device,
                     stride_patches: int = 8, max_per_patient: int | None = None,
                     seed: int = 0, conditional: bool = True,
-                    announce: tuple[int, ...] = (0, 1)) -> list[Window]:
+                    announce: tuple[int, ...] = (0, 1, 2)) -> list[Window]:
     """Slide prediction windows across each segment and capture the BG forecast.
 
     The model is ALWAYS conditioned: each window's true future ``announce``
-    channels (the logged carbs/insulin over the prediction zone) are announced to
-    the model, so the captured forecast is conditioned on them — the deployment
-    what-if regime in which the patient declares the meal/dose. There is no
-    unconditioned regime; ``conditional`` is retained only for call-compatibility
-    and no longer toggles anything.
+    channels (the logged carbs/insulin/exercise over the prediction zone) are
+    announced to the model, so the captured forecast is conditioned on them — the
+    deployment what-if regime in which the patient declares the meal/dose/session.
+    There is no unconditioned regime; ``conditional`` is retained only for
+    call-compatibility and no longer toggles anything.
 
     Args:
         stride_patches: gap (in patches) between successive window starts.
         max_per_patient: cap on windows per patient (random subsample if exceeded).
         conditional: deprecated no-op (the forecast is always conditioned).
-        announce: output-channel indices announced — carbs (0) and insulin (1);
-            BG is never conditionable.
+        announce: output-channel indices announced — carbs (0), insulin (1) and
+            exercise (2); BG is never conditionable. Exercise is identically zero
+            on every real cohort, so announcing it declares "no session".
     """
     by_patient: dict[str, list[Window]] = {}
     for seg in segments:

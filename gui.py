@@ -11,10 +11,11 @@ with a per-τ quantile uncertainty envelope and a draggable cursor.  The
 model is risk-space: its head emits ONLY a BG quantile forecast (no carb /
 insulin / IS / HGO dynamics outputs, no trend head, no physics
 reconstruction).  The user can place 3-point curve events (raised-cosine
-bells) for carbs / insulin into the prediction zone and re-run a what-if
-pass: the announced carb / insulin INPUT is perturbed and ``predict`` is
-re-run, so the median BG forecast moves in response to the plan — useful
-for sanity-checking the model's response to specific meal / bolus plans.
+bells) for carbs / insulin / exercise into the prediction zone and re-run a
+what-if pass: the announced carb / insulin / exercise INPUT is perturbed and
+``predict`` is re-run, so the median BG forecast moves in response to the plan
+— useful for sanity-checking the model's response to specific meal / bolus /
+session plans.
 
 Architecture
 ------------
@@ -40,15 +41,18 @@ until the worker writes ``median_bg`` / ``bands`` back into
 
 Channel layout convention
 -------------------------
-* Display channels (what the user sees on screen): three entries —
-  ``[BG, Carbs, Insulin]``.  BG is the model's median forecast; carbs and
-  insulin are the announced what-if inputs the user can paint.
+* Display channels (what the user sees on screen): four entries —
+  ``[BG, Carbs, Insulin, Exercise]``.  BG is the model's median forecast;
+  carbs, insulin and exercise are the announced what-if inputs the user can
+  paint.  Exercise is painted in g/step carbohydrate-equivalent glucose
+  disposal, the scale the model is trained on.
 * The model emits no dynamics channels.  The green BG curve drawn on the
   chart is ``predict``'s ``median_bg``; the shaded envelope is its ``bands``
   (per-τ quantile edges in mg/dL).
 
 The mapping table ``DISPLAY_TO_OUTPUT_CH`` translates display → announced
-output-channel index (carbs → 0, insulin → 1).  BG has no announced channel.
+output-channel index (carbs → 0, insulin → 1, exercise → 2).  BG has no
+announced channel.
 
 Usage::
 
@@ -69,7 +73,7 @@ Controls::
     M             Meal builder
     B             Bolus builder
     S             Screenshot
-    1-3           Toggle curve visibility
+    1-4           Toggle curve visibility
     A             Toggle all curves
     +/-           Zoom in/out
     Scroll        Zoom around cursor
@@ -179,6 +183,7 @@ HYPER_THRESHOLD_MGDL = BG_HYPER_THRESHOLD
 COLOR_BG_CURVE = (70, 180, 70)
 COLOR_CARBS = (230, 160, 50)
 COLOR_INSULIN = (80, 140, 240)
+COLOR_EXERCISE = (190, 125, 235)
 
 PREDICTION_LINE_ALPHA = 200
 OVERRIDE_LINE_COLOR = (255, 80, 80)
@@ -195,56 +200,74 @@ CONTROL_POINT_HIT_RADIUS = ui_px(12)
 CONFIDENCE_BAND_SMOOTH_STEPS = 25
 MU_SMOOTH_STEPS = 13
 
-# The three display channels: BG (the model's median forecast) and the two
-# announced what-if inputs (carbs, insulin). Their stats-names match the
-# input feature stack [bg_absolute, carb_intake, insulin_combined].
-OUTPUT_CHANNEL_ORDER = ['carb_intake', 'insulin_combined']
+# The four display channels: BG (the model's median forecast) and the three
+# announced what-if inputs (carbs, insulin, exercise). Their stats-names match
+# the input feature stack
+# [bg_absolute, carb_intake, insulin_combined, exercise_equiv].
+OUTPUT_CHANNEL_ORDER = ['carb_intake', 'insulin_combined', 'exercise_equiv']
 
-# Number of display channels (BG + carbs + insulin).
-N_DISPLAY_CHANNELS = 3
+# Number of display channels (BG + carbs + insulin + exercise).
+N_DISPLAY_CHANNELS = 4
 
+# Per-channel y-axis span for the painted / drawn curves, in the channel's own
+# raw unit. Exercise shares carb's span: it is a carbohydrate-EQUIVALENT
+# glucose-disposal rate in the same grams-per-step unit, so the two read on one
+# scale.
 DISPLAY_CHANNEL_RAW_RANGES: list[tuple[float, float]] = [
     (0.0,     400.0),
     (0.0,     10.0),
     (0.0,     1.0),
+    (0.0,     10.0),
 ]
 
 DISPLAY_TO_STATS_NAME: list[str] = [
-    'bg_absolute', 'carb_intake', 'insulin_combined',
+    'bg_absolute', 'carb_intake', 'insulin_combined', 'exercise_equiv',
 ]
 
-# Display channel → input feature slot. The 3-feature input stack is
-# [bg_absolute, carb_intake, insulin_combined], so BG/carb/insulin sit at feats
-# 0/1/2 (carb/insulin are the announceable ones).
-DISPLAY_TO_FEATURE_IDX: list[int] = [0, 1, 2]
+# Display channel → input feature slot. The 4-feature input stack is
+# [bg_absolute, carb_intake, insulin_combined, exercise_equiv], so
+# BG/carb/insulin/exercise sit at feats 0/1/2/3 (all but BG are announceable).
+DISPLAY_TO_FEATURE_IDX: list[int] = [0, 1, 2, 3]
 
-# Display channel → announced output-channel index (carbs → 0, insulin → 1).
-# BG (display 0) is the model's forecast, never an announced input.
-DISPLAY_TO_OUTPUT_CH: dict[int, int] = {1: 0, 2: 1}
+# Display channel → announced output-channel index (carbs → 0, insulin → 1,
+# exercise → 2). BG (display 0) is the model's forecast, never an announced
+# input.
+DISPLAY_TO_OUTPUT_CH: dict[int, int] = {1: 0, 2: 1, 3: 2}
 
 # Announced output-channel index → display channel (the inverse of
 # DISPLAY_TO_OUTPUT_CH); used to route a pencil stroke's display channel back
 # through the output-channel override compiler.
 OUTPUT_TO_DISPLAY_CH: dict[int, int] = {v: k for k, v in DISPLAY_TO_OUTPUT_CH.items()}
 
-DISPLAY_CHANNEL_CLEAR_DEFAULTS: list[float] = [100.0, 0.0, 0.0]
+DISPLAY_CHANNEL_CLEAR_DEFAULTS: list[float] = [100.0, 0.0, 0.0, 0.0]
 
 # Short display names per announced output channel for status messages.
-OUTPUT_CHANNEL_SHORT_NAMES: list[str] = ['carbs', 'insulin']
+OUTPUT_CHANNEL_SHORT_NAMES: list[str] = ['carbs', 'insulin', 'exercise']
 
+# The one announced channel the basal ramp writes into.
+INSULIN_OUTPUT_CH: int = OUTPUT_CHANNEL_ORDER.index('insulin_combined')
+
+# Exercise is announced at the trained g/step scale — a carbohydrate-equivalent
+# glucose disposal rate, not a 0-1 intensity. Any conversion belongs to whoever
+# supplies the session, never to the display.
 DISPLAY_CHANNEL_UNITS: list[str] = [
     'mg/dL',
     'g/5min',
     'U/5min',
+    'g/step',
 ]
 
 SCROLL_SPEED = 48
 ZOOM_FACTOR = 1.3
 HOVER_TOOLTIP_DELAY_MS = 200
 
+# One colour per display channel — indexed by ``disp_ch`` over
+# ``range(N_DISPLAY_CHANNELS)`` on every draw path, so it stays the same length
+# as the table above.
 CHANNEL_COLORS = [
-    COLOR_BG_CURVE, COLOR_CARBS, COLOR_INSULIN,
+    COLOR_BG_CURVE, COLOR_CARBS, COLOR_INSULIN, COLOR_EXERCISE,
 ]
+assert len(CHANNEL_COLORS) == N_DISPLAY_CHANNELS
 
 
 def _safe_import_pygame():
@@ -263,48 +286,69 @@ def _features_from_raw(
     """Convert a simulator raw-dict chunk into the normalized feature
     stack and per-step bookkeeping arrays the GUI keeps around.
 
-    The risk-space model takes a 3-feature input stack
-    ``[bg_absolute, carb_intake, insulin_combined]`` — there is no bg_delta /
-    IS / HGO input and no temporal sin/cos columns.  bg (feat 0) is fed through
-    the Kovatchev risk transform ``f`` BEFORE the z-score (``normalize`` applies
-    it via ``RISK_SPACE_CHANNELS``); carb / insulin keep log1p + z.
+    The risk-space model takes an ``N_INPUT_FEATURES``-feature input stack
+    ``[bg_absolute, carb_intake, insulin_combined, exercise_equiv, bg_masked]``
+    — four normalized signal channels plus the per-patch ``bg_masked``
+    announcement bit — with no bg_delta / IS / HGO input and no temporal sin/cos
+    columns.  Every step of this stack is an OBSERVED reading, so the bit column
+    is 0.0 throughout; the masked set is written into the patches downstream, by
+    the builder that knows it.  bg (feat 0)
+    is fed through the Kovatchev risk transform ``f`` BEFORE the z-score
+    (``normalize`` applies it via ``RISK_SPACE_CHANNELS``); carb / insulin /
+    exercise keep log1p + z.  ``total_exercise`` is the carbohydrate-EQUIVALENT
+    glucose-disposal curve in g/step (the simulator subtracts it from the
+    appearance term), so it is fed at its trained g/step scale and never
+    rescaled to an intensity, and never through the risk transform — it is not
+    a glucose.
 
-    Returns (features_norm[N,3], bg_raw[N], context_raw[N,3]) where N is
-    trimmed to a multiple of PATCH_SIZE.
+    Returns (features_norm[N, N_INPUT_FEATURES], bg_raw[N], context_raw[N,4])
+    where N is trimmed to a multiple of PATCH_SIZE.  ``context_raw`` stays at the
+    four signal channels — it is the chart's data, not the model's input.
     """
-    from config import PATCH_SIZE
+    from config import PATCH_SIZE, N_INPUT_FEATURES
+    from data import BG_MASKED_FEAT
     from normalization import CHANNEL_NAMES, normalize
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
     # Use bg_observed (post-CGM-noise) so the GUI matches what the model was
     # trained on.  The model consumes RAW post-noise signals: bg is only clamped
-    # to the physical BG range, carb/insulin floored at 0 (mirroring
+    # to the physical BG range, carb/insulin/exercise floored at 0 (mirroring
     # ``data._build_sample`` — no smoothing).  ``bg_raw`` / ``context_raw`` below
     # stay unclamped for the chart; only the model-input ``features`` are clamped.
     bg_obs_raw = raw['bg_observed'].astype(np.float32)
     carb_raw = raw['total_carb'].astype(np.float32)
     insulin_raw = raw['total_insulin'].astype(np.float32)
+    exercise_raw = raw['total_exercise'].astype(np.float32)
     bg_obs = np.clip(bg_obs_raw, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.clip(carb_raw, 0.0, None).astype(np.float32)
     insulin = np.clip(insulin_raw, 0.0, None).astype(np.float32)
+    exercise = np.clip(exercise_raw, 0.0, None).astype(np.float32)
     N = (len(bg_obs) // PATCH_SIZE) * PATCH_SIZE
     bg_obs = bg_obs[:N]; carb = carb[:N]; insulin = insulin[:N]
+    exercise = exercise[:N]
     bg_obs_raw = bg_obs_raw[:N]; carb_raw = carb_raw[:N]; insulin_raw = insulin_raw[:N]
+    exercise_raw = exercise_raw[:N]
 
-    # The displayed/plotted CGM + carb + insulin stay RAW (chart realism);
-    # only the model-input ``features`` carry the clamp + normalization.
+    # The displayed/plotted CGM + carb + insulin + exercise stay RAW (chart
+    # realism); only the model-input ``features`` carry the clamp + normalization.
     bg_raw = bg_obs_raw.copy()
-    context_raw = np.stack([bg_obs_raw, carb_raw, insulin_raw], axis=-1).astype(np.float32)
+    context_raw = np.stack(
+        [bg_obs_raw, carb_raw, insulin_raw, exercise_raw], axis=-1,
+    ).astype(np.float32)
 
-    # Normalize the three clamped signal channels through the shared transform:
+    # Normalize the four clamped signal channels through the shared transform:
     # bg (feat 0) via the Kovatchev risk transform BEFORE z (RISK_SPACE_CHANNELS),
-    # the sparse carb/insulin via log1p + z.  CHANNEL_NAMES is the trimmed 3-list
-    # [bg_absolute, carb_intake, insulin_combined] — one column per input feature.
-    assert list(CHANNEL_NAMES) == ['bg_absolute', 'carb_intake', 'insulin_combined'], (
-        f"unexpected CHANNEL_NAMES {list(CHANNEL_NAMES)}"
+    # the sparse carb/insulin/exercise via log1p + z.  One CHANNEL_NAMES entry per
+    # SIGNAL channel, in stack order; the bg_masked bit above them is not a signal
+    # and carries no statistics, so the stack is one column wider than CHANNEL_NAMES.
+    assert len(CHANNEL_NAMES) == BG_MASKED_FEAT < N_INPUT_FEATURES, (
+        f"CHANNEL_NAMES has {len(CHANNEL_NAMES)} entries against "
+        f"BG_MASKED_FEAT={BG_MASKED_FEAT}, N_INPUT_FEATURES={N_INPUT_FEATURES}: "
+        f"{list(CHANNEL_NAMES)}"
     )
-    signal = np.stack([bg_obs, carb, insulin], axis=-1).astype(np.float32)
-    features = normalize(signal, norm_stats)
+    signal = np.stack([bg_obs, carb, insulin, exercise], axis=-1).astype(np.float32)
+    features = np.zeros((len(bg_obs), N_INPUT_FEATURES), dtype=np.float32)
+    features[:, :BG_MASKED_FEAT] = normalize(signal, norm_stats)
 
     return features, bg_raw, context_raw
 
@@ -640,21 +684,28 @@ def _compile_overrides_from_edits(
     pencil_strokes: list | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
     """Compile the user's painted curve / pencil / basal edits into announced
-    carb / insulin INPUT overrides for the prediction zone.
+    carb / insulin / exercise INPUT overrides for the prediction zone.
 
     The model has no dynamics outputs, so the announced inputs are built from
-    a ZERO baseline (no carb / no insulin) plus the user's raised-cosine
-    curves, freehand pencil strokes, and basal ramp — there is nothing to seed
-    from a model prediction.  Curve bells and pencil strokes on the same channel
-    sum together.  Returns ``(overrides_norm, overrides_raw)`` over output
-    channels {0: carb, 1: insulin}; ``predict_what_if`` consumes
-    ``overrides_norm``.
+    a ZERO baseline (no carb, no insulin, no exercise) plus the user's
+    raised-cosine curves, freehand pencil strokes, and basal ramp — there is
+    nothing to seed from a model prediction.  Curve bells and pencil strokes on
+    the same channel sum together.  Returns ``(overrides_norm, overrides_raw)``
+    over output channels {0: carb, 1: insulin, 2: exercise}; ``predict_what_if``
+    consumes ``overrides_norm``.
+
+    Every announced channel carries only what the user painted.  Exercise is a
+    PLAN channel like the other two: nothing the patient did not announce is
+    ever written into the prediction zone.
     """
     from config import PATCH_SIZE, CHANNEL_TO_FEAT
 
     pencil_strokes = pencil_strokes or []
 
-    has_edit = {0: False, 1: False}
+    # The announceable set is the display table's, not a literal — a display
+    # channel added without its entry here is silently dropped, taking the
+    # user's stroke with it.
+    has_edit = {out_ch: False for out_ch in DISPLAY_TO_OUTPUT_CH.values()}
     for event in curve_events:
         out_ch = DISPLAY_TO_OUTPUT_CH.get(event.channel)
         if out_ch in has_edit:
@@ -664,21 +715,22 @@ def _compile_overrides_from_edits(
         if out_ch in has_edit and len(stroke.xs) > 0:
             has_edit[out_ch] = True
     if basal_rate_delta != 0.0:
-        has_edit[1] = True
+        has_edit[INSULIN_OUTPUT_CH] = True
 
     overrides_norm: dict[int, np.ndarray] = {}
     overrides_raw: dict[int, np.ndarray] = {}
 
-    for out_ch in (0, 1):
-        # Only carbs (0) / insulin (1) are announceable — they are the
-        # input channels the model conditions on.
+    for out_ch in sorted(has_edit):
+        # Announceable channels are the ones the model conditions on — the
+        # input feats CHANNEL_TO_FEAT names.
         if out_ch not in CHANNEL_TO_FEAT:
             continue
         if not has_edit[out_ch]:
             continue
         ch_name = OUTPUT_CHANNEL_ORDER[out_ch]
 
-        # Zero baseline: no announced carb / insulin until the user paints one.
+        # Zero baseline: nothing announced on this channel until the user
+        # paints it.
         modified_raw = np.zeros((n_pred, PATCH_SIZE), dtype=np.float32)
 
         for event in curve_events:
@@ -697,7 +749,7 @@ def _compile_overrides_from_edits(
             )
             modified_raw = modified_raw + pencil_vals
 
-        if out_ch == 1 and basal_rate_delta != 0.0:
+        if out_ch == INSULIN_OUTPUT_CH and basal_rate_delta != 0.0:
             basal_vals = _basal_curve_raw_values(
                 basal_rate_delta, n_pred, PATCH_SIZE,
                 basal_ramp_up_h, basal_ramp_down_h, basal_duration_h,
@@ -706,10 +758,11 @@ def _compile_overrides_from_edits(
 
         modified_raw = np.maximum(modified_raw, 0.0)
 
-        # The model consumes RAW post-noise doses (carb/insulin floored at 0);
-        # the announced what-if dose is already floored above, so normalize it
-        # directly — no smoothing.  ``overrides_raw`` (chart overlay) keeps the
-        # RAW announced dose.
+        # The model consumes RAW post-noise doses (carb/insulin/exercise floored
+        # at 0); the announced what-if dose is already floored above, so
+        # normalize it directly — no smoothing.  ``overrides_raw`` (chart
+        # overlay) keeps the RAW announced value, at its own trained scale:
+        # exercise in g/step carbohydrate-equivalent, never an intensity.
         norm_vals = _normalize_channel_array(
             modified_raw.flatten(), ch_name, norm_stats
         ).reshape(n_pred, PATCH_SIZE)
@@ -729,18 +782,27 @@ def _decode_tod(
 ) -> tuple[float | None, float | None, np.ndarray | None]:
     """Decode the diagnostic time-of-day probe for ``context``.
 
-    Runs one cheap ``B=1`` forward with ``return_time=True`` (the forecast
-    ``q_tau`` / ``median`` are computed identically and untouched — the probe
-    reads a detached hidden state) and decodes the resultant length R of the
-    per-bin softmax belief (via ``utils.time_of_day_decode_bins``).  ``overrides``
-    should mirror the announced-dose overrides used for the displayed forecast so
-    the probe's context matches the shown bands on the what-if path.
+    Runs one cheap ``B=1`` forecast through ``inference.predict`` with
+    ``return_time=True`` (the forecast ``q_tau`` / ``median`` are computed
+    identically and untouched — the probe reads a detached hidden state) and
+    decodes the resultant length R of the per-bin softmax belief (via
+    ``utils.time_of_day_decode_bins``).  ``overrides`` should mirror the
+    announced-dose overrides used for the displayed forecast so the probe's
+    context matches the shown bands on the what-if path.
+
+    The probe is read off the MASKED patches, one row per head slot, and the
+    masked set is no longer implied by position — it is built and passed to the
+    model explicitly.  This goes through ``predict`` rather than assembling the
+    forward's arguments here so that the masked set, the per-slot anchors and the
+    patches' ``bg_masked`` bits are all built in one place: a second builder here
+    would be a second chance for them to disagree.  Slot 0 is the first masked
+    patch, which for the forecast protocol is the forecast origin.
 
     Args:
         model: loaded T1DMAI model.
         context: (n_ctx, PATCH_SIZE, N_INPUT_FEATURES) normalized context.
         norm_stats: normalization statistics (the ``normalize(0)`` no-dose
-            baseline + the mg/dL ``last_bg`` anchor).
+            baseline + the mg/dL anchor).
         device: torch device to run the forward on.
         overrides: optional {output-channel: (PREDICTION_PATCHES, PATCH_SIZE)}
             normalized announced-dose overrides.
@@ -748,41 +810,37 @@ def _decode_tod(
     Returns:
         (pred_hour, confidence, bin_probs): ``pred_hour`` the decoded
         prediction-origin hour-of-day in [0, 24), ``confidence`` the resultant
-        length R in [0, 1] of patch 0's bin distribution (higher = more
-        confident), ``bin_probs`` the ``(PREDICTION_PATCHES, TIME_PROBE_N_BINS)``
+        length R in [0, 1] of the FIRST masked patch's bin distribution (higher =
+        more confident), ``bin_probs`` the ``(masked patches, TIME_PROBE_N_BINS)``
         per-patch softmax belief. All ``None`` when the probe is disabled
         (``time_pred is None``).
     """
-    from inference import _build_patches_tensor
-    from utils import last_bg_mgdl_from_context, time_of_day_decode_bins
+    from inference import predict
+    from utils import time_of_day_decode_bins
     from config import TIME_PROBE_N_BINS
 
-    patches, attn_mask = _build_patches_tensor(
-        context, overrides=overrides, normalization_stats=norm_stats,
-    )
-    patches = patches.unsqueeze(0).to(device)
-    attn_mask = attn_mask.to(device)
-    last_bg_t = torch.tensor(
-        [float(last_bg_mgdl_from_context(context, norm_stats))],
-        dtype=torch.float32, device=device,
-    )
     with torch.no_grad():
-        out = model(patches, attn_mask, last_bg_t, return_time=True)
-    time_pred = out[2]
+        out = predict(model, context, normalization_stats=norm_stats,
+                      device=device, overrides=overrides, return_time=True)
+    time_pred = out.get('time_pred')
     if time_pred is None:
         return None, None, None
-    hours, Rs = time_of_day_decode_bins(time_pred[:, 0, :], TIME_PROBE_N_BINS)
+    hours, Rs = time_of_day_decode_bins(time_pred[0:1, :], TIME_PROBE_N_BINS)
     hour = float(hours.reshape(-1)[0].item())
     R = float(Rs.reshape(-1)[0].item())
-    bin_probs = torch.softmax(time_pred[0], dim=-1).cpu().numpy()
+    bin_probs = torch.softmax(time_pred, dim=-1).cpu().numpy()
     return hour, R, bin_probs
 
 
 def _painted_rolls_for_state(state, min_rolls: int, max_rolls: int) -> int:
-    """Number of ``PREDICTION_PATCHES``-long rolls needed to cover the furthest
-    painted dose (curve events + high-level events + pencil strokes), clamped to
-    ``[min_rolls, max_rolls]``.  Positions are absolute patch units, so the
-    furthest painted point minus ``n_ctx`` is the painted span in patches.
+    """Number of rolls needed to cover the furthest painted dose (curve events +
+    high-level events + pencil strokes), clamped to ``[min_rolls, max_rolls]``.
+    Positions are absolute patch units, so the furthest painted point minus
+    ``n_ctx`` is the painted span in patches.
+
+    One roll masks a span of ``PREDICTION_PATCHES`` patches at the right edge of
+    its window — the forecast case of the masked-BG objective — so that is the
+    span each roll covers.
 
     This is the *fit-to-drawing* horizon shared by the long-prediction dispatch
     and the announced-dose preview overlay."""
@@ -803,11 +861,15 @@ def _painted_rolls_for_state(state, min_rolls: int, max_rolls: int) -> int:
 
 
 def _preview_horizon_patches_for_state(state) -> int:
-    """Prediction-zone length (patches) to compile/draw the announced-dose
+    """Length in patches, past ``n_ctx``, to compile/draw the announced-dose
     preview over.  At least one forward window, grown to cover the drawing
     (fit-to-drawing, capped at ``GUI_MAX_PREDICTION_HOURS``) and to match an
     existing forecast's rolled horizon — so a dose painted past 2 h stays
-    visible rather than clipping to the single-pass window."""
+    visible rather than clipping to the single-pass window.
+
+    This is a DRAWING extent, not the model's masked set: the announced plan is
+    painted over patches the model may never have masked in one pass.  The masked
+    set the model actually reads is built per forward, one roll at a time."""
     from config import PREDICTION_PATCHES, PREDICTION_HORIZON_HOURS, GUI_MAX_PREDICTION_HOURS
     max_rolls = max(1, round(GUI_MAX_PREDICTION_HOURS / PREDICTION_HORIZON_HOURS))
     n = _painted_rolls_for_state(state, 1, max_rolls) * PREDICTION_PATCHES
@@ -834,6 +896,12 @@ def _run_prediction(
         hour = _hour_at_pred_start(state)
         state.active_band_label = f"{hour:0.1f}h"
         n_ctx = state.context.shape[0]
+        # The masked span's ANCHOR, for the chart's readout. The anchor rule is
+        # one-sided and LEFT-PREFERRING: every slot of a span takes the last step
+        # of the left neighbour patch (the first step of the right neighbour only
+        # when the span starts at patch 0), and every slot of one span gets the
+        # same value. For the GUI's right-edge span that is step n_ctx*PATCH_SIZE-1.
+        # The anchor is not the distance a metric bins on: it ignores the near side.
         last_bg_idx = n_ctx * PATCH_SIZE - 1
         if state.bg_raw is not None and last_bg_idx >= 0:
             state.last_bg = float(state.bg_raw[last_bg_idx])
@@ -872,7 +940,7 @@ def _run_prediction(
                     basal_ramp_up_h, basal_ramp_down_h, basal_duration_h,
                     pencil_strokes=state.pencil_strokes,
                 )
-            # Re-run predict with the announced carb/insulin INPUT perturbed;
+            # Re-run predict with the announced carb/insulin/exercise INPUT perturbed;
             # the model's median BG forecast shifts in response.
             result = predict_what_if(
                 model, state.context, state.patient_seed,
@@ -1265,7 +1333,7 @@ class T1DMAIGui:
             ch_name = self.state.channel_names[self.state.selected_edit_channel]
             self.state.status_message = (
                 f"Pencil ON — drag to draw {ch_name} "
-                "(Tab = carb/insulin, L = long predict)"
+                "(Tab = carb/insulin/exercise, L = long predict)"
             )
         self._needs_redraw = True
 
@@ -1288,7 +1356,8 @@ class T1DMAIGui:
         """Fit-to-drawing long prediction: roll ``predict_rolling`` out far
         enough to cover the painted doses (floor ``GUI_LONG_PREDICTION_HOURS``,
         cap ``GUI_MAX_PREDICTION_HOURS``), conditioning every roll on the
-        announced carb / insulin.  SPACE stays the single-pass 2 h forecast."""
+        announced carb / insulin / exercise.  SPACE stays the single-pass 2 h
+        forecast."""
         if self.state.is_computing or self.state.context is None or self.model is None:
             return
         from config import (
@@ -1720,8 +1789,8 @@ class T1DMAIGui:
         self._compile_curve_overrides()
 
     def _compile_curve_overrides(self) -> None:
-        """Recompile the painted carb / insulin announcement for the canvas
-        preview.
+        """Recompile the painted carb / insulin / exercise announcement for
+        the canvas preview.
 
         The risk-space model has no dynamics outputs and cannot reconstruct
         BG without a forward pass, so this only refreshes ``state.overrides`` /
@@ -2757,7 +2826,7 @@ class T1DMAIGui:
                 draw_curve(surf, local_transform, pred_times, y_pred, color,
                            width=2, alpha=PREDICTION_LINE_ALPHA)
 
-            # --- Announced carb / insulin input in the prediction zone ---
+            # --- Announced carb / insulin / exercise input in the pred zone ---
             out_ch = DISPLAY_TO_OUTPUT_CH.get(disp_ch)
             if (out_ch is not None and overrides_raw is not None
                     and out_ch in overrides_raw):
@@ -2891,7 +2960,7 @@ class T1DMAIGui:
         elif tool == TOOL_PENCIL:
             ch_name = self.state.channel_names[self.state.selected_edit_channel]
             lines = [
-                f"Pencil — channel: {ch_name}  (Tab to cycle carb/insulin)",
+                f"Pencil — channel: {ch_name}  (Tab to cycle carb/insulin/exercise)",
                 "Drag in the PRED zone to draw a dose curve (smoothed). Draw past 2 h to plan ahead.",
                 "L / Shift+Space = long predict (covers your drawing). Ctrl+Z = undo. P = exit tool",
             ]
@@ -2903,7 +2972,7 @@ class T1DMAIGui:
             lines = [
                 "SPC=Predict 2h  L/Shift+SPC=Long Predict  W=What-If  P=Pencil  F=Roll  G=Sim Fwd  V=Eval  R=Reset",
                 "E=Curve Editor  Tab=Cycle edit channel  C=Clear All curves  N=New Patient  S=Screenshot",
-                "1-3=Toggle channels (BG/Carbs/Insulin)  A=Toggle all  Q=Quit",
+                "1-4=Toggle channels (BG/Carbs/Insulin/Exercise)  A=Toggle all  Q=Quit",
                 "Scroll=Zoom at cursor  +/-=Zoom  Middle/Right-drag=Pan",
             ]
             line_h = self._font_small.get_height() + ui_px(4)
@@ -3099,13 +3168,20 @@ class T1DMAIGui:
     def _draw_clock_face_overlay(self, surface: 'pygame.Surface', mx: int, my: int) -> None:
         """Draw the time-of-day probe's clock-face histogram, rotated to the cursor.
 
-        The P per-patch beliefs are ONE origin-phase belief sampled at deterministic
-        elapsed offsets (patch p == origin advanced by ``p * ADV_HOURS``); they are
+        The probe emits one row per MASKED patch, and the rows are ticked at the
+        patches they were read off rather than at a fixed trailing zone: the row
+        count is ``probs.shape[0]``, not ``PREDICTION_PATCHES``. For the GUI's
+        forecast the masked set is the contiguous span that starts at ``n_ctx``, so
+        the ticks land there — but the count comes from the probe output, so a
+        shorter or longer masked set ticks correctly instead of silently drawing a
+        2 h zone.
+
+        Those per-patch beliefs are ONE origin-phase belief sampled at deterministic
+        elapsed offsets (row p == origin advanced by ``p * ADV_HOURS``); they are
         fused once (``utils.aggregate_origin_belief``) into a single origin belief,
         then rendered at the cursor's continuous elapsed offset ``t`` by rigidly
         rotating that belief on the dial by ``2*pi*t/24`` (angles only, no re-binning,
-        so cursor motion is smooth and exact). Native patch boundaries are ticked on
-        the timeline so the P real sample positions stay visible. Diagnostic only.
+        so cursor motion is smooth and exact). Diagnostic only.
         """
         import utils
         import gui_renderer
@@ -3121,11 +3197,12 @@ class T1DMAIGui:
         ct = self.chart_transform
         n_ctx = self.state.context.shape[0]
 
+        n_masked = int(probs.shape[0])
         adv_hours = PREDICTION_HORIZON_HOURS / PREDICTION_PATCHES
 
         tick_top = int(ct.sy + ct.sh - ui_px(8))
         tick_bot = int(ct.sy + ct.sh)
-        for p in range(PREDICTION_PATCHES + 1):
+        for p in range(n_masked + 1):
             tx = int(round(ct.x_to_screen(n_ctx + p)))
             if ct.sx <= tx <= ct.sx + ct.sw:
                 pygame.draw.line(surface, CLOCK_TICK_COLOR, (tx, tick_top), (tx, tick_bot), 1)
@@ -3200,7 +3277,7 @@ class T1DMAIGui:
         elif key == pygame.K_s:
             self._do_screenshot()
 
-        elif key in (pygame.K_1, pygame.K_2, pygame.K_3):
+        elif key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
             idx = key - pygame.K_1
             if idx < len(self.state.channel_visible):
                 self.state.toggle_channel(idx)

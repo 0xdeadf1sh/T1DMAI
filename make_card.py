@@ -230,7 +230,7 @@ def _param_breakdown(sd: dict) -> tuple[dict[str, int], int]:
     groups = {
         "Patch embedding":                  r"^patch_embed\.",
         "Temporal attn (Q/K/V/O)":          r"^blocks\.\d+\.attn\.w_[qkvo]\.",
-        "Temporal attn (Q/K norm + ALiBi)": r"^blocks\.\d+\.attn\.(q_norm|k_norm|alibi_slopes)",
+        "Temporal attn (Q/K norm)":         r"^blocks\.\d+\.attn\.(q_norm|k_norm|alibi_slopes)",
         "SwiGLU FFN":                       r"^blocks\.\d+\.ffn\.",
         "Block RMSNorms":                   r"^blocks\.\d+\.norm\d+\.",
         "Final RMSNorm":                    r"^final_norm\.",
@@ -470,7 +470,7 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
     block(0.12, 0.520, 0.30, 0.050, "Temporal self-attention",
           f"{cfg['n_heads']} heads × dim {cfg['d_model']//cfg['n_heads']}",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
-    ax.text(0.45, 0.543, "Q/K RMSNorm   ·   RoPE   ·   ALiBi bias",
+    ax.text(0.45, 0.543, "Q/K RMSNorm   ·   RoPE",
             fontsize=9, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
     arrow((0.27, 0.520), (0.27, 0.482))
 
@@ -645,13 +645,24 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             f"{cfg['patch_size']} timesteps × {config.N_INPUT_FEATURES} features  =  {config.PATCH_DIM} numbers",
             fontsize=9.5, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # Exactly N_INPUT_FEATURES channels — bg plus the two announced dose channels.
-    # The four sin/cos time-of-day / day-of-week features are removed; time-of-day
-    # survives only as a detached diagnostic probe head, never a model input.
+    # Exactly N_INPUT_FEATURES channels — bg, the three announced plan channels,
+    # and the mask bit. The four sin/cos time-of-day / day-of-week features are
+    # removed; time-of-day survives only as a detached diagnostic probe head,
+    # never a model input. Exercise is a carbohydrate-equivalent glucose-disposal
+    # curve on the carb scale, not an intensity.
+    #
+    # Feat 4 is the one input that is not a normalized signal: one BIT per patch,
+    # 1.0 where feat 0 is withheld. It is announced rather than inferred because a
+    # masked span may end at the last patch (forecast), start at patch 0
+    # (backcast) or sit between visible patches (infill), so masking cannot be
+    # read off position, and z = 0 in a masked bg slot is a legal reading rather
+    # than a sentinel.
     feats = [
-        ("BG absolute", "mg/dL",     "always · 0 in pred zone"),
-        ("Carbs",       "g / 5 min", "announced future"),
-        ("Insulin",     "U / 5 min", "announced future"),
+        ("BG absolute",           "mg/dL",     "always · 0 where masked"),
+        ("Carbs",                 "g / 5 min", "announced future"),
+        ("Insulin",               "U / 5 min", "announced future"),
+        ("Exercise (carb-equiv)", "g / 5 min", "announced future"),
+        ("BG masked",             "bit/patch", "1 where BG is withheld"),
     ]
     assert len(feats) == config.N_INPUT_FEATURES
     row_y = p_y + p_h - 0.090
@@ -723,7 +734,7 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             transform=ax.transAxes)
     ax.text(n_x + 0.015, n_y + n_h - 0.060,
             "The BG head emits an ascending fan of risk-space quantiles;\n"
-            "there are no dynamics outputs. Carbs / insulin are inputs only;\n"
+            "there are no dynamics outputs. Carbs / insulin / exercise are inputs only;\n"
             "IS / HGO are simulator latents — dropped, neither in nor out.\n"
             f"{_forecast_line}",
             fontsize=9, color=SLATE, va="top", family=FONT_BODY,
@@ -1066,11 +1077,23 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
         # target = 0.90.  Higher-is-better is ambiguous (over- and under-coverage
         # both miss), so these track toward 0.90 — flagged as lower-distance, the
         # closest the simple best/last-10 table supports.
+        #
+        # Each coverage row is followed by the mean band WIDTH that produced it.
+        # Coverage on its own is not a calibration claim: a wide enough band
+        # covers everything, and the pair is the only honest reading. A run whose
+        # validation pass emitted no sharpness renders those rows as "—" rather
+        # than dropping them, so the omission is visible on the card.
         ("Calibration  (90% band coverage, target 0.90)", GOLD,
-         [("coverage90@30",  True, "coverage @30m",  "{:.3f}", "{:.3f}"),
-          ("coverage90@60",  True, "coverage @60m",  "{:.3f}", "{:.3f}"),
-          ("coverage90@120", True, "coverage @120m", "{:.3f}", "{:.3f}")]),
+         [("coverage90@30",  True,  "coverage @30m",              "{:.3f}", "{:.3f}"),
+          ("sharp90@30",     False, "  band width @30m  (mg/dL)", "{:.1f}", "{:.1f}"),
+          ("coverage90@60",  True,  "coverage @60m",              "{:.3f}", "{:.3f}"),
+          ("sharp90@60",     False, "  band width @60m  (mg/dL)", "{:.1f}", "{:.1f}"),
+          ("coverage90@120", True,  "coverage @120m",             "{:.3f}", "{:.3f}"),
+          ("sharp90@120",    False, "  band width @120m (mg/dL)", "{:.1f}", "{:.1f}")]),
     ]
+    # Rows added since CARD_H was sized. The canvas grows by exactly their space
+    # so the physical pitch and every font size stay where they were.
+    _EXTRA_ROWS = 3
 
     # CG-EGA (Kovatchev 2004): %AP higher better, %EP lower better, per region.
     # Read straight out of validation_log.csv, so the section stands or falls with
@@ -1086,23 +1109,24 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
          ("cgega_ep_eu",    False, "%EP euglycemic  (lower better)",         "{:.3f}", "{:.3f}"),
          ("cgega_ap_hyper", True,  "%AP hyper  (higher better)",             "{:.3f}", "{:.3f}"),
          ("cgega_ep_hyper", False, "%EP hyper  (lower better)",              "{:.3f}", "{:.3f}")])
+    h_scale = 1.0 + _EXTRA_ROWS * ROW
     if CGEGA_COLUMNS_TRUSTWORTHY:
         sections.insert(3, cgega_section)
-        h_scale = 1.0
     else:
-        h_scale = 1.0 - (SEC_HEAD + SEC_PAD + len(cgega_section[2]) * ROW)
-        ROW /= h_scale
-        BAND /= h_scale
-        SEC_PAD /= h_scale
-        SEC_HEAD /= h_scale
+        h_scale -= SEC_HEAD + SEC_PAD + len(cgega_section[2]) * ROW
         print("  · card_08_metrics: CG-EGA section omitted "
               "(CGEGA_COLUMNS_TRUSTWORTHY is False)")
+    ROW /= h_scale
+    BAND /= h_scale
+    SEC_PAD /= h_scale
+    SEC_HEAD /= h_scale
 
     fig, ax = _setup_card((13.0, CARD_H * h_scale))
     y = _header(ax, "Validation metrics",
                 "Headline results",
                 "Best-over-run (with the step where it was achieved) and mean over the "
-                "last 10 validation rows. Future carb/insulin are announced (conditioned).")
+                "last 10 validation rows. Future carb/insulin/exercise are announced "
+                "(conditioned).")
 
     def _tight_section(yy: float, lab: str, color=NAVY) -> float:
         """Section eyebrow with a tighter gap than the shared _section (this card
@@ -1537,7 +1561,7 @@ def card_showcase(cfg: dict, summary: dict,
     block(0.090, 0.418, 0.290, 0.018, "RMSNorm", "", ec=RULE, fc=CARD, title_size=8)
     arrow((cx, 0.418), (cx, 0.412))
     block(0.090, 0.378, 0.290, 0.028, "Temporal self-attention",
-          f"{cfg['n_heads']} heads × dim {cfg['d_model']//cfg['n_heads']}  ·  RoPE  ·  ALiBi",
+          f"{cfg['n_heads']} heads × dim {cfg['d_model']//cfg['n_heads']}  ·  RoPE",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
     arrow((cx, 0.378), (cx, 0.300))
 

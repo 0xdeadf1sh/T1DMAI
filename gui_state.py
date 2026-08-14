@@ -19,8 +19,8 @@ The model emits ONLY a BG quantile forecast:
 dynamics outputs (carb / insulin / IS / HGO), no trend head, and no physics
 reconstruction.  The headline forecast is ``median_bg`` (mg/dL) and the
 uncertainty envelope is ``bands`` (per-τ quantile edges in mg/dL).  The
-what-if path perturbs the announced carb / insulin INPUT and re-runs
-``predict`` — the model's BG response moves accordingly.
+what-if path perturbs the announced carb / insulin / exercise INPUT and
+re-runs ``predict`` — the model's BG response moves accordingly.
 
 Design choices
 --------------
@@ -93,7 +93,7 @@ class CurveEvent:
     context window), so they stay anchored when the prediction zone
     extends via rolling.
     """
-    channel: int       # display channel (1=carbs, 2=insulin)
+    channel: int       # display channel (1=carbs, 2=insulin, 3=exercise)
     left_patch: float   # absolute patch position of left tail
     peak_patch: float   # absolute patch position of peak
     right_patch: float  # absolute patch position of right tail
@@ -110,20 +110,21 @@ class CurveEvent:
 class PencilStroke:
     """A single freehand pencil stroke over the prediction zone.
 
-    The user drags the pencil to draw an announced carb / insulin curve
-    directly on the chart. Samples are stored as parallel arrays of
+    The user drags the pencil to draw an announced carb / insulin / exercise
+    curve directly on the chart. Samples are stored as parallel arrays of
     *absolute* patch positions (``xs``, from the start of the context
     window, so they stay anchored when the prediction zone extends via
     rolling — exactly like ``CurveEvent``) and raw-unit dose values
-    (``ys``, g/5min for carbs, U/5min for insulin).
+    (``ys``, g/5min for carbs, U/5min for insulin, g/step carbohydrate-
+    equivalent for exercise).
 
     The stroke is resampled onto the model's (patch, timestep) grid and
     smoothed at compile time (``gui._pencil_strokes_to_raw_values``); it
     contributes a dose of 0 outside its drawn ``xs`` span.
     """
-    channel: int             # display channel (1=carbs, 2=insulin)
+    channel: int             # display channel (1=carbs, 2=insulin, 3=exercise)
     xs: list[float] = field(default_factory=list)   # absolute patch positions
-    ys: list[float] = field(default_factory=list)   # raw dose values (g/5min or U/5min)
+    ys: list[float] = field(default_factory=list)   # raw values (g/5min, U/5min or g/step)
 
 
 @dataclass
@@ -163,7 +164,7 @@ class PredictionResult:
     bands: np.ndarray | None = None         # (P, S, N_QUANTILES) per-τ band edges (mg/dL)
     n_rolls: int = 1                        # number of rolls for extended prediction
     is_what_if: bool = False                # whether this is an input-perturbation what-if
-    overrides_raw: dict[int, np.ndarray] | None = None  # raw carb/insulin announced in the pred zone
+    overrides_raw: dict[int, np.ndarray] | None = None  # raw carb/insulin/exercise announced in the pred zone
     # Time-of-day probe read-out (diagnostic; decoded from the model's
     # ``return_time=True`` head — see ``gui._decode_tod``). Both are None when
     # the probe is disabled (``TIME_PROBE_ENABLED`` False) or on decode failure.
@@ -182,19 +183,25 @@ class GUIState:
 
     def __init__(self) -> None:
         # ---- Channel visibility toggles (N_INPUT_FEATURES channels) ----
-        # Channels: BG (the model's forecast), Carbs, Insulin (announced
-        # what-if inputs). IS / HGO / BG-delta are no longer model signals.
-        self.channel_visible: list[bool] = [True, True, True]
-        self.channel_names: list[str] = ['Blood Glucose', 'Carbs', 'Insulin']
+        # Channels: BG (the model's forecast), Carbs, Insulin, Exercise (the
+        # announced what-if inputs). IS / HGO / BG-delta are no longer model
+        # signals. Both lists carry one entry per display channel and are zipped
+        # against gui.CHANNEL_COLORS to build the sidebar toggles — a short list
+        # truncates that zip and the missing toggle just disappears.
+        self.channel_visible: list[bool] = [True, True, True, True]
+        self.channel_names: list[str] = [
+            'Blood Glucose', 'Carbs', 'Insulin', 'Exercise',
+        ]
 
         # ---- Active tool ----
         self.active_tool: str = TOOL_NONE
         self.selected_channel: int = -1       # which channel is selected for editing
 
         # ---- Overrides: output-channel index → (P, S) array ----
-        # Keys are output-channel indices [0=carbs, 1=insulin] passed straight
-        # to inference.predict_what_if's overrides dict (NORMALIZED values).
-        # BG can't be overridden — the model always predicts it.
+        # Keys are output-channel indices [0=carbs, 1=insulin, 2=exercise]
+        # passed straight to inference.predict_what_if's overrides dict
+        # (NORMALIZED values). BG can't be overridden — the model always
+        # predicts it.
         self.overrides: dict[int, np.ndarray] = {}
 
         # ---- Prediction results ----
@@ -218,7 +225,8 @@ class GUIState:
 
         # ---- Curve-editor channel selection ----
         # Display channel index being edited in curve editor mode.
-        # 1=Carbs, 2=Insulin (BG is the model's forecast, non-editable).
+        # 1=Carbs, 2=Insulin, 3=Exercise (BG is the model's forecast,
+        # non-editable).
         self.selected_edit_channel: int = 1
 
         # ---- Chart view state ----
@@ -241,8 +249,8 @@ class GUIState:
 
         # ---- Pencil tool: freehand announced-dose strokes ----
         # Coexists with the raised-cosine curve editor: pencil strokes and
-        # CurveEvents both compile to announced carb / insulin and sum together
-        # (``gui._compile_overrides_from_edits``).
+        # CurveEvents both compile to announced carb / insulin / exercise
+        # and sum together (``gui._compile_overrides_from_edits``).
         self.pencil_strokes: list[PencilStroke] = []
 
         # ---- High-level intervention events (right panel) ----
@@ -283,8 +291,8 @@ class GUIState:
         Set an announced-input override for a what-if output channel.
 
         Args:
-            channel: Output channel index (0=carbs, 1=insulin).  BG is the
-                     model's forecast and cannot be overridden.
+            channel: Output channel index (0=carbs, 1=insulin, 2=exercise).
+                     BG is the model's forecast and cannot be overridden.
             values: (P, PATCH_SIZE) array of normalized override values, where
                      P is PREDICTION_PATCHES (or n_rolls × PREDICTION_PATCHES
                      for an extended rolling forecast).
@@ -343,9 +351,11 @@ class GUIState:
     def cycle_edit_channel(self, delta: int = 1) -> None:
         """
         Cycle `selected_edit_channel` through paintable display channels
-        (Carbs, Insulin). BG is the model's forecast and not editable.
+        (Carbs, Insulin, Exercise). BG is display channel 0, the model's
+        forecast, and the only non-editable one — the rest are read off
+        `channel_names` so a channel added to the table is reachable here.
         """
-        editable = [1, 2]
+        editable = list(range(1, len(self.channel_names)))
         try:
             idx = editable.index(self.selected_edit_channel)
         except ValueError:

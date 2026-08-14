@@ -254,13 +254,23 @@ def fig_excursion(val, outdir: Path) -> None:
 
 def fig_calibration(val, outdir: Path) -> None:
     """Marginal coverage of the central-90% quantile band (the outer
-    ``QUANTILE_LEVELS`` edges, τ 0.05 / 0.95), per horizon."""
-    fig, ax = plt.subplots(figsize=(8.4, 4.8))
+    ``QUANTILE_LEVELS`` edges, τ 0.05 / 0.95), per horizon — beside the width
+    that bought it.
+
+    Coverage alone is not a calibration statement: a band wide enough covers
+    everything. The sharpness axis is always drawn, so a run that reaches 0.90
+    cannot be read without the mg/dL width it took. When the validation pass
+    emitted no ``sharp90@`` column the axis says so rather than disappearing.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.8))
     s = val["step"]
-    series = [("@30m", "coverage90@30", "#1f4e8c"),
-              ("@60m", "coverage90@60", "#2a8a3e"),
-              ("@120m", "coverage90@120", "#c5343c")]
-    for name, col, c in series:
+    series = [("@30m", 30, "#1f4e8c"),
+              ("@60m", 60, "#2a8a3e"),
+              ("@120m", 120, "#c5343c")]
+
+    ax = axes[0]
+    for name, h, c in series:
+        col = f"coverage90@{h}"
         if col not in val:
             continue
         y = val[col]
@@ -273,6 +283,29 @@ def fig_calibration(val, outdir: Path) -> None:
     ax.set_xlabel("training step"); ax.set_ylabel("coverage")
     ax.set_title("90% quantile-band coverage (target 0.90)")
     ax.legend(loc="best", title="horizon")
+
+    ax = axes[1]
+    drawn = False
+    for name, h, c in series:
+        col = f"sharp90@{h}"
+        if col not in val:
+            continue
+        y = val[col]
+        if not np.isfinite(y).any():
+            continue
+        ax.plot(s, y, color=c, linewidth=1.4, label=name)
+        drawn = True
+    ax.set_xlabel("training step"); ax.set_ylabel("mean band width  [mg/dL]")
+    ax.set_title("90% band sharpness (narrower = better at equal coverage)")
+    if drawn:
+        ax.legend(loc="best", title="horizon")
+    else:
+        ax.text(0.5, 0.5, "sharp90@ unpopulated in this run's validation log",
+                ha="center", va="center", fontsize=9.5, color="#888888",
+                transform=ax.transAxes)
+        print("  · fig07_calibration: sharpness axis empty "
+              "(validation_log.csv carries no sharp90@ value)")
+
     _suptitle(fig, "Uncertainty calibration")
     fig.tight_layout()
     fig.savefig(outdir / "fig07_calibration.png")
@@ -338,12 +371,22 @@ def fig_summary(train, val, outdir: Path) -> None:
     ax.plot(s_v, val["hyper_recall"], color="#c5343c", linewidth=1.3, label="hyper R")
     ax.set_ylim(0.5, 1.0); ax.set_title("Excursion recall"); ax.set_xlabel("step"); ax.legend(loc="best", fontsize=8)
 
+    # Coverage never appears without the width that bought it: the band's mean
+    # mg/dL sharpness rides the twin axis, dashed.
     ax = fig.add_subplot(gs[2, 1])
     if "coverage90@60" in val:
         ax.plot(s_v, val["coverage90@60"], color="#1f4e8c", linewidth=1.3)
     ax.axhline(0.90, color="k", linestyle=":", linewidth=0.9)
     ax.set_ylim(0.0, 1.0)
     ax.set_title("90% coverage @60m (target = 0.90)"); ax.set_xlabel("step"); ax.set_ylabel("coverage")
+    ax_w = ax.twinx()
+    ax_w.grid(False)
+    if "sharp90@60" in val and np.isfinite(val["sharp90@60"]).any():
+        ax_w.plot(s_v, val["sharp90@60"], color="#8a8a8a", linewidth=1.1, linestyle="--")
+        ax_w.set_ylabel("width [mg/dL]", fontsize=8.5, color="#8a8a8a")
+    else:
+        ax_w.set_ylabel("width n/a", fontsize=8.5, color="#bbbbbb")
+        ax_w.set_yticks([])
 
     ax = fig.add_subplot(gs[2, 2])
     g = train["grad_norm"]

@@ -3,7 +3,7 @@ Quantitative backing for the realeval write-up:
 
 Q3 — amplitude of the model's BG predictions vs the real signal, scored on the
      per-PATCH (30-min) ΔBG (the granularity the eval uses). The model is always
-     conditioned — each window announces its true future carbs/insulin.
+     conditioned — each window announces its true future carbs/insulin/exercise.
 
 Q4 — inter-patch variability: the typical 30-min patch-to-patch BG move
      (std of true per-patch ΔBG), pooled and as a per-patient distribution
@@ -28,7 +28,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)                              # curves (local load_model/split_segments)
 torch.set_num_threads(8)
 
-from config import PATCH_SIZE, PREDICTION_PATCHES
+from config import PATCH_SIZE, PREDICTION_PATCHES, CHANNEL_TO_FEAT
 from realdata import load_dataset
 from realdata.features import build_feature_stack, context_window
 from realdata.calibrate import _future_overrides
@@ -52,7 +52,7 @@ def _std(sumsq, s, n):
     return float(np.sqrt(max(sumsq / n - (s / n) ** 2, 0.0)))
 
 
-def run(model, stats, device, segs, announce=(0, 1), pairs_out=None):
+def run(model, stats, device, segs, announce=(0, 1, 2), pairs_out=None):
     """Pooled per-patch ΔBG statistics over ``segs``.
 
     ``pairs_out``, when a list is passed, additionally collects the raw
@@ -60,8 +60,15 @@ def run(model, stats, device, segs, announce=(0, 1), pairs_out=None):
     so the callers that consume only the summary (shift15, augexp) are untouched,
     and out of the JSON, which stays a summary.
     """
+    # Every announceable channel is announced, and that is checked rather than left
+    # to read correctly: an announced set short of ``CHANNEL_TO_FEAT`` leaves the
+    # dropped slot at ``normalize(0)``, which for exercise_equiv is a legal "no
+    # session" value (−0.139 z on the balanced pool), so the amplitude is measured
+    # in a regime training never saw.
+    assert tuple(announce) == tuple(CHANNEL_TO_FEAT), (
+        f"announced set {tuple(announce)} != announceable set {tuple(CHANNEL_TO_FEAT)}")
     # pooled accumulators for per-patch ΔBG (BG amplitude + direction). The model
-    # is always conditioned — each window announces its true future carbs/insulin.
+    # is always conditioned — each window announces its true future carbs/insulin/exercise.
     bg = dict(pp=0.0, pt=0.0, tt=0.0, p=0.0, t=0.0, n=0)
     per_patient_dbg: dict[str, list] = {}
     for seg in segs:

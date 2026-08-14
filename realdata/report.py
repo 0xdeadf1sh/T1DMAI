@@ -5,13 +5,14 @@ actual-vs-predicted figure driver, both parameterized by evaluation mode.
 Two metrics entry points consume this module:
 
   * ``metrics/real/``      — evaluate on the unmodified real records, announcing
-                             each window's LOGGED future carbs/insulin (the
-                             deployment what-if regime).
+                             each window's LOGGED future carbs/insulin and its
+                             (identically zero) exercise column — the deployment
+                             what-if regime.
   * ``metrics/augmented/`` — same, on records whose unlogged meals/boluses have
                              been reconstructed and injected (``augment_fn``),
                              then announced.
 
-Both are CONDITIONAL evaluations (future carbs/insulin given to the model); the
+Both are CONDITIONAL evaluations (the future maskable channels given to the model); the
 only difference is the ``augment_fn`` applied to each Segment after load. The
 rendered README is a public artifact — observed numbers beside published peers,
 no proposed changes.
@@ -126,7 +127,7 @@ def load_model(device, path: str = CKPT):
 def evaluate_all(device, conditional: bool = True, augment_fn=None) -> dict:
     """Evaluate every dataset with the current checkpoint.
 
-    The model is always conditioned (each window's future carbs/insulin are
+    The model is always conditioned (each window's future carbs/insulin/exercise are
     announced); ``conditional`` is a deprecated no-op kept for call-compatibility.
     """
     model, stats, step = load_model(device)
@@ -572,7 +573,10 @@ def _intro(mode: str) -> str:
         " This report evaluates the model in the **announced-event (what-if) regime**: at each "
         "prediction window the patient's future carbohydrate and insulin over the forecast "
         "horizon are given to the model, as they are at deployment when a meal or dose is "
-        "declared. The forecast is conditioned on those announcements.")
+        "declared. The forecast is conditioned on those announcements. The model's fourth "
+        "input, the carbohydrate-equivalent exercise channel, is announced on the same "
+        "footing but is zero throughout: none of these cohorts records exercise on a scale "
+        "the channel is defined in.")
     if mode == 'augmented':
         aug = (
             " The records are additionally **augmented**: meals and boluses that the source "
@@ -608,7 +612,8 @@ forecasters. It reports numbers only and draws no judgement of relative quality.
 - **Inputs.** CGM, carbohydrate, and insulin only — the channels the published
   forecasters also receive. Carbohydrate/insulin events are convolved with the
   simulator's absorption/action kernels. The prediction-horizon carbohydrate and insulin
-  are announced to the model.
+  are announced to the model. The model's exercise input is present but zero on every
+  window: no cohort here records exercise in the channel's units.
 - **Forecast.** The model emits a risk-space quantile fan, inverted to mg/dL. The headline
   level metrics score the truth against the band between τ={METRIC_BAND_TAU_LO:.2f} and
   τ={METRIC_BAND_TAU_HI:.2f} (definition below); the same metrics on the quantile median
@@ -788,6 +793,8 @@ median-line series; the published peers are tabulated above rather than plotted.
 - Numbers are computed on real CGM; the model is simulator-trained and saw no real CGM.
 - The prediction-horizon carbohydrate and insulin are announced to the model; the published
   peers forecast without that announcement, so the input regimes differ.{_augment_caveat(mode)}
+- The exercise input is zero on every window of every cohort here, while the training
+  distribution carries exercise, so this evaluation exercises none of that channel.
 - Point and window-mean RMSE are different aggregations; rows compare only within a basis.
 - The published OhioT1DM peer numbers come from differing test protocols and splits;
   Crossformer/PatchTST are cross-dataset external tests (trained on DCLP3).
@@ -949,9 +956,10 @@ relative quality.{step_line}
   distinct random patient — {meta.get('hours', '?')} h per patient after a
   {meta.get('warmup', '?')} h warmup discard. Calibration and test patients are disjoint
   seed pools.
-- **Inputs.** The announced-event (what-if) regime: each window's future carbohydrate and
-  insulin over the forecast horizon are given to the model, as in the real-data reports.
-  The model consumes only CGM, carbohydrate, and insulin (time-of-day is inferred, not an input).
+- **Inputs.** The announced-event (what-if) regime: each window's future carbohydrate,
+  insulin and exercise over the forecast horizon are given to the model, as in the
+  real-data reports. The model consumes only CGM, carbohydrate, insulin and the
+  carbohydrate-equivalent exercise channel (time-of-day is inferred, not an input).
 - **Forecast.** The model emits a risk-space quantile fan, inverted to mg/dL; the headline
   level metrics score the truth against the τ={METRIC_BAND_TAU_LO:.2f}–τ={METRIC_BAND_TAU_HI:.2f}
   band (definition below), with the same metrics on the quantile median kept alongside in
@@ -1000,7 +1008,7 @@ band-scored and the median-line series.
 
 - In-domain: the model was trained on this simulator, so these numbers are an upper
   reference, not real-data performance — read them beside `metrics/real/`.
-- The prediction-horizon carbohydrate and insulin are announced to the model.
+- The prediction-horizon carbohydrate, insulin and exercise are announced to the model.
 - Per-window counts are capped (test windows shown above).
 - Hypo/hyper recall and precision rest on the event counts noted under the suite table.
 
@@ -1074,7 +1082,7 @@ def _fmt_clock(hour: float | None) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-def _collect(model, stats, name, device, augment_fn, announce=(0, 1)):
+def _collect(model, stats, name, device, augment_fn, announce=(0, 1, 2)):
     """Per-window announced-event BG forecasts (trajectory/parity/clarke source).
 
     The forecast is the model's risk-space median (``median_bg`` for the single
@@ -1147,11 +1155,11 @@ def _collect(model, stats, name, device, augment_fn, announce=(0, 1)):
 
 
 def build_figures(figdir: str, device, conditional: bool = True, augment_fn=None,
-                  announce: tuple[int, ...] = (0, 1)):
+                  announce: tuple[int, ...] = (0, 1, 2)):
     """Write {dataset}_{trajectories,parity,clarke}.png (announced-event median BG
     forecast) into ``figdir``, on the current checkpoint.
 
-    The model is always conditioned (the horizon's carbohydrate/insulin are
+    The model is always conditioned (the horizon's carbohydrate/insulin/exercise are
     announced); ``conditional`` is a deprecated no-op kept for call-compatibility.
 
     The risk-space redesign removed the model's dynamics outputs, so the former

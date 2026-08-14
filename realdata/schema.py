@@ -9,7 +9,15 @@ patient's record carrying the *raw events* the model's input bridge needs:
     carb_grams   grams/step     meal carbohydrate ingested in that 5-min step
     bolus_units  IU/step        discrete bolus insulin delivered in that step
     basal_rate   IU/hour        piecewise-constant basal rate (forward-filled)
-    exercise     intensity      activity proxy (0 where the source has none)
+    exercise     grams/step     carbohydrate-EQUIVALENT glucose disposal from
+                                activity, on the simulator's scale (0 where the
+                                source has none — which is every adapter today)
+
+``exercise`` is the one field carried in the model's own units rather than the
+source's: the input channel is trained on the simulator's g/step carbohydrate-
+equivalent disposal curve, so a source reporting duration, heart rate, or a 0-1
+intensity is converted to that scale before it reaches this field, never after.
+Every adapter currently writes zeros, which is the channel's "no session" value.
 
 Why raw events and not the model's channels?  The model consumes *absorption /
 action curves* (the simulator's gamma carb-absorption and first-order basal +
@@ -61,7 +69,7 @@ class Segment:
     carb_grams: np.ndarray     # (N,) grams ingested in this step
     bolus_units: np.ndarray    # (N,) bolus IU delivered in this step
     basal_rate: np.ndarray     # (N,) basal IU/hour, piecewise-constant
-    exercise: np.ndarray       # (N,) activity proxy (0 if unavailable)
+    exercise: np.ndarray       # (N,) g/step carbohydrate-equivalent glucose disposal (0 if unavailable)
     split: str = ''            # 'training' | 'testing' | '' — canonical-protocol origin
     carb_curve: np.ndarray | None = None      # (N,) g/step appearance, pre-resolved
     insulin_curve: np.ndarray | None = None   # (N,) IU/step action, pre-resolved (basal+bolus)

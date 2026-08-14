@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)                              # curves (local load_model
 torch.set_num_threads(8)
 
 from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
-                    BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
+                    BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, CHANNEL_TO_FEAT,
                     QUANTILE_LEVELS, N_QUANTILES,
                     METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI)
 from realdata import load_dataset
@@ -42,12 +42,26 @@ from figstyle import plt
 
 F.style()
 
+# Every window runs the FORECAST protocol: one masked span of PREDICTION_PATCHES
+# patches ending at the window's last patch, with the whole context visible — the
+# forecast case of the masked-BG objective, not a mode of its own. ``PRED`` is that
+# span in steps. Detection scans the whole span, so the recall reported here pools
+# d = 1..PREDICTION_PATCHES one-sided (``realdata.run_eval.horizon_d_patches`` is
+# the single derivation of d): it is a per-window "does the band cross anywhere"
+# call, not a per-horizon number, and it is never split by span length or by arm.
 PRED = PREDICTION_PATCHES * PATCH_SIZE
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 DATASETS = ('ohiot1dm', 'azt1d', 'shanghai')
 STRIDE = 8 * PATCH_SIZE
 CAP = 60
-ANNOUNCE = (0, 1)
+ANNOUNCE = (0, 1, 2)                       # carb, insulin, exercise
+# Every announceable channel is announced, and that is checked rather than left to
+# read correctly: an announced set short of ``CHANNEL_TO_FEAT`` leaves the dropped
+# slot at ``normalize(0)``, which for exercise_equiv is a legal "no session" value
+# (−0.139 z on the balanced pool), so the recall contrast is measured in a regime
+# training never saw.
+assert ANNOUNCE == tuple(CHANNEL_TO_FEAT), (
+    f"announced set {ANNOUNCE} != announceable set {tuple(CHANNEL_TO_FEAT)}")
 _BAND_LO_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)
 _BAND_HI_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)
 
@@ -140,7 +154,12 @@ def main():
     model, stats, step = load_model(device)
     model = model.to(device); model.eval()
     print(f"[q2] model step={step} device={device}")
-    res = {'_meta': {'step': step}}
+    # The bin the recalls below are taken over, recorded beside them: a right-edge
+    # masked span, scanned whole, so d runs 1..PREDICTION_PATCHES one-sided.
+    res = {'_meta': {'step': step,
+                     'protocol': 'forecast (masked span at the last patch)',
+                     'd_patches_pooled': list(range(1, PREDICTION_PATCHES + 1)),
+                     'one_sided': True}}
     for ds in DATASETS:
         segs = load_dataset(ds)
         _, test = split_segments(segs, ds)

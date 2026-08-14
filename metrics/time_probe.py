@@ -12,7 +12,7 @@ phase the forecast representation actually encodes.
 Training reports the probe on the (in-domain) simulator validation set; this
 script measures the SAME headline metrics on the three real cohorts, where the
 Segment's wall-clock ``t0`` supplies the true origin hour.  Each window is scored
-conditioned (its true future carbs/insulin announced), matching the rest of the
+conditioned (its true future carbs/insulin/exercise announced), matching the rest of the
 real-data eval and the always-conditioned training-validation regime the probe
 metrics are defined on.
 
@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 
 from config import (
     PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_HORIZON_HOURS,
-    TIME_PROBE_ENABLED, TIME_PROBE_N_BINS, TIME_PROBE_BIN_HOURS,
+    TIME_PROBE_ENABLED, TIME_PROBE_N_BINS, TIME_PROBE_BIN_HOURS, CHANNEL_TO_FEAT,
 )
 from realdata import load_dataset
 from realdata.features import build_feature_stack, context_window
@@ -56,11 +56,24 @@ from utils import (
 )
 from clock_face import draw_clock_axis
 
-PRED = PREDICTION_PATCHES * PATCH_SIZE                # steps in one prediction horizon
+# Every window runs the FORECAST protocol: one masked span of PREDICTION_PATCHES
+# patches ending at the window's last patch, with the whole context visible — the
+# forecast case of the masked-BG objective, not a mode of its own. The probe emits
+# one row per MASKED patch, so row j is the patch at d = j + 1 patches from the
+# nearest visible evidence, one-sided; the inter-patch clock advance below is the
+# spacing of those patches, not of a fixed zone. Row 0 is the forecast origin.
+PRED = PREDICTION_PATCHES * PATCH_SIZE                # steps in one masked forecast span
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
-STRIDE = PREDICTION_PATCHES * PATCH_SIZE              # one horizon → adjacent windows are a cross-window pair
+STRIDE = PREDICTION_PATCHES * PATCH_SIZE              # one span → adjacent windows are a cross-window pair
 CAP = 120                                            # windows/patient
-ANNOUNCE = (0, 1)                                     # conditioned: announce carb + insulin
+ANNOUNCE = (0, 1, 2)                                  # conditioned: carb + insulin + exercise
+# Every announceable channel is announced, and that is checked rather than left to
+# read correctly: an announced set short of ``CHANNEL_TO_FEAT`` leaves the dropped
+# slot at ``normalize(0)``, which for exercise_equiv is a legal "no session" value
+# (−0.139 z on the balanced pool), so the probe is scored in a regime training
+# never saw.
+assert ANNOUNCE == tuple(CHANNEL_TO_FEAT), (
+    f"announced set {ANNOUNCE} != announceable set {tuple(CHANNEL_TO_FEAT)}")
 DATASETS = ('ohiot1dm', 'azt1d', 'shanghai')
 ADV = PATCH_SIZE * 5.0 / 60.0                         # inter-patch clock advance (0.5 h)
 FIGDIR = os.path.join(HERE, 'time_figures')
@@ -115,11 +128,13 @@ def collect(model, stats, device, segs) -> Accum:
             ov = _future_overrides(feats, ps, ANNOUNCE)
             out = predict(model, ctx, normalization_stats=stats, device=device,
                           overrides=ov, return_time=True)
-            tp = out.get('time_pred')                    # (P, n_bins) risk-free bin logits
+            # One row per MASKED patch, in mask order — not a fixed trailing zone.
+            tp = out.get('time_pred')                    # (masked patches, n_bins) bin logits
             if tp is None:                               # probe disabled ⇒ nothing to score
                 return acc
             tp = tp.detach().cpu()
-            h0, r0 = time_of_day_decode_bins(tp[0:1, :], TIME_PROBE_N_BINS)   # patch-0 clock
+            # Row 0 is the FIRST masked patch, the forecast origin under this protocol.
+            h0, r0 = time_of_day_decode_bins(tp[0:1, :], TIME_PROBE_N_BINS)
             jump = float(time_inter_patch_jump_hours(
                 tp.unsqueeze(0), TIME_PROBE_N_BINS, ADV).item())
             probs = torch.softmax(tp, dim=-1).numpy()    # (P, n_bins)
@@ -294,6 +309,12 @@ def main() -> None:
         'advance_hours': ADV, 'horizon_hours': PREDICTION_HORIZON_HOURS,
         'stride_patches': PREDICTION_PATCHES, 'cap_per_patient': CAP,
         'chance': CHANCE,
+        # The protocol and the bin, recorded beside the numbers: a right-edge
+        # masked span, scored off its rows, so d runs 1..PREDICTION_PATCHES
+        # one-sided. The scalar clock is read at row 0, d = 1.
+        'protocol': 'forecast (masked span at the last patch)',
+        'd_patches': list(range(1, PREDICTION_PATCHES + 1)),
+        'one_sided': True,
     }}
     accs: dict[str, Accum] = {}
     for ds in DATASETS:
