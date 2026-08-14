@@ -31,11 +31,11 @@ def test_migrated_values_in_sane_ranges():
 
 
 def test_redesign_provenance_and_knobs_migrated():
-    """The risk-v3 redesign advances the provenance stamps; DILATE is restored on
-    the risk-v3 arch — ARCH_VERSION / LOSS_SCHEMA name the architecture and loss,
+    """The risk-v4 redesign advances the provenance stamps; DILATE is restored on
+    the risk-v4 arch — ARCH_VERSION / LOSS_SCHEMA name the architecture and loss,
     RoPE drops to base 1000, and the DILATE knobs replace the retired TILDE-Q ones."""
     import config
-    assert config.ARCH_VERSION == 'risk-v3'
+    assert config.ARCH_VERSION == 'risk-v4'
     assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-v3'
     assert config.ROPE_BASE == 1000
     assert (hasattr(config, 'DILATE_ALPHA') and hasattr(config, 'DILATE_GAMMA')
@@ -46,6 +46,8 @@ def test_redesign_provenance_and_knobs_migrated():
         assert not hasattr(config, gone), \
             f"{gone} must be retired (the static combine is replaced by Kendall-Gal)"
     assert not hasattr(config, 'TILDEQ_ALPHA'), "TILDEQ_ALPHA must be retired"
-    assert config.N_INPUT_FEATURES == 3, "temporal inputs removed -> 3 features"
+    assert config.N_INPUT_FEATURES == 5, \
+        ("temporal inputs removed, exercise_equiv at feat 3, bg_masked at feat 4 "
+         "-> 5 features")
     print(f"[DUMP] redesign provenance | ARCH={config.ARCH_VERSION} "
           f"LOSS={config.LOSS_SCHEMA} ROPE_BASE={config.ROPE_BASE}")

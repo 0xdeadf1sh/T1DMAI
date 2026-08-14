@@ -67,6 +67,50 @@ def test_attention_mask_shape():
         print(f"  {label} {i}: {row}")
 
 
+def test_attention_mask_is_not_memoized():
+    """THE MEMO IS GONE.  The old cache keyed on ``(n_context, n_prediction)`` and
+    handed the identical tensor to every caller at that key — so a mask built for
+    one masked set was returned for another, with no shape error and nothing to
+    notice.  The masked set is now arbitrary and no cheap key identifies it.
+
+    Two witnesses, and the first is the one that matters: two DIFFERENT masked
+    sets at the SAME ``n_ctx`` must produce DIFFERENT masks.  The bit-identity
+    gate cannot catch a returning memo — it runs the one key the memo was built
+    for."""
+    import utils
+    from utils import create_attention_mask, create_attention_mask_from_visible
+
+    n_ctx, T = 8, 12
+
+    def visible(masked_patches):
+        v = torch.ones(1, T, dtype=torch.bool)
+        v[0, list(masked_patches)] = False
+        return v
+
+    # Same n_ctx (8 visible patches), two different masked sets of the same size.
+    a = create_attention_mask_from_visible(visible([2, 3, 8, 9]))
+    b = create_attention_mask_from_visible(visible([4, 5, 10, 11]))
+    assert a.shape == b.shape == (1, T, T)
+    assert not torch.equal(a, b), (
+        "two different masked sets at the same n_ctx produced the SAME mask — "
+        "a memo keyed on (n_context, n_prediction) is back")
+
+    # No module-level cache, and repeated identical calls hand back independent
+    # tensors: a caller that edits one must not poison the next.
+    assert not hasattr(utils, '_ATTENTION_MASK_CACHE'), \
+        "utils._ATTENTION_MASK_CACHE must be deleted — no memo can be correct here"
+    m1 = create_attention_mask(n_ctx, T - n_ctx)
+    m2 = create_attention_mask(n_ctx, T - n_ctx)
+    assert torch.equal(m1, m2), "the same masked set must give the same mask"
+    assert m1.data_ptr() != m2.data_ptr(), \
+        "each call must return a FRESH tensor, not a shared cached one"
+    m1[0, 0] = False
+    assert bool(m2[0, 0]), "editing one returned mask perturbed another"
+    n_diff = int((a != b).sum())
+    print(f"\n[DUMP] mask memo | two masked sets at n_ctx={n_ctx} differ in "
+          f"{n_diff} of {T * T} entries; no cache attribute; fresh tensor per call ✓")
+
+
 # ---------------------------------------------------------------------------
 # Kovatchev risk transform — the ONLY (b)mg/dL <-> (c)risk-space bridge.
 # kovatchev_f imports BG_CLAMP_MIN/MAX from the simulator (the units tripwire);
@@ -107,9 +151,11 @@ def test_kovatchev_constants_against_reference():
 
 
 def test_kovatchev_f_units_tripwire():
-    """kovatchev_f is the CONTROLLED-caller guard: a z-scored value (~[-3,3])
-    trips the hard ``g >= BG_CLAMP_MIN`` assert loudly (the units tripwire).
-    Re-f of an f'd value (output ~[-3,+3]) must likewise trip."""
+    """kovatchev_f is the CONTROLLED-caller guard: a z-scored value trips the hard
+    ``g >= BG_CLAMP_MIN`` assert loudly (the units tripwire).  The guarantee is
+    pool-independent — every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3.
+    Re-f of an f'd value (output in [f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)], which sits
+    wholly below that floor) must likewise trip."""
     from utils import kovatchev_f
 
     bg_min, _ = _sim_clamps()
@@ -118,7 +164,8 @@ def test_kovatchev_f_units_tripwire():
     # A z-space vector (what the tripwire exists to catch) must raise.
     with pytest.raises(AssertionError):
         kovatchev_f(torch.tensor([-2.5, 0.3, 1.7]))
-    # Re-f of an already-risk value (≈[-3.16, +3.16]) must also raise.
+    # Re-f of an already-risk value (in [f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]) must
+    # also raise.
     risk_vals = kovatchev_f(torch.tensor([100.0, 250.0]))
     with pytest.raises(AssertionError):
         kovatchev_f(risk_vals)
@@ -202,7 +249,8 @@ def test_f_once_per_target_batch_is_mgdl():
                             [40.0, 90.0, 140.0, 200.0, 300.0]])
     assert (true_bg >= bg_min - 1e-3).all(), "target must be mg/dL, not f-transformed"
     assert (true_bg <= bg_max + 1e-3).all()
-    # A doubly-f'd target would be ~[-3, 3] and fail the floor — assert the trap.
+    # A doubly-f'd target lands in [f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)], wholly below
+    # the mg/dL floor, and fails it — assert the trap.
     from utils import kovatchev_f
     risk = kovatchev_f(true_bg)
     assert (risk < bg_min).all(), "f-transformed values are NOT in the mg/dL band"
@@ -280,15 +328,17 @@ def test_assemble_quantiles_index_for_index_and_gap():
         f"strict gap violated: min adjacent gap {float(diffs.min()):.3e} "
         f"< {BG_QUANTILE_SPREAD_MIN}")
 
-    # Median assembly depends on the BG_HEAD_MEDIAN_MODE gate.
-    from config import (BG_HEAD_MEDIAN_MODE, BG_HEAD_MEDIAN_GLOBAL_DIM,
-                        BG_HEAD_STEP_BASIS_TYPE)
-    from utils import get_global_median_basis
+    # Median assembly depends on the BG_HEAD_MEDIAN_MODE gate.  Under 'global' the
+    # subspace dimension is per-SPAN — ``global_median_dim(L)``, not the configured
+    # G, which is only the value at L == PREDICTION_PATCHES.  The legacy (B,)
+    # anchor form makes all P slots one span, so L == P here.
+    from config import (BG_HEAD_MEDIAN_MODE, BG_HEAD_STEP_BASIS_TYPE)
+    from utils import get_global_median_basis, global_median_dim
     anchor = kovatchev_f(last_bg).view(B, 1, 1)
     delta = head_raw[..., 0]
     if BG_HEAD_MEDIAN_MODE == 'global':
         n = P * S
-        g = min(BG_HEAD_MEDIAN_GLOBAL_DIM, n)
+        g = min(global_median_dim(P), n)
         Bg = get_global_median_basis(n, g, BG_HEAD_STEP_BASIS_TYPE,
                                      device=delta.device, dtype=delta.dtype)
         dflat = delta.reshape(B, n)
@@ -797,6 +847,112 @@ def test_global_median_basis_orthonormal_and_cached():
     Bg2 = get_global_median_basis(n, G, 'dct')
     assert torch.equal(Bg, Bg2)
     print(f"\n[DUMP] R3 basis | ({n},{G}) orthonormal, col0 DC (val {float(col0[0]):.3f}), cached ✓")
+
+
+def test_global_median_dim_scales_with_span_length():
+    """``G_L = max(1, ceil(G * L / PREDICTION_PATCHES))`` at EVERY ``L`` the
+    sampler can draw, reproducing the configured ``G`` exactly at
+    ``L == PREDICTION_PATCHES``, non-decreasing in ``L``, and always a strict
+    projection (``1 <= G_L < n = L * PATCH_SIZE``).
+
+    ``MASK_SPAN_LENGTHS`` is retuned between runs, so the table of dimensions it
+    produces is computed from the formula rather than written down — a dict keyed
+    on one span ceiling is a ``KeyError`` at the next.
+
+    A FIXED ``G`` is a defect here, not an approximation: at ``L = 1`` it would be
+    ``min(G, PATCH_SIZE)`` columns over ``PATCH_SIZE`` points — the identity — so
+    the L2 contraction that kills the median drift is ABSENT, not weakened, and
+    every fan assert still passes.  This test measures that difference directly."""
+    from config import (BG_HEAD_MEDIAN_GLOBAL_DIM, MASK_SPAN_LENGTHS, PATCH_SIZE,
+                        PREDICTION_PATCHES, BG_HEAD_STEP_BASIS_TYPE)
+    from utils import get_global_median_basis, global_median_dim
+
+    cutoffs = []
+    dims = []
+    for L in MASK_SPAN_LENGTHS:
+        n = L * PATCH_SIZE
+        g = global_median_dim(L)
+        want = max(1, math.ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * L / PREDICTION_PATCHES))
+        assert g == want, f"G_L at L={L} is {g}, expected {want}"
+        assert 1 <= g < n, f"G_L={g} must satisfy 1 <= G_L < n={n} at L={L}"
+        dims.append(g)
+        cutoffs.append(2.0 * n / g)
+    assert dims == sorted(dims), f"G_L must be non-decreasing in L, got {dims}"
+    assert global_median_dim(PREDICTION_PATCHES) == BG_HEAD_MEDIAN_GLOBAL_DIM, \
+        "G_L must reproduce the configured G at L == PREDICTION_PATCHES"
+
+    # The L = 1 contrast: the fixed-G projection is the identity, the scaled one
+    # is not.  ``x - P x`` is exactly zero for the identity.
+    torch.manual_seed(0)
+    n1 = 1 * PATCH_SIZE
+    x = torch.randn(64, n1)
+    fixed = get_global_median_basis(n1, min(BG_HEAD_MEDIAN_GLOBAL_DIM, n1),
+                                    BG_HEAD_STEP_BASIS_TYPE)
+    scaled = get_global_median_basis(n1, global_median_dim(1), BG_HEAD_STEP_BASIS_TYPE)
+    resid_fixed = float((x - (x @ fixed) @ fixed.T).abs().max())
+    resid_scaled = float((x - (x @ scaled) @ scaled.T).abs().max())
+    if BG_HEAD_MEDIAN_GLOBAL_DIM >= n1:
+        assert resid_fixed < 1e-5, (
+            f"a fixed G at L=1 should be the identity to 1e-5, residual {resid_fixed:.2e}")
+    assert resid_scaled > 1e-2, (
+        f"G_1 must actually contract at L=1, residual {resid_scaled:.2e}")
+    print(f"\n[DUMP] G_L | {dims} over "
+          f"L={list(MASK_SPAN_LENGTHS)}; cutoff 2n/G_L = "
+          f"{[round(c, 1) for c in cutoffs]} steps; L=1 identity residual "
+          f"fixed={resid_fixed:.2e} vs scaled={resid_scaled:.2e} ✓")
+
+
+def test_assembled_median_basis_has_rank_g_l_per_span():
+    """PER SPAN, the assembled median lives in a ``G_L``-dimensional subspace.
+
+    Measured through ``assemble_quantiles`` itself, not on the basis alone: for
+    each span length L a batch of random head outputs is assembled, the span's
+    ``median - anchor`` block is stacked ``(B, L*PATCH_SIZE)`` with ``B >> n``, and
+    its numerical rank must be exactly ``G_L``, computed from the formula rather
+    than written down — ``MASK_SPAN_LENGTHS`` is retuned between runs.  A fixed
+    ``G`` reports rank ``BG_HEAD_MEDIAN_GLOBAL_DIM`` at every L — full rank at
+    L = 1, where the projection has silently become the identity."""
+    import config
+    from config import (MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, PATCH_SIZE,
+                        N_SPREADS)
+    from utils import assemble_quantiles, kovatchev_f, global_median_dim
+
+    assert config.BG_HEAD_MEDIAN_MODE == 'global', \
+        "the rank property belongs to the 'global' median mode"
+
+    B, M, S = 96, MAX_MASKED_PATCHES, PATCH_SIZE
+    ranks = {}
+    padded = []
+    for L in MASK_SPAN_LENGTHS:
+        torch.manual_seed(100 + L)
+        head_raw = torch.randn(B, M, S, 1 + 2 * N_SPREADS) * 1.5
+        # One span of L patches starting at patch 3; the surplus slots are padded
+        # and gather patch 0, which can never continue a span.
+        mask_idx = torch.zeros(B, M, dtype=torch.int64)
+        valid = torch.zeros(B, M, dtype=torch.bool)
+        mask_idx[:, :L] = torch.arange(3, 3 + L)
+        valid[:, :L] = True
+        anchor_bg = torch.full((B, M), 120.0)
+
+        _, median = assemble_quantiles(head_raw, anchor_bg, mask_idx, valid)
+        anchor = kovatchev_f(anchor_bg[:, :1]).unsqueeze(-1)          # (B,1,1)
+        block = (median[:, :L] - anchor).reshape(B, L * S)            # (B, n)
+        r = int(torch.linalg.matrix_rank(block.double(), tol=1e-6))
+        ranks[L] = r
+        assert r == global_median_dim(L), (
+            f"span of L={L} assembled a rank-{r} median, expected G_L="
+            f"{global_median_dim(L)} over n={L * S} steps")
+        # Padded slots carry no median of their own: they sit exactly at anchor.
+        # At L == M the span fills every slot and there is no padding to check.
+        if L < M:
+            pad = median[:, L:] - anchor
+            assert float(pad.abs().max()) == 0.0, \
+                "a padded slot's median must be exactly its anchor (no head gradient)"
+            padded.append(L)
+    assert padded, "no L leaves a padded slot: the pad-at-anchor property is untested"
+    print(f"\n[DUMP] per-span rank | L->rank {ranks} == G_L "
+          f"{{{', '.join(f'{L}: {global_median_dim(L)}' for L in MASK_SPAN_LENGTHS)}}}; "
+          f"pad-at-anchor over L={padded} of M={M} ✓")
 
 
 def test_reshape_consistency_with_to_patch_major():

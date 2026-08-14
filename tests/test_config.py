@@ -19,10 +19,12 @@ def test_config_imports():
     # patches); the real invariant is that an integer number of patches tiles
     # each hour, not any specific size.
     assert 60 % (PATCH_SIZE * 5) == 0
-    # Risk-space redesign: 3 input features (bg, carb, insulin) — the 4 temporal
-    # sin/cos features are dropped. No per-channel output set — the BG head emits
-    # the 7 risk-space quantiles.
-    assert N_INPUT_FEATURES == 3
+    # Risk-space redesign: 5 input features
+    # [bg_absolute, carb_intake, insulin_combined, exercise_equiv, bg_masked] —
+    # the 4 temporal sin/cos features are dropped and feat 4 announces the masked
+    # set.  No per-channel output set — the BG head emits the 7 risk-space
+    # quantiles.
+    assert N_INPUT_FEATURES == 5
     assert N_QUANTILES == 7
     assert MAX_SEQ_LEN == MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
     # Prediction patches tile the horizon at (60 / (PATCH_SIZE*5)) patches/hour.
@@ -50,22 +52,79 @@ def test_head_dim_consistency():
 
 
 def test_patch_dim_consistency():
-    """PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES — there are NO mask bits."""
+    """PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES == 30.
+
+    The ``bg_masked`` announcement bit is feat 4 INSIDE the step-major block, not
+    a trailing tier: PATCH_DIM grows by PATCH_SIZE to carry one bit per patch, so
+    the identity above and the ``[:, f::N_INPUT_FEATURES]`` stride idiom both
+    survive.  The retired ``N_MASK_BITS`` tier — a separate trailing width — must
+    stay deleted."""
     import config
     from config import PATCH_DIM, PATCH_SIZE, N_INPUT_FEATURES
     expected = PATCH_SIZE * N_INPUT_FEATURES
     assert PATCH_DIM == expected, f"PATCH_DIM {PATCH_DIM} != {expected}"
-    # The mask-bit tier is deleted: N_MASK_BITS must no longer exist.
+    assert PATCH_DIM == 30, f"expected PATCH_DIM 30 at the active config, got {PATCH_DIM}"
     assert not hasattr(config, 'N_MASK_BITS'), \
-        "config.N_MASK_BITS must be deleted (no per-patch mask bits)"
+        "config.N_MASK_BITS must be deleted (the trailing mask-bit tier is gone)"
+
+
+def test_mask_sampler_constants():
+    """The masked-BG sampler knobs are well formed and mutually consistent.
+
+    The span ceiling and the budget are TUNED between runs — together they set the
+    ``d`` histogram the masked objective is supervised on — so what is asserted
+    here is the shape of the three constants and the constraints that tie them to
+    each other and to the window the picker draws, never one particular tuple.
+    ``MAX_MASKED_PATCHES`` is two things at once: the sampler's cap on ``sum(L)``
+    and ``M``, the head's slot count."""
+    from config import (MASK_MAX_SPANS, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
+                        MIN_CONTEXT_PATCHES, PREDICTION_PATCHES)
+
+    assert isinstance(MASK_SPAN_LENGTHS, tuple) and MASK_SPAN_LENGTHS, \
+        f"MASK_SPAN_LENGTHS must be a non-empty tuple, got {MASK_SPAN_LENGTHS!r}"
+    assert all(isinstance(L, int) and L >= 1 for L in MASK_SPAN_LENGTHS), \
+        f"MASK_SPAN_LENGTHS must hold positive ints, got {MASK_SPAN_LENGTHS}"
+    assert list(MASK_SPAN_LENGTHS) == sorted(set(MASK_SPAN_LENGTHS)), \
+        f"MASK_SPAN_LENGTHS must be strictly ascending, got {MASK_SPAN_LENGTHS}"
+    assert isinstance(MASK_MAX_SPANS, int) and MASK_MAX_SPANS >= 1, \
+        f"MASK_MAX_SPANS must be a positive int, got {MASK_MAX_SPANS!r}"
+    assert isinstance(MAX_MASKED_PATCHES, int), \
+        "MAX_MASKED_PATCHES is M, the head's slot count, so it must be an int, " \
+        f"got {MAX_MASKED_PATCHES!r}"
+    assert MAX_MASKED_PATCHES >= MASK_SPAN_LENGTHS[-1], (
+        f"a single longest span ({MASK_SPAN_LENGTHS[-1]}) must fit the masked-patch "
+        f"budget ({MAX_MASKED_PATCHES}), or the sampler rejects for ever")
+    # The shortest window the picker can draw must hold the largest legal masked
+    # set plus its mandatory separators, or sample_mask_spans raises.
+    shortest_T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
+    assert MAX_MASKED_PATCHES + (MASK_MAX_SPANS - 1) <= shortest_T, (
+        f"{MAX_MASKED_PATCHES} masked patches + {MASK_MAX_SPANS - 1} separators "
+        f"do not fit the shortest window ({shortest_T} patches)")
+    print(f"\n[DUMP] mask knobs | spans<={MASK_MAX_SPANS} lengths={MASK_SPAN_LENGTHS} "
+          f"budget={MAX_MASKED_PATCHES} (== M); shortest window {shortest_T} ✓")
+
+
+def test_channel_count_is_not_the_feature_count():
+    """``len(CHANNEL_NAMES) == 4`` while ``N_INPUT_FEATURES == 5``.
+
+    ``bg_masked`` is a BIT, not a normalized signal: it has no mean, no std and
+    no log1p encoding, so it gets no CHANNEL_NAMES entry.  The two numbers used to
+    be the same and an identity between them is what breaks first."""
+    from config import N_INPUT_FEATURES
+    from normalization import CHANNEL_NAMES, N_CHANNELS
+
+    assert N_CHANNELS == len(CHANNEL_NAMES) == 4, \
+        f"CHANNEL_NAMES must stay at 4 signal channels, got {CHANNEL_NAMES}"
+    assert N_INPUT_FEATURES == N_CHANNELS + 1, \
+        "N_INPUT_FEATURES is the signal channels plus the bg_masked bit"
 
 
 def test_architecture_redesign_constants():
-    """The risk-v3 redesign with DILATE restored: RoPE base 1000, DILATE loss knobs
+    """The risk-v4 redesign with DILATE restored: RoPE base 1000, DILATE loss knobs
     present, the learned Kendall-Gal weighting restored (KENDALL_LOGVAR_INIT), the
     median-curvature (L_smooth) penalty and the static loss weights removed, the
     seam (L_seam) penalty still retired, and the TILDE-Q / risk-input-flag /
-    temporal-slice constants all deleted.  Provenance stamps: risk-v3 / the
+    temporal-slice constants all deleted.  Provenance stamps: risk-v4 / the
     kendall-pinball-dilate loss schema.  The clinical hypo/hyper detectors fire off
     the selectable lower / upper band edges (default τ=0.10 / τ=0.90)."""
     import config
@@ -126,8 +185,8 @@ def test_architecture_redesign_constants():
         "config.BG_INPUT_RISK_SPACE must be deleted (risk-space input is unconditional)"
 
     # Provenance stamps advance with the redesign.
-    assert config.ARCH_VERSION == 'risk-v3', \
-        f"ARCH_VERSION must be 'risk-v3', got {config.ARCH_VERSION!r}"
+    assert config.ARCH_VERSION == 'risk-v4', \
+        f"ARCH_VERSION must be 'risk-v4', got {config.ARCH_VERSION!r}"
     assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-v3', \
         f"LOSS_SCHEMA must be 'kendall-pinball-dilate-v3', got {config.LOSS_SCHEMA!r}"
     print(f"\n[DUMP] redesign | ROPE_BASE={config.ROPE_BASE} "

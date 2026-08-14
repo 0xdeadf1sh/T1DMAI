@@ -51,24 +51,20 @@ def _onehot_logits(bins: torch.Tensor, n_bins: int, hot: float = 20.0) -> torch.
     return torch.nn.functional.one_hot(bins, n_bins).to(torch.float32) * hot
 
 
-def _forward_inputs(B: int = 2) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
-    """CPU ``(patches, attn_mask, last_bg)`` mirroring tests/test_model.py.
+def _forward_inputs(B: int = 2):
+    """CPU ``(patches, attn_mask, anchor_bg, mask_idx)`` mirroring tests/test_model.py.
 
     Args:
         B: batch size.
 
     Returns:
-        patches: ``(B, T, PATCH_DIM)`` random inputs, ``T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES``.
-        attn_mask: ``(T, T)`` all-True bool mask.
-        last_bg: ``(B,)`` mg/dL anchor inside the physical band.
+        The four-tensor forward contract for a right-edge forecast span:
+        ``T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES`` and
+        ``M = PREDICTION_PATCHES``, so the probe emits one row per horizon patch.
     """
-    from config import MIN_CONTEXT_PATCHES, PREDICTION_PATCHES, PATCH_DIM
+    from tests.forward_inputs import right_edge_inputs
 
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    attn_mask = torch.ones(T, T, dtype=torch.bool)
-    last_bg = torch.full((B,), 120.0)
-    return patches, attn_mask, last_bg
+    return right_edge_inputs(B, all_true_mask=True)
 
 
 # ============================================================================
@@ -262,9 +258,9 @@ def test_model_forward_bin_logits_shape_and_disable(monkeypatch):
     B = 2
     torch.manual_seed(0)
     m_with = model_mod.T1DMAI().eval()
-    patches, attn_mask, last_bg = _forward_inputs(B)
+    patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B)
     with torch.no_grad():
-        q1, med1, time_pred = m_with(patches, attn_mask, last_bg, return_time=True)
+        q1, med1, time_pred = m_with(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
 
     assert time_pred is not None, "enabled probe must return per-patch logits"
     expected = (B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)
@@ -275,7 +271,7 @@ def test_model_forward_bin_logits_shape_and_disable(monkeypatch):
     m_without = model_mod.T1DMAI().eval()
     assert m_without.time_head is None, "disabled probe must not build time_head"
     with torch.no_grad():
-        q0, med0, tp0 = m_without(patches, attn_mask, last_bg, return_time=True)
+        q0, med0, tp0 = m_without(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
 
     assert tp0 is None, "disabled probe must yield time_pred=None"
     max_q = float((q0 - q1).abs().max())

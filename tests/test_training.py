@@ -79,8 +79,10 @@ def test_pinball_gradients():
 
 def test_soft_dtw_grads_and_gamma_sweep():
     """SoftDTWBatch is differentiable and finite across a γ sweep (including the
-    O(1) DILATE_GAMMA), even at the worst-case risk pair f≈-3.16 vs +3.16 over a
-    full 24-step horizon. The value is bounded below by 0 (squared cost)."""
+    O(1) DILATE_GAMMA), even at the worst-case risk pair f(BG_CLAMP_MIN) vs
+    f(BG_CLAMP_MAX) over a full 24-step horizon. That pair is derived through the
+    risk transform rather than written as a numeral, so it follows the clamp; the
+    band is asymmetric. The value is bounded below by 0 (squared cost)."""
     from dilate import SoftDTWBatch, _pairwise_sq_cost
     from config import DILATE_GAMMA
 
@@ -98,15 +100,25 @@ def test_soft_dtw_grads_and_gamma_sweep():
         assert torch.isfinite(g).all(), f"sDTW grad non-finite at γ={gamma}"
         x.grad = None
 
-    # Worst-case risk extremes: f(BG_CLAMP_MIN)≈-3.162 vs f(BG_CLAMP_MAX)≈+3.162.
-    xa = torch.full((1, H), -3.162, requires_grad=True)
-    ya = torch.full((1, H), 3.162)
+    # Worst-case risk extremes: the physical clamp carried through f, so the pair
+    # follows BG_CLAMP_MIN/MAX instead of a pinned numeral. The widest cell cost
+    # is (f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))^2.
+    from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
+    from utils import kovatchev_f
+    r_lo, r_hi = kovatchev_f(
+        torch.tensor([float(BG_CLAMP_MIN), float(BG_CLAMP_MAX)])).tolist()
+    xa = torch.full((1, H), r_lo, requires_grad=True)
+    ya = torch.full((1, H), r_hi)
     cost = _pairwise_sq_cost(xa, ya)
+    assert torch.isfinite(cost).all(), "cell cost must stay finite at the risk extremes"
     val = SoftDTWBatch.apply(cost, float(DILATE_GAMMA))
     assert torch.isfinite(val).all(), "sDTW must stay finite at the risk extremes"
     (gx,) = torch.autograd.grad(val.sum(), xa)
     assert torch.isfinite(gx).all()
-    print(f"\n[DUMP] soft_dtw | finite over γ-sweep + worst-case risk pair ✓")
+    print(f"\n[DUMP] soft_dtw | finite over γ-sweep + worst-case risk pair "
+          f"f({BG_CLAMP_MIN:g})={r_lo:.4f} f({BG_CLAMP_MAX:g})={r_hi:.4f} "
+          f"cell={float(cost.detach().max()):.4f} sDTW={float(val.detach().max()):.2f} "
+          f"max|g|={float(gx.abs().max()):.2f} ✓")
 
 
 def test_dilate_divergence_zero_at_match():
@@ -392,20 +404,17 @@ def test_resume_data_alignment():
 def test_checkpoint_save_load():
     """Model can be saved and loaded producing identical (q_tau, median)."""
     from model import T1DMAI
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
+    from tests.forward_inputs import right_edge_inputs
     import os
 
     model = T1DMAI()
     model.eval()
 
     B = 1
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    mask = torch.ones(T, T, dtype=torch.bool)
-    last_bg = torch.full((B,), 120.0)
+    patches, mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=0)
 
     with torch.no_grad():
-        q1, m1 = model(patches, mask, last_bg)
+        q1, m1 = model(patches, mask, anchor_bg, mask_idx)
 
     path = '/tmp/test_checkpoint_t1dmai.pt'
     torch.save({'model_state_dict': model.state_dict()}, path)
@@ -416,7 +425,7 @@ def test_checkpoint_save_load():
     model2.eval()
 
     with torch.no_grad():
-        q2, m2 = model2(patches, mask, last_bg)
+        q2, m2 = model2(patches, mask, anchor_bg, mask_idx)
 
     assert torch.allclose(q1, q2, atol=1e-6), "Loaded model produces different q_tau"
     assert torch.allclose(m1, m2, atol=1e-6), "Loaded model produces different median"
@@ -429,19 +438,16 @@ def test_muon_optimizer_step():
     """Muon and AdamW optimizers update their respective parameters."""
     from model import T1DMAI
     from muon import Muon
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
+    from tests.forward_inputs import right_edge_inputs
 
     model = T1DMAI()
 
     initial_params = {name: p.clone() for name, p in model.named_parameters()}
 
     B = 1
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    mask = torch.ones(T, T, dtype=torch.bool)
-    last_bg = torch.full((B,), 120.0)
+    patches, mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=1)
 
-    q_tau, median = model(patches, mask, last_bg)
+    q_tau, median = model(patches, mask, anchor_bg, mask_idx)
     loss = q_tau.sum() + median.sum()
     loss.backward()
 
@@ -610,3 +616,120 @@ def test_weight_decay_schedule_correction():
     assert corrected_group['weight_decay'] == MUON_WEIGHT_DECAY
     print(f"[DUMP] wd_correction | wd_correction=False restores corrected_wd="
           f"{corrected_group['weight_decay']:.6e} == baseline {MUON_WEIGHT_DECAY:.6e} ✓")
+
+
+# ===========================================================================
+# CSV log schemas — the header and the row writer come from ONE list.
+# ===========================================================================
+
+def test_csv_header_and_row_same_length():
+    """Header and row writer stay element-for-element aligned.
+
+    They used to be two mirrored literals per log, 136 columns each for the
+    validation log; a metric added to one alone shifted every column after it
+    with no error to catch it. Both now come from one ``(name, decimals)`` spec,
+    so the length equality is what checks that the extraction still holds.
+
+    The checkpoint's ``val_record`` is a THIRD surface and is deliberately NOT
+    compared here: it carries keys no CSV column has and misses columns the CSV
+    writes, so an equality assert against it fails on the first run.
+    """
+    import csv
+    import io
+
+    from train import _train_log_columns, _val_log_columns, _csv_row
+
+    for name, columns in (('train', _train_log_columns()),
+                          ('val', _val_log_columns())):
+        header = [c for c, _ in columns]
+        row = _csv_row(columns, {})
+        assert len(header) == len(row), (
+            f"{name} log: header has {len(header)} columns, the row writer "
+            f"emits {len(row)}"
+        )
+        assert len(set(header)) == len(header), (
+            f"{name} log: duplicate column names "
+            f"{sorted({c for c in header if header.count(c) > 1})}"
+        )
+
+        # Through the writer the loop actually uses, so a widening that only
+        # appears once the row is serialised is caught as well as one in the list.
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(header)
+        w.writerow(row)
+        parsed = list(csv.reader(io.StringIO(buf.getvalue())))
+        assert len(parsed[0]) == len(parsed[1]), (
+            f"{name} log: written header has {len(parsed[0])} cells, the "
+            f"written row has {len(parsed[1])}"
+        )
+        print(f"[DUMP] csv schema | {name}: {len(header)} columns, header == row ✓")
+
+
+def test_val_log_has_no_dead_alias():
+    """``val_pinball`` is gone rather than duplicating ``val_loss_Q``.
+
+    ``risk_total_loss`` emits no ``pinball`` component, so the column fell
+    through to ``loss_Q`` and the two were bit-identical on every row ever
+    written. The pinball term IS ``loss_Q``; two names for it read as two
+    measurements.
+    """
+    from train import _val_log_columns
+
+    names = [c for c, _ in _val_log_columns()]
+    assert 'val_loss_Q' in names
+    assert 'val_pinball' not in names, "val_pinball is a dead alias of val_loss_Q"
+    print("[DUMP] csv schema | val_pinball absent, val_loss_Q present ✓")
+
+
+def test_val_log_bins_masked_bg_on_d():
+    """Every masked-BG family is reported per ``d``, and none is pooled.
+
+    ``d`` is the distance in patches to the nearest visible evidence on either
+    side. Uniform mask placement puts 98.06% of supervision at ``d <= 2``, so a
+    pooled masked-BG scalar falls without the model improving and must not exist
+    to be selected on. The forecast protocol's per-patch end-horizons ARE
+    ``d = 1..PREDICTION_PATCHES`` one-sided; infill carries its own namespace and
+    its linear-interpolation baseline.
+
+    Both axes and the infill column names come from ``metrics.protocols``, so
+    this test reads them from there too — a local range here would be the second
+    copy the log surface was rebuilt to remove.
+    """
+    from config import PREDICTION_PATCHES
+    from metrics.protocols import FORECAST, INFILL, column, reachable_d
+    from train import _val_log_columns, _excursion_bucket_horizons
+
+    names = [c for c, _ in _val_log_columns()]
+    eh = _excursion_bucket_horizons(PREDICTION_PATCHES)
+    fc_d = reachable_d(FORECAST)
+    inf_d = reachable_d(INFILL)
+
+    # The forecast horizons and its d bins are the same axis, one for one.
+    assert len(eh) == len(fc_d) == PREDICTION_PATCHES
+
+    for h in eh:
+        for fam in ('crps', 'winkler90', 'sharp90', 'sharp50', 'joint_cov90'):
+            assert f'{fam}@{h}' in names, f"missing {fam}@{h}"
+    for d in inf_d:
+        for fam in ('crps_n', 'rmse', 'rmse_interp', 'crps', 'winkler90',
+                    'marginal90_cov', 'marginal90_width_mean'):
+            col = column(INFILL, fam, d)
+            assert col in names, f"missing {col}"
+
+    # Sharpness sits beside coverage everywhere coverage is reported.
+    for col in [c for c in names if c.startswith('coverage90@')]:
+        assert col.replace('coverage90@', 'sharp90@') in names, (
+            f"{col} has no sharpness companion")
+
+    # No pooled masked-BG scalar: one of these family names carrying no axis
+    # suffix would be exactly that. metrics.protocols.column refuses to build an
+    # infill name without a d; this checks none reached the list another way.
+    for fam in ('crps', 'winkler90'):
+        assert fam not in names, f"{fam} is pooled over d"
+    for name in names:
+        if name.startswith(INFILL.prefix):
+            assert '@d' in name, f"{name} is an infill column with no d"
+
+    print(f"[DUMP] csv schema | forecast d axis {eh} (one-sided d=1..{len(fc_d)}), "
+          f"infill d axis {list(inf_d)}, no pooled masked-BG column ✓")

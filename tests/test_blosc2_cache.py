@@ -10,8 +10,14 @@ Builds tiny caches end-to-end and asserts:
 
 * The on-disk layout matches the documented format — one ``.b2nd`` per channel,
   ``icr.npy``, ``meta.json`` with the eight loader-required fields, and the
-  builder-emitted ``normalization_stats.json`` (the 3-channel {mean, std}
-  contract the model consumes).
+  builder-emitted ``normalization_stats.json``.  That file carries THREE
+  {mean, std} entries — bg / carb / insulin — while the model consumes FOUR
+  input channels; ``exercise_equiv`` is a hand merge onto the pool's own file
+  that a rebuild loses.  The three-key emission is pinned here as the external
+  builder's live contract, and the fact that it is refused by the four-CHANNEL
+  input pipeline is pinned beside it.  Four is the count of NORMALIZED channels;
+  the model's input stack is five features wide, the fifth being the bg_masked
+  bit, which carries no statistics.
 * ``T1DMDataset(cache_path=...)`` opens the cache and returns samples whose
   shapes / dtypes / value ranges match the spec.
 * Re-building the **same** pool with a different ``rows_per_chunk`` value
@@ -48,6 +54,7 @@ import config as _cfg
 import data as _data
 from config import (
     MAX_CONTEXT_PATCHES,
+    MAX_MASKED_PATCHES,
     MIN_CONTEXT_PATCHES,
     PATCH_DIM,
     PATCH_SIZE,
@@ -78,8 +85,13 @@ _REQUIRED_META_KEYS = (
     'pool_size', 'n_timesteps', 'sim_hours', 'simulator_warmup_hours',
     'patient_uniform_sample_prob', 'dt_minutes', 'channels', 'cache_format',
 )
-# The 3-channel {mean, std} contract in the builder-emitted normalization_stats.json.
-_NORM_STATS_KEYS = frozenset({'bg_absolute', 'carb_intake', 'insulin_combined'})
+# The 3-channel {mean, std} contract in the builder-emitted
+# normalization_stats.json.  DELIBERATE: the external T1DMSIM builder writes
+# exactly these three, and the model's fourth input channel (``exercise_equiv``)
+# is merged onto the real pools' files by hand.  Pinned so a builder change that
+# starts (or stops) emitting the fourth key is visible here rather than in a
+# training run.
+_BUILDER_NORM_STATS_KEYS = frozenset({'bg_absolute', 'carb_intake', 'insulin_combined'})
 
 
 def _build_tiny_cache(out_dir: str, rows_per_chunk: int = DEFAULT_ROWS_PER_CHUNK) -> None:
@@ -111,9 +123,27 @@ def blosc2_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 
 def _cache_stats(cache_dir: str) -> dict:
-    """Load the cache's own emitted normalization_stats.json (3-channel contract)."""
+    """Load the cache's own emitted normalization_stats.json (3-channel contract).
+
+    This is the builder's file verbatim, so it is SHORT of the model's fourth
+    input channel.  Feeding it to ``T1DMDataset`` raises — see
+    ``test_builder_three_key_stats_are_refused_by_the_loader``.  Use
+    ``_model_stats`` for anything that assembles a sample.
+    """
     with open(os.path.join(cache_dir, 'normalization_stats.json')) as f:
         return json.load(f)
+
+
+def _model_stats(cache_dir: str) -> dict:
+    """Fit the full N_CHANNELS-channel statistics off the cache itself.
+
+    The builder's emitted file covers three of the four normalized channels, so every
+    test that actually builds a sample refits from the pool — on a 4-patient
+    cache that is milliseconds, and it keeps the fixture honest about which
+    channels the input pipeline requires.
+    """
+    from normalization import compute_normalization_stats_from_cache
+    return compute_normalization_stats_from_cache(cache_dir)
 
 
 def _transcode_to_npy_memmap(blosc2_dir: str, npy_dir: str) -> None:
@@ -172,13 +202,21 @@ def test_cache_layout(blosc2_cache: str) -> None:
     assert meta['patient_uniform_sample_prob'] == _TINY_UNIFORM_PROB
     assert tuple(meta['channels']) == CHANNEL_NAMES
 
-    # normalization_stats.json: exactly the 3-channel {mean, std} contract.
+    # normalization_stats.json: exactly the 3-channel {mean, std} contract the
+    # external builder emits — one key short of the model's input stack.
+    from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
     stats = _cache_stats(out_dir)
-    assert set(stats) == _NORM_STATS_KEYS, f"norm stats keys = {set(stats)}"
+    assert set(stats) == _BUILDER_NORM_STATS_KEYS, f"norm stats keys = {set(stats)}"
     for name, mv in stats.items():
         assert set(mv) == {'mean', 'std'}, f"{name} stats = {mv}"
         assert np.isfinite(mv['mean']) and np.isfinite(mv['std']) and mv['std'] > 0
-    print(f"[DUMP] cache_layout | norm stats = {stats}")
+    # The gap is exactly the hand-merged exercise channel; if the builder ever
+    # emits it, this is where the hand merge stops being needed.
+    assert set(NORM_CHANNEL_NAMES) - set(stats) == {'exercise_equiv'}, (
+        f"builder-emitted stats {sorted(stats)} vs model channels "
+        f"{sorted(NORM_CHANNEL_NAMES)}: the gap must be exactly exercise_equiv")
+    print(f"[DUMP] cache_layout | norm stats = {stats} (builder: 3 keys; model "
+          f"needs {len(NORM_CHANNEL_NAMES)}, exercise_equiv hand-merged)")
 
 
 def test_cache_compression_shrinks_disk(blosc2_cache: str) -> None:
@@ -215,7 +253,7 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
     from data import T1DMDataset
 
     out_dir = blosc2_cache
-    stats = _cache_stats(out_dir)
+    stats = _model_stats(out_dir)
     dataset = T1DMDataset(
         master_seed=0,
         total_steps=2,
@@ -236,7 +274,9 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
 
         assert MIN_CONTEXT_PATCHES <= n_ctx <= MAX_CONTEXT_PATCHES
         assert patches.shape == (n_ctx + PREDICTION_PATCHES, PATCH_DIM)
-        assert targets.shape == (PREDICTION_PATCHES, PATCH_SIZE)
+        # One target row per HEAD SLOT (M = MAX_MASKED_PATCHES), not per horizon
+        # patch: padded slots gather patch 0 and ``valid`` discards them.
+        assert targets.shape == (MAX_MASKED_PATCHES, PATCH_SIZE)
         assert patches.dtype == torch.float32 and targets.dtype == torch.float32
         assert torch.isfinite(patches).all(), f"non-finite patches at {i}"
         assert torch.isfinite(targets).all(), f"non-finite targets at {i}"
@@ -254,6 +294,35 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
     print(f"\n[DUMP] cache_read | sample0 keys={sorted(s0.keys())} "
           f"patches={tuple(s0['patches'].shape)} targets={tuple(s0['targets'].shape)} "
           f"n_ctx={s0['n_context_patches']} last_bg={s0['bg_formula_data']['last_bg']:.1f}")
+
+
+def test_builder_three_key_stats_are_refused_by_the_loader(blosc2_cache: str) -> None:
+    """The builder's own three-key stats file must FAIL against the four-CHANNEL
+    normalization rather than quietly leaving a channel untrained.
+
+    The builder emits bg / carb / insulin; the input gather walks the model's
+    ``CHANNEL_NAMES`` and indexes ``stats[name]``, so the missing entry has to
+    surface as a ``KeyError``.  A ``.get(name, {'mean': 0, 'std': 1})`` fallback
+    anywhere on this path would turn a missing fit into an untrained channel that
+    trains to completion — this is the pin that stops one being added.
+    """
+    from data import T1DMDataset
+
+    stats = _cache_stats(blosc2_cache)          # builder file, verbatim
+    assert 'exercise_equiv' not in stats
+    dataset = T1DMDataset(
+        master_seed=0,
+        total_steps=1,
+        batch_size=1,
+        normalization_stats=stats,
+        patient_uniform_sample_prob=_TINY_UNIFORM_PROB,
+        simulator_warmup_hours=_TINY_WARMUP_HOURS,
+        cache_path=blosc2_cache,
+    )
+    with pytest.raises(KeyError, match='exercise_equiv'):
+        dataset[0]
+    print("\n[DUMP] three_key_stats | builder file raises KeyError('exercise_equiv') "
+          "at the input gather — no silent-default fallback ✓")
 
 
 def test_rows_per_chunk_does_not_perturb_values(tmp_path: pathlib.Path) -> None:
@@ -301,7 +370,7 @@ def test_missing_required_meta_key_is_rejected(
     with open(os.path.join(bad_dir, 'meta.json'), 'w') as f:
         json.dump(meta, f)
 
-    stats = _cache_stats(blosc2_cache)
+    stats = _model_stats(blosc2_cache)
     with pytest.raises(ValueError, match='missing keys'):
         T1DMDataset(
             master_seed=0, total_steps=1, batch_size=1,
@@ -326,7 +395,7 @@ def test_unsupported_cache_format_is_rejected(
     with open(os.path.join(bad_dir, 'meta.json'), 'w') as f:
         json.dump(meta, f)
 
-    stats = _cache_stats(blosc2_cache)
+    stats = _model_stats(blosc2_cache)
     with pytest.raises(ValueError, match='not supported'):
         T1DMDataset(
             master_seed=0, total_steps=1, batch_size=1,
@@ -359,7 +428,7 @@ def test_npy_memmap_cache_reads_back_identically(
     with open(os.path.join(npy_dir, 'meta.json')) as f:
         assert json.load(f)['cache_format'] == CACHE_FORMAT_NPY
 
-    stats = _cache_stats(blosc2_dir)
+    stats = _model_stats(blosc2_dir)
     kwargs = dict(
         master_seed=0,
         total_steps=2,
@@ -423,13 +492,17 @@ def _oracle_cache_stats(cache_dir: str, n_rows: int | None = None) -> dict:
     """Independent per-channel stats over a (tiny) blosc2 cache — NO smoothing.
 
     A deliberately naive oracle for cross-checking the streaming Welford
-    accumulation in ``compute_normalization_stats_from_cache``: read the three
+    accumulation in ``compute_normalization_stats_from_cache``: read all four
     input signals in full and apply the SAME forward transform the model fit
     uses — Kovatchev ``f`` on bg (``utils.kovatchev_f_np``, which clamps to the
-    physical range), ``log1p(max(x, 0))`` on the sparse carb/insulin channels —
-    directly on the RAW post-noise values (causal smoothing was removed
-    project-wide), then take a plain ``np.mean`` / sample ``np.std(ddof=1)`` over
-    the flattened values.
+    physical range), ``log1p(max(x, 0))`` on the sparse carb / insulin /
+    exercise channels — directly on the RAW post-noise values (causal smoothing
+    was removed project-wide), then take a plain ``np.mean`` / sample
+    ``np.std(ddof=1)`` over the flattened values.
+
+    ``total_exercise`` is read at its cached g/step carbohydrate-equivalent
+    scale.  It is not a glucose, so it takes carb's log1p branch and never the
+    risk transform.
     """
     import blosc2
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
@@ -440,14 +513,20 @@ def _oracle_cache_stats(cache_dir: str, n_rows: int | None = None) -> dict:
         full = np.asarray(arr[:], dtype=np.float64)
         return full if n_rows is None else full[:n_rows]
 
-    src = {
-        'bg_absolute': _read('bg_observed'),
-        'carb_intake': _read('total_carb'),
-        'insulin_combined': _read('total_insulin'),
+    # model channel -> cached channel it is fit from.
+    _SOURCE_CHANNEL = {
+        'bg_absolute': 'bg_observed',
+        'carb_intake': 'total_carb',
+        'insulin_combined': 'total_insulin',
+        'exercise_equiv': 'total_exercise',
     }
+    assert set(_SOURCE_CHANNEL) == set(NORM_CHANNEL_NAMES), (
+        f"oracle covers {sorted(_SOURCE_CHANNEL)} but the model fits "
+        f"{sorted(NORM_CHANNEL_NAMES)} — an uncovered channel silently drops out")
+
     out = {}
     for name in NORM_CHANNEL_NAMES:
-        raw = src[name]
+        raw = _read(_SOURCE_CHANNEL[name])
         if name == 'bg_absolute':
             vals = kovatchev_f_np(raw).ravel()
         else:
@@ -461,7 +540,8 @@ def test_normalization_stats_from_cache(
 ) -> None:
     """``compute_normalization_stats_from_cache`` matches a no-smoothing oracle,
     is format-agnostic (blosc2 == npy-memmap), honors ``sample_rows``, and
-    reproduces the builder's own emitted ``normalization_stats.json``."""
+    reproduces the builder's own emitted ``normalization_stats.json`` on the
+    three channels that file carries."""
     from normalization import (
         CHANNEL_NAMES as NORM_CHANNEL_NAMES,
         compute_normalization_stats_from_cache,
@@ -490,13 +570,21 @@ def test_normalization_stats_from_cache(
     for name in NORM_CHANNEL_NAMES:
         assert got_2[name]['mean'] == pytest.approx(oracle_2[name]['mean'], rel=1e-6, abs=1e-6), name
 
-    # (4) The builder emitted the same 3-channel stats it fits during transcode
-    #     (both are no-smoothing + identical forward transform + [40, 400]
-    #     Kovatchev constants), so they agree with the recomputed stats.
+    # (4) The builder emitted the same stats it fits during transcode (both are
+    #     no-smoothing + the identical forward transform + the same Kovatchev
+    #     constants), so they agree with the recomputed ones — over the three
+    #     channels the builder writes.  The fourth, exercise_equiv, is fit here
+    #     but never emitted: a rebuilt pool loses the hand merge.
     emitted = _cache_stats(blosc2_dir)
-    for name in NORM_CHANNEL_NAMES:
+    assert set(emitted) == _BUILDER_NORM_STATS_KEYS
+    for name in sorted(_BUILDER_NORM_STATS_KEYS):
         assert emitted[name]['mean'] == pytest.approx(got[name]['mean'], rel=1e-6, abs=1e-6), name
         assert emitted[name]['std'] == pytest.approx(got[name]['std'], rel=1e-6, abs=1e-6), name
+    assert 'exercise_equiv' in got and got['exercise_equiv']['std'] > 0, (
+        "the cache fitter must produce exercise_equiv even though the builder "
+        "does not emit it")
 
     print(f"\n[DUMP] norm_from_cache | oracle match + npy==blosc2 + sample_rows "
-          f"honored + emitted==recomputed across {len(NORM_CHANNEL_NAMES)} channels")
+          f"honored across {len(NORM_CHANNEL_NAMES)} channels; "
+          f"emitted==recomputed over the builder's {len(_BUILDER_NORM_STATS_KEYS)} "
+          f"(exercise_equiv fit but not emitted)")

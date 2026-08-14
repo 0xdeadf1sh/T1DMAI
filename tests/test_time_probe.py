@@ -25,9 +25,13 @@ The bin helpers themselves (``time_of_day_bin_target`` / ``time_of_day_decode_bi
 ``time_cross_window_consistency_loss`` / ``time_cross_window_jump_hours``) are
 covered in ``tests/test_time_probe_bins.py``.
 
-The forward-input construction (patch shape ``(B, T, PATCH_DIM)``, the boolean
-``attn_mask``, and the ``_last_bg`` helper) mirrors ``tests/test_model.py`` so the
-model tests run on CPU with the same harness.
+The forward inputs come from ``tests.forward_inputs.right_edge_inputs`` — the
+four-tensor contract ``(patches, attn_mask, anchor_bg, mask_idx)`` — so the probe
+tests exercise the same masked-set harness as the model tests.  The probe reads
+one hidden state per HEAD SLOT, so its logits are ``(B, M, TIME_PROBE_N_BINS)``
+and slot ``j`` is patch ``mask_idx[:, j]``: a right-edge span makes ``M ==
+PREDICTION_PATCHES`` and slot ``j`` the patch at ``pred_start + j``, which is the
+only case in which the old ``pred_start_hour + 0.5*j`` target is correct.
 """
 
 import math
@@ -36,29 +40,21 @@ import pytest
 import torch
 
 import config
-from config import MIN_CONTEXT_PATCHES, PREDICTION_PATCHES, PATCH_DIM
+from config import PREDICTION_PATCHES
+from tests.forward_inputs import right_edge_inputs
 
 
-def _last_bg(B: int) -> torch.Tensor:
-    """A valid ``(B,)`` mg/dL anchor inside the physical band (mirrors test_model.py)."""
-    return torch.full((B,), 120.0)
-
-
-def _forward_inputs(B: int = 2) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CPU ``(patches, attn_mask, last_bg)`` built exactly as tests/test_model.py does.
+def _forward_inputs(B: int = 2):
+    """CPU ``(patches, attn_mask, anchor_bg, mask_idx)`` for a right-edge forecast.
 
     Args:
         B: batch size.
 
     Returns:
-        patches: ``(B, T, PATCH_DIM)`` random inputs, ``T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES``.
-        attn_mask: ``(T, T)`` all-True bool mask.
-        last_bg: ``(B,)`` mg/dL anchor.
+        The four forward tensors, with ``T = MIN_CONTEXT_PATCHES +
+        PREDICTION_PATCHES`` and ``M = PREDICTION_PATCHES`` (every slot valid).
     """
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    attn_mask = torch.ones(T, T, dtype=torch.bool)
-    return patches, attn_mask, _last_bg(B)
+    return right_edge_inputs(B, all_true_mask=True)
 
 
 # ============================================================================
@@ -146,11 +142,11 @@ def test_forward_return_time_arity():
     torch.manual_seed(0)
     B = 2
     model = T1DMAI().eval()
-    patches, attn_mask, last_bg = _forward_inputs(B)
+    patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B)
 
     with torch.no_grad():
-        out2 = model(patches, attn_mask, last_bg)
-        out3 = model(patches, attn_mask, last_bg, return_time=True)
+        out2 = model(patches, attn_mask, anchor_bg, mask_idx)
+        out3 = model(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
 
     assert len(out2) == 2, f"return_time=False must give a 2-tuple, got len {len(out2)}"
     assert len(out3) == 3, f"return_time=True must give a 3-tuple, got len {len(out3)}"
@@ -176,11 +172,11 @@ def test_probe_does_not_perturb_forecast():
     model = T1DMAI().eval()
     # Build the inputs ONCE and feed the identical tensors to both calls; the
     # forward draws no RNG, so any difference would come solely from the probe.
-    patches, attn_mask, last_bg = _forward_inputs(B=2)
+    patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B=2)
 
     with torch.no_grad():
-        q0, m0 = model(patches, attn_mask, last_bg)
-        q1, m1, _ = model(patches, attn_mask, last_bg, return_time=True)
+        q0, m0 = model(patches, attn_mask, anchor_bg, mask_idx)
+        q1, m1, _ = model(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
 
     max_q = float((q0 - q1).abs().max())
     max_m = float((m0 - m1).abs().max())
@@ -201,9 +197,9 @@ def test_detach_isolates_trunk():
 
     torch.manual_seed(0)
     model = T1DMAI()
-    patches, attn_mask, last_bg = _forward_inputs(B=2)
+    patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B=2)
 
-    _, _, time_pred = model(patches, attn_mask, last_bg, return_time=True)
+    _, _, time_pred = model(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
     assert time_pred is not None, "enabled probe must return a time_pred"
     # Probe-only objective (MSE to a fixed non-trivial target).
     target = torch.ones_like(time_pred)
@@ -237,9 +233,9 @@ def test_undetached_probe_shapes_trunk():
 
     torch.manual_seed(0)
     model = T1DMAI()
-    patches, attn_mask, last_bg = _forward_inputs(B=2)
+    patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B=2)
 
-    _, _, time_pred = model(patches, attn_mask, last_bg, return_time=True)
+    _, _, time_pred = model(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
     assert time_pred is not None, "enabled probe must return a time_pred"
     target = torch.ones_like(time_pred)
     loss = (time_pred - target).pow(2).mean()
@@ -323,14 +319,22 @@ def test_cross_window_training_step_smoke():
     penalty is FINITE, and its co-training gradient reaches BOTH the probe head and
     the shared trunk (``patch_embed``) — with all values finite (NaN-propagation
     guard never fires).  Also checks the ``tod_xwin_jump_h`` witness is a finite
-    ``(B,)``.  This is exactly the mechanism train.py S2 wires; building it here keeps
-    the test independent of the train.py surface edits.
+    ``(B,)``.  The second forward consumes the SHIPPED ``next_window`` tensors —
+    ``patches`` / ``attn_mask`` / ``anchor_bg`` / ``mask_idx``, the same fields
+    train.py S2 hands the model — so a collate that builds window k+1's attention
+    mask from the wrong masked set fails here; the local rebuild below is an
+    independent oracle pinning that one field.  The penalty is
+    ``utils.time_cross_window_consistency_loss`` at the fixed one-horizon advance,
+    not train.py's per-sample variant: what is covered is the data.py -> model
+    plumbing, not train.py's own surface.
     """
     from data import T1DMDataset, collate_fn
     from model import T1DMAI
     from config import (TIME_PROBE_ENABLED, TIME_PROBE_CROSS_WINDOW_WEIGHT,
-                        TIME_PROBE_N_BINS, PREDICTION_HORIZON_HOURS)
-    from utils import (time_cross_window_consistency_loss,
+                        TIME_PROBE_N_BINS, PREDICTION_HORIZON_HOURS,
+                        PREDICTION_PATCHES)
+    from utils import (create_attention_mask_from_visible,
+                       time_cross_window_consistency_loss,
                        time_cross_window_jump_hours)
 
     if not (TIME_PROBE_ENABLED and TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0):
@@ -349,12 +353,34 @@ def test_cross_window_training_step_smoke():
     model = T1DMAI()
     patches = batch['patches']
     attn_mask = batch['attn_mask']
-    last_bg = batch['bg_formula_data']['last_bg']
+    bfd = batch['bg_formula_data']
 
-    # Window k (main forward) and window k+1 (2nd forward, SAME attn_mask — same n_ctx).
-    _, _, time_pred_k = model(patches, attn_mask, last_bg, return_time=True)
-    _, _, time_pred_next = model(nw['patches'], attn_mask,
-                                 nw['last_bg'].float(), return_time=True)
+    # Window k carries the sampled masked set; window k+1 carries its OWN
+    # right-edge span, so each forward takes its own (anchor_bg, mask_idx) AND its
+    # own attention mask.  The two windows share n_ctx and therefore the left-pad,
+    # but NOT the masked set: reusing window k's mask would tell the second
+    # forward that a different set of rows is the one being predicted.
+    #
+    # The rebuild is an ORACLE, not the input: it derives window k+1's mask from
+    # n_context_patches and the shipped masked set alone, and the shipped field is
+    # pinned to it.  The forward below then runs on the shipped field, so a collate
+    # that hands the second window the wrong mask fails this test.
+    max_T = patches.shape[1]
+    is_pad = torch.zeros(B, max_T, dtype=torch.bool)
+    nw_masked = torch.zeros(B, max_T, dtype=torch.bool)
+    for i in range(B):
+        n_pad = max_T - (int(batch['n_context_patches'][i]) + PREDICTION_PATCHES)
+        is_pad[i, :n_pad] = True
+        nw_masked[i, nw['mask_idx'][i][nw['valid_slots'][i]]] = True
+    rebuilt_attn_mask = create_attention_mask_from_visible(~nw_masked, is_pad)
+    assert torch.equal(nw['attn_mask'], rebuilt_attn_mask), (
+        "next_window['attn_mask'] is not the mask window k+1's own masked set builds")
+
+    _, _, time_pred_k = model(patches, attn_mask, bfd['anchor_bg'].float(),
+                              bfd['mask_idx'], return_time=True)
+    _, _, time_pred_next = model(nw['patches'], nw['attn_mask'],
+                                 nw['anchor_bg'].float(), nw['mask_idx'],
+                                 return_time=True)
     assert time_pred_k is not None and time_pred_next is not None
     assert time_pred_k.shape == time_pred_next.shape
 

@@ -512,10 +512,8 @@ def test_cumulative_median_propagates_through_model_and_inference(monkeypatch):
     import config
     from model import T1DMAI
     from risk_loss import risk_total_loss, KendallGalWeighting
-    from utils import create_attention_mask
-    from config import (
-        PREDICTION_PATCHES, PATCH_SIZE, PATCH_DIM, MAX_CONTEXT_PATCHES,
-    )
+    from config import PREDICTION_PATCHES, PATCH_SIZE, MAX_CONTEXT_PATCHES
+    from tests.forward_inputs import right_edge_inputs
     monkeypatch.setattr(config, "BG_HEAD_MEDIAN_MODE", 'cumulative', raising=False)
 
     if PREDICTION_PATCHES <= 1:
@@ -524,12 +522,13 @@ def test_cumulative_median_propagates_through_model_and_inference(monkeypatch):
     torch.manual_seed(0)
     model = T1DMAI().train()
     B = 3
-    n_ctx = MAX_CONTEXT_PATCHES
-    patches = torch.randn(B, n_ctx + PREDICTION_PATCHES, PATCH_DIM)
-    attn = create_attention_mask(n_ctx, PREDICTION_PATCHES)
-    last_bg = torch.tensor([90.0, 150.0, 210.0])
+    # ONE right-edge span: all PREDICTION_PATCHES slots belong to a single span, so
+    # the cumulative median carries its offset across every interior seam.  Across
+    # two spans the offset restarts at each span's own anchor, by design.
+    patches, attn, anchor_bg, mask_idx = right_edge_inputs(
+        B, n_ctx=MAX_CONTEXT_PATCHES, seed=0)
 
-    q_tau, median = model(patches, attn, last_bg)
+    q_tau, median = model(patches, attn, anchor_bg, mask_idx)
     # C0 continuity at every interior seam (forward path).
     end = median[:, :-1, PATCH_SIZE - 1]
     start = median[:, 1:, 0]

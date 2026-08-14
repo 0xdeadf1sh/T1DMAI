@@ -188,6 +188,18 @@ def test_sim_collect_rows_band_capture(delta_none):
     if not ckpts:
         pytest.skip("no checkpoint available")
     device = torch.device('cpu')
+    # A checkpoint from an earlier input layout cannot be loaded at all: PATCH_DIM
+    # is ``patch_embed``'s fan-in and it moves whenever an input feature is added
+    # (24 -> 30 with the bg_masked bit).  The weights would have to be re-strided
+    # column by column to lift, so an incompatible checkpoint is SKIPPED rather
+    # than reported as a wiring failure of the code under test.
+    from config import PATCH_DIM
+    sd = torch.load(ckpts[-1], map_location='cpu',
+                    weights_only=True)['model_state_dict']
+    ckpt_patch_dim = int(sd['patch_embed.weight'].shape[1])
+    if ckpt_patch_dim != PATCH_DIM:
+        pytest.skip(f"checkpoint {os.path.basename(ckpts[-1])} was trained at "
+                    f"PATCH_DIM {ckpt_patch_dim}; this build is {PATCH_DIM}")
     model, stats, _ = load_model(device, ckpts[-1])
     runs = make_sim_runs((8000,), 90.0)
     delta = None if delta_none else getattr(model, 'conformal_delta', None)

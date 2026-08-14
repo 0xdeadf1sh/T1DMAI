@@ -17,10 +17,10 @@ import math
 import torch
 
 import config
-from config import (PATCH_DIM, PREDICTION_PATCHES, PATCH_SIZE, MAX_CONTEXT_PATCHES,
+from config import (PREDICTION_PATCHES, PATCH_SIZE, MAX_CONTEXT_PATCHES,
                     N_QUANTILES, BG_HEAD_STEP_BASIS_DIM)
 from model import T1DMAI, make_step_basis
-from utils import create_attention_mask
+from tests.forward_inputs import right_edge_inputs
 
 
 def test_make_step_basis_orthonormal_dct_and_poly():
@@ -64,15 +64,13 @@ def test_within_patch_median_has_no_high_frequency_energy(monkeypatch):
       energy). The period-2 zigzag is removed structurally either way."""
     torch.manual_seed(0)
     m = T1DMAI().eval()
-    n_ctx = MAX_CONTEXT_PATCHES
-    patches = torch.randn(3, n_ctx + PREDICTION_PATCHES, PATCH_DIM)
-    attn = create_attention_mask(n_ctx, PREDICTION_PATCHES)
-    last_bg = torch.full((3,), 140.0)
+    patches, attn, anchor_bg, mask_idx = right_edge_inputs(
+        3, n_ctx=MAX_CONTEXT_PATCHES, anchor_mgdl=140.0, seed=0)
 
     # Legacy 'independent': median == anchor + per-patch step_basis curve ⇒ exact ~0.
     monkeypatch.setattr(config, "BG_HEAD_MEDIAN_MODE", 'independent', raising=False)
     with torch.no_grad():
-        q, med = m(patches, attn, last_bg)
+        q, med = m(patches, attn, anchor_bg, mask_idx)
     assert q.shape == (3, PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES)
     assert torch.allclose(med, q[..., 3], atol=1e-6), "median must equal q_tau[...,3]"
     incl_i, excl_i = _within_patch_hf_energy(med)
@@ -81,7 +79,7 @@ def test_within_patch_median_has_no_high_frequency_energy(monkeypatch):
     # R3 'global': within-patch high modes merely SUPPRESSED (not pinned), but tiny.
     monkeypatch.setattr(config, "BG_HEAD_MEDIAN_MODE", 'global', raising=False)
     with torch.no_grad():
-        _, med_g = m(patches, attn, last_bg)
+        _, med_g = m(patches, attn, anchor_bg, mask_idx)
     incl_g, excl_g = _within_patch_hf_energy(med_g)
     assert excl_g < 1e-3, f"'global' excluded high-freq energy {excl_g:.3e} not suppressed"
     assert excl_g < 1e-2 * max(incl_g, 1e-12), (

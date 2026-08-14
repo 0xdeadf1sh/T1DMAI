@@ -1,9 +1,16 @@
 """Tests for model.py — shape checks, parameter count, forward pass correctness.
 
 Risk-space redesign: the model emits a single quantile BG head; the forward
-signature is ``forward(patches, attn_mask, last_bg) -> (q_tau, median)`` in
-RISK space. There are no per-channel dynamics heads, MDN, trend, event, or
-alarm heads, and the forward takes no extra output-toggle kwargs.
+signature is
+``forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)`` in RISK
+space.  There are no per-channel dynamics heads, MDN, trend, event, or alarm
+heads, and the forward takes no extra output-toggle kwargs.
+
+The head gathers ``M`` masked patches BY INDEX and carries one anchor per slot;
+it is not a trailing slice against one broadcast ``last_bg``.  A right-edge span
+of ``PREDICTION_PATCHES`` is the special case these tests mostly use, built by
+``tests.forward_inputs.right_edge_inputs``.  ``T`` is whatever the batch's
+longest sample needs (``T <= MAX_SEQ_LEN``, never asserted equal to it).
 """
 
 import math
@@ -11,10 +18,7 @@ import math
 import pytest
 import torch
 
-
-def _last_bg(B: int) -> torch.Tensor:
-    """A valid (B,) mg/dL anchor inside the physical band."""
-    return torch.full((B,), 120.0)
+from tests.forward_inputs import masked_set_inputs, right_edge_inputs
 
 
 def test_model_instantiation():
@@ -57,23 +61,19 @@ def test_old_heads_removed():
 
 def test_forward_shape():
     """Forward pass produces the (q_tau, median) 2-tuple with correct shapes,
-    median == q_tau[...,3], and ascending quantiles."""
+    median == q_tau[...,3], and ascending quantiles.  The slot axis is ``M`` —
+    the width of ``mask_idx`` — which a right-edge forecast sets to
+    ``PREDICTION_PATCHES``."""
     from model import T1DMAI
-    from config import (PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES,
-                        PATCH_DIM, MIN_CONTEXT_PATCHES)
+    from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES
     model = T1DMAI()
     model.eval()
 
     B = 2
-    n_ctx = MIN_CONTEXT_PATCHES    # minimum context (8 hours)
-    n_pred = PREDICTION_PATCHES
-    T = n_ctx + n_pred
-
-    patches = torch.randn(B, T, PATCH_DIM)
-    attn_mask = torch.ones(T, T, dtype=torch.bool)
+    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=0)
 
     with torch.no_grad():
-        out = model(patches, attn_mask, _last_bg(B))
+        out = model(patches, attn_mask, anchor_bg, mask_idx)
     assert len(out) == 2, "forward must return the 2-tuple (q_tau, median)"
     q_tau, median = out
 
@@ -89,20 +89,63 @@ def test_forward_shape():
     print(f"[DUMP] forward | median mean: {median.mean():.4f}, std: {median.std():.4f}")
 
 
+def test_forward_gathers_an_arbitrary_masked_set():
+    """The slot axis follows ``mask_idx``, not position: a backcast (span at patch
+    0), an infill (span between visible patches) and a forecast run through the
+    same forward, at ``M = MAX_MASKED_PATCHES`` with padded slots.
+
+    The head slices nothing — a trailing slice would emit the same shapes here and
+    the wrong patches, which is why this asserts the gather instead: slot ``j``'s
+    hidden state must be the one at ``mask_idx[:, j]``."""
+    from model import T1DMAI
+    from config import MAX_MASKED_PATCHES, PATCH_SIZE, N_QUANTILES, PREDICTION_PATCHES
+    model = T1DMAI().eval()
+
+    n_ctx = 16
+    spans_per_row = [
+        [(0, 3)],                       # backcast: span starts at patch 0
+        [(4, 2), (9, 1)],               # infill: interior spans, separated
+        [(n_ctx, PREDICTION_PATCHES)],  # forecast: span ends at T-1
+    ]
+    patches, attn_mask, anchor_bg, mask_idx, valid = masked_set_inputs(
+        spans_per_row, n_ctx, seed=3)
+    B = len(spans_per_row)
+
+    with torch.no_grad():
+        q_tau, median = model(patches, attn_mask, anchor_bg, mask_idx)
+    assert q_tau.shape == (B, MAX_MASKED_PATCHES, PATCH_SIZE, N_QUANTILES)
+    assert median.shape == (B, MAX_MASKED_PATCHES, PATCH_SIZE)
+    assert torch.isfinite(q_tau).all() and torch.isfinite(median).all()
+
+    # Move ONE span to a different start, holding ``patches`` and ``attn_mask``
+    # fixed: only the gather index changes, so a head that sliced positionally
+    # would return exactly the same numbers.  The span keeps its length, so the
+    # per-span median basis is unchanged and the difference is purely the gather.
+    moved = mask_idx.clone()
+    moved[1, :2] = torch.tensor([6, 7])   # still ascending, still separated from 9
+    with torch.no_grad():
+        q_moved, _ = model(patches, attn_mask, anchor_bg, moved)
+    assert not torch.allclose(q_moved[1, :2], q_tau[1, :2], atol=1e-6), \
+        "moving a span's mask_idx did not move the head slots — positional slice?"
+    assert torch.allclose(q_moved[0], q_tau[0], atol=1e-6), \
+        "an untouched row's slots must be unaffected"
+    print(f"\n[DUMP] gather | backcast/infill/forecast in one batch, "
+          f"q_tau {tuple(q_tau.shape)}, valid counts "
+          f"{valid.sum(dim=1).tolist()} ✓")
+
+
 def test_forward_no_nan():
     """No NaN or Inf in output for random input."""
     from model import T1DMAI
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
     model = T1DMAI()
     model.eval()
 
     B = 2
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    attn_mask = torch.ones(T, T, dtype=torch.bool)
+    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(
+        B, seed=1, all_true_mask=True)
 
     with torch.no_grad():
-        q_tau, median = model(patches, attn_mask, _last_bg(B))
+        q_tau, median = model(patches, attn_mask, anchor_bg, mask_idx)
 
     assert not torch.isnan(q_tau).any(), "NaN detected in q_tau"
     assert not torch.isnan(median).any(), "NaN detected in median"
@@ -110,50 +153,51 @@ def test_forward_no_nan():
     assert not torch.isinf(median).any(), "Inf detected in median"
 
 
-def test_forward_last_bg_required_and_validated():
-    """last_bg is a required (B,) mg/dL tensor; a z-scored anchor (~[-3,3]) must
-    trip the forward-top units assert."""
+def test_forward_anchor_required_and_validated():
+    """``anchor_bg`` is a required ``(B, M)`` mg/dL tensor; a z-scored anchor must
+    trip the forward-top units assert, and a ``(B,)`` broadcast anchor — the shape
+    the retired ``last_bg`` had — must be refused outright.  The units guarantee is
+    pool-independent: every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3, the
+    floor the assert reads.  It covers ALL M slots, padded ones included."""
     from model import T1DMAI
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
     model = T1DMAI().eval()
 
     B = 2
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    attn_mask = torch.ones(T, T, dtype=torch.bool)
+    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=2)
 
-    # A z-space anchor (the bug the assert exists to catch) must raise.
     with torch.no_grad():
+        # A z-space anchor (the bug the assert exists to catch) must raise.
         with pytest.raises(AssertionError):
-            model(patches, attn_mask, torch.tensor([-1.5, 0.7]))
-    print("\n[DUMP] forward | z-space last_bg trips the units assert ✓")
+            model(patches, attn_mask, torch.full_like(anchor_bg, -1.5), mask_idx)
+        # One bad slot is enough — the tripwire reads every slot, not slot 0.
+        one_bad = anchor_bg.clone()
+        one_bad[1, -1] = 0.7
+        with pytest.raises(AssertionError):
+            model(patches, attn_mask, one_bad, mask_idx)
+        # The retired (B,) broadcast anchor no longer type-checks.
+        with pytest.raises(AssertionError):
+            model(patches, attn_mask, anchor_bg[:, 0], mask_idx)
+    print("\n[DUMP] forward | z-space anchor (any slot) and (B,) anchor both trip ✓")
 
 
 def test_forward_variable_context():
-    """Model handles different context lengths."""
+    """Model handles different context lengths — ``T`` is per batch, never
+    ``MAX_SEQ_LEN``."""
     from model import T1DMAI
-    from utils import create_attention_mask
-    from config import PREDICTION_PATCHES, PATCH_DIM, MIN_CONTEXT_PATCHES
+    from config import PREDICTION_PATCHES, MIN_CONTEXT_PATCHES
     model = T1DMAI()
     model.eval()
 
-    # Short context (minimum allowed)
-    T_short = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches_short = torch.randn(1, T_short, PATCH_DIM)
-    mask_short = create_attention_mask(MIN_CONTEXT_PATCHES, PREDICTION_PATCHES)
-
-    # Long context (~2× minimum)
-    long_ctx = MIN_CONTEXT_PATCHES * 2
-    T_long = long_ctx + PREDICTION_PATCHES
-    patches_long = torch.randn(1, T_long, PATCH_DIM)
-    mask_long = create_attention_mask(long_ctx, PREDICTION_PATCHES)
+    short = right_edge_inputs(1, n_ctx=MIN_CONTEXT_PATCHES, seed=4)
+    long = right_edge_inputs(1, n_ctx=MIN_CONTEXT_PATCHES * 2, seed=5)
 
     with torch.no_grad():
-        q_short, _ = model(patches_short, mask_short, _last_bg(1))
-        q_long, _ = model(patches_long, mask_long, _last_bg(1))
+        q_short, _ = model(*short)
+        q_long, _ = model(*long)
 
     assert q_short.shape[1] == PREDICTION_PATCHES
     assert q_long.shape[1] == PREDICTION_PATCHES
+    assert short[0].shape[1] != long[0].shape[1], "the two T must differ"
 
 
 def test_attention_mask_pred_bidirectional():
@@ -188,10 +232,10 @@ def test_rope_positions():
         MAX_SEQ_LEN,
     ]
     for T in seq_lens:
-        patches = torch.randn(1, T, PATCH_DIM)
-        mask = torch.ones(T, T, dtype=torch.bool)
+        inputs = right_edge_inputs(1, n_ctx=T - PREDICTION_PATCHES, seed=T,
+                                   all_true_mask=True)
         with torch.no_grad():
-            q_tau, _ = model(patches, mask, _last_bg(1))
+            q_tau, _ = model(*inputs)
         assert not torch.isnan(q_tau).any(), f"NaN at T={T}"
     print(f"\n[DUMP] rope | passed all sequence lengths: {seq_lens}")
 
@@ -232,22 +276,18 @@ def test_rope_orthogonal_and_identity_at_pos0():
 
 
 def test_bidirectional_pred_forward_finite():
-    """With the now-bidirectional prediction block, a fixed small input runs a
+    """With the now-bidirectional masked block, a fixed small input runs a
     finite forward — the RoPE tables built inside ``model.forward`` (base
-    ROPE_BASE) compose with the bidirectional pred attention without NaN/Inf."""
+    ROPE_BASE) compose with the bidirectional masked-row attention without
+    NaN/Inf."""
     from model import T1DMAI
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
-    from utils import create_attention_mask
 
     torch.manual_seed(0)
     model = T1DMAI().eval()
     B = 3
-    n_ctx = MIN_CONTEXT_PATCHES
-    T = n_ctx + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    mask = create_attention_mask(n_ctx, PREDICTION_PATCHES)
+    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=6)
     with torch.no_grad():
-        q_tau, median = model(patches, mask, _last_bg(B))
+        q_tau, median = model(patches, attn_mask, anchor_bg, mask_idx)
     assert torch.isfinite(q_tau).all() and torch.isfinite(median).all(), \
         "bidirectional-pred forward produced a non-finite output"
     print(f"\n[DUMP] rope | bidirectional-pred forward finite "
@@ -256,25 +296,24 @@ def test_bidirectional_pred_forward_finite():
 
 def test_init_median_is_persistence():
     """At init (BG_HEAD_INIT_SCALE small, bias 0) the median delta ≈ 0, so the
-    median risk ≈ f(last_bg) — i.e. the initial forecast is persistence."""
+    median risk ≈ f(anchor_bg) — i.e. the initial forecast is persistence, and it
+    is the SLOT's own anchor that each slot persists from."""
     from model import T1DMAI
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
     from utils import kovatchev_f
 
     torch.manual_seed(0)
     m = T1DMAI().eval()
     B = 4
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    mask = torch.ones(T, T, dtype=torch.bool)
-    last_bg = torch.tensor([90.0, 120.0, 150.0, 200.0])
+    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=7)
+    # A different anchor per row: the median must follow each row's own value.
+    anchor_bg = torch.tensor([90.0, 120.0, 150.0, 200.0]).unsqueeze(1).expand_as(anchor_bg)
     with torch.no_grad():
-        _, median = m(patches, mask, last_bg)
-    anchor = kovatchev_f(last_bg).view(B, 1, 1)
+        _, median = m(patches, attn_mask, anchor_bg.contiguous(), mask_idx)
+    anchor = kovatchev_f(anchor_bg[:, 0]).view(B, 1, 1)
     max_dev = float((median - anchor).abs().max())
-    print(f"\n[DUMP] init_persistence | max|median - f(last_bg)| = {max_dev:.4f}")
+    print(f"\n[DUMP] init_persistence | max|median - f(anchor_bg)| = {max_dev:.4f}")
     assert max_dev < 0.5, (
-        f"initial median should sit near the persistence anchor f(last_bg), "
+        f"initial median should sit near the persistence anchor f(anchor_bg), "
         f"max deviation {max_dev}")
 
 
@@ -284,15 +323,13 @@ def test_gradient_flow():
     off the forecast path (I1/I3) and is excluded here; its own gradient isolation
     is covered by ``test_time_probe.test_detach_isolates_trunk``."""
     from model import T1DMAI
-    from config import PATCH_DIM, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
     model = T1DMAI()
 
     B = 2
-    T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
-    patches = torch.randn(B, T, PATCH_DIM)
-    mask = torch.ones(T, T, dtype=torch.bool)
+    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(
+        B, seed=8, all_true_mask=True)
 
-    q_tau, median = model(patches, mask, _last_bg(B))
+    q_tau, median = model(patches, attn_mask, anchor_bg, mask_idx)
     # Sum over every quantile band so each head slot gets a grad.
     loss = q_tau.sum() + median.sum()
     loss.backward()
