@@ -34,16 +34,19 @@ The shape divergence runs three batched soft-DTW dynamic programs (the cross
 term and two self terms) and TDI one more.  The recursion has a sequential
 dependency along anti-diagonals, but every cell *on* a given anti-diagonal is
 independent, so we sweep diagonals (``2·H - 1`` of them) with the whole batch
-and the whole diagonal vectorised — never a per-sample Python loop (the batch
-axis is ``BATCH_SIZE`` and the horizon ``H = PREDICTION_PATCHES * PATCH_SIZE``).
+and the whole diagonal vectorised — never a per-sample Python loop.  The caller
+(``risk_loss.py``) buckets masked spans by length and issues one call per bucket,
+so the batch axis is that bucket's span count and the horizon ``H`` is its span
+length times ``PATCH_SIZE`` — neither is fixed across calls, and an empty bucket
+must not be dispatched at all (see :func:`dilate_loss`).
 ``SoftDTWBatch``'s forward and backward are hand-written so
 the DP runs once and the gradient is the standard soft-DTW backward recursion
 (no autograd graph over the ``2·H-1`` diagonal steps).
 
 Everything is fp32; the soft-min is max-subtraction-stabilised.  Cost is the
 squared difference in risk space — a single cell peaks at
-``(f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))**2 = 40.0`` (with the default
-``BG_CLAMP_MAX = 400`` / ``BG_CLAMP_MIN = 40``), and the max-subtracted softmin
+``(f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))**2 = 99.6416`` (with the default
+``BG_CLAMP_MAX = 400`` / ``BG_CLAMP_MIN = 10``), and the max-subtracted softmin
 is overflow-free in fp32 down to
 ``gamma = 1e-3``.  ``gamma`` is purely a softness knob (smaller ⇒ harder min);
 soft-DTW is 1-homogeneous in ``(cost, gamma)``, so scaling both by the same
@@ -89,7 +92,7 @@ def _softmin(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, gamma: float) ->
     The max-subtraction (here a *min*-subtraction on the pre-divided terms)
     keeps the exponentials in fp32 range even when the risk-space costs peak
     near a single-cell maximum of
-    ``(f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))**2 = 40.0``; this softmin
+    ``(f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))**2 = 99.6416``; this softmin
     is overflow-free in fp32 down to ``gamma = 1e-3``.
 
     Args:
@@ -275,8 +278,17 @@ def dilate_loss(
     ``SoftDTWBatch`` forward, reusing ``sDTW(C)`` — never by materialising the
     alignment matrix.  Cost is the squared difference in risk space.
 
+    The loss is NOT scale-free in ``H``: the shape term grows with the horizon
+    while the normalised TDI (``Ω[i,j] = ((i-j)/H)**2``) does not track it, so
+    ``alpha`` weights a different mixture at each ``H``.  A caller comparing or
+    combining calls at different ``H`` — the span-length buckets of the masked-BG
+    objective — must weight and log them per bucket rather than treat the scalars
+    as commensurate.
+
     Args:
         m:      (B, H) forecast median trajectory in RISK space (requires grad).
+                ``B > 0``: the reductions are means over the batch axis, so an
+                empty bucket would yield NaN and is rejected, not skipped here.
         y_risk: (B, H) f-transformed target trajectory in RISK space.
         alpha:  shape/time mix in ``[0, 1]`` (``L = α·shape + (1-α)·tdi``).
         gamma:  soft-min softness knob (> 0; smaller ⇒ harder min).  The
@@ -292,6 +304,19 @@ def dilate_loss(
     """
     assert m.dim() == 2 and y_risk.dim() == 2, "m and y_risk must be (B, H)"
     assert m.shape == y_risk.shape, "m and y_risk must share shape (B, H)"
+    # An EMPTY batch is rejected loudly. Both reductions below are ``.mean()``
+    # over the batch axis, so a (0, H) input would return (nan, nan, nan) with no
+    # exception — and that NaN reaches the training/validation totals, where a
+    # ``val_total < best_val_loss`` comparison is False for NaN against an
+    # initial float('inf') and the run ends with no best checkpoint. A caller
+    # bucketing spans by length MUST skip its empty buckets (it also pays the
+    # full 2H-1 anti-diagonal sweep for them otherwise); this assert is what
+    # stops a missed skip from becoming a silent NaN.
+    assert m.shape[0] > 0, (
+        "dilate_loss got an EMPTY batch (0 rows): the mean over the batch axis "
+        "would be NaN. Skip empty span-length buckets in the caller."
+    )
+    assert m.shape[1] > 0, "dilate_loss got a zero-length horizon (B, 0)"
     assert 0.0 <= alpha <= 1.0, "alpha must be in [0, 1]"
     assert gamma > 0.0, "gamma must be positive"
     assert tdi_fd_eps > 0.0, "tdi_fd_eps must be positive"

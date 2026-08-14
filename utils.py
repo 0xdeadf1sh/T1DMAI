@@ -11,10 +11,12 @@ module of their own:
   patients in the same order.  The model itself doesn't see the seed —
   it is only used to drive the simulator deterministically.
 
-* ``create_attention_mask`` — produces the hybrid context-vs-prediction mask
-  used by every temporal self-attention layer.  Bidirectional inside the
-  context, bidirectional inside the prediction horizon, full attention from
-  prediction → context, blocked from context → prediction.
+* ``create_attention_mask_from_visible`` — produces the attention mask used by
+  every temporal self-attention layer, from a ``(B, T)`` VISIBLE/MASKED/PAD
+  labelling.  Visible positions see visible positions, masked positions see
+  everything real, padding is blocked in both directions bar the diagonal.
+  ``create_attention_mask(n_context, n_prediction)`` is the right-edge
+  (forecast) shim over it.  Neither memoizes.
 
 * ``kovatchev_f`` / ``kovatchev_f_target`` / ``kovatchev_f_inv`` — the sole
   bridge between mg/dL physical space (b) and Kovatchev *risk* space (c).
@@ -27,13 +29,16 @@ module of their own:
   with a physical clamp backstop; ``kovatchev_f_inv`` is the only (c)→(b)
   inverse, clamping the risk input first and the mg/dL output second.
 
-* ``assemble_quantiles`` — turns the BG head's raw per-step output (a median
-  delta + spreads) into an ascending 7-quantile fan in risk space, anchored at
-  ``f(last_bg)``.  Returns ``(q_tau, median)``.
+* ``assemble_quantiles`` — turns the BG head's raw per-slot output (a median
+  delta + spreads) into an ascending 7-quantile fan in risk space, anchored
+  per masked slot at ``f(anchor_bg)``.  Returns ``(q_tau, median)``.  The
+  smooth-basis median projection runs PER SPAN, at the per-span dimension
+  ``global_median_dim(L)``.
 
-* ``last_bg_mgdl_from_context`` — denormalizes the rightmost context
-  ``bg_absolute`` cell into mg/dL, the shared (a)→(b) bridge that produces the
-  ``last_bg`` anchor at inference.
+* ``last_bg_mgdl_from_context`` — denormalizes a context ``bg_absolute`` cell
+  into mg/dL, the shared (a)→(b) bridge that produces the anchor at inference.
+  Vectorised over an arbitrary set of ``(patch, step)`` cells; the rightmost
+  cell is the default.
 
 * ``ModelEMA`` — maintains a shadow copy of the model's float parameters and
   buffers, blended after every accepted optimizer step as
@@ -48,7 +53,7 @@ import hashlib
 import math
 import warnings
 from contextlib import contextmanager
-from typing import Iterator, NamedTuple
+from typing import Iterator, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -58,13 +63,17 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 
 # Kovatchev risk-transform constants, re-anchored to the [40, 400] mg/dL device
-# range (BG_CLAMP_MIN / BG_CLAMP_MAX): f(g) = SCALE * (ln(g)^POWER - OFFSET).
-# The clinically-validated power POWER = 1.084 is kept from Kovatchev et al. (it
-# encodes the hypo > hyper danger asymmetry); SCALE and OFFSET are re-solved so
-# f(40) = -sqrt(10) and f(400) = +sqrt(10) — i.e. the risk 10*f^2 saturates at
-# 100 exactly at both CGM rails. The zero-risk euglycemic center consequently
-# sits at ~128 mg/dL (the log^POWER center of [40, 400]). These endpoints are
-# verified in a unit test.
+# range: f(g) = SCALE * (ln(g)^POWER - OFFSET). The clinically-validated power
+# POWER = 1.084 is kept from Kovatchev et al. (it encodes the hypo > hyper danger
+# asymmetry); SCALE and OFFSET are re-solved so f(40) = -sqrt(10) and
+# f(400) = +sqrt(10) — i.e. the risk 10*f^2 saturates at 100 exactly at both
+# anchors. The zero-risk euglycemic center consequently sits at ~128 mg/dL (the
+# log^POWER center of [40, 400]). These endpoints are verified in a unit test.
+# The anchors are NOT the physical clamp: [BG_CLAMP_MIN, BG_CLAMP_MAX] is
+# [10, 400] mg/dL, wider below, so the realised risk range is asymmetric —
+# [f(10), f(400)] = [-6.8198, +3.1623] and risk reaches ~465 at the floor. That
+# clamp is applied in kovatchev_f_target and kovatchev_f_np; kovatchev_f itself
+# only asserts the floor and warns above the ceiling.
 _KOVATCHEV_SCALE = 2.2211457449985317
 _KOVATCHEV_POWER = 1.084
 _KOVATCHEV_OFFSET = 5.540076976170212
@@ -96,62 +105,94 @@ def compute_patient_seed(master_seed: int, step: int, position: int) -> int:
     return int(digest, 16) % (2**63 - 1)
 
 
+def create_attention_mask_from_visible(
+    visible: torch.Tensor, is_pad: "torch.Tensor | None" = None,
+) -> torch.Tensor:
+    """Per-sample attention mask for an arbitrary masked set — the general form.
 
-_ATTENTION_MASK_CACHE: "dict[tuple[int, int], torch.Tensor]" = {}
+    A sequence position is one of three things: VISIBLE (its ``bg_absolute`` is
+    observed), MASKED (its BG is withheld and the head predicts it), or PAD (a
+    left-padding slot carrying no data).  ``visible`` labels the first,
+    ``is_pad`` the third, and MASKED is everything left over.  The mask is
+    NOT a function of position: a masked span may sit at the right edge
+    (forecast), at the left edge (backcast) or anywhere between (infill).
+
+    Rule (True = attend, False = block)::
+
+        visible row → visible col   allowed   (bidirectional among evidence)
+        visible row → masked  col   blocked   (evidence never reads a prediction)
+        masked  row → any real col  allowed   (a prediction reads everything)
+        pad row / pad col           blocked, except the diagonal
+
+    Built in exactly four lines, all four load-bearing::
+
+        attn  = vis[:, None, :] | masked[:, :, None]
+        attn &= ~is_pad[:, None, :]          # nothing reads a pad column
+        attn &= ~is_pad[:, :, None]          # a pad row reads nothing but itself
+        attn[:, diag, diag] = True           # no all-False row (softmax NaN)
+
+    Dropping line 3 leaves a pad row neither masked nor row-filtered, so it
+    opens onto every visible column.  The forward OUTPUT is unchanged either
+    way — pad columns are blocked, so a pad row never feeds a real row — which
+    is why only a full-mask comparison catches it, never a head/output gate.
+    Line 4 is the SOLE reason a pad row is not all-False once line 3 is in
+    place: it is not redundant with anything.
+
+    Nothing is memoized.  The masked set varies per sample, and no cheap key
+    identifies it — a memo on ``(n_context, n_prediction)`` hands one sample's
+    mask to another with no shape error and no way to notice.  Each call
+    returns a fresh tensor.
+
+    Args:
+        visible: ``(B, T)`` bool, True where the position's BG is observed.
+            Entries at PAD positions are ignored (lines 2-3 dominate).
+        is_pad: ``(B, T)`` bool left-padding flags, or None for no padding.
+
+    Returns:
+        attn: ``(B, T, T)`` bool, True = attend.  ``model.forward`` gives it the
+            head axis with ``unsqueeze(1)`` before SDPA — never straight, which
+            would align B onto the head axis.
+    """
+    assert visible.dtype == torch.bool and visible.ndim == 2, (
+        f"visible must be (B, T) bool, got {tuple(visible.shape)} {visible.dtype}"
+    )
+    T = visible.shape[1]
+    if is_pad is None:
+        is_pad = torch.zeros_like(visible)
+    assert is_pad.dtype == torch.bool and is_pad.shape == visible.shape, (
+        f"is_pad must be (B, T) bool matching visible, got "
+        f"{tuple(is_pad.shape)} {is_pad.dtype}"
+    )
+    vis = visible & ~is_pad
+    masked = (~visible) & ~is_pad
+    attn = vis[:, None, :] | masked[:, :, None]
+    attn &= ~is_pad[:, None, :]
+    attn &= ~is_pad[:, :, None]
+    diag = torch.arange(T, device=visible.device)
+    attn[:, diag, diag] = True
+    return attn
 
 
 def create_attention_mask(n_context: int, n_prediction: int) -> torch.Tensor:
-    """
-    Create the hybrid attention mask for T1DMAI sequences.
+    """Right-edge shim over :func:`create_attention_mask_from_visible`.
 
-    The mask shape is intentionally non-causal: context patches are fully
-    observed and benefit from bidirectional attention, and prediction patches
-    attend bidirectionally among themselves as well (the whole prediction
-    horizon is decoded jointly in one forward pass).
-
-    Pattern (True = attend, False = block)::
-
-        Context  → Context     bidirectional  (every ctx sees every ctx)
-        Context  → Prediction  blocked        (ctx can't peek at the future)
-        Pred     → Context     full           (every pred sees all of ctx)
-        Pred     → Prediction  bidirectional  (every pred sees every pred)
+    The special case where the masked span is the trailing ``n_prediction``
+    patches — a forecast — with no padding.  It builds the ``(1, T)`` visible
+    bool internally and returns the ``(T, T)`` mask, which is what the export
+    self-check and the single-sample call sites still ask for.  It does NOT
+    memoize; see the general form for why no memo can be correct.
 
     Args:
-        n_context: Number of context patches (C).
-        n_prediction: Number of prediction patches (P).
+        n_context: Number of leading VISIBLE patches (C).
+        n_prediction: Number of trailing MASKED patches (P).
 
     Returns:
-        mask: (C+P, C+P) bool tensor.  Memoized by ``(n_context, n_prediction)``
-            and returned as a SHARED read-only tensor — every caller treats it
-            read-only (``collate_fn`` copies it into the batch mask; inference
-            passes it straight through), so aliasing the cache is safe.
+        mask: ``(C+P, C+P)`` bool tensor, freshly built on every call.
     """
-    key = (n_context, n_prediction)
-    cached = _ATTENTION_MASK_CACHE.get(key)
-    if cached is not None:
-        return cached
     T = n_context + n_prediction
-    # Start with all-False (block everything) and switch on the three regions
-    # we want to allow.  The fourth region (context → prediction) stays False.
-    mask = torch.zeros(T, T, dtype=torch.bool)
-
-    # Context-to-context: bidirectional — every observed timestep can see
-    # every other observed timestep, regardless of order.
-    mask[:n_context, :n_context] = True
-
-    # Prediction-to-context: full attention — predicted patches always see
-    # every context patch.
-    mask[n_context:, :n_context] = True
-
-    # Prediction-to-prediction: bidirectional — every prediction patch sees
-    # every other prediction patch.  The full horizon is decoded jointly in a
-    # single forward pass, so there is no within-horizon causal constraint;
-    # future leak is prevented by the blocked context → prediction region, not
-    # by triangulating this block.
-    mask[n_context:, n_context:] = True
-
-    _ATTENTION_MASK_CACHE[key] = mask
-    return mask
+    visible = torch.zeros(1, T, dtype=torch.bool)
+    visible[0, :n_context] = True
+    return create_attention_mask_from_visible(visible)[0]
 
 
 def kovatchev_f(g: torch.Tensor) -> torch.Tensor:
@@ -164,9 +205,11 @@ def kovatchev_f(g: torch.Tensor) -> torch.Tensor:
     asymmetry for free.
 
     This variant is the **units tripwire**: it hard-asserts its argument is
-    physical mg/dL (``g >= BG_CLAMP_MIN - 1e-3``), so a z-scored value (~[-3, 3])
-    trips it loudly.  It is reserved for CONTROLLED callers that must never carry
-    z-space — the ``f(last_bg)`` anchor and any re-``f`` of an inverted value.
+    physical mg/dL (``g >= BG_CLAMP_MIN - 1e-3``), so a z-scored value trips it
+    loudly: the z-score guarantee is ``z_max < BG_CLAMP_MIN - 1e-3``, the assert's
+    own threshold, so no z-space tensor passes it.  It is reserved for CONTROLLED
+    callers that must never carry z-space — the ``f(last_bg)`` anchor and any
+    re-``f`` of an inverted value.
     The upper bound is a soft warning only (``g > BG_CLAMP_MAX + 1e-3``) since a
     legitimate physical BG never exceeds the simulator clamp.  ``f`` is NEVER
     differentiated — every call site feeds it a constant (detached) tensor.
@@ -227,8 +270,9 @@ def kovatchev_f_inv(r: torch.Tensor) -> torch.Tensor:
 
     Belt-and-suspenders against both failure modes of a naive inverse:
 
-    1. Clamp the **risk input** first to ``[f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]``
-       (≈ ``[-3.1623, +3.1623]`` = ``[f(40), f(400)]`` = ±sqrt(10)).  This guarantees the
+    1. Clamp the **risk input** first to ``[f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]``,
+       both bounds computed from the clamp (≈ ``[-6.8198, +3.1623]``, asymmetric:
+       the floor sits well below the ``f(40) = -sqrt(10)`` anchor).  This guarantees the
        reconstructed base ``(r/_KOVATCHEV_SCALE + _KOVATCHEV_OFFSET)`` is ``>= 0``
        (no negative-base / complex / NaN for ``r`` far below range) and bounded
        above (no fp32 ``exp`` overflow for ``r`` far above range).
@@ -759,12 +803,15 @@ def get_global_median_basis(
 
     Identical construction to :func:`model.make_step_basis` (DCT-II cosine modes or
     orthonormal polynomials, ascending frequency/degree, L2-orthonormal columns) but
-    evaluated over the FULL ``n = PREDICTION_PATCHES * PATCH_SIZE`` prediction horizon
-    rather than a single patch.  ``assemble_quantiles`` projects the per-patch median
-    delta onto ``span`` of these ``k`` columns; with ``k`` small the median is confined
-    to a smooth low-frequency subspace (periods below ~``2*n/k`` steps — including the
-    per-patch seam sawtooth — are unrepresentable), and the projection is an L2
-    contraction (``||proj(x)|| <= ||x||``) so the per-patch offset cannot drift.
+    evaluated over a whole masked SPAN, ``n = L * PATCH_SIZE`` for a span of ``L``
+    patches, rather than a single patch.  ``assemble_quantiles`` projects the span's
+    per-patch median delta onto ``span`` of these ``k`` columns; with ``k`` small the
+    median is confined to a smooth low-frequency subspace (periods below ~``2*n/k``
+    steps — including the per-patch seam sawtooth — are unrepresentable), and the
+    projection is an L2 contraction (``||proj(x)|| <= ||x||``) so the per-patch offset
+    cannot drift.  ``k`` comes from :func:`global_median_dim`, which scales it with
+    ``L``; the function itself is closed-form in ``(n, k)`` and indifferent to which
+    span it serves.
 
     The cache is keyed by ``(n, k, kind, device, dtype)``, so the basis materializes
     once already resident on the requested ``device``/``dtype`` (no per-forward H2D copy
@@ -772,8 +819,8 @@ def get_global_median_basis(
     device-resident tensor so an in-place edit by any caller can never poison the cache.
 
     Args:
-        n: horizon length ``PREDICTION_PATCHES * PATCH_SIZE`` (``>= 1``).
-        k: number of basis columns ``G``, ``1 <= k <= n`` (caller clamps to ``min(G, n)``).
+        n: span length in timesteps, ``L * PATCH_SIZE`` (``>= 1``).
+        k: number of basis columns ``G_L``, ``1 <= k <= n`` (caller clamps to ``min(G_L, n)``).
         kind: ``'dct'`` (DCT-II) or ``'poly'`` (orthonormal polynomials).
         device: target device for the returned tensor (default: CPU/cache device).
         dtype: target dtype (default: float32).
@@ -810,8 +857,121 @@ def get_global_median_basis(
     return basis.clone()
 
 
+def global_median_dim(span_patches: int) -> int:
+    """``G_L`` — the smooth-basis dimension for a masked span of ``L`` patches.
+
+    ``G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * L / PREDICTION_PATCHES))``, so
+    the configured ``G`` is reproduced exactly at ``L == PREDICTION_PATCHES`` and
+    scales down with shorter spans::
+
+        L        1     2     3     4( == PREDICTION_PATCHES)
+        n = L*S  6    12    18    24
+        G_L      2     3     5     6
+        2n/G_L  6.0   8.0   7.2   8.0     (shortest representable period, steps)
+
+    A FIXED ``G`` is a defect here rather than an approximation: at ``L = 1`` the
+    projection would be ``min(G, n) = 6`` columns over ``n = 6`` points — the
+    identity to 1e-5 — so the anti-drift contraction is ABSENT, not weakened, and
+    every fan assert still passes.  What ``G_L`` holds roughly constant is the
+    fraction of the span the basis can bend, not the cutoff period: the cutoff
+    ``2n/G_L`` above is what to report, not a claim that the period is fixed.
+
+    Args:
+        span_patches: span length ``L`` in patches (``>= 1``).
+
+    Returns:
+        ``G_L >= 1``.  The caller still clamps to ``min(G_L, n)`` before building
+        the basis.
+    """
+    from config import BG_HEAD_MEDIAN_GLOBAL_DIM, PREDICTION_PATCHES
+    assert span_patches >= 1, f"span_patches must be >= 1, got {span_patches}"
+    return max(1, math.ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * span_patches / PREDICTION_PATCHES))
+
+
+def _span_layout(
+    mask_idx: "torch.Tensor | None", valid: "torch.Tensor | None",
+    B: int, M: int, device: torch.device,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Group the ``M`` head slots into contiguous masked spans.
+
+    Slot ``j`` continues slot ``j-1``'s span iff their patch indices are adjacent
+    (``mask_idx[j] == mask_idx[j-1] + 1``) and, when ``valid`` is given, both are
+    real.  The sampler never lets two masked spans abut — a visible patch always
+    separates them — so adjacency in ``mask_idx`` identifies a span exactly.
+    Padded slots gather patch 0, which can never continue a span (that would need
+    a predecessor at patch −1), so they fall out as singletons and cannot merge
+    into a real span even when a real span does start at patch 0.
+
+    ``mask_idx is None`` means the legacy single-span layout: all ``M`` slots are
+    one contiguous span, reproducing the trailing prediction zone exactly.
+
+    Returns:
+        start: ``(B, M)`` int64 — the slot index at which each slot's span begins.
+        length: ``(B, M)`` int64 — the span's length ``L`` in patches, per slot.
+    """
+    ar = torch.arange(M, device=device)
+    if mask_idx is None:
+        new = ar.eq(0).unsqueeze(0).expand(B, M)
+    else:
+        cont = mask_idx[:, 1:] == mask_idx[:, :-1] + 1
+        if valid is not None:
+            cont = cont & valid[:, 1:] & valid[:, :-1]
+        new = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=device), ~cont], dim=1)
+    ar_b = ar.unsqueeze(0).expand(B, M)
+    # Running max of "index if a span starts here else -1" = the current span's
+    # start slot.  new[:, 0] is always True, so every slot resolves to >= 0.
+    start = torch.cummax(
+        torch.where(new, ar_b, torch.full_like(ar_b, -1)), dim=1).values
+    ones = torch.ones(B, M, dtype=torch.long, device=device)
+    counts = torch.zeros(B, M, dtype=torch.long, device=device).scatter_add_(1, start, ones)
+    length = counts.gather(1, start)
+    return start, length
+
+
+def _median_global_per_span(
+    delta: torch.Tensor, start: torch.Tensor, length: torch.Tensor, kind: str,
+) -> torch.Tensor:
+    """Project each span's median delta onto its own low-frequency subspace.
+
+    One matmul per distinct span length present in the batch (at most four under
+    ``MASK_SPAN_LENGTHS``, plus singletons from padded slots): spans of equal ``L``
+    share ``n = L * PATCH_SIZE`` and ``G_L``, so they stack into a single
+    ``(n_spans, n)`` block.  Slots are contiguous within a span, so the gather is
+    ``start + arange(L)`` and the scatter back writes each slot exactly once.
+
+    Args:
+        delta: ``(B, M, S)`` per-slot median delta (risk space).
+        start: ``(B, M)`` span-start slot index (see :func:`_span_layout`).
+        length: ``(B, M)`` span length in patches.
+        kind: ``BG_HEAD_STEP_BASIS_TYPE``.
+
+    Returns:
+        ``(B, M, S)`` projected delta, span by span.
+    """
+    B, M, S = delta.shape
+    ar = torch.arange(M, device=delta.device)
+    is_start = start.eq(ar.unsqueeze(0))
+    out = torch.zeros_like(delta)
+    # One host sync for the whole loop: the distinct span lengths present.
+    for L in torch.unique(length[is_start]).tolist():
+        sel = is_start & length.eq(L)
+        rows, cols = sel.nonzero(as_tuple=True)               # (n_L,) each
+        idx = cols.unsqueeze(1) + torch.arange(L, device=delta.device).unsqueeze(0)
+        blk = delta[rows.unsqueeze(1), idx]                   # (n_L, L, S)
+        n = L * S
+        g = min(global_median_dim(L), n)
+        Bg = get_global_median_basis(
+            n, g, kind, device=delta.device, dtype=delta.dtype)
+        proj = (blk.reshape(-1, n) @ Bg) @ Bg.transpose(0, 1)
+        out[rows.unsqueeze(1), idx] = proj.reshape(-1, L, S)
+    return out
+
+
 def assemble_quantiles(
-    head_raw: torch.Tensor, last_bg_mgdl: torch.Tensor,
+    head_raw: torch.Tensor, anchor_bg_mgdl: torch.Tensor,
+    mask_idx: "torch.Tensor | None" = None,
+    valid: "torch.Tensor | None" = None,
     carry_spread: "torch.Tensor | float" = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble the BG head's raw output into an ascending risk-space quantile fan.
@@ -821,27 +981,40 @@ def assemble_quantiles(
     ``N_SPREADS+1..2*N_SPREADS`` = the ``τ<.5`` spreads nearest→far .25/.1/.05).
     Spreads are passed through ``softplus`` + ``BG_QUANTILE_SPREAD_MIN`` (a strict
     positive floor against σ-collapse) and accumulated by ``cumsum`` so the fan is
-    monotone by construction.  The anchor ``f(last_bg)`` is detached (a constant)
-    and held flat across the whole horizon.
+    monotone by construction.  The anchor ``f(anchor_bg)`` is detached (a constant),
+    held flat across the ``PATCH_SIZE`` steps of ITS OWN slot; each of the ``M``
+    masked slots carries its own anchor.
+
+    The ``M`` axis is a set of masked patches gathered by index, not a trailing
+    horizon: a span may end at patch ``T−1`` (forecast), start at patch 0
+    (backcast) or sit between visible patches (infill).  Slots are grouped into
+    contiguous spans from ``mask_idx`` (:func:`_span_layout`) and every median
+    mode is evaluated PER SPAN — nothing accumulates or low-passes across the
+    visible patches that separate two spans.
 
     Median assembly is gated by ``config.BG_HEAD_MEDIAN_MODE`` (R3, three modes):
 
     * ``'global'`` (DEFAULT, R3): the per-patch median delta ``delta = head_raw[..., 0]``
-      is reshaped ``(B, P*S)`` C-contiguous patch-major (matching
+      is reshaped ``(n_spans, L*S)`` C-contiguous patch-major (matching
       ``risk_loss._to_patch_major``) and PROJECTED onto a fixed low-frequency DCT-II
-      subspace ``span(Bg)`` over the FULL ``P*S`` horizon: ``z = delta_flat @ Bg``,
-      ``delta_global = z @ Bgᵀ``, ``m = anchor + delta_global.reshape(B,P,S)``.  A
+      subspace ``span(Bg)`` over the span's own ``n = L*S`` steps: ``z = delta_flat @ Bg``,
+      ``delta_global = z @ Bgᵀ``, ``m = anchor + delta_global``.  A
       projection is an **L2 CONTRACTION** (``||proj(x)|| <= ||x||``), so the per-patch
       offset ``o[p] = m[:,p,0] − anchor`` is bounded and non-monotone in ``p`` — it
       CANNOT drift or amplify, structurally killing R1's unconstrained-integrator drift.
-      The low-pass (small ``G``) leaves the median smooth (the per-patch period-2 / seam
-      sawtooth is unrepresentable), so C0 seam-continuity is intentionally NOT pinned.
+      The subspace dimension is ``global_median_dim(L)``, NOT a fixed ``G``: a fixed
+      ``G`` degenerates to the identity at ``L = 1`` and loses the contraction with
+      every fan assert still green.  The low-pass leaves the median smooth (the
+      per-patch period-2 / seam sawtooth is unrepresentable), so C0 seam-continuity
+      is intentionally NOT pinned.
       At init (delta≈0 ⇒ z≈0 ⇒ delta_global≈0) ``m ≈ anchor`` everywhere (persistence).
     * ``'cumulative'`` (R1, BIT-IDENTICAL legacy): each patch CONTINUES from the previous
-      patch's endpoint.  With ``d = head_raw[..., 0]``, ``d_rel = d − d[..., :1]``,
-      ``rise = d[..., -1] − d[..., 0]``, and the EXCLUSIVE cumsum of ``rise`` over the
-      patch dim (``o[..., 0]==0``) gives ``m = anchor + o[..., None] + d_rel`` — **C0
-      continuity** at every seam and the FIRST step pinned EXACTLY to the anchor.
+      patch's endpoint, WITHIN ITS SPAN.  With ``d = head_raw[..., 0]``,
+      ``d_rel = d − d[..., :1]``, ``rise = d[..., -1] − d[..., 0]``, and the EXCLUSIVE
+      cumsum of ``rise`` over the slots of one span (``o == 0`` at each span's first
+      slot) gives ``m = anchor + o[..., None] + d_rel`` — **C0
+      continuity** at every seam and the FIRST step of each span pinned EXACTLY to
+      that span's anchor.
     * ``'independent'`` (BIT-IDENTICAL legacy): ``m = anchor + delta`` — each patch's
       within-patch median curve is INDEPENDENT, so the median can jump at the seams.
 
@@ -861,77 +1034,121 @@ def assemble_quantiles(
     mirrored there, or the rolling band silently stops matching the fan it widens.
 
     Args:
-        head_raw: ``(B, P, S, 1 + 2*N_SPREADS)`` raw head output (risk space).
-        last_bg_mgdl: ``(B,)`` last context BG (mg/dL), the persistence anchor.
-        carry_spread: risk-space scalar or tensor broadcastable to ``(B, P, S, 1)``
+        head_raw: ``(B, M, S, 1 + 2*N_SPREADS)`` raw head output (risk space), one
+            slot per masked patch.
+        anchor_bg_mgdl: ``(B, M)`` per-slot anchor BG (mg/dL), ONE-SIDED and
+            left-preferring: the last step of the span's LEFT neighbour, or the
+            first step of the right neighbour when the span starts at patch 0.
+            Every slot of a span carries the same value, so the anchor is NOT the
+            nearest visible evidence for a slot near the span's right edge — it
+            ignores the near side, which costs no information (masked rows attend
+            both ways) and only makes this offset parameterisation work harder.
+            Evaluation bins on the two-sided distance ``d``, never on this.
+            ``(B,)`` is accepted as the legacy single-span form (one broadcast
+            ``last_bg``) and then ``mask_idx`` must be None.
+        mask_idx: ``(B, M)`` int64 patch index of each slot.  Required whenever
+            ``anchor_bg_mgdl`` is ``(B, M)``: it is what identifies the spans, and
+            without it the whole ``M`` axis would silently low-pass as one span.
+            None selects the legacy layout (all ``M`` slots one contiguous span),
+            which reproduces the trailing prediction zone exactly.
+        valid: ``(B, M)`` bool, False on padded slots.  Optional — padded slots
+            gather patch 0 and fall out as their own singleton spans either way;
+            passing ``valid`` additionally pins their median to their anchor, so
+            no gradient reaches ``head_raw[..., 0]`` there.
+        carry_spread: risk-space scalar or tensor broadcastable to ``(B, M, S, 1)``
             that seeds the cumulative spread base (default ``0.0``).
 
     Returns:
-        q_tau: ``(B, P, S, N_QUANTILES)`` quantiles in risk space, ascending in τ
+        q_tau: ``(B, M, S, N_QUANTILES)`` quantiles in risk space, ascending in τ
             (index-for-index with ``QUANTILE_LEVELS``).
-        median: ``(B, P, S)`` median in risk space (== ``q_tau[..., 3]``).
+        median: ``(B, M, S)`` median in risk space (== ``q_tau[..., 3]``).
     """
     from config import (
         N_SPREADS, N_QUANTILES, BG_QUANTILE_SPREAD_MIN,
-        BG_HEAD_MEDIAN_MODE, BG_HEAD_MEDIAN_GLOBAL_DIM, BG_HEAD_STEP_BASIS_TYPE,
+        BG_HEAD_MEDIAN_MODE, BG_HEAD_STEP_BASIS_TYPE,
     )
     import torch.nn.functional as F
     assert head_raw.ndim == 4 and head_raw.shape[-1] == 1 + 2 * N_SPREADS, (
-        f"head_raw must be (B, P, S, {1 + 2 * N_SPREADS}), got {tuple(head_raw.shape)}"
+        f"head_raw must be (B, M, S, {1 + 2 * N_SPREADS}), got {tuple(head_raw.shape)}"
     )
-    assert last_bg_mgdl.ndim == 1 and last_bg_mgdl.shape[0] == head_raw.shape[0], (
-        f"last_bg_mgdl must be (B,) matching head_raw batch, got {tuple(last_bg_mgdl.shape)}"
-    )
+    B_, M_, S_ = head_raw.shape[:3]
+    if anchor_bg_mgdl.ndim == 1:
+        assert mask_idx is None, (
+            "a (B,) anchor is the legacy single-span form and cannot describe a "
+            "general masked set — pass a (B, M) anchor with mask_idx"
+        )
+        assert anchor_bg_mgdl.shape[0] == B_, (
+            f"anchor_bg_mgdl must be (B,)=({B_},), got {tuple(anchor_bg_mgdl.shape)}"
+        )
+        anchor_bm = anchor_bg_mgdl.unsqueeze(1).expand(B_, M_)
+    else:
+        assert anchor_bg_mgdl.shape == (B_, M_), (
+            f"anchor_bg_mgdl must be (B, M)=({B_}, {M_}), got "
+            f"{tuple(anchor_bg_mgdl.shape)}"
+        )
+        assert mask_idx is not None, (
+            "a (B, M) anchor needs mask_idx (B, M) to identify the spans"
+        )
+        anchor_bm = anchor_bg_mgdl
+    if mask_idx is not None:
+        assert mask_idx.shape == (B_, M_) and mask_idx.dtype == torch.int64, (
+            f"mask_idx must be (B, M)=({B_}, {M_}) int64, got "
+            f"{tuple(mask_idx.shape)} {mask_idx.dtype}"
+        )
+    if valid is not None:
+        assert valid.shape == (B_, M_) and valid.dtype == torch.bool, (
+            f"valid must be (B, M)=({B_}, {M_}) bool, got "
+            f"{tuple(valid.shape)} {valid.dtype}"
+        )
 
-    # Anchor: f(last_bg), detached (a constant), broadcast flat across (P, S).
+    # Anchor: f(anchor_bg), detached (a constant), flat across the slot's S steps.
     # Clamp the persistence anchor into the physical BG range first — a CGM-noisy
     # last reading can sit just above the simulator ceiling (e.g. 402 mg/dL), and
     # the anchor is a constant, so clamping silences kovatchev_f's ceiling warning
     # without touching any gradient.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
-    anchor = kovatchev_f(last_bg_mgdl.detach().clamp(BG_CLAMP_MIN, BG_CLAMP_MAX))  # (B,)
-    anchor = anchor.view(-1, 1, 1)                       # (B, 1, 1)
-    delta = head_raw[..., 0]                             # (B, P, S)
+    anchor = kovatchev_f(anchor_bm.detach().clamp(BG_CLAMP_MIN, BG_CLAMP_MAX))  # (B,M)
+    anchor = anchor.unsqueeze(-1)                        # (B, M, 1)
+    delta = head_raw[..., 0]                             # (B, M, S)
+    start, length = _span_layout(mask_idx, valid, B_, M_, delta.device)
     assert BG_HEAD_MEDIAN_MODE in ('global', 'cumulative', 'independent'), (
         f"BG_HEAD_MEDIAN_MODE must be 'global'/'cumulative'/'independent', "
         f"got {BG_HEAD_MEDIAN_MODE!r}")
     if BG_HEAD_MEDIAN_MODE == 'global':
-        # R3 GLOBAL SMOOTH-BASIS median: project the per-patch median delta onto a
-        # fixed low-frequency DCT-II subspace over the full P*S horizon.  A projection
-        # is an L2 contraction, so the per-patch offset cannot drift (kills R1's
-        # integrator).  delta_flat is C-contiguous patch-major (flat = p*S + s),
-        # matching risk_loss._to_patch_major so the basis low-passes the TIME axis.
-        B_, P_, S_ = delta.shape
-        n = P_ * S_
-        g = min(BG_HEAD_MEDIAN_GLOBAL_DIM, n)            # clamp G (P==1 edge: g<=S)
-        Bg = get_global_median_basis(
-            n, g, BG_HEAD_STEP_BASIS_TYPE,
-            device=delta.device, dtype=delta.dtype,
-        )                                                # (n, g) orthonormal columns
-        delta_flat = delta.reshape(B_, n)                # (B, P*S) patch-major
-        delta_global = (delta_flat @ Bg) @ Bg.transpose(0, 1)  # proj onto span(Bg)
-        m = anchor + delta_global.reshape(B_, P_, S_)    # (B,P,S) median (risk)
+        # R3 GLOBAL SMOOTH-BASIS median: project each span's median delta onto a
+        # fixed low-frequency DCT-II subspace over that span's own L*S steps.  A
+        # projection is an L2 contraction, so the per-patch offset cannot drift
+        # (kills R1's integrator).  The flattening is C-contiguous patch-major
+        # (flat = p*S + s), matching risk_loss._to_patch_major so the basis
+        # low-passes the TIME axis.
+        delta_med = _median_global_per_span(
+            delta, start, length, BG_HEAD_STEP_BASIS_TYPE)
     elif BG_HEAD_MEDIAN_MODE == 'cumulative':
         # Cumulative cross-patch-continuity median (R1): each patch continues from
         # the previous patch's endpoint.  d_rel zeroes each patch's curve at step 0;
-        # the exclusive cumsum of the per-patch rise carries the offset forward.
-        d_rel = delta - delta[..., :1]                   # (B,P,S) zero-based; d_rel[...,0]==0
-        rise = delta[..., -1] - delta[..., 0]            # (B,P) net within-patch rise
-        o = torch.cumsum(rise, dim=1) - rise             # (B,P) EXCLUSIVE cumsum: o[...,0]==0
-        delta_cum = o.unsqueeze(-1) + d_rel              # (B,P,S)
-        m = anchor + delta_cum                           # (B,P,S) median (risk), C0 at seams
+        # the exclusive cumsum of the per-patch rise carries the offset forward —
+        # restarted at every span, by subtracting the cumsum at the span's start.
+        d_rel = delta - delta[..., :1]                   # (B,M,S) zero-based; d_rel[...,0]==0
+        rise = delta[..., -1] - delta[..., 0]            # (B,M) net within-patch rise
+        excl = torch.cumsum(rise, dim=1) - rise          # (B,M) EXCLUSIVE cumsum
+        o = excl - excl.gather(1, start)                 # zero at each span's first slot
+        delta_med = o.unsqueeze(-1) + d_rel              # (B,M,S)
     else:  # 'independent'
-        m = anchor + delta                               # legacy flat — BIT-IDENTICAL
+        delta_med = delta                                # legacy flat — BIT-IDENTICAL
+    if valid is not None:
+        # Padded slots are anchor-flat: no median gradient reaches their head_raw.
+        delta_med = delta_med * valid.to(delta_med.dtype).unsqueeze(-1)
+    m = anchor + delta_med                               # (B,M,S) median (risk)
 
-    spread = F.softplus(head_raw[..., 1:]) + BG_QUANTILE_SPREAD_MIN  # (B,P,S,2*N_SPREADS)
+    spread = F.softplus(head_raw[..., 1:]) + BG_QUANTILE_SPREAD_MIN  # (B,M,S,2*N_SPREADS)
     d_up = spread[..., :N_SPREADS]                       # τ>.5: .75/.9/.95
     d_dn = spread[..., N_SPREADS:]                       # τ<.5: .25/.1/.05
-    up = m.unsqueeze(-1) + carry_spread + torch.cumsum(d_up, dim=-1)  # (B,P,S,N_SPREADS) ascending
-    dn = m.unsqueeze(-1) - carry_spread - torch.cumsum(d_dn, dim=-1)  # (B,P,S,N_SPREADS) descending
+    up = m.unsqueeze(-1) + carry_spread + torch.cumsum(d_up, dim=-1)  # (B,M,S,N_SPREADS) ascending
+    dn = m.unsqueeze(-1) - carry_spread - torch.cumsum(d_dn, dim=-1)  # (B,M,S,N_SPREADS) descending
 
     # Assemble ascending τ: [.05 .1 .25 | .5 | .75 .9 .95].
     # dn is [.25 .1 .05] (descending in value) → flip to [.05 .1 .25] (ascending).
-    q_tau = torch.cat([dn.flip(-1), m.unsqueeze(-1), up], dim=-1)  # (B,P,S,N_QUANTILES)
+    q_tau = torch.cat([dn.flip(-1), m.unsqueeze(-1), up], dim=-1)  # (B,M,S,N_QUANTILES)
     assert q_tau.shape[-1] == N_QUANTILES, (
         f"assembled {q_tau.shape[-1]} quantiles, expected {N_QUANTILES}"
     )
@@ -940,46 +1157,84 @@ def assemble_quantiles(
 
 def last_bg_mgdl_from_context(
     context: torch.Tensor, stats: dict[str, dict[str, float]],
+    patch_idx: "torch.Tensor | Sequence[int] | None" = None,
+    step_idx: "torch.Tensor | Sequence[int] | None" = None,
 ) -> torch.Tensor:
-    """The ``last_bg`` anchor (mg/dL) for inference — the LAST context BG input.
+    """Anchor BG (mg/dL) read out of the normalized context — the (a)→(b) bridge.
 
     The pipeline runs on RAW post-noise signals (no input/target smoothing): the
     context ``bg_absolute`` channel is the raw observed BG that produced the
-    training input and target.  So the anchor is simply that last context value
+    training input and target.  So the anchor is simply that context cell
     denormalized to mg/dL — it matches the training anchor as the SAME physical
-    mg/dL, to within a sub-ulp round-trip difference (``data._build_sample`` uses
-    ``last_bg = bg[pred_start-1]`` directly, while inference reconstructs it via a
-    z-unscale→f_inv round-trip training never does).  ``bg_absolute`` is the
+    mg/dL, to within a sub-ulp round-trip difference (``data._build_sample`` reads
+    the anchor off the raw mg/dL array directly, while inference reconstructs it
+    via a z-unscale→f_inv round-trip training never does).  ``bg_absolute`` is the
     RISK-space input channel — feat 0 is ``z( f(bg) )`` (Kovatchev ``f`` applied
     before the z-score) as the sole input path — so the inverse is the plain
     z-score un-scale followed unconditionally by ``kovatchev_f_inv_np`` back to
     mg/dL; ``model.forward`` re-applies ``f`` internally.
 
+    The general masked objective needs ``M`` anchors per sample, one per masked
+    slot, each at a different ``(patch, step)`` cell — the last step of the span's
+    left neighbour, or the first step of the right neighbour for a span starting
+    at patch 0.  Pass them as index tensors and all ``M`` cross in ONE host
+    transfer and one float64 NumPy inverse; the default reads the rightmost cell
+    and returns ``(1,)``, bit-identical to the single-anchor form it replaces.
+    Only visible cells may be indexed: feat 0 of a MASKED patch is a legal-looking
+    ``z`` that decodes to an ordinary mg/dL, so a wrong index yields a plausible
+    anchor rather than an error.
+
     Args:
         context: ``(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)`` normalized context.
         stats: normalization statistics dict (must carry ``bg_absolute``).
+        patch_idx: ``(M,)`` patch indices (negatives count from the right).
+            Default: the last patch.
+        step_idx: ``(M,)`` within-patch step indices, same length as
+            ``patch_idx``.  Default: the last step.
 
     Returns:
-        last_bg: ``(1,)`` anchor BG in mg/dL, clamped to the physical range.
+        anchor: ``(M,)`` BG in mg/dL, clamped to the physical range — ``(1,)`` in
+        the default single-cell form.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
+    import numpy as np
     assert context.ndim == 3, (
         f"context must be (n_ctx, PATCH_SIZE, N_INPUT_FEATURES), got {tuple(context.shape)}"
     )
+    n_ctx, n_steps = context.shape[0], context.shape[1]
+    assert (patch_idx is None) == (step_idx is None), (
+        "pass patch_idx and step_idx together, or neither"
+    )
+    if patch_idx is None:
+        # Last context BG cell (newest patch, newest step).  Left-padding sits at
+        # the FAR left, so the rightmost cell is always real data.
+        p = torch.tensor([-1], dtype=torch.long)
+        s = torch.tensor([-1], dtype=torch.long)
+    else:
+        p = torch.as_tensor(patch_idx, dtype=torch.long).reshape(-1)
+        s = torch.as_tensor(step_idx, dtype=torch.long).reshape(-1)
+        assert p.shape == s.shape, (
+            f"patch_idx and step_idx must have the same length, got "
+            f"{tuple(p.shape)} and {tuple(s.shape)}"
+        )
+    p = torch.where(p < 0, p + n_ctx, p)
+    s = torch.where(s < 0, s + n_steps, s)
+    assert bool(((p >= 0) & (p < n_ctx) & (s >= 0) & (s < n_steps)).all()), (
+        f"anchor cell out of range for a ({n_ctx}, {n_steps}) context"
+    )
     bg_mean = stats['bg_absolute']['mean']
     bg_std = stats['bg_absolute']['std']
-    # Last context BG cell (newest patch, newest step), un-z-scored.  Left-padding
-    # sits at the FAR left, so the rightmost cell is always real data.
-    last_z = float(context[-1, -1, 0].detach().float().cpu())
     # feat 0 is z( f(bg) ) — the sole input path — so un-z-scoring yields a RISK
     # value; invert it back to mg/dL so the anchor handed to model.forward stays
     # physical (forward re-applies f internally — this keeps model.py / the loss
-    # untouched).
-    import numpy as np
-    last_risk = last_z * (bg_std + 1e-8) + bg_mean
-    last_val = float(kovatchev_f_inv_np(np.asarray(last_risk, dtype=np.float64)))
-    last_mgdl = float(min(max(last_val, BG_CLAMP_MIN), BG_CLAMP_MAX))
-    return torch.tensor([last_mgdl], dtype=torch.float32, device=context.device)
+    # untouched).  One transfer for all M cells; the arithmetic is float64, as it
+    # was when this read a single Python float.
+    p = p.to(context.device)
+    s = s.to(context.device)
+    z = context[p, s, 0].detach().float().cpu().numpy().astype(np.float64)
+    risk = z * (bg_std + 1e-8) + bg_mean
+    mgdl = np.clip(kovatchev_f_inv_np(risk), BG_CLAMP_MIN, BG_CLAMP_MAX)
+    return torch.tensor(mgdl, dtype=torch.float32, device=context.device)
 
 
 class ModelEMA:

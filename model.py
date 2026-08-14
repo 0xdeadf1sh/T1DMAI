@@ -4,44 +4,44 @@ T1DMAI — Encoder-only transformer for risk-space BG forecasting.
 
 What the model does
 -------------------
-T1DMAI takes 8–24 hours of patient context (CGM blood glucose in
-Kovatchev RISK space plus the two observable behavioral signals, carb
-intake and combined insulin action) and produces an N-hour quantile
-forecast of blood glucose in Kovatchev RISK space.  The
-head emits, per prediction timestep, a median risk delta plus a set of
-ascending quantile spreads; ``utils.assemble_quantiles`` anchors the
-median at ``f(last_bg)`` and assembles the full ascending quantile fan.
-``N`` is the prediction horizon (``PREDICTION_HORIZON_HOURS`` in the
-config); a single model is trained on windows that may start at any time
-of day.  Inference owns the risk→mg/dL inverse (``kovatchev_f_inv``).
+T1DMAI takes a window of ``T`` patches, each visible or masked.  A masked
+patch withholds feat 0 (CGM blood glucose in Kovatchev RISK space) while
+carb intake, combined insulin action and exercise keep their true or
+announced values; feat 4 (``bg_masked``) announces which patches are
+masked.  The model emits a quantile fan in Kovatchev RISK space for every
+masked patch.  A masked span ending at patch ``T−1`` is a forecast, one
+starting at patch 0 a backcast, anything else infill.  The head emits,
+per masked-patch timestep, a median risk delta plus a set of ascending
+quantile spreads; ``utils.assemble_quantiles`` anchors the median at
+``f(anchor_bg)`` and assembles the full ascending quantile fan.  A single
+model is trained on windows that may start at any time of day.  Inference
+owns the risk→mg/dL inverse (``kovatchev_f_inv``).
 
 Architecture in one paragraph
 -----------------------------
 * **Patch embedding.**  Six consecutive 5-minute simulator timesteps are
   grouped into one 30-minute "patch", giving each patch
-  ``PATCH_SIZE × N_INPUT_FEATURES`` (= ``PATCH_DIM``) raw values (no mask
-  bits).
+  ``PATCH_SIZE × N_INPUT_FEATURES`` (= ``PATCH_DIM``) values, step-major.
   ``patch_embed = Linear(PATCH_DIM, D_MODEL)`` projects each patch
   into the model's hidden dimension.  No patient-conditioning embedding is
   added — patient identity is implicit in the context window the model is
   shown.
 * **N_LAYERS transformer blocks**, each with two pre-norm sub-layers:
-    1. ``TemporalSelfAttention`` over patches (RoPE on Q/K, ALiBi on
-       logits, QK-norm for stability, ``F.scaled_dot_product_attention``
-       underneath a custom mask that combines the hybrid attention
-       pattern — bidirectional within context, bidirectional within
-       prediction, context→prediction blocked — with the per-head
-       ALiBi linear-distance bias).
+    1. ``TemporalSelfAttention`` over patches (RoPE on Q/K, QK-norm for
+       stability, ``F.scaled_dot_product_attention`` underneath the bool
+       attention pattern the caller builds — visible rows see visible
+       columns, masked rows see everything, padding columns blocked).
     2. ``SwiGLU FFN`` of width ``FFN_DIM`` (config-driven).
-* **BG head.**  After a final RMSNorm we slice the prediction-horizon
-  patches and run them through a single 3-layer SiLU MLP that emits
-  ``1 + 2·N_SPREADS`` raw values per timestep (one median delta + the
-  ascending quantile spreads).  ``utils.assemble_quantiles`` turns these
-  into the ascending quantile fan anchored at ``f(last_bg)``.
+* **BG head.**  After a final RMSNorm we gather the ``M`` masked-patch
+  hidden states by ``mask_idx`` and run them through a single 3-layer SiLU
+  MLP that emits ``1 + 2·N_SPREADS`` raw values per timestep (one median
+  delta + the ascending quantile spreads).  ``utils.assemble_quantiles``
+  turns these into the ascending quantile fan anchored, per slot, at
+  ``f(anchor_bg)``.
 
 Forward pass returns the 2-tuple ``(q_tau, median)`` in risk space —
-``q_tau`` of shape ``(B, PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES)``,
-``median`` of shape ``(B, PREDICTION_PATCHES, PATCH_SIZE)``.
+``q_tau`` of shape ``(B, M, PATCH_SIZE, N_QUANTILES)``, ``median`` of
+shape ``(B, M, PATCH_SIZE)``.
 
 Numerical care taken throughout
 -------------------------------
@@ -63,7 +63,7 @@ from T1DMSIM.simulator import BG_CLAMP_MIN
 
 from config import (
     D_MODEL, N_LAYERS, N_HEADS, HEAD_DIM, FFN_DIM,
-    PATCH_DIM, PREDICTION_PATCHES, PATCH_SIZE,
+    PATCH_DIM, PATCH_SIZE,
     ROPE_BASE, BG_HEAD_HIDDEN, N_SPREADS, BG_HEAD_INIT_SCALE,
     BG_HEAD_STEP_BASIS_DIM, BG_HEAD_STEP_BASIS_TYPE,
     TIME_PROBE_ENABLED, TIME_PROBE_HIDDEN, TIME_PROBE_DETACH, TIME_PROBE_INIT_SCALE,
@@ -227,9 +227,6 @@ class TemporalSelfAttention(nn.Module):
         prevents gradient spikes through the ``N_LAYERS``-deep stack.
       * RoPE on Q and K injects relative-position information without learned
         positional embeddings.
-      * ALiBi recency bias adds a learnable per-head ``-|i-j| × |s_h|`` term
-        to the attention logits before softmax.  ``slopes`` are nn.Parameters,
-        ``.abs()`` keeps them non-negative.
 
     Input:  (B, T, D_MODEL)
     Output: (B, T, D_MODEL)
@@ -248,36 +245,22 @@ class TemporalSelfAttention(nn.Module):
         # sequences.
         self.q_norm = RMSNorm(HEAD_DIM)
         self.k_norm = RMSNorm(HEAD_DIM)
-        # ALiBi-style recency bias.  Initialized to the standard geometric
-        # series ``m_h = 2^(-8(h+1)/H)`` so heads start with a wide range of
-        # effective receptive fields (head 0 sharply local, head H-1 nearly
-        # flat).  ``.abs()`` in forward keeps slopes non-negative: the bias
-        # is ``-|i-j| × |s|``, so a negative slope would reward distant
-        # tokens (an anti-recency bias), which the model must never apply.
-        slopes_init = torch.tensor([
-            2.0 ** (-8.0 * (i + 1) / N_HEADS) for i in range(N_HEADS)
-        ], dtype=torch.float32)
-        self.alibi_slopes = nn.Parameter(slopes_init)
 
     def forward(
         self,
         x: torch.Tensor,
         rope_cos: torch.Tensor | None,
         rope_sin: torch.Tensor | None,
-        rel_dist: torch.Tensor,
-        struct: torch.Tensor,
+        attn_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             x:         (B, T, D_MODEL)
             rope_cos:  (T, HEAD_DIM) precomputed cosine table (or None)
             rope_sin:  (T, HEAD_DIM) precomputed sine table (or None)
-            rel_dist:  (T, T) |i-j| distance matrix, precomputed once in
-                       ``T1DMAI.forward`` (identical across layers).
-            struct:    additive structural mask — 0 where a position may attend,
-                       -inf where blocked.  ``(T, T)`` for a shared mask or
-                       ``(B, 1, T, T)`` for a per-sample mask.  Also precomputed
-                       once in ``T1DMAI.forward``.
+            attn_mask: bool attention mask, True where a position may attend.
+                       ``(T, T)`` for a shared mask or ``(B, 1, T, T)`` for a
+                       per-sample one; shaped once in ``T1DMAI.forward``.
 
         Returns:
             out: (B, T, D_MODEL)
@@ -307,25 +290,18 @@ class TemporalSelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # ALiBi bias: for each head h and pair (i, j), the bias is
-        # -|i-j| × |s_h|.  ``rel_dist`` (the |i-j| matrix) is layer-independent
-        # and precomputed once in ``T1DMAI.forward``; only the per-head slopes
-        # are layer-specific, so we combine them here.
-        slopes = self.alibi_slopes.abs().to(dtype=q.dtype)                  # (H,)
-        alibi_bias = -rel_dist * slopes.view(N_HEADS, 1, 1)                 # (H, T, T)
-
-        # Add the precomputed structural mask: ``struct`` is 0 where a position
-        # may attend and -inf where blocked, so ``alibi_bias + struct`` is the
-        # additive SDPA mask (finite + -inf == -inf, finite + 0 is exact — bit
-        # for bit the old per-layer masked_fill, without its bool negation, the
-        # (B, H, T, T) clone, or the oversized fill).  ``struct`` broadcasts:
-        # (T, T) → (1, H, T, T) for a shared mask, (B, 1, T, T) → (B, H, T, T)
-        # for a per-sample mask.
-        mask = alibi_bias.unsqueeze(0) + struct
-
-        # Use the SDPA fast path — Flash / memory-efficient kernel will
-        # dispatch automatically given a contiguous mask shape.
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)  # (B, H, T, head_dim)
+        # SDPA takes the bool mask as it stands (True = attend), so no per-layer
+        # additive float tensor is materialized.  Both accepted shapes broadcast
+        # against (B, H, T, T): (T, T) over batch and head, (B, 1, T, T) over
+        # head.  A bare 3-D (B, T, T) mask must never arrive here — broadcasting
+        # aligns from the right, so B would land on the head axis: it raises when
+        # B != N_HEADS and silently masks head b with row b's mask when B ==
+        # N_HEADS.  ``T1DMAI.forward`` adds the head axis; this asserts it did.
+        assert attn_mask.dim() in (2, 4), (
+            f"attn_mask must be (T, T) or (B, 1, T, T), got "
+            f"{tuple(attn_mask.shape)}"
+        )
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (B, H, T, head_dim)
         # Recombine heads: (B, H, T, head_dim) → (B, T, D_MODEL)
         out = out.transpose(1, 2).contiguous().view(B, T, D_MODEL)
         return self.w_o(out)
@@ -386,23 +362,21 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor | None,
         rope_sin: torch.Tensor | None,
-        rel_dist: torch.Tensor,
-        struct: torch.Tensor,
+        attn_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             x:         (B, T, D_MODEL)
             rope_cos:  (T, HEAD_DIM) precomputed cosine table (or None)
             rope_sin:  (T, HEAD_DIM) precomputed sine table (or None)
-            rel_dist:  (T, T) |i-j| distance matrix (layer-independent).
-            struct:    additive structural mask — ``(T, T)`` or ``(B, 1, T, T)``,
-                       0 where a position may attend, -inf where blocked.
+            attn_mask: bool attention mask — ``(T, T)`` or ``(B, 1, T, T)``,
+                       True where a position may attend.
 
         Returns:
             x: (B, T, D_MODEL)
         """
-        # Sub-layer 1: temporal self-attention with the hybrid mask + ALiBi.
-        x = x + self.attn(self.norm1(x), rope_cos, rope_sin, rel_dist, struct)
+        # Sub-layer 1: temporal self-attention under the caller's bool mask.
+        x = x + self.attn(self.norm1(x), rope_cos, rope_sin, attn_mask)
         # Sub-layer 2: SwiGLU FFN.
         x = x + self.ffn(self.norm2(x))
         return x
@@ -416,41 +390,46 @@ class T1DMAI(nn.Module):
     """
     T1DMAI: Transformer for Type 1 Diabetes risk-space BG forecasting.
 
-    Predicts blood glucose over the configured prediction horizon as a fan of
-    ascending quantiles in Kovatchev RISK space.  The ``bg_head`` emits, per
-    prediction timestep, a median risk delta plus ``2·N_SPREADS`` quantile
-    spreads; ``utils.assemble_quantiles`` anchors the median at ``f(last_bg)``
-    and assembles the full ascending fan.  Absolute BG in mg/dL is recovered
+    Predicts blood glucose over every masked patch as a fan of ascending
+    quantiles in Kovatchev RISK space.  The ``bg_head`` emits, per masked-patch
+    timestep, a median risk delta plus ``2·N_SPREADS`` quantile spreads;
+    ``utils.assemble_quantiles`` anchors the median at ``f(anchor_bg)`` and
+    assembles the full ascending fan.  Absolute BG in mg/dL is recovered
     by inference via ``kovatchev_f_inv`` — the model never leaves risk space.
 
     Forward pass inputs:
-        patches:       (B, T, PATCH_DIM) — patched input
-                       (PATCH_SIZE×N_INPUT_FEATURES = PATCH_DIM, no mask bits)
+        patches:       (B, T, PATCH_DIM) — patched input, step-major
+                       (PATCH_SIZE×N_INPUT_FEATURES = PATCH_DIM), ``T <=
+                       MAX_SEQ_LEN`` — the collate pads to the batch maximum,
+                       not to ``MAX_SEQ_LEN``
         attn_mask:     (T, T) or (B, T, T) bool — True = attend
-        last_bg:       (B,) mg/dL — last observed (raw post-noise) context BG; the
-                       risk anchor ``f(last_bg)`` for the median.
+        anchor_bg:     (B, M) mg/dL — per masked patch, the nearest visible
+                       reading; the risk anchor ``f(anchor_bg)`` for that
+                       slot's median.
+        mask_idx:      (B, M) int64 — patch index each head slot reads.
 
     Forward pass outputs:
-        q_tau:   (B, PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES) risk space
-        median:  (B, PREDICTION_PATCHES, PATCH_SIZE) risk space
+        q_tau:   (B, M, PATCH_SIZE, N_QUANTILES) risk space
+        median:  (B, M, PATCH_SIZE) risk space
                  (== the median quantile column of ``q_tau``,
                  ``QUANTILE_LEVELS.index(0.5)``)
 
     ``forward`` also accepts an opt-in ``return_time`` diagnostic switch: with
     ``return_time=True`` it additionally returns the time-of-day probe output
-    ``(B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)`` per-patch hour-of-day bin
-    logits (or ``None`` when the probe is disabled), read off every
-    prediction-patch hidden state (the head never feeds the forecast in the forward).
+    ``(B, M, TIME_PROBE_N_BINS)`` per-slot hour-of-day bin logits (or ``None``
+    when the probe is disabled), read off every gathered masked-patch hidden
+    state (the head never feeds the forecast in the forward).
     """
 
     def __init__(self) -> None:
         super().__init__()
 
         # --- Input embeddings ---
-        # patch_embed projects PATCH_DIM raw values per patch
-        # (PATCH_SIZE × N_INPUT_FEATURES = PATCH_DIM, no mask bits) into D_MODEL.
-        # Bias is included because the prediction-zone bg slot is always zeroed
-        # and a learned offset helps distinguish it from a true zero reading.
+        # patch_embed projects PATCH_DIM values per patch
+        # (PATCH_SIZE × N_INPUT_FEATURES = PATCH_DIM, step-major) into D_MODEL.
+        # A masked patch carries z = 0 in its bg slots — a legal reading (~142
+        # mg/dL), not a sentinel — so feat 4 announces the mask instead; the
+        # bias lets the projection use that bit as an offset.
         self.patch_embed = nn.Linear(PATCH_DIM, D_MODEL)
 
         # --- Transformer stack ---
@@ -461,10 +440,10 @@ class T1DMAI(nn.Module):
         # block before the output head.
         self.final_norm = RMSNorm(D_MODEL)
 
-        # --- BG quantile head (operates on prediction patches only) ---
-        # A single 3-layer SiLU MLP off the prediction-zone hidden state that
+        # --- BG quantile head (operates on the gathered masked patches only) ---
+        # A single 3-layer SiLU MLP off each masked patch's hidden state that
         # emits, per patch token, ``1 + 2·N_SPREADS`` channels:
-        #   col 0       = median risk delta (added to the f(last_bg) anchor),
+        #   col 0       = median risk delta (added to that slot's f(anchor_bg)),
         #   cols 1..N   = τ>.5 ascending spreads (softplus → positive gaps),
         #   cols N+1..  = τ<.5 ascending spreads.
         # ``utils.assemble_quantiles`` turns these into the ascending fan.
@@ -472,9 +451,10 @@ class T1DMAI(nn.Module):
         # values per channel (which let the within-patch median zigzag freely), the
         # head emits ``K = BG_HEAD_STEP_BASIS_DIM`` coefficients per channel, expanded
         # across the PATCH_SIZE within-patch timesteps in the forward via the fixed
-        # orthonormal ``step_basis`` (B, P, K, C) → (B, P, S, C). With K < PATCH_SIZE
+        # orthonormal ``step_basis`` (B, M, K, C) → (B, M, S, C). With K < PATCH_SIZE
         # the period-2 within-patch mode is unrepresentable (anti-oscillation). The
-        # FROZEN head_raw shape (B, P, S, 1 + 2·N_SPREADS) is unchanged downstream.
+        # FROZEN head_raw COLUMN layout (1 + 2·N_SPREADS, meanings unchanged) is the
+        # graph cut point downstream.
         self.bg_head = nn.Sequential(
             nn.Linear(D_MODEL, BG_HEAD_HIDDEN), nn.SiLU(),
             nn.Linear(BG_HEAD_HIDDEN, BG_HEAD_HIDDEN), nn.SiLU(),
@@ -544,8 +524,8 @@ class T1DMAI(nn.Module):
 
         # BG head final layer: tiny weight (BG_HEAD_INIT_SCALE) and zero bias
         # so the median risk delta ≈ 0 at step 0 — the initial median is
-        # f(persistence) (flat from last_bg) and the loss grows the forecast
-        # from there rather than from a random kick.
+        # f(persistence) (flat from each slot's anchor_bg) and the loss grows the
+        # forecast from there rather than from a random kick.
         final = self.bg_head[-1]  # pyright: ignore[reportIndexIssue]
         nn.init.normal_(final.weight, mean=0.0, std=BG_HEAD_INIT_SCALE)
         nn.init.zeros_(final.bias)
@@ -565,43 +545,65 @@ class T1DMAI(nn.Module):
         self,
         patches: torch.Tensor,
         attn_mask: torch.Tensor,
-        last_bg: torch.Tensor,
+        anchor_bg: torch.Tensor,
+        mask_idx: torch.Tensor,
         return_time: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Args:
-            patches:   (B, T, PATCH_DIM) — flattened feature values per patch
+            patches:   (B, T, PATCH_DIM) — flattened feature values per patch.
+                       ``T <= MAX_SEQ_LEN``: the collate left-pads to the batch
+                       maximum, so ``T`` varies batch to batch and is never
+                       asserted equal to ``MAX_SEQ_LEN``.
             attn_mask: (T, T) or (B, T, T) bool — True = attend
-            last_bg:   (B,) mg/dL — last observed (raw post-noise) context BG; the
-                       median's risk anchor is ``f(last_bg)``.  It is a constant
-                       w.r.t. the model (``.detach()``'d before ``f``), so no
-                       gradient flows into it.
+            anchor_bg: (B, M) mg/dL — per masked patch, the nearest visible
+                       reading (the last step of the left neighbour, or the
+                       first step of the right neighbour for a span at patch 0).
+                       Every slot of one span carries the same value.  It is a
+                       constant w.r.t. the model (``.detach()``'d before ``f``),
+                       so no gradient flows into it.  Padded slots must still
+                       carry a legal mg/dL value — the units tripwire below
+                       reads all ``M`` — and their outputs are discarded
+                       downstream by ``valid``.
+            mask_idx:  (B, M) int64 — the patch index each head slot reads.
+                       Padded slots gather position 0.
             return_time: opt-in diagnostic switch.  ``False`` (default) returns
                        the 2-tuple ``(q_tau, median)`` bit-identically; ``True``
                        additionally returns the time-of-day probe output.
 
         Returns:
-            q_tau:  (B, PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES) — ascending
-                    quantile fan in RISK space.
-            median: (B, PREDICTION_PATCHES, PATCH_SIZE) — risk-space median
+            q_tau:  (B, M, PATCH_SIZE, N_QUANTILES) — ascending quantile fan in
+                    RISK space.
+            median: (B, M, PATCH_SIZE) — risk-space median
                     (== the median quantile column of ``q_tau`` at
                     ``QUANTILE_LEVELS.index(0.5)``).
             time_pred: only when ``return_time=True`` —
-                    ``(B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)`` per-patch
-                    hour-of-day bin logits, or ``None`` when
-                    ``TIME_PROBE_ENABLED`` is False.  Read off every
-                    prediction-patch hidden state (no mean-pool); the head never
-                    feeds the forecast in the forward (though with
-                    TIME_PROBE_DETACH=False its loss co-trains the trunk).
+                    ``(B, M, TIME_PROBE_N_BINS)`` per-slot hour-of-day bin
+                    logits, or ``None`` when ``TIME_PROBE_ENABLED`` is False.
+                    Read off every gathered masked-patch hidden state (no
+                    mean-pool); the head never feeds the forecast in the forward
+                    (though with TIME_PROBE_DETACH=False its loss co-trains the
+                    trunk).
         """
         B, T, _ = patches.shape
-        assert last_bg.shape == (B,), (
-            f"last_bg must be (B,)=({B},), got {tuple(last_bg.shape)}"
+        assert mask_idx.dim() == 2 and mask_idx.shape[0] == B, (
+            f"mask_idx must be (B, M) with B={B}, got {tuple(mask_idx.shape)}"
         )
-        # Units tripwire: a z-scored value (~[-3, 3]) would trip this loudly,
-        # catching a normalized-space BG accidentally routed into the anchor.
-        assert bool((last_bg >= BG_CLAMP_MIN - 1e-3).all()), (
-            "last_bg below BG_CLAMP_MIN — non-mg/dL value routed into the anchor"
+        assert mask_idx.dtype == torch.int64, (
+            f"mask_idx must be int64 (gather index), got {mask_idx.dtype}"
+        )
+        M = mask_idx.shape[1]
+        assert anchor_bg.shape == (B, M), (
+            f"anchor_bg must be (B, M)=({B}, {M}), got {tuple(anchor_bg.shape)}"
+        )
+        # Units tripwire: a z-scored value would trip this loudly, catching a
+        # normalized-space BG accidentally routed into the anchor.  The
+        # guarantee is pool-independent — every legal z satisfies
+        # z_max < BG_CLAMP_MIN - 1e-3, the floor this assert reads.  It covers
+        # all M slots: on the inference path every anchor crosses the
+        # denormalize bridge (utils.last_bg_mgdl_from_context) before arriving.
+        assert bool((anchor_bg >= BG_CLAMP_MIN - 1e-3).all()), (
+            "anchor_bg below BG_CLAMP_MIN — non-mg/dL value routed into the anchor"
         )
 
         # --- Patch embedding ---
@@ -612,62 +614,68 @@ class T1DMAI(nn.Module):
         # identical across every block — we precompute and pass through.
         rope_cos, rope_sin = build_rope_cache(T, HEAD_DIM, device=x.device, dtype=x.dtype)
 
-        # --- Precompute the ALiBi distance matrix and structural mask once ---
-        # ``rel_dist`` (the |i-j| matrix) and ``struct`` (the additive 0/-inf
-        # attention mask) depend only on (T, attn_mask) — identical across every
-        # block — so we build them here instead of re-deriving them inside each
-        # layer.  ``struct`` is 0 where a position may attend and -inf where
-        # blocked; each block adds it to its own ALiBi bias, which is exactly the
-        # old per-layer masked_fill in fp32.  A shared 2D mask yields a (T, T)
-        # struct (broadcasts over B and H); a per-sample (B, T, T) mask yields a
-        # (B, 1, T, T) struct (broadcasts over H).
-        positions = torch.arange(T, device=x.device, dtype=x.dtype)
-        rel_dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()  # (T, T)
-        if attn_mask.dim() == 2:
-            struct = torch.zeros(T, T, device=x.device, dtype=x.dtype)
-            struct = struct.masked_fill(~attn_mask, float('-inf'))          # (T, T)
-        else:
-            struct = torch.zeros(
-                attn_mask.shape[0], T, T, device=x.device, dtype=x.dtype
-            ).masked_fill(~attn_mask, float('-inf')).unsqueeze(1)           # (B, 1, T, T)
+        # --- Shape the attention mask once for all layers ---
+        # SDPA consumes the bool mask directly (True = attend), so nothing
+        # additive is materialized and no (B, H, T, T) float is saved for
+        # backward.  A shared (T, T) mask broadcasts over batch and head
+        # unchanged.  A per-sample (B, T, T) mask must gain the head axis here:
+        # broadcasting aligns from the right, so an unexpanded (B, T, T) puts B
+        # on the head axis — raising when B != N_HEADS, and silently masking
+        # head b with row b's mask when B == N_HEADS.
+        assert attn_mask.dtype == torch.bool, (
+            f"attn_mask must be bool (True = attend), got {attn_mask.dtype}"
+        )
+        if attn_mask.dim() == 3:
+            attn_mask = attn_mask.unsqueeze(1)                              # (B, 1, T, T)
+            assert attn_mask.dim() == 4, (
+                f"per-sample mask must be (B, 1, T, T), got {tuple(attn_mask.shape)}"
+            )
 
         # --- Transformer blocks ---
         for block in self.blocks:
-            x = block(x, rope_cos, rope_sin, rel_dist, struct)
+            x = block(x, rope_cos, rope_sin, attn_mask)
 
         # --- Final norm ---
         x = self.final_norm(x)                           # (B, T, D_MODEL)
 
-        # --- BG head: operate only on the last PREDICTION_PATCHES tokens (the
-        # actual prediction horizon — the context patches are not supervised).
-        pred = x[:, -PREDICTION_PATCHES:, :]             # (B, P, D_MODEL)
-        # Per-patch coefficients (B, P, K, C), expanded across the PATCH_SIZE
+        # --- BG head: gather the M masked patches by index.  The masked set is
+        # arbitrary (forecast, backcast, infill), so this is a gather and not a
+        # trailing slice; padded slots gather position 0 and are discarded
+        # downstream by ``valid``.
+        pred = x.gather(
+            1, mask_idx.unsqueeze(-1).expand(B, M, D_MODEL)
+        )                                                # (B, M, D_MODEL)
+        # Per-patch coefficients (B, M, K, C), expanded across the PATCH_SIZE
         # within-patch timesteps by the fixed orthonormal step_basis (S, K):
         # head_raw[..., s, c] = Σ_k step_basis[s, k] · coeff[..., k, c].  K < S
         # makes the within-patch median curve smooth (no period-2 mode) by design.
         coeff = self.bg_head(pred).view(
-            B, PREDICTION_PATCHES, BG_HEAD_STEP_BASIS_DIM, 1 + 2 * N_SPREADS
-        )                                                # (B, P, K, 1 + 2*N_SPREADS)
-        head_raw = torch.einsum('sk,bpkc->bpsc', self.step_basis, coeff)
+            B, M, BG_HEAD_STEP_BASIS_DIM, 1 + 2 * N_SPREADS
+        )                                                # (B, M, K, 1 + 2*N_SPREADS)
+        head_raw = torch.einsum('sk,bmkc->bmsc', self.step_basis, coeff)
         assert head_raw.shape == (
-            B, PREDICTION_PATCHES, PATCH_SIZE, 1 + 2 * N_SPREADS
+            B, M, PATCH_SIZE, 1 + 2 * N_SPREADS
         ), f"head_raw shape {tuple(head_raw.shape)} unexpected after basis expansion"
 
-        # Assemble the ascending quantile fan in risk space.  The anchor
-        # f(last_bg.detach()) is formed inside the helper; last_bg is a
-        # constant, so detaching keeps gradient out of it.
-        q_tau, median = assemble_quantiles(head_raw, last_bg.detach())
+        # Assemble the ascending quantile fan in risk space.  The per-slot anchor
+        # f(anchor_bg.detach()) is formed inside the helper; anchor_bg is a
+        # constant, so detaching keeps gradient out of it.  mask_idx goes with it:
+        # it is what groups the M slots into spans, and the median mode runs per
+        # span — without it the whole M axis low-passes as one.
+        q_tau, median = assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx)
         if not return_time:
             return q_tau, median
         time_pred = None
         if self.time_head is not None:
-            # Run the probe on EVERY (final-normed) prediction-patch hidden state
-            # (no mean-pool), so each per-patch representation the BG head also
-            # reads is forced to encode the absolute clock. With TIME_PROBE_DETACH=
-            # False (crucial) the probe gradient back-props into the trunk, shaping
-            # that representation to carry circadian phase; True detaches it
-            # (read-only diagnostic). Either way the forward VALUE of q_tau/median
-            # is unchanged — the head never feeds them.
-            h = pred if not TIME_PROBE_DETACH else pred.detach()  # (B, P, D_MODEL)
-            time_pred = self.time_head(h)                         # (B, P, TIME_PROBE_N_BINS)
+            # Run the probe on EVERY (final-normed) gathered masked-patch hidden
+            # state (no mean-pool), so each per-patch representation the BG head
+            # also reads is forced to encode the absolute clock. With
+            # TIME_PROBE_DETACH=False (crucial) the probe gradient back-props into
+            # the trunk, shaping that representation to carry circadian phase;
+            # True detaches it (read-only diagnostic). Either way the forward
+            # VALUE of q_tau/median is unchanged — the head never feeds them.
+            # Slot j is patch mask_idx[:, j], so the caller's per-slot hour target
+            # must follow mask_idx, not a fixed offset from the context end.
+            h = pred if not TIME_PROBE_DETACH else pred.detach()  # (B, M, D_MODEL)
+            time_pred = self.time_head(h)                         # (B, M, TIME_PROBE_N_BINS)
         return q_tau, median, time_pred

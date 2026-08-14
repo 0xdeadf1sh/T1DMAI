@@ -5,7 +5,7 @@ T1DMAI Normalization — compute and load per-channel statistics.
 What this module is for
 -----------------------
 The model only ever sees normalized inputs (zero mean, unit variance) for the
-three signal channels — the full input feature stack, with no temporal columns.
+four signal channels — the full input feature stack, with no temporal columns.
 The mean and standard deviation needed to
 perform that normalization are computed *once*, before training begins, by
 simulating a large pool of independent patients and accumulating per-channel
@@ -20,11 +20,12 @@ Run once before training::
 
 Channels
 --------
-There are three channels that get normalized — the whole input stack.  Two of them are
+There are four channels that get normalized — the whole input stack.  Three of them are
 "sparse" — they sit at zero most of the time and spike occasionally (carbs at
-mealtimes, insulin at boluses).  Their distribution is heavy-tailed, so taking
-the raw mean/std would be dominated by rare events and the dense baseline
-(e.g. zero-carb windows) would land far below the normalized zero.
+mealtimes, insulin at boluses, glucose disposal during exercise).  Their
+distribution is heavy-tailed, so taking the raw mean/std would be dominated by
+rare events and the dense baseline (e.g. zero-carb windows) would land far below
+the normalized zero.
 
 To fix that, the sparse channels are passed through ``log1p`` *before* the
 mean/std fit.  ``log1p(x) ≈ x`` near zero, so the dense baseline barely moves,
@@ -39,10 +40,12 @@ its membership requires re-running this script.
 
 Channel roles
 -------------
-- Inputs (all three normalized signals): bg_absolute, carb_intake,
-  insulin_combined.  These are the entire input feature stack — there are no
-  temporal columns.  bg_absolute is z-scored in Kovatchev risk space (``f``
-  applied before the z-fit, its sole input path); carb/insulin keep log1p+z.
+- Inputs (all four normalized signals): bg_absolute, carb_intake,
+  insulin_combined, exercise_equiv.  These are the entire input feature stack —
+  there are no temporal columns.  bg_absolute is z-scored in Kovatchev risk
+  space (``f`` applied before the z-fit, its sole input path); carb, insulin and
+  exercise keep log1p+z.  exercise_equiv is carbohydrate-equivalent glucose
+  disposal in g/step, so it is encoded exactly like carb and never as a glucose.
   The model does not directly predict BG: the quantile head emits BG forecasts
   in Kovatchev risk space, anchored on the last context BG and inverted back to
   mg/dL downstream.
@@ -50,6 +53,7 @@ Channel roles
 
 from __future__ import annotations
 import json
+import math
 from typing import Any
 import numpy as np
 
@@ -61,7 +65,7 @@ import numpy as np
 # which is what prevents the "stats fitted on training samples" leakage class.
 from config import (
     NORM_N_PATIENTS, NORM_STATS_FILE,
-    MASTER_SEED, N_INPUT_FEATURES,
+    MASTER_SEED,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
 )
 
@@ -73,29 +77,38 @@ CHANNEL_NAMES = [
     'bg_absolute',         # Index 0: observed CGM blood glucose (mg/dL, post-CGM-noise)
     'carb_intake',         # Index 1: carbohydrate absorption curve (grams/step, post-absorption-noise)
     'insulin_combined',    # Index 2: combined basal+bolus insulin action (units/step, post-absorption-noise)
+    'exercise_equiv',      # Index 3: exercise glucose disposal as a carbohydrate EQUIVALENT (grams/step)
 ]
 
-# Every input feature column is a normalized signal channel: the input stack is
-# exactly [bg_absolute, carb_intake, insulin_combined] with no temporal columns,
-# so CHANNEL_NAMES must line up one-to-one with the model's input features.
-assert len(CHANNEL_NAMES) == N_INPUT_FEATURES, (
-    f"CHANNEL_NAMES has {len(CHANNEL_NAMES)} entries but N_INPUT_FEATURES="
-    f"{N_INPUT_FEATURES}; the normalized signal channels and the input features "
-    "must agree."
-)
-
-# Convenience constant — number of channels to normalize.  Used by Welford's
-# accumulator below to size the running-stats arrays.
+# Number of channels to normalize.  Used by Welford's accumulator below to size
+# the running-stats arrays.
 N_CHANNELS = len(CHANNEL_NAMES)
 
+# CHANNEL_NAMES lists the normalized SIGNAL channels, and there are exactly four:
+# [bg_absolute, carb_intake, insulin_combined, exercise_equiv], with no temporal
+# columns.  This count is pinned to 4 directly and is deliberately NOT tied to
+# ``config.N_INPUT_FEATURES``, which is 5: input feat 4 (``bg_masked``) is a
+# per-patch mask BIT announcing that feat 0 is withheld, not a measured signal.
+# It carries no statistics — no mean, no std, no log1p encoding — so it gets no
+# entry here and nothing in this module ever normalizes or denormalizes it.
+assert N_CHANNELS == 4, (
+    f"CHANNEL_NAMES has {N_CHANNELS} entries; N_CHANNELS is pinned at 4 "
+    "(bg_absolute, carb_intake, insulin_combined, exercise_equiv). Adding or "
+    "removing a normalized signal channel invalidates every saved checkpoint "
+    "and every saved normalization_stats.json, so change this deliberately."
+)
+
 # Sparse channels: non-negative, heavy-tailed event spikes (meal carbs, insulin
-# boluses).  log1p compresses spikes into the bulk distribution while leaving
-# the dense ≈0 baseline almost untouched, so the resulting normalized space
-# is much better behaved than a plain z-score.
+# boluses, exercise sessions).  log1p compresses spikes into the bulk
+# distribution while leaving the dense ≈0 baseline almost untouched, so the
+# resulting normalized space is much better behaved than a plain z-score.
+# ``exercise_equiv`` is carbohydrate-equivalent glucose disposal in g/step, so it
+# takes carb's encoding exactly — never the Kovatchev transform, and never a
+# rescaling to intensity: the trained scale is g/step.
 # Frozenset because membership is the only operation we ever do with it and
 # treating it as immutable prevents accidental mutation at runtime.
 SPARSE_LOG1P_CHANNELS: frozenset[str] = frozenset({
-    'carb_intake', 'insulin_combined',
+    'carb_intake', 'insulin_combined', 'exercise_equiv',
 })
 
 # Risk-space channels: the dense ``bg_absolute`` INPUT channel is fed through the
@@ -103,7 +116,8 @@ SPARSE_LOG1P_CHANNELS: frozenset[str] = frozenset({
 # on the way back), so the fitted bg mean/std live in risk space.  This is the
 # SOLE bg-input path — the single membership set every transform consults,
 # mirroring ``SPARSE_LOG1P_CHANNELS``.  The two sets are disjoint (bg is
-# dense/risk, carb+insulin are sparse/log1p).
+# dense/risk; carb, insulin and exercise are sparse/log1p) and only a glucose
+# ever belongs here.
 RISK_SPACE_CHANNELS: frozenset[str] = frozenset({'bg_absolute'})
 
 
@@ -261,12 +275,20 @@ def compute_normalization_stats(
         bg = data['bg_observed'].astype(np.float64)
         carb = data['total_carb'].astype(np.float64)
         insulin = data['total_insulin'].astype(np.float64)
+        exercise = data['total_exercise'].astype(np.float64)
 
         # Order MUST match CHANNEL_NAMES so the stats dict keys line up below.
-        raw_channels = [bg, carb, insulin]
+        raw_channels = [bg, carb, insulin, exercise]
+        # The zip below is silent on a short list: a missing array leaves that
+        # channel with zero observations and _finalize_welford_stats then emits
+        # {mean: 0.0, std: 0.0}, which the input pipeline divides by.
+        assert len(raw_channels) == len(CHANNEL_NAMES), (
+            f"{len(raw_channels)} raw channels against {len(CHANNEL_NAMES)} "
+            "CHANNEL_NAMES; every named channel needs its own array."
+        )
 
         # Apply the per-channel forward transform (bg → Kovatchev f, which clamps to
-        # the physical BG range; sparse carb/insulin → log1p(max(x,0))) directly on
+        # the physical BG range; sparse carb/insulin/exercise → log1p(max(x,0))) on
         # the RAW post-noise channels — no smoothing — BEFORE the Welford update, so
         # the saved stats live in the same raw + transformed space the model is fed.
         channels = [
@@ -336,10 +358,10 @@ def compute_normalization_stats_from_cache(
             f"Cache channels {tuple(meta['channels'])} disagree with expected "
             f"{CACHE_CHANNEL_NAMES}; rebuild the cache."
         )
-    # The cached channels we need (temporal, exercise, IS and HGO channels are
-    # not normalized). Order of the per-channel read in the loop must match
+    # The cached channels we need (temporal, IS and HGO channels are not
+    # normalized). Order of the per-channel read in the loop must match
     # CHANNEL_NAMES, NOT this set.
-    needed = ('bg_observed', 'total_carb', 'total_insulin')
+    needed = ('bg_observed', 'total_carb', 'total_insulin', 'total_exercise')
 
     arrays: dict[str, Any] = {}
     if cache_format == CACHE_FORMAT_NPY:
@@ -377,9 +399,16 @@ def compute_normalization_stats_from_cache(
         bg = np.asarray(arrays['bg_observed'][start:stop], dtype=np.float64)  # (B, T)
         carb = np.asarray(arrays['total_carb'][start:stop], dtype=np.float64)
         insulin = np.asarray(arrays['total_insulin'][start:stop], dtype=np.float64)
+        exercise = np.asarray(arrays['total_exercise'][start:stop], dtype=np.float64)
 
         # Order MUST match CHANNEL_NAMES so stats keys line up.
-        raw_channels = [bg, carb, insulin]
+        raw_channels = [bg, carb, insulin, exercise]
+        # A short list truncates the zip in silence — the missing channel gets
+        # zero observations and finalizes to {mean: 0.0, std: 0.0}.
+        assert len(raw_channels) == len(CHANNEL_NAMES), (
+            f"{len(raw_channels)} raw channels against {len(CHANNEL_NAMES)} "
+            "CHANNEL_NAMES; every named channel needs its own array."
+        )
         for c, (arr, name) in enumerate(zip(raw_channels, CHANNEL_NAMES)):
             # Forward-transform each (B, T) block directly — bg → Kovatchev f
             # (clamped to the physical range), sparse → log1p(max(x,0)) — with NO
@@ -413,14 +442,52 @@ def load_normalization_stats(path: str = NORM_STATS_FILE) -> dict[str, dict[str,
     """
     Load normalization statistics from a JSON file.
 
+    Validated on the way in, because nothing downstream distinguishes a
+    malformed file from a well-formed one.  A missing channel reaches
+    ``normalize`` through a ``.get`` default and trains an untrained channel; a
+    ``std`` of ``0.0`` divides by ``0 + 1e-8`` and scales its channel by ~1e8.
+    Neither raises, and both train to completion behind a plausible validation
+    table.
+
     Args:
         path: Path to ``normalization_stats.json``.
 
     Returns:
         stats: dict mapping channel_name → {'mean': float, 'std': float}.
+
+    Raises:
+        ValueError: the file lacks an entry for some channel in
+            ``CHANNEL_NAMES``, or carries a non-finite mean/std, or a std that
+            is not strictly positive.
     """
     with open(path, 'r') as f:
-        return json.load(f)
+        stats = json.load(f)
+
+    missing = [name for name in CHANNEL_NAMES if name not in stats]
+    if missing:
+        raise ValueError(
+            f"{path}: no statistics for {missing}. One entry per CHANNEL_NAMES "
+            f"channel is required ({list(CHANNEL_NAMES)}); the file carries "
+            f"{sorted(stats)}. A file fitted before a channel was added still "
+            f"yields a fully formed sample against the current pool."
+        )
+    for name in CHANNEL_NAMES:
+        entry = stats[name]
+        mean, std = float(entry['mean']), float(entry['std'])
+        if not (math.isfinite(mean) and math.isfinite(std)):
+            raise ValueError(
+                f"{path}: channel {name!r} has non-finite statistics "
+                f"(mean={mean}, std={std})."
+            )
+        if std <= 0.0:
+            raise ValueError(
+                f"{path}: channel {name!r} has std={std!r}. normalize divides by "
+                f"std + 1e-8, so this scales the channel by ~1e8. "
+                f"A zero std means the fitter recorded no observations for it — "
+                f"most often a zip() truncated between the raw-channel arrays and "
+                f"CHANNEL_NAMES."
+            )
+    return stats
 
 
 def normalize(

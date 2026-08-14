@@ -13,19 +13,20 @@ network is
   * **saturated** — near-full-rank maps, no dead units, evenly used heads — and
     is a candidate to **grow** to lift quality.
 
-The knobs mirror ``resize_model.py`` exactly: ``D_MODEL``, ``N_LAYERS``,
-``N_HEADS``, ``FFN_DIM`` (``--ffn-mult``), ``BG_HEAD_HIDDEN``
-(``--bg-head-hidden-mult``), ``PATCH_SIZE``, ``MIN/MAX_CONTEXT_PATCHES``.  The
-report ends with a per-knob verdict table and the concrete ``resize_model.py``
-command that would enact each suggestion.
+The knobs audited are ``D_MODEL``, ``N_LAYERS``, ``N_HEADS``, ``FFN_DIM``
+(``--ffn-mult``), ``BG_HEAD_HIDDEN`` (``--bg-head-hidden-mult``) and
+``PATCH_SIZE``, each a ``resize_model.py`` flag.  The report ends with a
+per-knob verdict table and the concrete ``resize_model.py`` command that would
+enact each suggestion.
 
 How it reads the model
 ----------------------
 Every architecture dimension is **derived from the checkpoint's tensor shapes**
 (not from the live ``config.py``), so the script audits whatever architecture
 produced the weights — any configuration ``resize_model.py`` can emit.  The
-frozen input layout (``N_INPUT_FEATURES = 3``, no mask bits) is the only
-structural assumption; ``PATCH_SIZE`` is recovered from ``PATCH_DIM``.
+frozen input layout (``config.N_INPUT_FEATURES`` — the four normalized signal
+channels plus the ``bg_masked`` announcement bit) is the only structural
+assumption; ``PATCH_SIZE`` is recovered from ``PATCH_DIM``.
 
 Signals (all data-free unless ``--data`` is passed)
 ---------------------------------------------------
@@ -45,8 +46,6 @@ Signals (all data-free unless ``--data`` is passed)
   * **Per-unit usage.**  FFN hidden units, BG-head hidden units, and attention
     heads are scored by their in/out weight-norm product; units far below the
     median are "ignored" and inflate the corresponding width.
-  * **Attention reach.**  ALiBi slopes give each head's effective temporal
-    horizon, compared against ``MIN/MAX_CONTEXT_PATCHES``.
 
 With ``--data N`` the script additionally streams ``N`` cached simulator
 samples through the model with forward hooks and measures *activation* dead
@@ -80,13 +79,19 @@ from typing import Any
 import numpy as np
 import torch
 
+from config import N_INPUT_FEATURES
+# The bg_masked column index, from its single definition.  ``data`` imports torch,
+# config and normalization and nothing heavier — blosc2 and T1DMSIM are pulled in
+# lazily, inside the cache reader — so this stays on the data-free path.
+from data import BG_MASKED_FEAT
+
 
 # ---------------------------------------------------------------------------
 # Frozen structural assumptions (see CLAUDE.md "FROZEN index map") and the init
 # scheme of model._init_weights.  These are NOT resize knobs; PATCH_SIZE is the
-# only patch-layout quantity resize_model.py changes, and it multiplies these.
+# only patch-layout quantity resize_model.py changes, and it multiplies
+# N_INPUT_FEATURES.
 # ---------------------------------------------------------------------------
-N_INPUT_FEATURES = 3              # [bg (risk-space z), carb, insulin]
 # model._init_weights: base_std = 0.02 * sqrt(512 / D_MODEL); residual-branch
 # output projections (attn.w_o, ffn.w2) use base_std / sqrt(2 * N_LAYERS); the
 # BG-head final layer uses BG_HEAD_INIT_SCALE.  Mirror them so the drift metric
@@ -111,7 +116,6 @@ STALE_OPT_REL = 0.01             # optimizer activity below 1% of the median ⇒
 STALE_OPT_ABS = 1e-10            # absolute optimizer-activity floor ⇒ dead
 DRIFT_NEAR_INIT = 0.08           # |std/init_std - 1| below this ⇒ "near-init" (barely trained)
 TAIL_REL = 0.01                  # singular values below 1% of σ_max counted as spectral tail
-ALIBI_REACH_NATS = 5.0           # attention bias of -5 nats ≈ horizon cutoff for a head
 
 
 # ===========================================================================
@@ -155,8 +159,8 @@ def derive_arch(sd: dict[str, torch.Tensor]) -> Arch:
     n_layers = len(block_ids)
     assert block_ids == list(range(n_layers)), f"non-contiguous block ids: {block_ids}"
 
-    n_heads = sd['blocks.0.attn.alibi_slopes'].shape[0]
     head_dim = sd['blocks.0.attn.q_norm.weight'].shape[0]
+    n_heads = d_model // head_dim
     assert head_dim * n_heads == d_model, (
         f"HEAD_DIM({head_dim}) * N_HEADS({n_heads}) != D_MODEL({d_model})"
     )
@@ -169,7 +173,9 @@ def derive_arch(sd: dict[str, torch.Tensor]) -> Arch:
     bg_head_hidden = sd[bg_linears[0]].shape[0]
     head_out_width = sd[bg_linears[-1]].shape[0]
 
-    # PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES (frozen layout, no mask bits).
+    # PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES, step-major.  The last feature is
+    # the per-patch ``bg_masked`` bit, written into all PATCH_SIZE of its columns,
+    # so it occupies a whole feature slot of the layout and this division holds.
     assert patch_dim % N_INPUT_FEATURES == 0, (
         f"PATCH_DIM={patch_dim} inconsistent with the frozen "
         f"{N_INPUT_FEATURES}-feature layout"
@@ -281,14 +287,12 @@ def init_std_for(name: str, arch: Arch, bg_head_init_scale: float) -> tuple[str,
 
     Returns:
         (kind, init_std).  kind in {'linear', 'residual', 'head_final', 'norm',
-        'bias', 'alibi'}; init_std is the std of the init distribution (NaN for
+        'bias'}; init_std is the std of the init distribution (NaN for
         kinds with a non-Gaussian reference handled separately).
     """
     base_std = INIT_BASE_STD_ANCHOR * math.sqrt(INIT_BASE_STD_ANCHOR_DMODEL / arch.d_model)
     residual_std = base_std / math.sqrt(RESIDUAL_WRITES_PER_BLOCK * arch.n_layers)
 
-    if name.endswith('alibi_slopes'):
-        return 'alibi', float('nan')
     if name.endswith('.bias'):
         return 'bias', 0.0
     if name.endswith('norm.weight') or name.endswith('norm1.weight') or name.endswith('norm2.weight'):
@@ -688,45 +692,28 @@ def build_verdicts(
     # ---- PATCH_SIZE: structural; report patch-embed input-column usage only. ----
     pe = np_sd['patch_embed.weight']                       # (D, PATCH_DIM)
     in_use = col_norms(pe)
-    feat_cols = in_use[:arch.patch_size * N_INPUT_FEATURES]
+    # The row is step-major, so feature f occupies columns f::N_INPUT_FEATURES.
+    # The last feature is the ``bg_masked`` announcement bit, held at one value for
+    # the whole patch and therefore written into all PATCH_SIZE of its columns.
+    # Those columns are a repeated indicator, not a normalized signal: the embedding
+    # only ever sees their SUM, so an individual column norm says nothing about
+    # whether the bit is used, and pooling them with the signal columns moves the
+    # median the deadness test is taken against.  Score the signal columns, and
+    # report the bit's summed contribution beside them.
+    n_feat_cols = arch.patch_size * N_INPUT_FEATURES
+    mask_bit_cols = np.arange(BG_MASKED_FEAT, n_feat_cols, N_INPUT_FEATURES)
+    signal_cols = np.setdiff1d(np.arange(n_feat_cols), mask_bit_cols)
+    feat_cols = in_use[signal_cols]
     dead_feat = int((feat_cols < DEAD_UNIT_REL * np.median(feat_cols)).sum())
+    bit_rel = float(np.linalg.norm(pe[:, mask_bit_cols].sum(axis=1))
+                    / (np.median(feat_cols) + 1e-12))
     sig = (f'{arch.patch_size} steps/patch ({arch.patch_size * 5} min); '
-           f'{dead_feat}/{feat_cols.size} input feature-columns near-dead')
+           f'{dead_feat}/{feat_cols.size} signal feature-columns near-dead; '
+           f'bg_masked bit weight {bit_rel:.2f}× the median signal column')
     verdicts.append(Verdict('PATCH_SIZE', str(arch.patch_size), 'NOTE', sig,
                             'structural — retrain required (see resize_model.py --patch-size)',
-                            {'dead_feature_cols': dead_feat}))
-
-    # ---- MIN/MAX_CONTEXT_PATCHES: ALiBi effective reach. ----
-    slopes = np.abs(np_sd['blocks.0.attn.alibi_slopes'])
-    slopes = slopes[slopes > 0]
-    # reach where bias hits -ALIBI_REACH_NATS, in patches; flattest head = longest reach.
-    reach_patches = ALIBI_REACH_NATS / slopes
-    max_reach = float(reach_patches.max())
-    patch_min = arch.patch_size * 5
-    max_reach_h = max_reach * patch_min / 60.0
-    # Compare the attention reach against the live MAX_CONTEXT_PATCHES (advisory).
-    max_ctx = None
-    try:
-        import config as _cfg
-        max_ctx = int(_cfg.MAX_CONTEXT_PATCHES)
-    except Exception:  # noqa: BLE001
-        pass
-    if max_ctx:
-        if max_reach > 1.5 * max_ctx:
-            tail = (f'reach >> MAX_CONTEXT_PATCHES={max_ctx}: ALiBi does not decay within the '
-                    'window (long-range attention used; window not the bottleneck)')
-        elif max_reach < 0.5 * max_ctx:
-            tail = (f'reach < MAX_CONTEXT_PATCHES={max_ctx}: attention decays well inside the '
-                    'window — context may be shrinkable')
-        else:
-            tail = f'reach comparable to MAX_CONTEXT_PATCHES={max_ctx}'
-    else:
-        tail = 'context spans up to MAX_CONTEXT_PATCHES'
-    sig = f'ALiBi flattest-head reach ~{max_reach:.0f} patches (~{max_reach_h:.1f} h); {tail}'
-    verdicts.append(Verdict('CONTEXT_PATCHES', 'MIN/MAX', 'NOTE', sig,
-                            'param-neutral — set --min/--max-context-patches per reach',
-                            {'alibi_reach_patches': reach_patches.tolist(),
-                             'max_reach_hours': max_reach_h}))
+                            {'dead_feature_cols': dead_feat,
+                             'bg_masked_rel_weight': bit_rel}))
 
     # Apply the undertrained guard: a near-init checkpoint yields no trustworthy
     # capacity advice, so neutralize every SHRINK/GROW to KEEP (the NOTE knobs
@@ -753,8 +740,8 @@ def run_data_pass(
     Patches the in-process ``config`` to the checkpoint's dims (so ``model``
     binds them), builds ``T1DMAI``, loads ``state_dict``, registers forward
     hooks, and runs ``n_samples`` cached simulator samples.  Returns activation
-    dead-fraction / reach summaries, or ``None`` if the cache/model is
-    unavailable (the caller continues with the data-free report).
+    dead-fraction summaries, or ``None`` if the cache/model is unavailable (the
+    caller continues with the data-free report).
 
     Args:
         arch: derived architecture.
@@ -780,9 +767,18 @@ def run_data_pass(
         config.PATCH_DIM = arch.patch_dim
         pph = 60 // (arch.patch_size * 5)
         config._PATCHES_PER_HOUR = pph
+        # PREDICTION_PATCHES no longer names a prediction ZONE — the supervised set
+        # is the sampled masked set.  What it still fixes is the WINDOW length the
+        # sampler places spans in (``collate_fn`` builds T = n_ctx +
+        # PREDICTION_PATCHES), so it stays derived from the checkpoint's patch size.
         config.PREDICTION_PATCHES = config.PREDICTION_HORIZON_HOURS * pph
         config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
         config.NIGHT_LONG_HORIZON_PATCHES = config.NIGHT_LONG_HORIZON_HOURS * pph
+        # MAX_MASKED_PATCHES (M, the head's slot count) is deliberately NOT rewritten
+        # from the checkpoint: no parameter of the model is shaped by it — the BG head
+        # emits K*(1+2*N_SPREADS) per slot and M is a runtime shape carried by
+        # ``mask_idx`` — so a checkpoint trained at a different M streams here
+        # unchanged, and no tensor shape could reveal the difference.
         sys.modules.pop('model', None)
         from model import T1DMAI
         from data import T1DMDataset, collate_fn
@@ -816,7 +812,6 @@ def run_data_pass(
 
     resid_var: list[np.ndarray] = []
     head_norm_acc = np.zeros(arch.n_heads)
-    attn_reach: list[float] = []
     hooks = []
 
     def pre_hook(key):
@@ -858,8 +853,18 @@ def run_data_pass(
                 batch = collate_fn([ds[i]])
                 patches = batch['patches'].to(device)
                 attn_mask = batch['attn_mask'].to(device)
-                last_bg = batch['bg_formula_data']['last_bg'].float().to(device)
-                model(patches, attn_mask, last_bg)
+                # The supervised set is the sampled masked set, not a trailing
+                # slice: the head gathers ``mask_idx`` (already rebased onto the
+                # padded patch axis by ``collate_fn``) and anchors each slot on its
+                # own ``anchor_bg``.  Both are (B, M) and both come from
+                # ``bg_formula_data``; the broadcast per-sample ``last_bg`` scalar
+                # is not the anchor any more.  Padded slots gather patch 0 and
+                # carry a legal mg/dL anchor, so the units tripwire over all M
+                # passes — this pass reads activations, so nothing discards them.
+                bgf = batch['bg_formula_data']
+                anchor_bg = bgf['anchor_bg'].float().to(device)     # (B, M) mg/dL
+                mask_idx = bgf['mask_idx'].long().to(device)        # (B, M)
+                model(patches, attn_mask, anchor_bg, mask_idx)
     except Exception as e:  # noqa: BLE001
         print(f"[data] forward failed mid-stream: {type(e).__name__}: {e}")
         for h in hooks:

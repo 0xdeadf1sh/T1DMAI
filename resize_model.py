@@ -66,7 +66,6 @@ modules that contribute are::
     N_LAYERS x TransformerBlock:
         TemporalSelfAttention  w_q/w_k/w_v/w_o : Linear(D_MODEL, D_MODEL) no bias
                                q_norm/k_norm   : RMSNorm(HEAD_DIM)
-                               alibi_slopes    : (N_HEADS,)
                                norm1           : RMSNorm(D_MODEL)
         SwiGLUFFN              w1/w3 : Linear(D_MODEL, FFN_DIM) no bias
                                w2    : Linear(FFN_DIM, D_MODEL) no bias
@@ -75,6 +74,16 @@ modules that contribute are::
     bg_head       Linear(D_MODEL, BG_HEAD_HIDDEN) -> SiLU
                   Linear(BG_HEAD_HIDDEN, BG_HEAD_HIDDEN) -> SiLU
                   Linear(BG_HEAD_HIDDEN, BG_HEAD_STEP_BASIS_DIM * (1 + 2*N_SPREADS))   (all with bias)
+    time_head     Linear(D_MODEL, TIME_PROBE_HIDDEN) -> SiLU
+                  Linear(TIME_PROBE_HIDDEN, TIME_PROBE_N_BINS)   (both with bias;
+                  present only when TIME_PROBE_ENABLED)
+
+Every width ``config.py`` writes as ``k * D_MODEL`` — ``FFN_DIM``,
+``BG_HEAD_HIDDEN``, ``TIME_PROBE_HIDDEN`` — and ``HEAD_DIM = D_MODEL //
+N_HEADS`` are re-derived at the candidate ``D_MODEL`` before the count, so a
+projected rung is counted at that rung throughout.  A width left at the live
+value would size one head for a different architecture than the rest of the
+model and the printed total would belong to neither.
 """
 import argparse
 import re
@@ -241,17 +250,24 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
     constants.  Uses ``torch.device('meta')`` so no real memory is allocated
     for the parameter tensors — only the ``numel`` count is needed.  Context-patch
     counts are deliberately not set here: they do not affect the parameter count
-    (RoPE / ALiBi are parameter-light).  ``patch_size`` *does* affect the count
+    (RoPE is parameter-free).  ``patch_size`` *does* affect the count
     (via PATCH_DIM; the ``(S, K)`` step_basis is a non-parameter buffer and the
-    bg_head output width K*(1 + 2*N_SPREADS) no longer scales with it), so when it
+    bg_head output width K*(1 + 2*N_SPREADS) is independent of it), so when it
     is given the derived constants are re-evaluated to match.
+
+    Every constant ``config.py`` derives from ``D_MODEL`` is re-derived here, so
+    the model instantiated is the candidate rung throughout.  ``FFN_DIM`` and
+    ``BG_HEAD_HIDDEN`` arrive resolved from the caller (they carry override
+    flags); ``HEAD_DIM`` and ``TIME_PROBE_HIDDEN`` have none and are re-derived
+    from their ``config.py`` relation at the candidate ``D_MODEL``.
     """
     import config
     # Snapshot every config global this helper mutates so it stays side-effect-free
     # (no global-state pollution of a long-lived `config` module across calls/tests).
     _MUTATED = ('D_MODEL', 'N_HEADS', 'HEAD_DIM', 'FFN_DIM', 'BG_HEAD_HIDDEN',
-                'N_LAYERS', 'PATCH_SIZE', 'PATCH_DIM', '_PATCHES_PER_HOUR',
-                'PREDICTION_PATCHES', 'MAX_SEQ_LEN', 'NIGHT_LONG_HORIZON_PATCHES')
+                'TIME_PROBE_HIDDEN', 'N_LAYERS', 'PATCH_SIZE', 'PATCH_DIM',
+                '_PATCHES_PER_HOUR', 'PREDICTION_PATCHES', 'MAX_SEQ_LEN',
+                'NIGHT_LONG_HORIZON_PATCHES')
     _saved = {k: getattr(config, k) for k in _MUTATED}
     try:
         config.D_MODEL = d_model
@@ -259,6 +275,10 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
         config.HEAD_DIM = d_model // n_heads
         config.FFN_DIM = ffn_dim
         config.BG_HEAD_HIDDEN = bg_head_hidden
+        # TIME_PROBE_HIDDEN = k * D_MODEL with no override flag: it follows
+        # D_MODEL at whatever multiplier config.py holds, the same symbolic
+        # relation FFN_DIM and BG_HEAD_HIDDEN keep.
+        config.TIME_PROBE_HIDDEN = (_saved['TIME_PROBE_HIDDEN'] // _saved['D_MODEL']) * d_model
         config.N_LAYERS = n_layers
         if patch_size is not None:
             # PATCH_SIZE feeds patch_embed (PATCH_DIM) and the (S, K) step_basis
@@ -391,7 +411,8 @@ def main() -> None:
         '--heads', type=int, default=None,
         help='Override N_HEADS: temporal attention heads (HEAD_DIM = D_MODEL // '
              'N_HEADS). More heads give finer attention subspaces at a smaller '
-             'per-head dim; near param-neutral (only ALiBi slopes scale).')
+             'per-head dim; near param-neutral (only the per-head Q/K norm '
+             'gains scale).')
     parser.add_argument(
         '--patch-size', type=int, default=None,
         help='Override PATCH_SIZE: timesteps per patch (x5 min = patch span; e.g. '
@@ -458,7 +479,7 @@ def main() -> None:
     )
     new = _arch_view(
         eff['d_model'], eff['n_layers'], eff['n_heads'], eff['ffn_dim'],
-        eff['bg_head_hidden'], eff['min_ctx'], eff['max_ctx'], config.PATCH_SIZE,
+        eff['bg_head_hidden'], eff['min_ctx'], eff['max_ctx'], eff['patch_size'],
     )
 
     changes = _changes(args)
