@@ -522,8 +522,7 @@ class T1DMDataset(Dataset):
         self._cache_slab: tuple[int, int] | None = None
 
         # Lazy state — populated on first access inside the worker so the
-        # blosc2 NDArray handles (mmap-backed) aren't pickled across the
-        # DataLoader fork boundary.
+        # open cache handles aren't pickled across the DataLoader fork boundary.
         self._cache_arrays: dict[str, Any] | None = None
         self._cache_icr: np.ndarray | None = None
         self._cache_pool_size: int | None = None
@@ -674,8 +673,8 @@ class T1DMDataset(Dataset):
         * ``'npy-memmap-v1'`` — each channel is a raw uncompressed ``.npy``
           memmap; a per-row read faults in only the touched pages.
 
-        In both cases ``mmap_mode='r'`` lets DataLoader workers share the
-        kernel page cache, and ``arr[i:i+1]`` returns a fresh ndarray row, so
+        Only the npy format is mapped. Workers share the kernel page cache
+        either way, and ``arr[i:i+1]`` returns a fresh ndarray row, so
         ``__getitem__`` is identical across formats.
         """
         if self._cache_arrays is None:
@@ -726,12 +725,18 @@ class T1DMDataset(Dataset):
             else:
                 import blosc2
                 for name in CACHE_CHANNEL_NAMES:
-                    # blosc2's stub mistypes **kwargs as dict per kwarg;
-                    # mmap_mode='r' is the documented API and works at runtime.
+                    # Deliberately NOT mmap_mode='r'. A mapped .b2nd faults each
+                    # touched chunk's compressed pages into this process and
+                    # nothing can drop them again — blosc2 exposes no mapping to
+                    # madvise, so the npy path's MADV_DONTNEED trick has no
+                    # counterpart here. Random access over the pool then grows
+                    # RssFile ~100 KB per channel per row (~400 MB/step at
+                    # BATCH_SIZE=512) until the whole cache is resident. Plain
+                    # file reads leave the pages in ordinary page cache, which is
+                    # charged to nobody and reclaimed under pressure.
                     arr = blosc2.open(
                         os.path.join(self.cache_path, f'{name}.b2nd'),
                         mode='r',
-                        mmap_mode='r',  # type: ignore[arg-type]
                     )
                     if not isinstance(arr, blosc2.NDArray):
                         raise ValueError(
@@ -766,8 +771,9 @@ class T1DMDataset(Dataset):
         accumulate as unbounded page cache. ``madvise(MADV_DONTNEED)`` on the
         page-aligned range covering the row drops them immediately (a re-read
         re-faults from the file). Best-effort: a no-op when the format is
-        blosc2 or ``MADV_DONTNEED`` is unavailable, and any per-call failure is
-        swallowed so a platform quirk can never break data loading.
+        blosc2 (not mapped at all, precisely because there would be no mapping
+        left to advise) or ``MADV_DONTNEED`` is unavailable, and any per-call
+        failure is swallowed so a platform quirk can never break data loading.
 
         Args:
             cache_idx: Row index within the cache pool that was just read.

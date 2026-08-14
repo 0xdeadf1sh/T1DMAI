@@ -320,8 +320,8 @@ def compute_normalization_stats_from_cache(
     separate simulation. The transform is identical (``kovatchev_f_np`` on
     ``RISK_SPACE_CHANNELS`` — bg fit in Kovatchev risk space — and ``log1p`` on
     ``SPARSE_LOG1P_CHANNELS``), so the output is a drop-in replacement for the
-    re-simulated stats. Rows are streamed in mmap-backed batches, so the full
-    pool never resides in RAM.
+    re-simulated stats. Rows are streamed in batches, so the full pool never
+    resides in RAM.
 
     Args:
         cache_path: Directory produced by ``T1DMSIM/cache_simulator.py`` (a
@@ -332,7 +332,7 @@ def compute_normalization_stats_from_cache(
             subsample, since each cache row is an i.i.d. draw keyed on its own
             index, so the leading block is as representative as a random one, at
             a fraction of the I/O.
-        batch_rows: Rows per mmap slice — larger means fewer, larger reads.
+        batch_rows: Rows per slice — larger means fewer, larger reads.
 
     Returns:
         stats: dict mapping channel_name → {'mean': float, 'std': float}.
@@ -371,9 +371,12 @@ def compute_normalization_stats_from_cache(
     elif cache_format == CACHE_FORMAT_BLOSC2:
         import blosc2
         for name in needed:
+            # Deliberately NOT mmap_mode='r' — see data.py's _load_cache. A
+            # mapped .b2nd accumulates every chunk it touches with no way to
+            # release them, and this pass reads the WHOLE pool, so the mapping
+            # would grow to the full on-disk size of the cache.
             arrays[name] = blosc2.open(
-                os.path.join(cache_path, f'{name}.b2nd'),
-                mode='r', mmap_mode='r')  # type: ignore[arg-type]
+                os.path.join(cache_path, f'{name}.b2nd'), mode='r')
     else:
         raise ValueError(
             f"Unsupported cache_format {cache_format!r} (expected "

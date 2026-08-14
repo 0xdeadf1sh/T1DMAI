@@ -890,8 +890,8 @@ channel list, the warmup hours, the simulated hours, `dt_minutes` and the
 uniform-sample probability against the runtime config, and raises rather than
 train on divergent data. The per-channel shape check against
 `pool_size × n_timesteps` happens later, in `_load_cache`, on the first row read
-inside a DataLoader worker — the open is deliberately lazy so memory-mapped
-handles are not pickled across the fork. The generation parameters under
+inside a DataLoader worker — the open is deliberately lazy so open cache handles
+are not pickled across the fork. The generation parameters under
 `params` — hypoglycemia oversampling, the rail filter, the seed salt — are **not**
 checked at all, so two pools with different glycemic mixes are both accepted.
 
@@ -905,18 +905,25 @@ measured per-channel ratios. Smaller chunks waste fewer decompressed bytes per
 single-row read but give zstd a smaller window; at the default 32 rows per chunk a
 chunk is `32 × n_timesteps × 4 B`, about 159 KB per channel at 1242 steps.
 
-**Resident memory.** Both layouts open memory-mapped, so DataLoader workers share
-the kernel page cache. They differ sharply in what stays resident. Under blosc2
-the shared pages hold *compressed* bytes and each read decompresses one chunk per
-channel into a fresh array, so the resident set is bounded by the compressed
-footprint. Under `npy-memmap` a read faults *uncompressed* pages of the touched
-row, and random access over a large pool touches ever-new rows, so the page cache
-climbs toward the full on-disk footprint — on a unified-memory device that
-presents as rising GPU memory and can starve the allocator. `CACHE_MADVISE_DONTNEED`
-bounds it: each read copies its row out and issues `madvise(MADV_DONTNEED)` on the
-pages it faulted. The reader also issues `madvise(MADV_RANDOM)` at open, without
-which the kernel's 128 KB readahead pulls far more than the row needs and leaves
-the remainder resident. The flag is a no-op under blosc2 and on the fly.
+**Resident memory.** The two layouts are read differently, and only one of them is
+mapped. Under blosc2 each channel is opened for ordinary file I/O and a read
+decompresses one chunk per channel into a fresh array, so nothing accumulates in
+the process; the compressed bytes stay in kernel page cache, shared between
+DataLoader workers and reclaimed under pressure. Mapping a `.b2nd` instead makes
+each touched chunk's compressed pages resident in every worker that read it, with
+no way to release them — blosc2 exposes no mapping to `madvise` — so random access
+over a large pool drives the resident set toward the pool's whole compressed
+footprint.
+
+Under `npy-memmap` the channel is mapped and a read faults *uncompressed* pages of
+the touched row. Random access over a large pool touches ever-new rows, so the
+resident set climbs toward the full on-disk footprint — on a unified-memory device
+that presents as rising GPU memory and can starve the allocator.
+`CACHE_MADVISE_DONTNEED` bounds it: each read copies its row out and issues
+`madvise(MADV_DONTNEED)` on the pages it faulted. The reader also issues
+`madvise(MADV_RANDOM)` at open, without which the kernel's 128 KB readahead pulls
+far more than the row needs and leaves the remainder resident. The flag is a no-op
+under blosc2 and on the fly.
 
 **Reuse is benign.** The index maps to a row by `patient_seed % slab_size` within
 the partition's disjoint slab, and each draw takes a fresh random window from

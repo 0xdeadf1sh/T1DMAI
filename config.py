@@ -333,8 +333,12 @@ NUM_WORKERS = 20                 # DataLoader worker processes
 # pages, and DONTNEED only drops the row range — the readahead remainder stays
 # resident (measured: ~128 KB/read, ~0.5 GB/step). T1DMDataset therefore also
 # issues madvise(MADV_RANDOM) on each channel mapping at open (see _load_cache),
-# suppressing readahead at the source; the two together drop growth ~160×. No
-# effect on the blosc2 cache format or on-the-fly generation.
+# suppressing readahead at the source; the two together drop growth ~160×.
+#
+# No effect on the blosc2 cache format or on-the-fly generation. blosc2 has the
+# same unbounded-growth failure and no cure — it exposes no mapping to madvise —
+# so _load_cache does not map a .b2nd at all and reads it through ordinary file
+# I/O, whose page cache is charged to nobody and reclaimed under pressure.
 CACHE_MADVISE_DONTNEED = True
 WARMUP_STEPS = 2000              # Steps for linear LR warmup
 LR_MIN_RATIO = 0.001             # Cosine decay floor as fraction of peak LR
