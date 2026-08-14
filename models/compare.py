@@ -2,7 +2,7 @@
 """
 Cross-model comparison over the trained checkpoints under ``models/``.
 
-Compares the full grid — four capacities (nano, small, medium, large) crossed with
+Compares the full grid — three capacities (nano, small, medium) crossed with
 three training variants (sim, ohio, multi) — on every evaluation cohort, horizon and
 probe the per-model metric directories carry, and writes high-resolution figures and
 machine-readable JSON. No markdown is produced.
@@ -71,7 +71,7 @@ from matplotlib.patches import Patch                                     # noqa:
 # ---------------------------------------------------------------------------- #
 # The grid.
 # ---------------------------------------------------------------------------- #
-SIZES = ('nano', 'small', 'medium', 'large')
+SIZES = ('nano', 'small', 'medium')
 VARIANTS = ('sim', 'ohio', 'multi')
 REAL_COHORTS = ('ohiot1dm', 'azt1d', 'shanghai')
 COHORTS = REAL_COHORTS + ('sim',)
@@ -87,7 +87,7 @@ VARIANT_SHORT = {'sim': 'sim', 'ohio': 'ohio', 'multi': 'multi'}
 SIZE_LABEL = {s: s for s in SIZES}
 
 # Capacity is an ordered magnitude, so it rides one hue light-to-dark.
-SIZE_COLOR = dict(zip(SIZES, fs.DOSE_CARB[1:5]))
+SIZE_COLOR = dict(zip(SIZES, fs.DOSE_CARB[1:1 + len(SIZES)]))
 # Variant is categorical. Used only where cohort is not also a hue.
 VARIANT_COLOR = dict(zip(VARIANTS, fs.SERIES))
 # The simulator cohort is the reference, per figstyle.
