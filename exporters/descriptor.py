@@ -21,6 +21,10 @@ from typing import Any
 import config as cfg
 from exporters.modified_forward import NEG_FILL
 
+# The channel order normalization owns — it names the keys of the
+# ``normalization_stats`` block below, so the descriptor cannot label them itself.
+from normalization import CHANNEL_NAMES
+
 # Kovatchev risk-transform constants and the physical BG clamp. Imported from the
 # single sources of truth (utils / the simulator) rather than hardcoded, so the
 # descriptor the Rust f/f_inv reproduce can never drift from the model's own
@@ -71,7 +75,8 @@ def build_descriptor(
                 "name": "attn_mask", "shape": [T, T], "dtype": precision,
                 "kind": "additive-float struct",
                 "attend": 0.0, "block": NEG_FILL,
-                "note": "ALiBi is an in-graph per-layer op; NOT pre-combined here",
+                "note": "the sole additive term on the attention logits; position "
+                        "enters through RoPE alone, so nothing is pre-combined here",
             },
             "output_head_raw": {
                 "name": "head_raw", "output_index": 0,
@@ -156,7 +161,11 @@ def build_descriptor(
             "N_LAYERS": cfg.N_LAYERS,
             "N_HEADS": cfg.N_HEADS,
             "HEAD_DIM": cfg.HEAD_DIM,
-            "CHANNEL_NAMES": ["bg_absolute", "carb_intake", "insulin_combined"],
+            # The normalized SIGNAL channels, in input-feature order — and the keys
+            # of `normalization_stats`. There are fewer of them than
+            # N_INPUT_FEATURES: the trailing `bg_masked` feat is a per-patch bit
+            # carrying no statistics, so it is named here by no channel.
+            "CHANNEL_NAMES": list(CHANNEL_NAMES),
             "CHANNEL_TO_FEAT": {str(k): v for k, v in cfg.CHANNEL_TO_FEAT.items()},
             "NON_MASKABLE_FEATS": list(cfg.NON_MASKABLE_FEATS),
             "MASKABLE_FEATS": list(cfg.MASKABLE_FEATS),

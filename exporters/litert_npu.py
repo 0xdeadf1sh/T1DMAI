@@ -1,7 +1,7 @@
 """LiteRT (.tflite) exporter — the NPU-path feasibility spike (T1DMDROID issue 1).
 
 Converts the SAME modified ``head_raw`` + ``time_logits`` forward the ExecuTorch
-XNNPACK exporter uses (external struct mask, in-graph ALiBi, graph cut at
+XNNPACK exporter uses (external struct mask, right-edge slice, graph cut at
 ``head_raw``, dual output) to a ``.tflite`` via ``litert-torch`` (formerly
 ``ai-edge-torch``), the Google AI Edge PyTorch->LiteRT converter that builds on
 ``torch.export`` — the same entry point the ExecuTorch lowering already uses
@@ -94,8 +94,8 @@ def main() -> None:
     stats = ck["normalization_stats"]
     wrapper = HeadRawForward(model).eval()
 
-    patches, struct, bool_mask, last_bg = build_representative_input(stats)
-    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} last_bg={last_bg:.2f}")
+    patches, struct, bool_mask, anchor_bg = build_representative_input(stats)
+    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} anchor={anchor_bg:.2f}")
 
     hr_shape = (1, cfg.PREDICTION_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
     tl_shape = (1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS)
@@ -103,8 +103,8 @@ def main() -> None:
     # eager references (the modified-forward outputs the .tflite must reproduce)
     with torch.no_grad():
         hr_eager, tl_eager_mod = wrapper(patches, struct)
-    tl_eager = eager_time_logits(model, patches, bool_mask, last_bg)  # stock return_time path
-    d_stock = float((hr_eager - stock_head_raw(model, patches, bool_mask, last_bg)).abs().max())
+    tl_eager = eager_time_logits(model, patches, bool_mask, anchor_bg)  # stock return_time path
+    d_stock = float((hr_eager - stock_head_raw(model, patches, bool_mask, anchor_bg)).abs().max())
     print(f"[verify] modified(struct) vs stock(bool) head_raw  max|Δ| = {d_stock:.3e}")
 
     os.makedirs(args.out_dir, exist_ok=True)

@@ -5,16 +5,19 @@ The MODIFIED forward differs from ``T1DMAI.forward`` in exactly three ways, all
 required by the on-device contract (PLAN §2.4):
 
 1. Its ONLY mask input is the external **struct additive-float mask** (0.0 where a
-   position may attend, ``NEG_FILL`` where blocked). The stock forward takes a bool
-   mask and does ``masked_fill(~bool, -inf)`` internally; here the caller supplies
-   the additive mask directly and it is added to the in-graph ALiBi bias, exactly as
-   the stock per-block ``mask = alibi_bias + struct`` does. ``NEG_FILL = -30000.0``
-   (not ``-inf``) keeps the fp16 NPU softmax finite; in fp32/fp64 ``exp(-30000)``
-   underflows to 0.0, so it is bit-identical to ``-inf`` on the blocked positions.
-2. ALiBi stays an **in-graph per-layer op** (``-rel_dist * |slope_h|`` from the frozen
-   per-layer slopes) — it is NOT pre-combined into the external mask.
+   position may attend, ``NEG_FILL`` where blocked). The stock forward hands SDPA a
+   bool mask and lets it do the blocking; here the caller supplies the additive form
+   directly, and it reaches SDPA as the sole additive term on the attention logits —
+   position enters through RoPE alone, so there is nothing else for it to be added
+   to. ``NEG_FILL = -30000.0`` (not ``-inf``) keeps the fp16 NPU softmax finite; in
+   fp32/fp64 ``exp(-30000)`` underflows to 0.0, so it is bit-identical to ``-inf``
+   on the blocked positions.
+2. The head reads the trailing ``PREDICTION_PATCHES`` patches as a SLICE where the
+   stock forward gathers ``M`` masked patches by ``mask_idx``. The export is the
+   RIGHT-EDGE SPECIALISATION of the general masked objective
+   (``T1DMCOMMON/SPEC/inference.md`` §3.1), so it takes no ``mask_idx``.
 3. The graph is **cut at ``head_raw``** (B, P, S, 1+2*N_SPREADS) in risk space — it
-   stops before ``assemble_quantiles``, so it needs no ``last_bg`` and emits no
+   stops before ``assemble_quantiles``, so it needs no ``anchor_bg`` and emits no
    ``q_tau``/``median``. Everything downstream of ``head_raw`` is Rust.
 """
 
@@ -39,9 +42,9 @@ class HeadRawForward(nn.Module):
 
     Reuses the model's own submodules (patch_embed, blocks, final_norm, bg_head,
     step_basis buffer, and the co-trained ``time_head`` probe); it only replaces the
-    forward *plumbing* — the bool->struct conversion becomes an external additive mask
-    input, and the tail (``assemble_quantiles``) is dropped so the graph ends at
-    ``head_raw``.
+    forward *plumbing* — the bool mask becomes an external additive one, the
+    masked-patch gather becomes the right-edge slice, and the tail
+    (``assemble_quantiles``) is dropped so the graph ends at ``head_raw``.
 
     The graph emits TWO outputs, in this fixed order:
 
@@ -79,18 +82,19 @@ class HeadRawForward(nn.Module):
 
         x = m.patch_embed(patches)                                   # (B, T, D_MODEL)
 
-        # RoPE tables + |i-j| distance depend only on (T, HEAD_DIM); at a fixed
-        # export shape they fold to constants inside the traced graph.
+        # The RoPE tables depend only on (T, HEAD_DIM); at a fixed export shape they
+        # fold to constants inside the traced graph.
         rope_cos, rope_sin = build_rope_cache(T, HEAD_DIM, device=x.device, dtype=x.dtype)
-        positions = torch.arange(T, device=x.device, dtype=x.dtype)
-        rel_dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()  # (T, T)
 
-        # Each block adds the external struct to its own per-layer ALiBi bias
-        # (the |slope_h| op stays in-graph); struct broadcasts (T,T)->(1,H,T,T).
+        # struct goes to SDPA as the sole additive term on the logits; it broadcasts
+        # (T,T)->(B,H,T,T) there.
         for block in m.blocks:
-            x = block(x, rope_cos, rope_sin, rel_dist, struct)
+            x = block(x, rope_cos, rope_sin, struct)
 
         x = m.final_norm(x)                                          # (B, T, D_MODEL)
+        # RIGHT-EDGE SPECIALISATION (SPEC/inference.md §3.1): the exported graph is
+        # cut to the trailing PREDICTION_PATCHES forecast and never gathers by
+        # mask_idx, so the head reads a slice where the general forward gathers.
         pred = x[:, -PREDICTION_PATCHES:, :]                         # (B, P, D_MODEL)
         coeff = m.bg_head(pred).view(
             B, PREDICTION_PATCHES, BG_HEAD_STEP_BASIS_DIM, 1 + 2 * N_SPREADS
@@ -148,8 +152,11 @@ def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
     """Load a checkpoint's EMA weights into a fresh ``T1DMAI`` (eval, frozen).
 
     Merges the EMA shadow over the live weights (INFERENCE.md §2.2) — validation
-    and every reported metric were produced under EMA. ``strict=False`` tolerates
-    the auxiliary ``time_head`` diagnostic probe, which the export never touches.
+    and every reported metric were produced under EMA. ``strict=False`` tolerates a
+    ``time_head`` present on only one side (the probe is a build-time switch, and a
+    checkpoint predating it carries none); the assert below rejects every other
+    mismatch. ``HeadRawForward`` then refuses a checkpoint whose probe is missing,
+    since the graph emits its logits.
 
     Returns:
         (model, checkpoint_dict).

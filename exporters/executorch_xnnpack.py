@@ -1,7 +1,7 @@
 """ExecuTorch XNNPACK (CPU fp32) exporter — spike S1.
 
 Loads the EMA checkpoint, wraps it in the modified ``head_raw`` forward (external
-struct mask, in-graph ALiBi, graph cut at ``head_raw``), ``torch.export``s it,
+struct mask, right-edge slice, graph cut at ``head_raw``), ``torch.export``s it,
 lowers to ExecuTorch XNNPACK -> an fp32 ``<id>.xnnpack.pte``, emits the descriptor,
 and verifies on host that:
 
@@ -27,6 +27,7 @@ import torch
 
 import config as cfg
 import model as model_module
+from data import BG_MASKED_FEAT
 from normalization import normalize, CHANNEL_NAMES
 from utils import last_bg_mgdl_from_context, time_of_day_decode_bins
 from inference import _build_patches_tensor
@@ -53,11 +54,10 @@ def build_representative_input(
     """A plausible normalized ``T=52`` input from a SYNTHETIC 24 h BG series.
 
     No simulator / sensor needed: a smooth diurnal BG curve with two meal-driven
-    excursions, a light constant basal, and two boluses — passed through the exact
-    training preprocessing (clamp bg / floor carb-insulin -> normalize; no
-    smoothing) and the shipped
-    ``_build_patches_tensor`` so the patches / mask are construction-identical to a
-    real forecast.
+    excursions, a light constant basal, two boluses and one exercise bout — passed
+    through the exact training preprocessing (clamp bg / floor the rest ->
+    normalize; no smoothing) and the shipped ``_build_patches_tensor`` so the
+    patches / mask are construction-identical to a real forecast.
 
     The graph is a SINGLE fixed shape ``T = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
     = 52`` with the real context LEFT-PADDED into the 48 context slots (pred at the
@@ -67,7 +67,7 @@ def build_representative_input(
     every pad COLUMN, so the pad values never reach a prediction token.
 
     Returns:
-        (patches (1,52,PATCH_DIM), struct (52,52), bool_mask (52,52), last_bg mg/dL).
+        (patches (1,52,PATCH_DIM), struct (52,52), bool_mask (52,52), anchor mg/dL).
     """
     n_steps = n_ctx * cfg.PATCH_SIZE
     t = np.arange(n_steps, dtype=np.float64)
@@ -81,16 +81,33 @@ def build_representative_input(
     insulin = np.full(n_steps, 0.02, dtype=np.float64)          # basal action
     insulin[int(0.30 * n_steps):int(0.30 * n_steps) + 10] += 0.25
     insulin[int(0.68 * n_steps):int(0.68 * n_steps) + 10] += 0.20
+    # Exercise is a carbohydrate-EQUIVALENT disposal curve in g/step, not an
+    # intensity: one bout, on the same scale as the meals above.
+    exercise = np.zeros(n_steps, dtype=np.float64)
+    exercise[int(0.55 * n_steps):int(0.55 * n_steps) + 12] = 1.5
 
-    # No smoothing: raw signals, bg clamped to the physical range, carb/insulin
-    # floored at 0 (matching data._build_sample / inference).
-    bg_s = np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX)
-    carb_s = np.maximum(carb, 0.0)
-    ins_s = np.maximum(insulin, 0.0)
-    raw = np.stack([bg_s, carb_s, ins_s], axis=-1).astype(np.float32)   # (N, 3)
-    assert list(CHANNEL_NAMES) == ["bg_absolute", "carb_intake", "insulin_combined"]
-    feats = normalize(raw, stats)                                       # (N, 3) z-space
-    context = torch.from_numpy(feats).reshape(n_ctx, cfg.PATCH_SIZE, cfg.N_INPUT_FEATURES)
+    # No smoothing: raw signals, bg clamped to the physical range, the rest floored
+    # at 0 (matching data._build_sample / inference).
+    signals = {
+        'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX),
+        'carb_intake': np.maximum(carb, 0.0),
+        'insulin_combined': np.maximum(insulin, 0.0),
+        'exercise_equiv': np.maximum(exercise, 0.0),
+    }
+    # Stacked in CHANNEL_NAMES order — normalization owns that order, and a channel
+    # added there raises here rather than silently landing in the wrong column.
+    raw = np.stack([signals[name] for name in CHANNEL_NAMES], axis=-1).astype(np.float32)
+    feats = normalize(raw, stats)                                       # (N, C) z-space
+    # Input feats 0..C-1 are the normalized signal channels in CHANNEL_NAMES order;
+    # feat BG_MASKED_FEAT is the mask BIT, which carries no statistics and whose only
+    # writer on this path is ``_build_patches_tensor``, so the context leaves it 0.
+    assert len(CHANNEL_NAMES) == BG_MASKED_FEAT, (
+        f"{len(CHANNEL_NAMES)} signal channels but bg_masked sits at feat "
+        f"{BG_MASKED_FEAT}; the signal block is no longer feats [0, {BG_MASKED_FEAT})"
+    )
+    ctx = np.zeros((n_steps, cfg.N_INPUT_FEATURES), dtype=np.float32)
+    ctx[:, :len(CHANNEL_NAMES)] = feats
+    context = torch.from_numpy(ctx).reshape(n_ctx, cfg.PATCH_SIZE, cfg.N_INPUT_FEATURES)
 
     patches, _mask = _build_patches_tensor(context, normalization_stats=stats)  # (n_ctx+P, PATCH_DIM)
     # Left-pad the CONTEXT to MAX_CONTEXT_PATCHES so the sequence is the fixed T=52
@@ -101,31 +118,49 @@ def build_representative_input(
         patches = torch.cat([pad, patches], dim=0)                              # (52, PATCH_DIM)
     struct = build_struct_mask(n_ctx, dtype=torch.float32)                      # (52, 52)
     bool_mask = (struct == 0.0)                                                 # padded bool mask
-    last_bg = float(last_bg_mgdl_from_context(context, stats))
-    return patches.unsqueeze(0).float(), struct, bool_mask, last_bg
+    anchor_bg = float(last_bg_mgdl_from_context(context, stats))
+    return patches.unsqueeze(0).float(), struct, bool_mask, anchor_bg
+
+
+def right_edge_slots(
+    B: int, T: int, anchor_bg: float,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """The ``(anchor_bg, mask_idx)`` pair naming the trailing forecast span.
+
+    The stock forward reads the masked patches by index, so reproducing the exported
+    graph's RIGHT-EDGE SPECIALISATION against it means naming those indices
+    explicitly: one span of ``PREDICTION_PATCHES`` slots ending at ``T - 1``. Every
+    slot of one span carries the same anchor.
+
+    Returns:
+        (anchor_bg (B, P) mg/dL, mask_idx (B, P) int64).
+    """
+    P = cfg.PREDICTION_PATCHES
+    mask_idx = torch.arange(T - P, T, dtype=torch.int64).expand(B, P).contiguous()
+    return torch.full((B, P), float(anchor_bg), dtype=torch.float32), mask_idx
 
 
 def stock_head_raw(
-    model, patches: torch.Tensor, bool_mask: torch.Tensor, last_bg: float,
+    model, patches: torch.Tensor, bool_mask: torch.Tensor, anchor_bg: float,
 ) -> torch.Tensor:
     """Capture the STOCK ``T1DMAI.forward``'s internal ``head_raw`` (bool-mask path).
 
     ``head_raw`` is a forward local, so we transiently swap the module-global
     ``assemble_quantiles`` (bound in ``model.py``) for a capturing shim, run the real
-    forward, and read the tapped tensor back.
+    forward on the right-edge masked set, and read the tapped tensor back.
     """
     captured: dict[str, torch.Tensor] = {}
     orig = model_module.assemble_quantiles
 
-    def _cap(head_raw, last_bg_mgdl, carry_spread=0.0):
+    def _cap(head_raw, anchor_bg_mgdl, mask_idx=None, valid=None, carry_spread=0.0):
         captured["head_raw"] = head_raw.detach().clone()
-        return orig(head_raw, last_bg_mgdl, carry_spread)
+        return orig(head_raw, anchor_bg_mgdl, mask_idx, valid, carry_spread)
 
     model_module.assemble_quantiles = _cap
     try:
-        last_bg_t = torch.tensor([last_bg], dtype=torch.float32)
+        anchor_t, mask_idx = right_edge_slots(patches.shape[0], patches.shape[1], anchor_bg)
         with torch.no_grad():
-            model(patches, bool_mask, last_bg_t)
+            model(patches, bool_mask, anchor_t, mask_idx)
     finally:
         model_module.assemble_quantiles = orig
     return captured["head_raw"]
@@ -208,21 +243,22 @@ def run_pte(pte_path: str, patches: torch.Tensor, struct: torch.Tensor) -> torch
 
 
 def eager_time_logits(
-    model, patches: torch.Tensor, bool_mask: torch.Tensor, last_bg: float,
+    model, patches: torch.Tensor, bool_mask: torch.Tensor, anchor_bg: float,
 ) -> torch.Tensor:
     """Stock ``T1DMAI.forward(..., return_time=True)`` per-patch time-probe logits.
 
     The eager reference the exported ``time_logits`` output is validated against —
-    the time analogue of ``stock_head_raw`` for the forecast head.
+    the time analogue of ``stock_head_raw`` for the forecast head, on the same
+    right-edge masked set.
     """
-    last_bg_t = torch.tensor([last_bg], dtype=torch.float32)
+    anchor_t, mask_idx = right_edge_slots(patches.shape[0], patches.shape[1], anchor_bg)
     with torch.no_grad():
-        _q, _m, time_pred = model(patches, bool_mask, last_bg_t, return_time=True)
+        _q, _m, time_pred = model(patches, bool_mask, anchor_t, mask_idx, return_time=True)
     assert time_pred is not None, "eager forward returned time_pred=None (probe absent)"
     return time_pred
 
 
-def write_time_head_golden(model, patches, bool_mask, last_bg, out_path: str) -> None:
+def write_time_head_golden(model, patches, bool_mask, anchor_bg, out_path: str) -> None:
     """Emit the Rust decode golden for ``utils.time_of_day_resultant``.
 
     Rows pair a 12-logit input with T1DMAI's own softmax probs + resultant (hour, R),
@@ -231,7 +267,7 @@ def write_time_head_golden(model, patches, bool_mask, last_bg, out_path: str) ->
     uniform, bimodal, sharp, wrap-around) to exercise the circular reduction.
     """
     n = cfg.TIME_PROBE_N_BINS
-    real = eager_time_logits(model, patches, bool_mask, last_bg)[0]   # (P, n_bins)
+    real = eager_time_logits(model, patches, bool_mask, anchor_bg)[0]   # (P, n_bins)
 
     rows_logits: list[tuple[str, list[float]]] = []
     for p in range(cfg.PREDICTION_PATCHES):
@@ -319,9 +355,9 @@ def main() -> None:
     stats = ck["normalization_stats"]
     wrapper = HeadRawForward(model).eval()
 
-    patches, struct, bool_mask, last_bg = build_representative_input(stats)
+    patches, struct, bool_mask, anchor_bg = build_representative_input(stats)
     print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} "
-          f"last_bg={last_bg:.2f} mg/dL")
+          f"anchor={anchor_bg:.2f} mg/dL")
 
     # --- struct builder must equal the stock create_attention_mask (n_ctx=48, no pad) ---
     from utils import create_attention_mask
@@ -349,7 +385,7 @@ def main() -> None:
     # --- (1) modified (struct) vs stock (bool) head_raw + time_logits ---
     with torch.no_grad():
         hr_mod, tl_mod = wrapper(patches, struct)
-    hr_stock = stock_head_raw(model, patches, bool_mask, last_bg)
+    hr_stock = stock_head_raw(model, patches, bool_mask, anchor_bg)
     d_struct = float((hr_mod - hr_stock).abs().max())
     print(f"[verify] modified(struct) vs stock(bool) head_raw  max|Δ| = {d_struct:.3e}")
     assert hr_mod.shape == hr_shape
@@ -373,7 +409,7 @@ def main() -> None:
     print(f"[verify] pte vs eager-modified head_raw            max|Δ| = {d_pte:.3e}")
 
     # --- (2a) .pte time_logits vs eager stock forward(return_time=True) ---
-    tl_eager = eager_time_logits(model, patches, bool_mask, last_bg)  # (1,P,n_bins)
+    tl_eager = eager_time_logits(model, patches, bool_mask, anchor_bg)  # (1,P,n_bins)
     d_time = float((tl_pte - tl_eager).abs().max())
     print(f"[verify] pte vs eager time_logits                  max|Δ| = {d_time:.3e}")
 
@@ -384,7 +420,7 @@ def main() -> None:
         print(f"[regress] new pte head_raw vs deployed pte head_raw max|Δ| = {d_regress:.3e}")
 
     # --- padded-context sanity: n_ctx=16, ensure finite + shape ---
-    p16, s16, _bm16, _lb16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES)
+    p16, s16, _bm16, _anchor16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES)
     o16 = run_pte_outputs(pte_work, p16, s16)
     hr16 = o16[0].reshape(hr_shape)
     tl16 = o16[1].reshape(tl_shape)
@@ -394,7 +430,7 @@ def main() -> None:
     # --- Rust decode golden for the time probe (opt-in) ---
     golden_path = args.golden
     if golden_path:
-        write_time_head_golden(model, patches, bool_mask, last_bg, golden_path)
+        write_time_head_golden(model, patches, bool_mask, anchor_bg, golden_path)
         print(f"[golden] wrote {golden_path}")
 
     # --- descriptor ---

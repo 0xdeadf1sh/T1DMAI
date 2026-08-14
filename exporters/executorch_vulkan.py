@@ -1,7 +1,7 @@
 """ExecuTorch Vulkan (GPU compute) exporter — T1DMDROID issue 20 feasibility spike.
 
 Lowers the SAME modified ``head_raw`` + ``time_logits`` forward the XNNPACK exporter
-uses (external struct mask, in-graph ALiBi, graph cut at ``head_raw``, dual output),
+uses (external struct mask, right-edge slice, graph cut at ``head_raw``, dual output),
 but with the ``VulkanPartitioner`` instead of ``XnnpackPartitioner``. It exists to
 answer ONE question cheaply, on host, before anyone builds a custom AAR:
 
@@ -11,7 +11,7 @@ answer ONE question cheaply, on host, before anyone builds a custom AAR:
 
 The suspects for rejection are the transformer-specific ops the NPU/GPU delegates
 tend not to cover: RoPE (complex-ish rotate-half + trig on positions), the SDPA with
-a float additive mask, the per-layer ALiBi bias add, and the ``einsum('sk,bpkc->bpsc')``
+a float additive mask, the per-head QK RMSNorm, and the ``einsum('sk,bpkc->bpsc')``
 step-basis projection. If the graph barely delegates, that is a legitimate STOP: report
 it and skip the custom-AAR / on-device measurement, because a graph shredded into dozens
 of tiny GPU subgraphs interleaved with CPU fallbacks will lose to a clean XNNPACK CPU run
@@ -373,8 +373,8 @@ def main() -> None:
     stats = ck["normalization_stats"]
     wrapper = HeadRawForward(model).eval()
 
-    patches, struct, _bool_mask, last_bg = build_representative_input(stats)
-    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} last_bg={last_bg:.2f}")
+    patches, struct, _bool_mask, anchor_bg = build_representative_input(stats)
+    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} anchor={anchor_bg:.2f}")
 
     rep = partition_report(wrapper, patches, struct)
     lowered = rep.pop("_lowered")
