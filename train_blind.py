@@ -614,33 +614,46 @@ def compute_learning_metrics(
         & (pb >= 70.0) & (pb <= 180.0)
     )
     zone_B = (~in_A) & (~zone_E) & (~zone_C) & (~zone_D)
-    _stage('clarke_A', in_A.sum())
-    _stage('clarke_B', zone_B.sum())
-    _stage('clarke_C', zone_C.sum())
-    _stage('clarke_D', zone_D.sum())
-    _stage('clarke_E', zone_E.sum())
+    _clarke_masks = {'A': in_A, 'B': zone_B, 'C': zone_C, 'D': zone_D, 'E': zone_E}
+    for _z, _m in _clarke_masks.items():
+        _stage(f'clarke_{_z}', _m.sum())
     out['clarke_total'] = float(in_A.numel())
 
-    # Per-horizon Clarke-A, DTS zone A and MARD (read-only diagnostics). The
-    # pooled zone shares mix every horizon, so they move when the horizon mixture
-    # moves; pZA at a stated horizon is what a published figure can be read
-    # against.
+    # Per-horizon zone shares for BOTH grids, and MARD (read-only diagnostics).
+    #
+    # WHAT THE HORIZON MEANS HERE. The pooled shares above are over every scored
+    # step of the forecast protocol — all ``PREDICTION_PATCHES × PATCH_SIZE`` of
+    # them — so they mix a 5-minute-ahead error with a 2-hour-ahead one and move
+    # when the horizon mixture moves. A ``@{h}`` share is the SINGLE step whose
+    # horizon is ``h`` minutes, which is what a published grid figure can be read
+    # against, and what shows that accuracy decays with distance rather than
+    # averaging that decay away.
+    #
+    # Every zone, not just A: a run trading A for B at 30 min while pushing D at
+    # 120 min holds both pooled figures still.
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         h_idx = (h_min // int(dt)) - 1
-        if 0 <= h_idx < total_steps_h:
-            _stage(f'evalfix_clarke_A@{h_min}', in_A[:, h_idx].sum())
-            out[f'evalfix_clarke_A@{h_min}_cnt'] = float(B)
+        _live = 0 <= h_idx < total_steps_h
+        for _z, _m in _clarke_masks.items():
+            if _live:
+                _stage(f'evalfix_clarke_{_z}@{h_min}', _m[:, h_idx].sum())
+                out[f'evalfix_clarke_{_z}@{h_min}_cnt'] = float(B)
+            else:
+                out[f'evalfix_clarke_{_z}@{h_min}'] = 0.0
+                out[f'evalfix_clarke_{_z}@{h_min}_cnt'] = 0.0
+        for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
+            if _live:
+                out[f'dts_{_zn}@{h_min}'] = float((_dts_zones[:, h_idx] == _zi).sum())
+                out[f'dts_{_zn}@{h_min}_cnt'] = float(B)
+            else:
+                out[f'dts_{_zn}@{h_min}'] = 0.0
+                out[f'dts_{_zn}@{h_min}_cnt'] = 0.0
+        if _live:
             _stage(f'evalfix_mard@{h_min}_sum', abs_rel[:, h_idx].sum())
             out[f'evalfix_mard@{h_min}_cnt'] = float(B)
-            out[f'dts_a@{h_min}'] = float((_dts_zones[:, h_idx] == 0).sum())
-            out[f'dts_a@{h_min}_cnt'] = float(B)
         else:
-            out[f'evalfix_clarke_A@{h_min}'] = 0.0
-            out[f'evalfix_clarke_A@{h_min}_cnt'] = 0.0
             out[f'evalfix_mard@{h_min}_sum'] = 0.0
             out[f'evalfix_mard@{h_min}_cnt'] = 0.0
-            out[f'dts_a@{h_min}'] = 0.0
-            out[f'dts_a@{h_min}_cnt'] = 0.0
 
     # roc_corr / roc_rmse / trend_gain_beta / trend_amp_ratio on the per-PATCH
     # (30-min) ΔBG (mean-collapse detectors — more important now). Five-sum
@@ -1285,10 +1298,24 @@ def _render_validation_table(
     higher_row('clarke_A+B', val_metrics.get('clarke_AB_pct'),
                98.0, fmt='{:.2f}', unit='%', warn_gap=2.0,
                prev_key='clarke_AB_pct')
+    # Every zone at every horizon, not zone A alone: the pooled shares above are
+    # over all scored steps, so they average the decay with distance away, and a
+    # run pushing mass into D at the far horizon while holding A at the near one
+    # moves neither pooled figure.
     for _h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
-        higher_row(f'  ↳ clarke_A @{_h}m', val_metrics.get(f'evalfix_clarke_A@{_h}'),
-                   90.0, fmt='{:.2f}', unit='%', warn_gap=5.0,
-                   prev_key=f'evalfix_clarke_A@{_h}')
+        for _z, _lo, _hi in (('A', 90.0, None), ('B', None, None), ('C', None, 1.0),
+                             ('D', None, 1.0), ('E', None, 0.1)):
+            _v = val_metrics.get(f'evalfix_clarke_{_z}@{_h}')
+            _k = f'evalfix_clarke_{_z}@{_h}'
+            if _lo is not None:
+                higher_row(f'  ↳ clarke_{_z} @{_h}m', _v, _lo,
+                           fmt='{:.2f}', unit='%', warn_gap=5.0, prev_key=_k)
+            elif _hi is not None:
+                lower_row(f'  ↳ clarke_{_z} @{_h}m', _v, _hi,
+                          fmt='{:.2f}', unit='%', warn_mult=2.0, prev_key=_k)
+            else:
+                info_row(f'  ↳ clarke_{_z} @{_h}m', _v, fmt='{:.2f}', unit='%',
+                         target='the A+B remainder', prev_key=_k, direction='none')
     _blank()
 
     # ============================================================
@@ -1321,6 +1348,15 @@ def _render_validation_table(
         _zv = val_metrics.get(f'dts_{_zn}_pct')
         info_row(_label, _zv, fmt='{:.2f}', unit='%', target=_target,
                  prev_key=f'dts_{_zn}_pct', direction='none', show_absent=True)
+    # And per horizon, on the same axis Clarke uses. The pooled shares above are
+    # over every scored step of the forecast protocol, so they mix a 5-minute
+    # error with a 2-hour one; a @{h} share is the single step at that horizon.
+    for _h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
+        for _zn in dts_grid.ZONE_NAMES:
+            info_row(f'  ↳ dts_{_zn.upper()} @{_h}m',
+                     val_metrics.get(f'dts_{_zn}@{_h}'), fmt='{:.2f}', unit='%',
+                     target='no threshold published',
+                     prev_key=f'dts_{_zn}@{_h}', direction='none')
     _blank()
 
     # ============================================================
@@ -1419,11 +1455,12 @@ def _render_validation_table(
                    prev_key=f'hyper_precision@{_h}', prev_scale=100.0)
     _blank()
 
-    # Nocturnal: two rows. The night RMSEs live in the rolled @180+ section, the
-    # night-onset block is four rates over a handful of nights, and night_clarke /
-    # night_mard duplicate their all-sample counterparts on a subset. All CSV-only.
-    # What is kept is the pair that says whether the model still calls a nocturnal
-    # hypo, which is the use case the long-horizon roll exists for.
+    # BOTH sides. The nocturnal hypo is the use case the long-horizon roll exists
+    # for, but a model that calls it by predicting low everywhere at night trades
+    # hyper detection for it, and the hypo pair alone cannot show that.
+    # The night RMSEs live in the rolled @180+ section; night_clarke / night_mard /
+    # night_cgega duplicate their all-sample counterparts on a subset and stay
+    # CSV-only.
     _section('Nocturnal Validation Metrics')
     night_hr = val_metrics.get('night_hypo_recall')
     higher_row(f"night_hypo_recall({val_metrics.get('night_hypo_n_steps', 0)}st)",
@@ -1435,6 +1472,43 @@ def _render_validation_table(
                (night_hp * 100.0) if night_hp is not None else None,
                75.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
                prev_key='night_hypo_precision', prev_scale=100.0)
+    night_yr = val_metrics.get('night_hyper_recall')
+    higher_row(f"night_hyper_recall({val_metrics.get('night_hyper_n_steps', 0)}st)",
+               (night_yr * 100.0) if night_yr is not None else None,
+               85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
+               prev_key='night_hyper_recall', prev_scale=100.0)
+    night_yp = val_metrics.get('night_hyper_precision')
+    higher_row(f'night_hyper_precision{_ptol_sfx}',
+               (night_yp * 100.0) if night_yp is not None else None,
+               85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
+               prev_key='night_hyper_precision', prev_scale=100.0)
+    _blank()
+
+    # ============================================================
+    # 7b. Night-onset excursion call (per NIGHT, not per step)
+    # ============================================================
+    # A different unit from every other row on the page: one binary call per
+    # night, from a forecast rolled across the whole night from the bedtime hour.
+    # The counts travel with the rates because none is derivable from another —
+    # nights scored against nights dropped, and each side's own true/predicted
+    # denominators — and because a rate over three nights is not a rate.
+    _no_n = int(val_metrics.get('night_onset_n_nights', 0) or 0)
+    _no_skip = int(val_metrics.get('night_onset_skipped', 0) or 0)
+    _section(f'Night-Onset Excursion Call ({_no_n} nights'
+             + (f', {_no_skip} skipped)' if _no_skip else ')'))
+    for _side, _rec_sota, _prec_sota in (('hypo', 80.0, 60.0), ('hyper', 80.0, 60.0)):
+        _nt = val_metrics.get(f'night_onset_{_side}_n_true')
+        _np = val_metrics.get(f'night_onset_{_side}_n_pred')
+        higher_row(f'night_onset_{_side}_recall'
+                   + (f'({int(_nt)} true)' if _nt else ''),
+                   _pct(val_metrics.get(f'night_onset_{_side}_recall')),
+                   _rec_sota, fmt='{:.2f}', unit='%', warn_gap=15.0,
+                   prev_key=f'night_onset_{_side}_recall', prev_scale=100.0)
+        higher_row(f'night_onset_{_side}_precision'
+                   + (f'({int(_np)} called)' if _np else ''),
+                   _pct(val_metrics.get(f'night_onset_{_side}_precision')),
+                   _prec_sota, fmt='{:.2f}', unit='%', warn_gap=15.0,
+                   prev_key=f'night_onset_{_side}_precision', prev_scale=100.0)
     _blank()
 
     # The counterfactual dose-response section of ``train.py``'s table has no
@@ -1447,12 +1521,50 @@ def _render_validation_table(
     # SOTA: green ~ a usable clock, red ~ near random-phase chance (chance is
     # mae 6 h, acc +/-1h 8%, +/-2h 17%, 4-bin 25%).
     # ============================================================
-    # One row. The probe co-trains the trunk but feeds neither the loss nor
-    # selection, and eleven rows of clock reliability is more than a diagnostic
-    # earns at this cadence; the rest are CSV-only.
+    # The whole probe. It feeds neither the loss nor selection, but it co-trains
+    # the trunk, and MAE alone cannot separate the three ways a clock fails: a
+    # constant offset (bias), a wide but centred spread (std), and a mostly-right
+    # clock with rare gross misses (p90, gross_rate) — which is the failure that
+    # matters, since a forecast head reading a confidently wrong hour is worse
+    # than one reading a vague right one. The three accuracies bracket the same
+    # residual at different tolerances; confidence and the two jump witnesses say
+    # whether the clock is stable within a window and across the pair.
     _section('Time-of-day probe (diagnostic)')
     lower_row('tod mae', val_metrics.get('tod_mae_h'), 1.5,
               fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_h')
+    lower_row('  ↳ mae @high confidence', val_metrics.get('tod_mae_hiconf'), 1.0,
+              fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_hiconf')
+    # Chance at random phase: ±1h 8%, ±2h 17%, 4-bin 25%.
+    higher_row('tod acc ±1h', _pct(val_metrics.get('tod_acc_1h')),
+               60.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
+               prev_key='tod_acc_1h', prev_scale=100.0)
+    higher_row('tod acc ±2h', _pct(val_metrics.get('tod_acc_2h')),
+               80.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
+               prev_key='tod_acc_2h', prev_scale=100.0)
+    higher_row('tod acc (bin)', _pct(val_metrics.get('tod_acc_bin')),
+               70.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
+               prev_key='tod_acc_bin', prev_scale=100.0)
+    # Reliability: bias is signed and centred on zero, so it is a band rather
+    # than a minimand — a clock 2 h fast is as broken as one 2 h slow.
+    band_row('tod bias', val_metrics.get('tod_bias_h'), -0.50, 0.50,
+             fmt='{:+.3f}', unit=' h', warn_pad=1.0, prev_key='tod_bias_h')
+    lower_row('tod std', val_metrics.get('tod_std_h'), 2.0,
+              fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_std_h')
+    lower_row('tod p90 (tail)', val_metrics.get('tod_p90_h'), 4.0,
+              fmt='{:.2f}', unit=' h', warn_mult=1.5, prev_key='tod_p90_h')
+    lower_row('tod gross-error rate', _pct(val_metrics.get('tod_gross_rate')),
+              10.0, fmt='{:.2f}', unit='%', warn_mult=2.0,
+              prev_key='tod_gross_rate', prev_scale=100.0)
+    info_row('tod confidence (R)', val_metrics.get('tod_conf'),
+             fmt='{:.3f}', target='resultant length, 0–1',
+             prev_key='tod_conf', direction='none')
+    # The two jump witnesses: within one window's slots, and across the paired
+    # windows one horizon apart. Both are deviations from the EXPECTED advance,
+    # so zero is right and either sign is wrong.
+    lower_row('tod jump (within window)', val_metrics.get('tod_jump_h'), 1.0,
+              fmt='{:.3f}', unit=' h', warn_mult=2.0, prev_key='tod_jump_h')
+    lower_row('tod jump (cross-window)', val_metrics.get('tod_xwin_jump_h'), 1.0,
+              fmt='{:.3f}', unit=' h', warn_mult=2.0, prev_key='tod_xwin_jump_h')
     _blank()
 
     # ============================================================
@@ -3256,15 +3368,19 @@ def _run_validation(
         result[f'dts_{_zn}_pct'] = None if _fr is None else 100.0 * _fr
 
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
-        c_cnt = agg.get(f'evalfix_clarke_A@{h_min}_cnt', 0.0)
-        result[f'evalfix_clarke_A@{h_min}'] = (
-            100.0 * agg.get(f'evalfix_clarke_A@{h_min}', 0.0) / c_cnt if c_cnt > 0 else None)
+        for _z in ('A', 'B', 'C', 'D', 'E'):
+            c_cnt = agg.get(f'evalfix_clarke_{_z}@{h_min}_cnt', 0.0)
+            result[f'evalfix_clarke_{_z}@{h_min}'] = (
+                100.0 * agg.get(f'evalfix_clarke_{_z}@{h_min}', 0.0) / c_cnt
+                if c_cnt > 0 else None)
+        for _zn in dts_grid.ZONE_NAMES:
+            d_cnt = agg.get(f'dts_{_zn}@{h_min}_cnt', 0.0)
+            result[f'dts_{_zn}@{h_min}'] = (
+                100.0 * agg.get(f'dts_{_zn}@{h_min}', 0.0) / d_cnt
+                if d_cnt > 0 else None)
         m_cnt = agg.get(f'evalfix_mard@{h_min}_cnt', 0.0)
         result[f'evalfix_mard@{h_min}'] = (
             100.0 * agg.get(f'evalfix_mard@{h_min}_sum', 0.0) / m_cnt if m_cnt > 0 else None)
-        d_cnt = agg.get(f'dts_a@{h_min}_cnt', 0.0)
-        result[f'dts_a@{h_min}'] = (
-            100.0 * agg.get(f'dts_a@{h_min}', 0.0) / d_cnt if d_cnt > 0 else None)
 
     # Marginal per-(h, τ) coverage of the 90% band.
     for h_min in COVERAGE_HORIZONS_MIN:
@@ -3601,13 +3717,15 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         # + EP is 1 by construction, so logging AP and EP alone left the benign
         # share derivable but never stated.
         *[(f'cgega_{m}_{r}', 4) for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'be', 'ep')],
-        *[(f'evalfix_clarke_A@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
+        *[(f'evalfix_clarke_{z}@{h}', 4)
+          for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN for z in ('A', 'B', 'C', 'D', 'E')],
         *[(f'clarke_{z}_pct', 4) for z in ('A', 'B', 'C', 'D', 'E')],
         ('clarke_AB_pct', 4),
         # DTS Error Grid: every zone, plus pZA per horizon. No A+B column — the
         # paper is explicit that presenting one is inappropriate.
         *[(f'dts_{z}_pct', 4) for z in dts_grid.ZONE_NAMES],
-        *[(f'dts_a@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
+        *[(f'dts_{z}@{h}', 4)
+          for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN for z in dts_grid.ZONE_NAMES],
         ('roc_rmse', 6), ('roc_corr', 4), ('trend_gain_beta', 4), ('trend_amp_ratio', 4),
         ('bg_curve_corr', 4),
         # Excursion-magnitude amplitude (NET peak deviation vs last_bg — the

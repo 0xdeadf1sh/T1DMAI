@@ -707,19 +707,25 @@ The module defines no pass/fail threshold on any of them, and
 | Relative error & derivative tracking | MARD per horizon, the rate-of-change correlation, and median roughness pooled and at the far patch |
 | Amplitude & excursion shape | The mean-collapse detectors: per-patch and per-excursion amplitude ratio, gain, correlation, and the overshoot/undershoot split |
 | Conformal probe @ excursion peaks | Raw against region-binned coverage, each with the width that bought it, and both hypo-escape rates |
-| Clinical error grid (Clarke) | All five zone shares, A+B, and zone A per horizon |
-| Clinical error grid (DTS) | All five pooled zone shares, uncoloured |
+| Clinical error grid (Clarke) | All five zone shares, A+B, and all five again per horizon |
+| Clinical error grid (DTS) | All five pooled zone shares and all five per horizon, uncoloured |
 | Clinical accuracy (CG-EGA) | Per-region accurate, benign and erroneous fractions |
 | Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error, and the same detection per 30-minute bucket |
-| Nocturnal | The nocturnal hypo recall and precision pair |
+| Nocturnal | Nocturnal hypo AND hyper recall/precision |
+| Night-onset excursion call | Per-NIGHT binary hypo and hyper recall/precision, with the nights scored, the nights skipped, and each side's true/called counts |
 | Counterfactual dose-response | The two dose directions and insulin monotonicity (`train.py` only — the blind fork removes the probe) |
-| Time-of-day probe | Mean absolute clock error |
+| Time-of-day probe | The whole probe: MAE pooled and at high confidence, the three accuracies, bias / std / p90 / gross-error rate, confidence, and the within- and cross-window jump witnesses |
+
+A **pooled** grid share is over every scored step of the forecast protocol, so it
+mixes a 5-minute-ahead error with a 2-hour-ahead one and moves when the horizon
+mixture moves. A `@{h}` share is the single step at that horizon, which is what a
+published grid figure can be read against. Both grids report both.
 
 `validation_log.csv` carries every metric on every row, this table included and
-the families it does not print besides: the proper scoring rules per `d`, the
-hypo alarm operating curve, the infill protocol's columns, per-horizon DTS zone
-A, the nocturnal duplicates of Clarke, MARD and CG-EGA, the night-onset call, the
-time-in-range internals, and the clock probe's reliability rows.
+the four families it does not print besides: the proper scoring rules per `d`, the
+hypo alarm operating curve, the infill protocol's columns, and the nocturnal
+duplicates of Clarke, MARD and CG-EGA (which repeat their all-sample counterparts
+on a subset).
 
 The two point error grids are reported side by side and are not
 interchangeable. Clarke's zones describe the treatment error a wrong reading

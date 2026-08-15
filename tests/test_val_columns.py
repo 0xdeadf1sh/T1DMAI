@@ -70,9 +70,6 @@ CSV_ONLY = {
     'Infill Protocol': 'infill_rmse@d1',
     'infill crps': 'infill_crps@d1',
     'pred_tir': 'pred_tir',
-    'tod acc': 'tod_acc_1h',
-    'night_hyper_recall': 'night_hyper_recall',
-    'night-onset': 'night_onset_hypo_recall',
 }
 
 # Families that WERE trimmed and have since been RESTORED to the page, each pinned
@@ -93,6 +90,14 @@ RESTORED_TO_THE_TABLE = {
     'bg_mae  @30m': 'bg_mae_30',
     'hypo_recall @30m': 'hypo_recall@30',
     'hyper_precision @30m': 'hyper_precision@30',
+    'clarke_E @120m': 'evalfix_clarke_E@120',
+    'dts_C @60m': 'dts_c@60',
+    'tod acc ±1h': 'tod_acc_1h',
+    'tod gross-error rate': 'tod_gross_rate',
+    'tod jump (cross-window)': 'tod_xwin_jump_h',
+    'night_hyper_recall': 'night_hyper_recall',
+    'night_onset_hypo_recall': 'night_onset_hypo_recall',
+    'night_onset_hyper_precision': 'night_onset_hyper_precision',
 }
 
 # The conformal probe is the one CSV_ONLY family the fixture cannot produce:
