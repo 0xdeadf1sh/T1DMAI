@@ -260,7 +260,10 @@ BG_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120, 180, 360, 480)
 EVALFIX_CLARKE_MARD_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120)
 # Marginal coverage horizons: the per-(h, τ) empirical coverage of the central
 # 90% band (τ.05/.95). MARGINAL — per-step, NOT joint-over-horizon.
-COVERAGE_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120)
+# One entry per masked patch of the forecast protocol, so the calibration rows
+# and the protocol's own d = 1..4 line up. 90 was absent while the protocol
+# reached it, which left d = 3 with no coverage row of its own.
+COVERAGE_HORIZONS_MIN: tuple[int, ...] = (30, 60, 90, 120)
 
 BG_TARGET_LO = 70.0
 BG_TARGET_HI = 180.0
@@ -724,12 +727,19 @@ def _render_validation_table(
 ) -> str:
     """Render a SOTA-target validation table with ANSI colors.
 
-    Four columns: ``Metric | Value | Prev | Target``. The model is always
-    conditioned (the prediction-zone carbs, insulin and exercise are all
-    announced — the announced set is ``tuple(CHANNEL_TO_FEAT)``), so there is a
-    single validation pass and one value per metric — colored by SOTA tier with a
-    trend arrow against the previous validation. Section-title rows span the full
-    inner width and are excluded from column-width measurement.
+    Three columns: ``Metric | Value | Prev``. The model is always conditioned (the
+    prediction-zone carbs, insulin and exercise are all announced — the announced
+    set is ``tuple(CHANNEL_TO_FEAT)``), so there is a single validation pass and
+    one value per metric — colored by SOTA tier with a trend arrow against the
+    previous validation. Section-title rows span the full inner width and are
+    excluded from column-width measurement.
+
+    This is a READING surface, not the record. ``validation_log.csv`` carries
+    every metric unchanged; rows are dropped from here wherever the console cost
+    outweighs what they say at a 1000-step cadence. Each ``target=`` string still
+    documents its row's intent and is simply not rendered. Where a family was
+    cut, the comment at that point says which and why, so it can be put back
+    knowingly rather than rediscovered.
     """
 
     def _fmt(fmt: str, val: float, suffix: str = '') -> str:
@@ -787,10 +797,6 @@ def _render_validation_table(
     #  unit). The value carries NO unit; the unit is appended once in the layout
     # after the value + trend.
 
-    # Qualifications too long for the Target column, marked ``[x]`` on the rows
-    # they govern and printed under the table. A cell here sets the column width
-    # for all 250 rows, so a sentence-length one doubles the table.
-    footnotes: list[str] = []
 
     def _section(title: str) -> None:
         rows.append((_colored(title, _ANSI_BOLD + _ANSI_CYAN), '', '', '', '', ''))
@@ -919,18 +925,12 @@ def _render_validation_table(
              prev_key='val_loss_total')
     info_row('val_loss_Q', val_metrics.get('val_loss_Q'),
              prev_key='val_loss_Q')
-    info_row('pinball (diag)', val_metrics.get('val_pinball'),
-             prev_key='val_pinball')
-    info_row('dilate (val)', val_metrics.get('val_loss_D'),
-             prev_key='val_loss_D', direction='none')
-    info_row('log_sigma_Q', val_metrics.get('log_sigma_Q'),
-             fmt='{:+.4f}', target='Kendall-Gal (diag)',
-             prev_key='log_sigma_Q', direction='none')
-    info_row('log_sigma_D', val_metrics.get('log_sigma_D'),
-             fmt='{:+.4f}', target='Kendall-Gal (diag)',
-             prev_key='log_sigma_D', direction='none')
-    info_row('train_ema', val_metrics.get('train_loss_ema'),
-             prev_key='train_loss_ema')
+    # val_loss_total is the SELECTION scalar, and it is the objective on each
+    # sample's own mask — 97% two-sided under uniform placement. It improved
+    # monotonically across the whole live run while the deployed one-sided band
+    # decayed, so it is not a proxy for forecast calibration; the calibration
+    # section below is what carries that. The remaining components (pinball,
+    # dilate, the two Kendall-Gal log-sigmas, train_ema) are CSV-only.
     band_row('overfit_ratio', val_metrics.get('overfit_ratio'),
              0.400, 0.600, fmt='{:.3f}', warn_pad=0.10,
              prev_key='overfit_ratio')
@@ -968,22 +968,10 @@ def _render_validation_table(
     _night_roll_n = int(val_metrics.get('night_roll_n', 0) or 0)
     _night_roll_skipped = int(val_metrics.get('night_roll_skipped', 0) or 0)
     _night_seen = _night_roll_n + _night_roll_skipped
-    if _roll_seen:
-        footnotes.append(
-            f"[c] rolled rows: each roll starts from the VISIBLE patch run "
-            f"ending at the forecast origin, not from the full n_ctx, and a "
-            f"sample whose run is under MIN_CONTEXT_PATCHES = "
-            f"{MIN_CONTEXT_PATCHES} patches ({MIN_CONTEXT_PATCHES * _PATCH_HOURS:g} h) "
-            f"is not scored at all. Every [c] row carries the count it was "
-            f"scored over in its own label, and no two of those counts are "
-            f"interchangeable: the night RMSEs are over the nocturnal subset, "
-            f"the roll rows over the whole validation set, and the night-onset "
-            f"rows over the nights of a separate dataset."
-        )
     _section('BG Forecast (RMSE) — Night Only @ 180+')
     for h_min in (180, 360, 480):
         _n_h = int(val_metrics.get(f'night_bg_rmse_{h_min}_n', 0) or 0)
-        lower_row(f'night_bg_rmse @{h_min}m ({_n_h}n) [c]',
+        lower_row(f'night_bg_rmse @{h_min}m ({_n_h}n)',
                   val_metrics.get(f'night_bg_rmse_{h_min}'),
                   night_bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
                   prev_key=f'night_bg_rmse_{h_min}')
@@ -994,19 +982,16 @@ def _render_validation_table(
         # nothing to explain them. The night pair renders on the same condition
         # rather than on its own, so an empty night subset prints ``0 of 0``
         # instead of leaving the vanished RMSEs unexplained.
-        info_row('night roll scored [c]', float(_night_roll_n),
-                 fmt='{:.0f}', unit=' samples',
-                 target=f'of {_night_seen} nocturnal',
-                 prev_key='night_roll_n', direction='higher', show_absent=True)
-        info_row('night roll skipped (short run) [c]', float(_night_roll_skipped),
+        # The roll now starts from the OBSERVED context, so a skip means the
+        # window itself was short — not that the training mask happened to land
+        # near the origin, which is what used to drop ~88% of these. Both skip
+        # counters stay on the page precisely so a return to that state is
+        # visible rather than silent; the night-scored count is CSV-only.
+        info_row('night roll skipped (short window)', float(_night_roll_skipped),
                  fmt='{:.0f}', unit=' samples',
                  target=f'of {_night_seen} nocturnal',
                  prev_key='night_roll_skipped', direction='lower', show_absent=True)
-        info_row(f'roll ctx (all {_roll_n} scored) [c]', _roll_ctx,
-                 fmt='{:.1f}', unit=' patches',
-                 target=f'≥ {MIN_CONTEXT_PATCHES} (= {MIN_CONTEXT_PATCHES * _PATCH_HOURS:g} h)',
-                 prev_key='roll_ctx_patches', direction='higher', show_absent=True)
-        info_row('roll skipped (short run) [c]', val_metrics.get('roll_skipped'),
+        info_row('roll skipped (short window)', val_metrics.get('roll_skipped'),
                  fmt='{:.0f}', unit=' samples', target=f'of {_roll_seen} seen',
                  prev_key='roll_skipped', direction='lower', show_absent=True)
     _blank()
@@ -1017,30 +1002,6 @@ def _render_validation_table(
     # Every coverage here carries its band width beside it (``sharp90`` /
     # ``sharp50``, the mean width of the same band over that horizon's patch).
     # The pair is the measurement: coverage on its own is bought by widening.
-    _section('Quantile Calibration (marginal coverage of 90% band, at one step)')
-    for h_min in COVERAGE_HORIZONS_MIN:
-        v = val_metrics.get(f'coverage90@{h_min}')
-        cov_sharp_row(f'coverage90 @{h_min}m',
-                      (v * 100.0) if v is not None else None,
-                      val_metrics.get(f'sharp90@{h_min}'),
-                      88.0, 92.0, warn_pad=5.0,
-                      prev_key=f'coverage90@{h_min}', target='88–92% + width')
-    # Diagnostic (uncoloured): sign_balance / inner50_cov, both target 0.50.
-    for h_min in COVERAGE_HORIZONS_MIN:
-        v = val_metrics.get(f'sign_balance@{h_min}')
-        info_row(f'sign_balance @{h_min}m',
-                 (v * 100.0) if v is not None else None,
-                 fmt='{:.2f}', unit='%', target='≈ 50% (diag)',
-                 prev_key=f'sign_balance@{h_min}', prev_scale=100.0, direction='none')
-    for h_min in COVERAGE_HORIZONS_MIN:
-        v = val_metrics.get(f'inner50_cov@{h_min}')
-        cov_sharp_row(f'inner50_cov @{h_min}m',
-                      (v * 100.0) if v is not None else None,
-                      val_metrics.get(f'sharp50@{h_min}'),
-                      45.0, 55.0, warn_pad=10.0,
-                      prev_key=f'inner50_cov@{h_min}', target='≈ 50% + width')
-    _blank()
-
     # ============================================================
     # 3b. Proper scoring rules — forecast protocol, per d.
     # ============================================================
@@ -1056,127 +1017,75 @@ def _render_validation_table(
         v = val_metrics.get(f'{key}@{h}')
         return float(v) if isinstance(v, (int, float)) else None
 
-    _fan_d = tuple(range(1, len(_fan_eh) + 1))
-    _section('Proper Scoring — forecast protocol, per d  (@30/60/90/120m = d 1/2/3/4)')
-    for _h in _fan_eh:
-        _n = _fan_n(_h)
-        info_row(f"crps @{_h}m({int(_n or 0)}st)", val_metrics.get(f'crps@{_h}'),
-                 fmt='{:.2f}', unit=' mg/dL', target='Minimize (proper)',
-                 prev_key=f'crps@{_h}', show_absent=True)
-    for _h in _fan_eh:
-        info_row(f'winkler90 @{_h}m', val_metrics.get(f'winkler90@{_h}'),
-                 fmt='{:.1f}', unit=' mg/dL', target='Minimize (width+miss)',
-                 prev_key=f'winkler90@{_h}', show_absent=True)
-    for _d, _h in zip(_fan_d, _fan_eh):
-        _c = val_metrics.get(f'_fan_cov90@{_h}')
-        cov_sharp_row(f'cov90 marginal @d{_d} {_h}m',
-                      (_c * 100.0) if _c is not None else None,
-                      val_metrics.get(f'sharp90@{_h}'),
-                      88.0, 92.0, warn_pad=5.0, n=_fan_n(_h),
-                      prev_key=f'_fan_cov90@{_h}', target='88–92% + width')
-    # JOINT, not marginal: every step of the path out to this horizon inside the
-    # band AT ONCE, one window at a time. It is bounded above by the smallest
-    # marginal in its scope and falls with scope, so it is labelled apart and can
-    # never be read as the per-step figure above.
-    for _h in _fan_eh:
-        _j = val_metrics.get(f'joint_cov90@{_h}')
-        cov_sharp_row(f'joint90 whole path ≤{_h}m',
+
+    _section('Quantile Calibration (marginal coverage of 90% band, at one step)')
+    for h_min in COVERAGE_HORIZONS_MIN:
+        v = val_metrics.get(f'coverage90@{h_min}')
+        cov_sharp_row(f'coverage90 @{h_min}m',
+                      (v * 100.0) if v is not None else None,
+                      val_metrics.get(f'sharp90@{h_min}'),
+                      88.0, 92.0, warn_pad=5.0,
+                      prev_key=f'coverage90@{h_min}', target='88–92% + width')
+    for h_min in COVERAGE_HORIZONS_MIN:
+        v = val_metrics.get(f'inner50_cov@{h_min}')
+        cov_sharp_row(f'inner50_cov @{h_min}m',
+                      (v * 100.0) if v is not None else None,
+                      val_metrics.get(f'sharp50@{h_min}'),
+                      45.0, 55.0, warn_pad=10.0,
+                      prev_key=f'inner50_cov@{h_min}', target='≈ 50% + width')
+    # One directional-bias witness rather than one per horizon: the far horizon is
+    # where median drift shows first. The rest are CSV-only.
+    _sb_h = COVERAGE_HORIZONS_MIN[-1]
+    _sb = val_metrics.get(f'sign_balance@{_sb_h}')
+    info_row(f'sign_balance @{_sb_h}m',
+             (_sb * 100.0) if _sb is not None else None,
+             fmt='{:.2f}', unit='%', target='≈ 50% (diag)',
+             prev_key=f'sign_balance@{_sb_h}', prev_scale=100.0, direction='none')
+
+    # ONE-SIDED vs TWO-SIDED at matched d. The forecast protocol is entirely
+    # one-sided and the infill protocol entirely two-sided, so the two coverages
+    # above and below are the same nominal level over the same d at different
+    # SIDEDNESS -- and that is the axis the sampler starves. Uniform placement
+    # leaves 0.82% of masked slots one-sided at d = 1, and the band there decays
+    # with training while every pooled figure holds; measured on the live nano
+    # run, one-sided d=1 covered 0.850 against two-sided 0.891 on the same
+    # windows, same patch, same anchor. Pairing them is what makes that legible
+    # from the table instead of from a separate study.
+    _os = val_metrics.get(f'coverage90@{COVERAGE_HORIZONS_MIN[0]}')
+    _ts = val_metrics.get(_infill_column('marginal90_cov', 1))
+    info_row('  ↳ one-sided cov90 @d1', (_os * 100.0) if _os is not None else None,
+             fmt='{:.2f}', unit='%', target='vs two-sided below',
+             prev_key=f'coverage90@{COVERAGE_HORIZONS_MIN[0]}', prev_scale=100.0,
+             direction='none', show_absent=True)
+    info_row('  ↳ two-sided cov90 @d1', (_ts * 100.0) if _ts is not None else None,
+             fmt='{:.2f}', unit='%', target='gap ⇒ sidedness starved',
+             prev_key=_infill_column('marginal90_cov', 1), prev_scale=100.0,
+             direction='none', show_absent=True)
+
+    # CRPS, Winkler and the per-d marginal cov/sharpness pairs are CSV-only now.
+    # They are proper scores, and a band ~20% too narrow at one horizon barely
+    # moves them: correcting the measured d=1 deficit changes Winkler by -1.7% and
+    # CRPS by -0.3%, because the loss saved by being sharp offsets the loss paid on
+    # the misses. Coverage is what shows it, and it is in the section above.
+    #
+    # joint90 survives because it is a different CLAIM, not a rescaling of the
+    # same one: every step of the path inside the band AT ONCE, one window at a
+    # time. Bounded above by the smallest marginal in its scope, it fell
+    # 0.69 -> 0.58 over 6k steps while the marginal held, so it is the one row
+    # here that catches a path-level failure the per-step figures cannot.
+    _joint_h = _fan_eh[-1] if _fan_eh else None
+    if _joint_h is not None:
+        _j = val_metrics.get(f'joint_cov90@{_joint_h}')
+        cov_sharp_row(f'joint90 whole path ≤{_joint_h}m',
                       (_j * 100.0) if _j is not None else None,
-                      val_metrics.get(f'_fan_joint_width@{_h}'),
+                      val_metrics.get(f'_fan_joint_width@{_joint_h}'),
                       70.0, 92.0, warn_pad=15.0,
-                      n=_fan_n(_h, '_fan_joint_n'), n_unit=' windows',
-                      prev_key=f'joint_cov90@{_h}',
+                      n=_fan_n(_joint_h, '_fan_joint_n'), n_unit=' windows',
+                      prev_key=f'joint_cov90@{_joint_h}',
                       target='≤ marginal (simultaneous)')
     _blank()
 
-    # Hypo alarm operating curve, swept over the band-edge τ. Detection rate,
-    # false alarms per day and the MEDIAN LEAD TIME travel together: a detection
-    # rate bought at a two-minute lead is not a usable alarm, and neither the
-    # rate nor the false-alarm rate can show that on its own. The false-alarm
-    # denominator is the span the alarm was actually exposed to; where none was
-    # derivable the rate is absent and never 0.
-    _alarm_events = int(val_metrics.get('alarm_hypo_n_events', 0) or 0)
-    _alarm_days = val_metrics.get('_alarm_observed_days')
-    _alarm_span = (f", {_alarm_days:.2f} observed days"
-                   if isinstance(_alarm_days, (int, float)) else "")
-    _alarm_note = val_metrics.get('_alarm_pooled_note')
-    if _alarm_note:
-        footnotes.append(f"[p] alarm, pooled rows: {_alarm_note}")
-    _section(f'Hypo Alarm Operating Curve ({_alarm_events} events{_alarm_span})')
 
-    def _alarm_cell(suffix: str, tag: str) -> str:
-        # Each of the three renders absent on its own. A validation set with no
-        # true hypo event has no detection rate and no lead time, but its false
-        # alarms are still counted — every alarm it issued was one.
-        _det = val_metrics.get(f'alarm_hypo_det@{tag}{suffix}')
-        _fa = val_metrics.get(f'alarm_hypo_fa_day@{tag}{suffix}')
-        _lead = val_metrics.get(f'alarm_hypo_lead_min@{tag}{suffix}')
-        return (
-            _colored('det ' + ('—' if _det is None else f'{_det * 100.0:.1f}%'),
-                     _ANSI_CYAN)
-            + _colored(f"  ·  {'—' if _fa is None else f'{_fa:.2f}'} fa/day"
-                       f"  ·  lead {'—' if _lead is None else f'{_lead:.0f}'} min",
-                       _ANSI_GRAY))
-
-    for _t in _alarm_curve_taus():
-        _tg = _tau_tag(_t)
-        # The pooled row is the deployed decision — one alarm per forecast
-        # origin, scanning the whole zone — and its score is a max over that
-        # zone. The per-d rows under it are what shows which horizon the
-        # detection came from: the pooled figure does not move when one d stops
-        # contributing entirely.
-        text_row(f'alarm τ={_t:g} edge < {BG_HYPO_THRESHOLD:g} mg/dL [p]',
-                 _alarm_cell('', _tg),
-                 target='higher det, lower fa, longer lead')
-        for _d, _h in zip(_fan_d, _fan_eh):
-            _n_ev = val_metrics.get(f'alarm_hypo_n_events@{_h}')
-            text_row(f'  ↳ @d{_d} {_h}m({int(_n_ev or 0)} ev)',
-                     _alarm_cell(f'@{_h}', _tg),
-                     target='higher det, lower fa, longer lead')
-    _blank()
-
-    # ============================================================
-    # 3c. Infill protocol — interior spans, two-sided, per d.
-    # ============================================================
-    # Scored against LINEAR INTERPOLATION between the bracketing visible
-    # readings, never against persistence: persistence is a forecasting baseline
-    # and against a two-sided span it is a strawman rather than a baseline.
-    _inf_d = _infill_reachable_d()
-    _inf_w = int(val_metrics.get('_infill_windows', 0) or 0)
-    _section(f'Infill Protocol — interior spans, per d, {_inf_w} windows '
-             f'(baseline: interpolation)')
-    for _d in _inf_d:
-        _rmse = val_metrics.get(_infill_column('rmse', _d))
-        _base = val_metrics.get(_infill_column('rmse_interp', _d))
-        _n = val_metrics.get(_infill_column('crps_n', _d))
-        _cell = None if _rmse is None else (
-            _colored(f"{_rmse:.1f}", _ANSI_CYAN)
-            + _colored(f" mg/dL  vs interp {'—' if _base is None else f'{_base:.1f}'}",
-                       _ANSI_GRAY))
-        text_row(f"infill rmse @d{_d}({int(_n or 0)}st)", _cell,
-                 target='< interpolation')
-    for _d in _inf_d:
-        info_row(f'infill crps @d{_d}', val_metrics.get(_infill_column('crps', _d)),
-                 fmt='{:.2f}', unit=' mg/dL', target='Minimize (proper)',
-                 prev_key=_infill_column('crps', _d), show_absent=True)
-    for _d in _inf_d:
-        info_row(f'infill winkler90 @d{_d}',
-                 val_metrics.get(_infill_column('winkler90', _d)),
-                 fmt='{:.1f}', unit=' mg/dL', target='Minimize (width+miss)',
-                 prev_key=_infill_column('winkler90', _d), show_absent=True)
-    for _d in _inf_d:
-        _c = val_metrics.get(_infill_column('marginal90_cov', _d))
-        cov_sharp_row(f'infill cov90 @d{_d}',
-                      (_c * 100.0) if _c is not None else None,
-                      val_metrics.get(_infill_column('marginal90_width_mean', _d)),
-                      88.0, 92.0, warn_pad=5.0,
-                      prev_key=_infill_column('marginal90_cov', _d),
-                      target='88–92% + width')
-    _blank()
-
-    # ============================================================
-    # 4. Relative Error & Derivative Tracking
-    # ============================================================
     _section('Relative Error & Derivative Tracking')
     mard_sota = {30: 7.0, 60: 12.0, 120: 19.0}
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
@@ -1189,81 +1098,36 @@ def _render_validation_table(
     higher_row('direction (roc_corr)', val_metrics.get('roc_corr'),
                0.650, fmt='{:+.3f}', warn_gap=0.20,
                prev_key='roc_corr')
-    higher_row('amplitude (trend_amp_ratio)', val_metrics.get('trend_amp_ratio'),
-               0.600, fmt='{:.3f}', warn_gap=0.30,
-               prev_key='trend_amp_ratio')
-    higher_row('dir×amp (trend_gain_beta)', val_metrics.get('trend_gain_beta'),
-               0.800, fmt='{:+.3f}', warn_gap=0.30,
-               prev_key='trend_gain_beta')
-    higher_row('bg_curve_corr', val_metrics.get('bg_curve_corr'),
-               0.700, fmt='{:+.3f}', warn_gap=0.20,
-               prev_key='bg_curve_corr')
-    # Excursion-magnitude amplitude (NET peak deviation — what trend_amp_ratio
-    # above misses). exc_amp_ratio is the headline knob for the DILATE_ALPHA / G
-    # recalibration: green ≈ 1.0, red when it over-disperses (>1) or damps (<1).
-    band_row('amp@peak (exc_amp_ratio)', val_metrics.get('exc_amp_ratio'),
-             0.90, 1.10, fmt='{:.3f}', warn_pad=0.20,
-             prev_key='exc_amp_ratio')
-    band_row('exc_gain_beta', val_metrics.get('exc_gain_beta'),
-             0.90, 1.10, fmt='{:+.3f}', warn_pad=0.25,
-             prev_key='exc_gain_beta')
-    higher_row('exc_corr', val_metrics.get('exc_corr'),
-               0.650, fmt='{:+.3f}', warn_gap=0.20,
-               prev_key='exc_corr')
-    lower_row('exc_overshoot_frac', val_metrics.get('exc_overshoot_frac'),
-              0.150, fmt='{:.3f}', warn_mult=2.0,
-              prev_key='exc_overshoot_frac')
-    lower_row('exc_undershoot_frac', val_metrics.get('exc_undershoot_frac'),
-              0.150, fmt='{:.3f}', warn_mult=2.0,
-              prev_key='exc_undershoot_frac')
-    info_row('exc_n (windows)', val_metrics.get('exc_n'),
-             fmt='{:.0f}', target='count (diag)', direction='none')
-    # Conformal coverage probe: does split-conformal recalibration restore the band
-    # coverage the raw fan loses at excursion peaks? RAW = the model's bands, CAL =
-    # after per-(step,quantile) conformal (median untouched). Fit/eval on a held-out
-    # val split (small sample — directional). cov90 → 0.90; hypo escape (truth below
-    # the τ=0.10 edge) → 0.10. Both coverages carry their mean band width: the
-    # correction moves coverage and width together, and the pair is what says
-    # which way.
-    if val_metrics.get('conf_cov90_raw') is not None:
-        cov_sharp_row('conf cov90@peak RAW',
-                      val_metrics.get('conf_cov90_raw') * 100.0,
-                      val_metrics.get('conf_width_raw'),
-                      88.0, 92.0, warn_pad=5.0,
-                      prev_key='conf_cov90_raw', target='ref 90% + width (diag)')
-        cov_sharp_row('conf cov90@peak CAL',
-                      val_metrics.get('conf_cov90_cal') * 100.0,
-                      val_metrics.get('conf_width_cal'),
-                      88.0, 92.0, warn_pad=5.0,
-                      prev_key='conf_cov90_cal', target='ref 90% + width (diag)')
-        info_row('conf hypo-escape RAW', val_metrics.get('conf_hypo_esc_raw') * 100.0,
-                 fmt='{:.1f}', unit='%', target='ref 10 (diag)', direction='none')
-        info_row('conf hypo-escape CAL', val_metrics.get('conf_hypo_esc_cal') * 100.0,
-                 fmt='{:.1f}', unit='%', target='ref 10 (diag)', direction='none')
-        info_row('conf_n (exc windows)', val_metrics.get('conf_n'),
-                 fmt='{:.0f}', target='count (diag)', direction='none')
+    # The amplitude / excursion-shape block (trend_amp_ratio, trend_gain_beta,
+    # bg_curve_corr, exc_*) and the in-training conformal probe (conf_*) are
+    # CSV-only. None is a selection metric, and conf_hypo_esc in particular reads
+    # as a calibration figure while being a WIDTH figure: sweeping one global
+    # half-width factor over a fixed model takes it 0.250 -> 0.079 as coverage
+    # goes 0.888 -> 0.981, so it cannot be compared across two models whose bands
+    # differ in width, which is exactly what it was being used for.
     _blank()
 
     # ============================================================
     # 5. Clinical Error Grid Analysis (Clarke)
     # ============================================================
+    # Per-horizon clarke_A and clarke_D are CSV-only; A+B is the one that carries
+    # the grid's clinical claim in a single number.
     _section('Clinical Error Grid Analysis (Clarke)')
-    clarke_A_sota = {30: 95.0, 60: 85.0, 120: 72.0}
-    for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
-        higher_row(f'clarke_A @{h_min}m', val_metrics.get(f'evalfix_clarke_A@{h_min}'),
-                   clarke_A_sota[h_min], fmt='{:.2f}', unit='%', warn_gap=2.0,
-                   prev_key=f'evalfix_clarke_A@{h_min}')
     higher_row('clarke_A+B', val_metrics.get('clarke_AB_pct'),
                98.0, fmt='{:.2f}', unit='%', warn_gap=2.0,
                prev_key='clarke_AB_pct')
-    lower_row('clarke_D', val_metrics.get('clarke_D_pct'),
-              0.50, fmt='{:.3f}', unit='%', warn_mult=4.0,
-              prev_key='clarke_D_pct')
     _blank()
 
     # ============================================================
     # 5b. Clinical Accuracy (CG-EGA)
     # ============================================================
+    # Kept whole while Clarke is cut to one row, because it is the only thing on
+    # this page that scores RATE OF CHANGE jointly with value, binned by glycemic
+    # region: Clarke A+B is point accuracy and roc_corr is rate correlation with
+    # no clinical binning, so neither can say the model gets DIRECTION wrong
+    # specifically in the hypo region. That bin is also the reason the block is
+    # readable at all now — at VALIDATION_N_PATIENTS = 100 it held ~11 units, so a
+    # single unit moved cgega_ap_hypo by 0.09.
     _section('Clinical Accuracy (CG-EGA)')
     for _reg, _ap_sota in (('hypo', 80.0), ('eu', 90.0), ('hyper', 85.0)):
         _ap = val_metrics.get(f'cgega_ap_{_reg}')
@@ -1283,14 +1147,8 @@ def _render_validation_table(
     # 6. Longitudinal Excursions & TIR
     # ============================================================
     _section('Longitudinal Excursions & TIR')
-    pred_tir = val_metrics.get('pred_tir')
-    true_tir = val_metrics.get('true_tir')
-    info_row('pred_tir', (pred_tir * 100.0) if pred_tir is not None else None,
-             fmt='{:.2f}', unit='%', target='≈ true_tir',
-             prev_key='pred_tir', prev_scale=100.0, direction='none')
-    info_row('true_tir', (true_tir * 100.0) if true_tir is not None else None,
-             fmt='{:.2f}', unit='%', target='ground truth',
-             prev_key='true_tir', prev_scale=100.0, direction='none')
+    # pred_tir / true_tir are CSV-only: tir_abs_err is their difference and is the
+    # figure that moves.
     tir_e = val_metrics.get('tir_err')
     lower_row('tir_abs_err', (tir_e * 100.0) if tir_e is not None else None,
               5.0, fmt='{:.2f}', unit='%', warn_mult=2.0,
@@ -1320,48 +1178,12 @@ def _render_validation_table(
                prev_key='hyper_precision', prev_scale=100.0)
     _blank()
 
-    # Per-horizon excursion detection (disjoint 30-min buckets).
-    _section('Excursions by Horizon  (announced carbs+insulin+exercise)')
-    _eh = _excursion_bucket_horizons(PREDICTION_PATCHES)
-    for _h in _eh:
-        v = val_metrics.get(f'hypo_recall@{_h}')
-        higher_row(f"hypo_recall@{_h}m({val_metrics.get(f'hypo_n_steps@{_h}', 0)}st)",
-                   (v * 100.0) if v is not None else None,
-                   _excursion_target(EXCURSION_TARGET_HYPO_RECALL, _h),
-                   fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hypo_recall@{_h}', prev_scale=100.0)
-    for _h in _eh:
-        v = val_metrics.get(f'hypo_precision@{_h}')
-        higher_row(f'hypo_precision@{_h}m{_ptol_sfx}',
-                   (v * 100.0) if v is not None else None,
-                   _excursion_target(EXCURSION_TARGET_HYPO_PRECISION, _h),
-                   fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hypo_precision@{_h}', prev_scale=100.0)
-    for _h in _eh:
-        v = val_metrics.get(f'hyper_recall@{_h}')
-        higher_row(f"hyper_recall@{_h}m({val_metrics.get(f'hyper_n_steps@{_h}', 0)}st)",
-                   (v * 100.0) if v is not None else None,
-                   _excursion_target(EXCURSION_TARGET_HYPER_RECALL, _h),
-                   fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hyper_recall@{_h}', prev_scale=100.0)
-    for _h in _eh:
-        v = val_metrics.get(f'hyper_precision@{_h}')
-        higher_row(f'hyper_precision@{_h}m{_ptol_sfx}',
-                   (v * 100.0) if v is not None else None,
-                   _excursion_target(EXCURSION_TARGET_HYPER_PRECISION, _h),
-                   fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hyper_precision@{_h}', prev_scale=100.0)
-    _blank()
-
-    # ============================================================
-    # 7. Nocturnal Validation Metrics
-    # ============================================================
+    # Nocturnal: two rows. The night RMSEs live in the rolled @180+ section, the
+    # night-onset block is four rates over a handful of nights, and night_clarke /
+    # night_mard duplicate their all-sample counterparts on a subset. All CSV-only.
+    # What is kept is the pair that says whether the model still calls a nocturnal
+    # hypo, which is the use case the long-horizon roll exists for.
     _section('Nocturnal Validation Metrics')
-    for h_min in (30, 60, 120):
-        lower_row(f'night_bg_rmse @{h_min}m',
-                  val_metrics.get(f'night_bg_rmse_{h_min}'),
-                  bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
-                  prev_key=f'night_bg_rmse_{h_min}')
     night_hr = val_metrics.get('night_hypo_recall')
     higher_row(f"night_hypo_recall({val_metrics.get('night_hypo_n_steps', 0)}st)",
                (night_hr * 100.0) if night_hr is not None else None,
@@ -1372,103 +1194,31 @@ def _render_validation_table(
                (night_hp * 100.0) if night_hp is not None else None,
                75.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
                prev_key='night_hypo_precision', prev_scale=100.0)
-    night_yr = val_metrics.get('night_hyper_recall')
-    higher_row(f"night_hyper_recall({val_metrics.get('night_hyper_n_steps', 0)}st)",
-               (night_yr * 100.0) if night_yr is not None else None,
-               85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
-               prev_key='night_hyper_recall', prev_scale=100.0)
-    night_yp = val_metrics.get('night_hyper_precision')
-    higher_row(f'night_hyper_precision{_ptol_sfx}',
-               (night_yp * 100.0) if night_yp is not None else None,
-               85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
-               prev_key='night_hyper_precision', prev_scale=100.0)
-    # Rolled, like the @180+ rows above, and under the same floor. Each rate
-    # carries ITS OWN denominator: a recall is over the nights that truly
-    # excursed, a precision over the nights called, and neither is the count of
-    # nights scored — that one is a row of its own below, where it cannot be
-    # read as the denominator of the rate beside it.
-    no_n = int(val_metrics.get('night_onset_n_nights', 0) or 0)
-    no_skipped = int(val_metrics.get('night_onset_skipped', 0) or 0)
-    no_seen = no_n + no_skipped
-    no_hr = val_metrics.get('night_onset_hypo_recall')
-    higher_row(f"night-onset hypo recall ({val_metrics.get('night_onset_hypo_n_true', 0)} true) [c]",
-               (no_hr * 100.0) if no_hr is not None else None,
-               70.0, fmt='{:.2f}', unit='%', warn_gap=15.0,
-               prev_key='night_onset_hypo_recall', prev_scale=100.0)
-    no_hp = val_metrics.get('night_onset_hypo_precision')
-    higher_row(f"night-onset hypo precision ({val_metrics.get('night_onset_hypo_n_pred', 0)} called) [c]",
-               (no_hp * 100.0) if no_hp is not None else None,
-               50.0, fmt='{:.2f}', unit='%', warn_gap=15.0,
-               prev_key='night_onset_hypo_precision', prev_scale=100.0)
-    no_yr = val_metrics.get('night_onset_hyper_recall')
-    higher_row(f"night-onset hyper recall ({val_metrics.get('night_onset_hyper_n_true', 0)} true) [c]",
-               (no_yr * 100.0) if no_yr is not None else None,
-               70.0, fmt='{:.2f}', unit='%', warn_gap=15.0,
-               prev_key='night_onset_hyper_recall', prev_scale=100.0)
-    no_yp = val_metrics.get('night_onset_hyper_precision')
-    higher_row(f"night-onset hyper precision ({val_metrics.get('night_onset_hyper_n_pred', 0)} called) [c]",
-               (no_yp * 100.0) if no_yp is not None else None,
-               60.0, fmt='{:.2f}', unit='%', warn_gap=15.0,
-               prev_key='night_onset_hyper_precision', prev_scale=100.0)
-    if no_seen:
-        # show_absent, like the roll pair: a night-onset pass that scored nothing
-        # drops all four rates above, and these two rows are then the only thing
-        # on the page that says why.
-        info_row('night-onset nights scored [c]', float(no_n),
-                 fmt='{:.0f}', unit=' nights', target=f'of {no_seen} seen',
-                 prev_key='night_onset_n_nights', direction='higher', show_absent=True)
-        info_row('night-onset nights skipped [c]', float(no_skipped),
-                 fmt='{:.0f}', unit=' nights', target=f'of {no_seen} seen',
-                 prev_key='night_onset_skipped', direction='lower', show_absent=True)
-    for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
-        higher_row(f'night_clarke_A @{h_min}m', val_metrics.get(f'night_clarke_A@{h_min}'),
-                   clarke_A_sota[h_min], fmt='{:.2f}', unit='%', warn_gap=2.0,
-                   prev_key=f'night_clarke_A@{h_min}')
-    for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
-        lower_row(f'night_mard @{h_min}m', val_metrics.get(f'night_mard@{h_min}'),
-                  mard_sota[h_min], fmt='{:.2f}', unit='%', warn_mult=2.0,
-                  prev_key=f'night_mard@{h_min}')
     _blank()
 
     # ============================================================
     # 8. Counterfactual dose-response probe (uncoloured diagnostics)
     # ============================================================
     _cf_n = int(val_metrics.get('cf_n', 0) or 0)
-    _cf_hypo_n = int(val_metrics.get('cf_hypo_n', 0) or 0)
-    _cf_hyper_n = int(val_metrics.get('cf_hyper_n', 0) or 0)
+    # Three rows: the two directions and the harder of the two monotonicity
+    # checks. The magnitudes (cf_*_dbg), carb monotonicity and the two rescue
+    # rates are CSV-only. These stay on the page because they are the check that
+    # the model responds to dose AT ALL — risk-v3 scored 0.56 on insulin
+    # monotonicity, a coin flip, with every accuracy metric looking healthy, and
+    # nothing else here would have said so.
     _section(f'Counterfactual Dose-Response ({_cf_n} samples)')
-    _cc = val_metrics.get('cf_carb_dbg')
-    info_row('carb→BG (+bolus)', _cc, fmt='{:+.2f}', unit=' mg/dL',
-             target='> 0 (carbs raise)', prev_key='cf_carb_dbg', direction='none')
     _ccd = val_metrics.get('cf_carb_dir')
     info_row('carb→BG direction', (_ccd * 100.0) if _ccd is not None else None,
              fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
              prev_key='cf_carb_dir', prev_scale=100.0, direction='none')
-    _ci = val_metrics.get('cf_insulin_dbg')
-    info_row('insulin→BG (+bolus)', _ci, fmt='{:+.2f}', unit=' mg/dL',
-             target='< 0 (insulin lowers)', prev_key='cf_insulin_dbg', direction='none')
     _cid = val_metrics.get('cf_insulin_dir')
     info_row('insulin→BG direction', (_cid * 100.0) if _cid is not None else None,
              fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
              prev_key='cf_insulin_dir', prev_scale=100.0, direction='none')
-    _ccm = val_metrics.get('cf_carb_monotonic')
-    info_row('carb monotonic', (_ccm * 100.0) if _ccm is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_carb_monotonic', prev_scale=100.0, direction='none')
     _cim = val_metrics.get('cf_insulin_monotonic')
     info_row('insulin monotonic', (_cim * 100.0) if _cim is not None else None,
              fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
              prev_key='cf_insulin_monotonic', prev_scale=100.0, direction='none')
-    _chr = val_metrics.get('cf_hypo_rescue')
-    info_row(f'hypo rescue (carb, {_cf_hypo_n}n)',
-             (_chr * 100.0) if _chr is not None else None,
-             fmt='{:.1f}', unit='%', target='higher (diag)',
-             prev_key='cf_hypo_rescue', prev_scale=100.0, direction='none')
-    _cyr = val_metrics.get('cf_hyper_rescue')
-    info_row(f'hyper rescue (insulin, {_cf_hyper_n}n)',
-             (_cyr * 100.0) if _cyr is not None else None,
-             fmt='{:.1f}', unit='%', target='higher (diag)',
-             prev_key='cf_hyper_rescue', prev_scale=100.0, direction='none')
     _blank()
 
     # ============================================================
@@ -1477,32 +1227,12 @@ def _render_validation_table(
     # SOTA: green ~ a usable clock, red ~ near random-phase chance (chance is
     # mae 6 h, acc +/-1h 8%, +/-2h 17%, 4-bin 25%).
     # ============================================================
+    # One row. The probe co-trains the trunk but feeds neither the loss nor
+    # selection, and eleven rows of clock reliability is more than a diagnostic
+    # earns at this cadence; the rest are CSV-only.
     _section('Time-of-day probe (diagnostic)')
     lower_row('tod mae', val_metrics.get('tod_mae_h'), 1.5,
               fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_h')
-    higher_row('tod acc +/-1h', val_metrics.get('tod_acc_1h'), 60.0,
-               fmt='{:.1f}', unit='%', warn_gap=30.0, prev_key='tod_acc_1h')
-    higher_row('tod acc +/-2h', val_metrics.get('tod_acc_2h'), 80.0,
-               fmt='{:.1f}', unit='%', warn_gap=35.0, prev_key='tod_acc_2h')
-    higher_row('tod acc 4-bin', val_metrics.get('tod_acc_bin'), 70.0,
-               fmt='{:.1f}', unit='%', warn_gap=30.0, prev_key='tod_acc_bin')
-    higher_row('tod confidence R', val_metrics.get('tod_conf'), 0.80,
-               fmt='{:.2f}', warn_gap=0.40, prev_key='tod_conf')
-    # Clock reliability: is the probe usable as an actual clock?
-    band_row('tod bias', val_metrics.get('tod_bias_h'), -1.0, 1.0,
-             fmt='{:+.2f}', unit=' h', warn_pad=2.0, prev_key='tod_bias_h')
-    lower_row('tod precision sd', val_metrics.get('tod_std_h'), 1.5,
-              fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_std_h')
-    lower_row('tod p90 err', val_metrics.get('tod_p90_h'), 3.0,
-              fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_p90_h')
-    lower_row('tod gross >3h', val_metrics.get('tod_gross_rate'), 10.0,
-              fmt='{:.1f}', unit='%', warn_mult=2.5, prev_key='tod_gross_rate')
-    lower_row('tod mae hi-conf', val_metrics.get('tod_mae_hiconf'), 1.0,
-              fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_hiconf')
-    lower_row('tod jump', val_metrics.get('tod_jump_h'), 0.25,
-              fmt='{:.2f}', unit=' h', warn_mult=3.0, prev_key='tod_jump_h')
-    lower_row('tod xwin jump', val_metrics.get('tod_xwin_jump_h'), 0.5,
-              fmt='{:.2f}', unit=' h', warn_mult=3.0, prev_key='tod_xwin_jump_h')
     _blank()
 
     # ============================================================
@@ -1540,18 +1270,18 @@ def _render_validation_table(
     def _value_cell(value: str, trend: str, unit: str) -> str:
         return f"{_with_unit(value, unit)}{trend}"
 
-    headers = ['Metric', 'Value', 'Prev', 'Target']
+    headers = ['Metric', 'Value', 'Prev']
     col_w = [len(h) for h in headers]
     for r in rows:
         if _is_section_row(r) or _is_blank_row(r):
             continue
-        metric, value, prev, trend, target, unit = r
-        cells = (metric, _value_cell(value, trend, unit), prev, target)
+        metric, value, prev, trend, _target, unit = r
+        cells = (metric, _value_cell(value, trend, unit), prev)
         for i, cell in enumerate(cells):
             col_w[i] = max(col_w[i], len(_strip_ansi(cell)))
 
-    c1, c2, c3, c4 = col_w
-    inner_w = c1 + c2 + c3 + c4 + 9
+    c1, c2, c3 = col_w
+    inner_w = c1 + c2 + c3 + 6
 
     max_title_w = 0
     for r in rows:
@@ -1561,16 +1291,15 @@ def _render_validation_table(
         c1 += max_title_w - inner_w
         inner_w = max_title_w
 
-    top_edge = f"├─{'─' * c1}─┬─{'─' * c2}─┬─{'─' * c3}─┬─{'─' * c4}─┤"
-    mid_edge = f"├─{'─' * c1}─┼─{'─' * c2}─┼─{'─' * c3}─┼─{'─' * c4}─┤"
-    bot_edge = f"└─{'─' * c1}─┴─{'─' * c2}─┴─{'─' * c3}─┴─{'─' * c4}─┘"
-    sep_line = f"│ {' ' * c1} │ {' ' * c2} │ {' ' * c3} │ {' ' * c4} │"
+    top_edge = f"├─{'─' * c1}─┬─{'─' * c2}─┬─{'─' * c3}─┤"
+    mid_edge = f"├─{'─' * c1}─┼─{'─' * c2}─┼─{'─' * c3}─┤"
+    bot_edge = f"└─{'─' * c1}─┴─{'─' * c2}─┴─{'─' * c3}─┘"
+    sep_line = f"│ {' ' * c1} │ {' ' * c2} │ {' ' * c3} │"
 
     title_top = f"┌─{'─' * inner_w}─┐"
     title_lines = [
         f"Validation @ step {step} — {PREDICTION_HORIZON_HOURS}h window",
         "Conditioned (announced carbs+insulin+exercise)",
-        "SOTA Target Comparison",
     ]
     title_inner = [
         f"│ {_ANSI_BOLD}{_ANSI_CYAN}{_pad(t, inner_w, 'c')}{_ANSI_RESET} │"
@@ -1580,8 +1309,7 @@ def _render_validation_table(
     header_row = (
         f"│ {_ANSI_BOLD}{_pad('Metric', c1)}{_ANSI_RESET} "
         f"│ {_ANSI_BOLD}{_pad('Value', c2)}{_ANSI_RESET} "
-        f"│ {_ANSI_BOLD}{_pad('Prev', c3)}{_ANSI_RESET} "
-        f"│ {_ANSI_BOLD}{_pad('Target', c4)}{_ANSI_RESET} │"
+        f"│ {_ANSI_BOLD}{_pad('Prev', c3)}{_ANSI_RESET} │"
     )
 
     lines = [title_top, *title_inner, top_edge, header_row, mid_edge]
@@ -1589,7 +1317,7 @@ def _render_validation_table(
         if _is_blank_row(r):
             lines.append(sep_line)
             continue
-        metric, value, prev, trend, target, unit = r
+        metric, value, prev, trend, _target, unit = r
         if _is_section_row(r):
             title = _strip_ansi(metric)
             lines.append(
@@ -1600,13 +1328,9 @@ def _render_validation_table(
         lines.append(
             f"│ {_pad(metric, c1)} "
             f"│ {_pad(vcell, c2)} "
-            f"│ {_pad(prev, c3)} "
-            f"│ {_colored(_pad(target, c4), _ANSI_GRAY) if target else _pad('', c4)} │"
+            f"│ {_pad(prev, c3)} │"
         )
     lines.append(bot_edge)
-    for note in footnotes:
-        lines.extend(_colored(seg, _ANSI_GRAY) for seg in textwrap.wrap(
-            note, width=inner_w + 2, subsequent_indent='    '))
     return '\n'.join(lines)
 
 
@@ -1913,6 +1637,49 @@ def _reconstruct_context_from_patch(
     return context
 
 
+def _observed_patches(sample: dict[str, Any], norm_stats: dict) -> torch.Tensor:
+    """One sample's patch rows with every withheld BG written back, ``(T, PATCH_DIM)``.
+
+    A rolling context is the patient's OBSERVED CGM history. The training mask is
+    a property of the objective, not of the data: the withheld readings exist, they
+    are in ``targets``, and on the phone the context arrives whole. Handing the
+    roll a context with the training mask's holes in it therefore measures a case
+    that is never deployed, and — because the roll needs a CONTIGUOUS visible run
+    of ``MIN_CONTEXT_PATCHES`` reaching the origin — throws most of the sample
+    away doing it: 526 of 600 windows dropped on the live nano run, 88%, and 171
+    of 203 nocturnal ones. risk-v3 had no interior masking, so this never fired.
+
+    Restoring first is what ``_infill_protocol`` already does through
+    ``_window_bg_mgdl``; this is the same operation on an UN-collated sample. It
+    is not leakage: every restored patch precedes the forecast origin, and the
+    horizon the roll is scored against is untouched. Measured paired on the
+    windows the masked path did keep, RMSE is unchanged (52.66 vs 51.94 at 360
+    min), so it moves the denominator and not the number.
+
+    Args:
+        sample: one un-collated ``T1DMDataset`` sample.
+        norm_stats: the run's normalization statistics.
+
+    Returns:
+        ``(T, PATCH_DIM)`` with feat 0 restored everywhere. Feat 4 is left as the
+        caller found it; ``_reconstruct_context_from_patch`` zeroes it.
+    """
+    bf = sample['bg_formula_data']
+    patches = sample['patches']
+    if not torch.is_tensor(patches):
+        patches = torch.from_numpy(np.asarray(patches)).float()
+    _, bg_z = _window_bg_mgdl(
+        patches.unsqueeze(0),
+        torch.as_tensor(np.asarray(bf['mask_idx'])).long().reshape(1, -1),
+        torch.as_tensor(np.asarray(bf['valid'])).bool().reshape(1, -1),
+        torch.as_tensor(np.asarray(sample['targets'])).float().unsqueeze(0),
+        norm_stats,
+    )
+    out = patches.clone()
+    out[:, _BG_FEAT::N_INPUT_FEATURES] = bg_z[0]
+    return out
+
+
 def _is_nocturnal(hour: float) -> bool:
     if NOCTURNAL_START_HOUR <= NOCTURNAL_END_HOUR:
         return NOCTURNAL_START_HOUR <= hour < NOCTURNAL_END_HOUR
@@ -1994,17 +1761,20 @@ def _accumulate_long_horizon_bg_metrics(
     use case knows the programmed basal ahead of time). BG stays autoregressive
     (the model re-feeds its own median); only the doses are announced.
 
-    Each roll runs on the sample's VISIBLE context run, which reaches back only
-    as far as the nearest masked patch, and a sample whose run is under
-    ``MIN_CONTEXT_PATCHES`` is not rolled at all. The counters that make the
-    surviving set readable travel with the metrics: ``roll_ctx_patches`` (mean
-    run length, over the scored samples), ``roll_n`` (how many were scored) and
-    ``roll_skipped`` (how many were not), each over EVERY sample; and
-    ``night_roll_cnt`` / ``night_roll_skipped`` in ``night_agg``, the same split
-    restricted to the nocturnal samples the ``night_bg_rmse_*`` family is scored
-    over. Both pairs reach the validation table — the horizons this fills are 3
-    to 8 hours out, the night rows are a subset of the all-sample ones, and
-    nothing else on the page says which sample set either was measured over."""
+    Each roll runs on the sample's OBSERVED context (``_observed_patches``), so
+    the run reaching the origin is the whole ``n_ctx`` rather than whatever the
+    training mask left intact, and only a genuinely short window falls under
+    ``MIN_CONTEXT_PATCHES``. The counters that make the surviving set readable
+    travel with the metrics: ``roll_ctx_patches`` (mean run length, over the
+    scored samples), ``roll_n`` (how many were scored) and ``roll_skipped`` (how
+    many were not), each over EVERY sample; and ``night_roll_cnt`` /
+    ``night_roll_skipped`` in ``night_agg``, the same split restricted to the
+    nocturnal samples the ``night_bg_rmse_*`` family is scored over. Both pairs
+    reach the validation table — the horizons this fills are 3 to 8 hours out,
+    the night rows are a subset of the all-sample ones, and nothing else on the
+    page says which sample set either was measured over. A non-zero
+    ``roll_skipped`` now means the window itself was short, not that the mask
+    landed badly, and is worth looking at."""
     from inference import predict_rolling
 
     if n_rolls <= 0:
@@ -2021,12 +1791,14 @@ def _accumulate_long_horizon_bg_metrics(
         # leaves the night family with no denominator of its own.
         is_night = _is_nocturnal(float(bf.get('pred_start_hour', 0.0)))
         # The roll starts at the context edge and re-feeds its own median, so its
-        # context is the VISIBLE run reaching that edge — never the positional
-        # prefix, whose masked patches would roll off a fabricated reading, and
-        # never a run too short to carry the evening dynamics the 8 h horizon is
-        # rolled through.
+        # context must be a run of REAL readings reaching that edge — never the
+        # positional prefix, whose masked patches would roll off a fabricated
+        # value. Restoring the withheld BG first (``_observed_patches``) makes
+        # that run the whole ``n_ctx``, which is both the deployed case and the
+        # only way this metric keeps its denominator.
         context = _reconstruct_context_from_patch(
-            sample['patches'], n_ctx, bf['mask_idx'], bf['valid'])
+            _observed_patches(sample, norm_stats), n_ctx,
+            np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool))
         if context is None:
             agg['roll_skipped'] = agg.get('roll_skipped', 0.0) + 1.0
             if night_agg is not None and is_night:
@@ -2126,13 +1898,15 @@ def _run_night_onset_validation(
             n_ctx = int(sample['n_context_patches'])
             bf = sample['bg_formula_data']
             context = _reconstruct_context_from_patch(
-                sample['patches'], n_ctx, bf['mask_idx'], bf['valid'])
+                _observed_patches(sample, norm_stats), n_ctx,
+                np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool))
             if context is None:
-                # No visible run of at least MIN_CONTEXT_PATCHES reaching the
-                # origin — the night is not scored rather than rolled off a
-                # masked patch or off two hours of history. Counted, so that
-                # ``n`` + ``skipped`` is the number of nights surveyed and a
-                # shrinking scored set is visible rather than only its effect.
+                # The observed context is shorter than MIN_CONTEXT_PATCHES — the
+                # night is not scored rather than rolled off two hours of
+                # history. Counted, so that ``n`` + ``skipped`` is the number of
+                # nights surveyed and a shrinking scored set is visible rather
+                # than only its effect. With the BG restored this can now only
+                # fire on a genuinely short window, not on mask placement.
                 c['skipped'] += 1
                 continue
             dt = int(_dt_minutes(bf))
@@ -2294,7 +2068,8 @@ def _run_counterfactual_probe(
             # monotonicity and the rescue rate survive it. A single forward, too
             # — nothing is re-fed, so a short run does not compound.
             context = _reconstruct_context_from_patch(
-                sample['patches'], n_ctx, bf['mask_idx'], bf['valid'],
+                _observed_patches(sample, norm_stats), n_ctx,
+                np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool),
                 min_patches=1)
             if context is None:
                 continue

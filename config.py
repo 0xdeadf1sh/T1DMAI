@@ -535,7 +535,12 @@ EMA_DECAY = 0.999
 CHECKPOINT_INTERVAL = 1000       # Save checkpoint every N steps
 VALIDATION_INTERVAL = 1000       # Run validation every N steps
 LOG_INTERVAL = 100               # Log to CSV every N steps
-VALIDATION_N_PATIENTS = 100      # Number of patients in the validation set
+# Every coverage row in the validation table is a proportion over this many
+# windows, so at 100 its 95% interval is 5-11 points — wider than any effect the
+# table tracks, and wide enough to have hidden a 30-minute band covering 0.83
+# while the row read 0.905. At 1000 the interval is ~1.9 points. The cost is the
+# per-sample rolling long-horizon loop, which runs on every window.
+VALIDATION_N_PATIENTS = 1000     # Number of patients in the validation set
 
 # === Normalization ===
 # The normalization pass mirrors the cache / on-the-fly DATA GENERATION so the
@@ -569,7 +574,14 @@ NORM_STATS_FILE = "normalization_stats.json"
 # held-out witness. The partition still feeds NEITHER the loss nor the headline
 # validation metrics — only the post-hoc band recalibration.
 CALIBRATION_RESERVE_SEED_OFFSET = 2_000_000   # disjoint seed band (vs norm's +1_000_000 and train's hashed seeds)
-CALIBRATION_RESERVE_N_PATIENTS = 500          # patients in the held-out conformal-calibration partition
+# The conformal fit's OWN coverage is a random variable in the calibration size:
+# swept on 60 random splits, test coverage at n_cal=64 has sd 0.036 (p5-p95
+# 0.838-0.946), at 256 sd 0.020, at 512 sd 0.015, at 1024 sd 0.011. Below 39 a
+# mondrian region bin cannot even form its own tau=0.05 order statistic and takes
+# the marginal delta instead (mondrian.fit_mondrian), which at n_cal=64 is what
+# happens to the low-BG bin — it draws ~14 windows. This ceiling has to sit above
+# whatever calibrate_conformal.py is run with.
+CALIBRATION_RESERVE_N_PATIENTS = 2000         # patients in the held-out conformal-calibration partition
 
 # === GUI what-if / long-prediction knobs ===
 # The interactive GUI (``gui.py``) drives the model through ``inference.predict``

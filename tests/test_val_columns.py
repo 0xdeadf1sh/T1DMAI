@@ -56,18 +56,27 @@ CALLER_WRITTEN = {'step', 'train_loss_ema', 'overfit_ratio'}
 # VALUE separates the two, so the prefix is not what a pairing check matches on.
 _COV_VALUE = re.compile(r'\d+\.\d{2}%')
 _COV_WIDTH = re.compile(r'@ w \d+(?:\.\d+)? mg/dL')
-_COV_LABELS = ('coverage90', 'inner50_cov', 'cov90 marginal',
-               'joint90 whole path', 'infill cov90')
+_COV_LABELS = ('coverage90', 'inner50_cov', 'joint90 whole path')
 
-# A conformal probe's output at the scale a real one returns: the correction
-# widens the band and lifts coverage toward 90%.  Nothing here is measured — it
-# exists to put the two ``conf cov90@peak`` rows on the page, which a run of
-# N_VAL windows never does.
-SYNTHETIC_CONFORMAL = {
-    'conf_cov90_raw': 0.7213, 'conf_width_raw': 44.2,
-    'conf_cov90_cal': 0.8967, 'conf_width_cal': 61.5,
-    'conf_hypo_esc_raw': 0.191, 'conf_hypo_esc_cal': 0.104,
-    'conf_n': 37.0,
+# Families the console table no longer renders, each mapped to one column the
+# record must still carry.  The table is a reading surface and the CSV is the
+# record, so a trimmed row must still be MEASURED — dropping a row from the page
+# and dropping the metric look identical from the page.
+CSV_ONLY = {
+    'crps @': 'crps@30',
+    'winkler90 @': 'winkler90@30',
+    'Hypo Alarm': 'alarm_hypo_n_events',
+    'fa/day': 'alarm_hypo_fa_day@q25',
+    'Infill Protocol': 'infill_rmse@d1',
+    'infill crps': 'infill_crps@d1',
+    'conf cov90@peak': 'conf_cov90_raw',
+    'exc_undershoot_frac': 'exc_undershoot_frac',
+    'amplitude (trend_amp_ratio)': 'trend_amp_ratio',
+    'clarke_A @': 'evalfix_clarke_A@30',
+    'pred_tir': 'pred_tir',
+    'tod acc': 'tod_acc_1h',
+    'night_hyper_recall': 'night_hyper_recall',
+    'night-onset': 'night_onset_hypo_recall',
 }
 
 
@@ -109,8 +118,7 @@ def _coverage_rows(table: str) -> "list[str]":
 def _expected_coverage_rows() -> int:
     """How many coverage rows the table declares, from the same lists it renders from."""
     return (2 * len(train.COVERAGE_HORIZONS_MIN)                     # coverage90, inner50_cov
-            + 2 * len(train._excursion_bucket_horizons(PREDICTION_PATCHES))  # cov90 marginal, joint90
-            + len(train._infill_reachable_d()))                      # infill cov90
+            + bool(train._excursion_bucket_horizons(PREDICTION_PATCHES)))  # joint90, far horizon only
 
 
 def _assert_alarm_points_are_operating_points(metrics: dict) -> int:
@@ -239,12 +247,19 @@ def test_a_detection_rate_is_never_reported_without_its_lead_time():
     print(f"[DUMP] alarm lead | {fired} fired τ, each with a lead time ✓")
 
 
-def test_the_rendered_table_shows_the_new_rows(val_metrics):
-    """The table renders every scoring rule, per d, with sharpness beside coverage."""
+def test_the_rendered_table_shows_the_calibration_rows(val_metrics):
+    """The table renders the calibration section, with sharpness beside coverage.
+
+    Calibration is what the page is for: it is the one family the selection scalar
+    cannot stand in for, since ``val_loss_total`` improved monotonically across a
+    whole run while the deployed one-sided band decayed.  So the coverage rows
+    stay, each with the width that bought it, and the one/two-sided pair at the
+    same ``d`` stays beside them.
+    """
     table = train._strip_ansi(train._render_validation_table(1, val_metrics, None))
-    for needle in ('Proper Scoring', 'Hypo Alarm Operating Curve',
-                   'Infill Protocol', 'crps @30m', 'winkler90 @120m',
-                   'joint90 whole path', 'fa/day', 'lead '):
+    for needle in ('Quantile Calibration', 'coverage90 @30m', 'inner50_cov @30m',
+                   'joint90 whole path', 'one-sided cov90 @d1',
+                   'two-sided cov90 @d1'):
         assert needle in table, f"validation table is missing {needle!r}"
     # Sharpness never travels apart from coverage: a rendered coverage figure
     # carries a width VALUE on the same line.  The row count is pinned too — a
@@ -257,27 +272,27 @@ def test_the_rendered_table_shows_the_new_rows(val_metrics):
     for line in rows:
         assert _COV_WIDTH.search(line), (
             f"coverage row without the width that bought it: {line.strip()}")
-    print(f"[DUMP] val table | scoring sections rendered, {len(rows)} coverage "
+    print(f"[DUMP] val table | calibration section rendered, {len(rows)} coverage "
           f"rows each paired with a width ✓")
 
 
-def test_conformal_coverage_rows_carry_the_width_that_bought_them():
-    """``conf cov90@peak`` RAW and CAL each render their own coverage and width.
+def test_rows_dropped_from_the_table_are_still_recorded(val_metrics):
+    """Every family the console table stops rendering is still a declared column.
 
-    The correction moves coverage and width together, so a drop read without the
-    width reads a narrowing as a loss of calibration.  Each row is matched
-    against the width it was given, which a swapped or dropped width fails.
+    The table is a reading surface at a 1000-step cadence; ``validation_log.csv``
+    is the record.  From the page a trimmed row and a metric nobody computes look
+    the same, so each dropped family is pinned here to the column that still
+    carries it — and to its absence from the page, so a row quietly restored
+    without its width or its ``n`` is caught as well.
     """
-    table = train._strip_ansi(
-        train._render_validation_table(1, dict(SYNTHETIC_CONFORMAL), None))
-    for label, cov_key, w_key in (
-            ('conf cov90@peak RAW', 'conf_cov90_raw', 'conf_width_raw'),
-            ('conf cov90@peak CAL', 'conf_cov90_cal', 'conf_width_cal')):
-        line = next((l for l in table.splitlines() if label in l), None)
-        assert line is not None, f'{label} is not rendered at all'
-        assert f"{SYNTHETIC_CONFORMAL[cov_key] * 100.0:.2f}%" in line, (
-            f'{label} does not render its own coverage: {line.strip()}')
-        assert f"@ w {SYNTHETIC_CONFORMAL[w_key]:.1f} mg/dL" in line, (
-            f'{label} renders a coverage without the width that bought it: '
-            f'{line.strip()}')
-    print("[DUMP] conformal rows | RAW and CAL each paired with their own width ✓")
+    table = train._strip_ansi(train._render_validation_table(1, val_metrics, None))
+    declared = {c for c, _ in train._val_log_columns()}
+    for label, column in CSV_ONLY.items():
+        assert column in declared, (
+            f"{label!r} was dropped from the table and {column!r} is not a "
+            f"declared column either — the metric is gone, not moved")
+        assert label not in table, (
+            f"{label!r} is back on the validation table; if that is deliberate, "
+            f"move it out of CSV_ONLY rather than leaving the two disagreeing")
+    print(f"[DUMP] csv-only families | {len(CSV_ONLY)} trimmed families still "
+          f"declared as columns and absent from the page ✓")
