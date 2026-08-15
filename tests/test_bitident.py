@@ -88,7 +88,14 @@ _spec = importlib.util.spec_from_file_location("bitident_gate", BITIDENT)
 bitident = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bitident)
 
-INFILL_SPANS = [(34, 2), (40, 3)]
+# Interior (neither edge), non-abutting, and inside the SHORTEST row's real
+# region: ``build_batch`` left-pads a MIN_CONTEXT_PATCHES row up to the
+# MAX_CONTEXT_PATCHES one, so every column here must be at least
+# ``MAX_CONTEXT_PATCHES - MIN_CONTEXT_PATCHES``. Derived rather than hardcoded
+# because the previous literals silently fell into the pad when the context
+# window moved 16-48 -> 48-96.
+_INFILL_FLOOR = config.MAX_CONTEXT_PATCHES - config.MIN_CONTEXT_PATCHES
+INFILL_SPANS = [(_INFILL_FLOOR + 6, 2), (_INFILL_FLOOR + 12, 3)]
 
 # The batch's own shape and content, which ``capacity()`` does not carry: these
 # move the frozen inputs rather than the arithmetic over them, so a reference at

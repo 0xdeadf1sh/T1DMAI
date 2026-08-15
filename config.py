@@ -115,22 +115,21 @@ MASKABLE_FEATS = (1, 2, 3)       # carb / insulin / exercise carry the announced
 CHANNEL_TO_FEAT = {0: 1, 1: 2, 2: 3}   # carb -> feat 1; insulin -> feat 2; exercise -> feat 3
 
 # === Sequence Lengths ===
-# Variable 8–24 h context. The T1DMSIM diff report (§0.5) measures pooled-CGM
+# Variable 24–48 h context. The T1DMSIM diff report (§0.5) measures pooled-CGM
 # Pearson ACF₀.₂ at 5.3 h for the simulator and 2.4–4.8 h across the three
-# real cohorts. The 8 h floor sits ABOVE every one of those autocorrelation
-# lengths, so the whole autocorrelated span is in scope even at the narrowest
-# context. 24 h is held as the working ceiling for two reasons: (1) basal is
-# injected once daily on a fixed interval with no jitter (T1DMSIM/simulator.py
+# real cohorts. The 24 h floor sits well ABOVE every one of those
+# autocorrelation lengths, so the whole autocorrelated span is in scope even at
+# the narrowest context. It also covers one full basal injection cycle — basal
+# is injected once daily on a fixed interval with no jitter (T1DMSIM/simulator.py
 # BASAL_DOSE_INTERVAL_HOURS — the two analogues differ in ACTION duration,
-# glargine 26 h and degludec 42 h, not in dosing cadence), so the ceiling covers
-# one full injection cycle, supporting patient-identity inference for the
-# patient-agnostic model; (2) the 8 h night long-horizon rolling validation
-# needs ≥ 16 h of GT context to preserve real evening dynamics in the window
-# through all rolls (see inference.predict_rolling sliding logic). Training
-# samples n_ctx uniformly in [MIN, MAX]; the collate function left-pads to the
-# BATCH maximum so every sample's window ends at the right edge.
-MAX_CONTEXT_PATCHES = 48         # Max context patches (ceiling; hours = MAX_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
-MIN_CONTEXT_PATCHES = 16         # Min context patches (floor; hours = MIN_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
+# glargine 26 h and degludec 42 h, not in dosing cadence) — which supports
+# patient-identity inference for the patient-agnostic model, and it leaves the
+# 8 h night long-horizon rolling validation ≥ 16 h of GT context to preserve
+# real evening dynamics through all rolls (see inference.predict_rolling sliding
+# logic). Training samples n_ctx uniformly in [MIN, MAX]; the collate function
+# left-pads to the BATCH maximum so every sample's window ends at the right edge.
+MAX_CONTEXT_PATCHES = 96         # Max context patches (ceiling; hours = MAX_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
+MIN_CONTEXT_PATCHES = 48         # Min context patches (floor; hours = MIN_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
 
 # === Prediction Horizon ===
 # The span of the fixed FORECAST protocol: a dense right-edge window of
