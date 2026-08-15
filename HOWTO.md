@@ -83,8 +83,9 @@ The `d ≥ 3` share is `d_balance.d_distribution` at the live sampler constants,
 with `--min-context-patches` at half the ceiling on every row. It barely moves
 across the table because the right-edge quota, not the window width, is what
 supplies the far horizons: at quota 0 the same three rows read 22.79 / 21.72 /
-21.39%, and under the pre-quota sampler's four-patch span ceiling they read
-1.94 / 1.26 / 0.96%.
+21.39%. Under the retired four-patch span ceiling they read 1.94 / 1.26 / 0.96%,
+at the floor of 16 patches that ceiling was paired with rather than at half the
+ceiling.
 
 ```bash
 venv/bin/python resize_model.py --min-context-patches 48 --max-context-patches 96
@@ -94,9 +95,10 @@ Three properties of that table are worth knowing before choosing.
 
 **Pass `--min-context-patches` as well.** Training draws `n_ctx` uniformly from
 `[MIN, MAX]`, and every evaluation entry point scores at `MAX_CONTEXT_PATCHES`.
-Raising only the ceiling moves the *mean* training context to 28 h at 96 patches
-and 40 h at 144, while the reported number stays pinned to the ceiling — a
-mixture scored only at its widest point. Moving both keeps the two together.
+Raising only the ceiling, from the live floor of 48 patches, moves the *mean*
+training context to 36 h at 96 patches and 48 h at 144, while the reported number
+stays pinned to the ceiling — a mixture scored only at its widest point. Moving
+both keeps the two together.
 
 **48, 96 and 144 are the arithmetically clean widths.** Hour-of-day coverage is
 exactly uniform when `n_candidates % 48 == 0`, where

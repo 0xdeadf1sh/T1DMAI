@@ -700,21 +700,23 @@ The module defines no pass/fail threshold on any of them, and
 
 | Section | What it carries |
 | --- | --- |
-| Training & internal losses | `val_loss_total`, the pinball and DILATE terms, the two log-σ |
+| Training & internal losses | `val_loss_total` and `val_loss_Q`, the selection scalar and its pinball half |
 | BG forecast (RMSE) | Single-pass horizons, 30 / 60 / 120 min |
 | BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample |
-| Quantile calibration | Marginal 90 % band coverage, inner-50 % coverage, `sign_balance` |
-| Proper scoring — forecast protocol | CRPS, Winkler, marginal and joint coverage with width, per `d` |
-| Hypo alarm operating curve | Detection, false alarms per day and lead time per τ, pooled and per `d` |
-| Infill protocol | RMSE against interpolation, CRPS, Winkler and coverage, per `d` |
-| Relative error & derivative tracking | MARD, rate-of-change and trend rows, excursion amplitude, the conformal probe |
-| Clinical error grid (Clarke) | Per-horizon zone A, plus pooled A+B and D |
+| Quantile calibration | Marginal 90 % band coverage and inner-50 % coverage with their widths, `sign_balance` at the far horizon, the one-sided against two-sided pair at `d = 1`, and joint coverage of the whole path |
+| Relative error & derivative tracking | MARD and the rate-of-change correlation |
+| Clinical error grid (Clarke) | Pooled zone A+B |
 | Clinical accuracy (CG-EGA) | Per-region accurate and erroneous fractions |
-| Longitudinal excursions & TIR | Pooled hypo/hyper detection, time in range |
-| Excursions by horizon | The same detection over disjoint 30-minute buckets |
-| Nocturnal | Night-only metrics, and the per-night onset call |
-| Counterfactual dose-response | Sign, monotonicity and rescue probes |
-| Time-of-day probe | Accuracy, reliability and the two no-jump witnesses |
+| Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error |
+| Nocturnal | The nocturnal hypo recall and precision pair |
+| Counterfactual dose-response | The two dose directions and insulin monotonicity |
+| Time-of-day probe | Mean absolute clock error |
+
+`validation_log.csv` carries every metric on every row, this table included and
+the families it does not print besides: the proper scoring rules per `d`, the
+hypo alarm operating curve, the infill protocol's columns, the excursion
+amplitude block, the in-training conformal probe, per-horizon Clarke zones, the
+night-onset call and the clock probe's reliability rows.
 
 Level metrics all read `pred_bg = f_inv(median)`, asserted inside the physical
 range on entry. The exception is excursion detection, below.
