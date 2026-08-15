@@ -111,8 +111,8 @@ SELECTION_HORIZON: int = 60
 #
 # It is read at ONE horizon, which is ONE ``d`` (the distance in patches to the
 # nearest visible evidence — 60 min is d = 2, one-sided, under the forecast
-# protocol).  It is never pooled across d: 98.06% of the masked-BG supervision the
-# model trains under sits at d ≤ 2, so any average over d improves for free.
+# protocol).  It is never pooled across d: the masked-BG supervision the model
+# trains under concentrates at small d, so any average over d improves for free.
 SELECTION_METRIC: str = 'crps'
 SELECTION_D_PATCHES: int = horizon_d_patches(SELECTION_HORIZON)
 
@@ -277,28 +277,54 @@ def _sampler_message(tc: dict[str, Any]) -> str:
         "trained under.\n"
         f"  checkpoint: mask_span_lengths={tuple(lengths) if lengths is not None else None} "
         f"max_masked_patches={tc.get('max_masked_patches')} "
-        f"mask_right_edge_quota={tc.get('mask_right_edge_quota')}\n"
+        f"mask_right_edge_quota={_stored_quota(tc)}\n"
         f"  live:       mask_span_lengths={tuple(config.MASK_SPAN_LENGTHS)} "
         f"max_masked_patches={config.MAX_MASKED_PATCHES} "
         f"mask_right_edge_quota={config.MASK_RIGHT_EDGE_QUOTA}\n"
         "Nothing else catches this: no parameter shape depends on the sampler, so "
-        "the strict state-dict load accepts weights trained under any of them. The "
-        "live values bind all the same — MAX_MASKED_PATCHES is M in this script's "
-        "slot tensors, and the span-length law and the quota together set the d "
-        "mixture the fine-tune supervises.\n"
+        "the strict state-dict load accepts weights trained under any of them. This "
+        "script draws no mask from ``data.sample_mask_spans`` — its masked set is one "
+        "right-edge span — so what the mismatch says is that the WEIGHTS were shaped "
+        "by a different supervision mixture than the live config describes, and "
+        "MAX_MASKED_PATCHES is M in this script's slot tensors besides.\n"
         "Restore the checkpoint's values in config.py, or fine-tune a checkpoint "
         "trained under the live ones."
     )
+
+
+_SAMPLER_KEYS = ('mask_span_lengths', 'max_masked_patches', 'mask_right_edge_quota')
+
+
+def _stored_quota(tc: dict[str, Any]) -> "float | None":
+    """The right-edge quota a checkpoint was trained under, or None if unknowable.
+
+    Within a ``training_config`` that describes a sampler at all, an ABSENT quota
+    key is information rather than a reason to skip the comparison: the key was
+    introduced with the quota itself, so such a checkpoint was trained under
+    uniform placement, which is quota 0.0.  Reading absence as "unknown" would
+    exempt precisely the checkpoints that can mismatch, since the pre-quota ones
+    are the only ones that do.
+
+    A ``training_config`` that describes no sampler at all is a different case and
+    returns None: nothing about it is recoverable, and ``_arch_guard`` skips its
+    keys for the same reason.
+    """
+    if 'mask_right_edge_quota' in tc:
+        return float(tc['mask_right_edge_quota'])
+    if any(k in tc for k in _SAMPLER_KEYS):
+        return 0.0
+    return None
 
 
 def _sampler_guard(ckpt: dict[str, Any]) -> None:
     """Raise ``SystemExit`` if the live mask sampler is not the checkpoint's.
 
     The recorded sampler CONSTANTS are compared, so the check is true provenance:
-    it is those values that reach the sampler, the slot tensors and the loss.
+    it is those values that shaped the supervision the weights were trained on.
 
-    Only keys present in ``ckpt['training_config']`` are compared, as in
-    ``_arch_guard``.
+    Keys absent from ``ckpt['training_config']`` are skipped as in ``_arch_guard``,
+    with one exception: the right-edge quota, whose absence pins it at 0.0 (see
+    ``_stored_quota``).
     """
     tc = ckpt.get('training_config', {}) or {}
     # ``mask_span_lengths`` is stored as a list and bound as a tuple, so both sides
@@ -307,10 +333,27 @@ def _sampler_guard(ckpt: dict[str, Any]) -> None:
     checks = [
         ('mask_span_lengths', config.MASK_SPAN_LENGTHS, tuple),
         ('max_masked_patches', config.MAX_MASKED_PATCHES, int),
-        ('mask_right_edge_quota', config.MASK_RIGHT_EDGE_QUOTA, float),
     ]
-    if any(norm(tc[k]) != norm(live) for k, live, norm in checks if k in tc):
+    mismatched = any(norm(tc[k]) != norm(live) for k, live, norm in checks if k in tc)
+    stored_quota = _stored_quota(tc)
+    if mismatched or (stored_quota is not None
+                      and stored_quota != float(config.MASK_RIGHT_EDGE_QUOTA)):
         raise SystemExit(_sampler_message(tc))
+
+    # A retired knob, checked because the checkpoint still records it and this code
+    # can no longer reproduce what it names: under it the pinball loss carried a
+    # per-``d`` weight, so the fine-tune would continue those weights' training on a
+    # loss that no longer has them. The name is dead in config; it is alive in every
+    # checkpoint written before it went.
+    if tc.get('d_balanced_loss'):
+        raise SystemExit(
+            "Retired training objective: the checkpoint records "
+            "d_balanced_loss=True, and the per-d loss weights it names no longer "
+            "exist — risk_loss.pinball_loss weights every masked patch equally now. "
+            "Fine-tuning it would continue those weights' training under a "
+            "different objective, which nothing downstream would report.\n"
+            "Fine-tune a checkpoint trained under the live loss."
+        )
 
 
 def load_checkpoint(
@@ -735,9 +778,10 @@ def crps_by_d_from_windows(
     one-sided, so those are ``d = 1..PREDICTION_PATCHES``.
 
     CRPS itself is ``metrics.scoring.crps_steps``; nothing about it is restated here.
-    The POOLED figure that module also returns is deliberately not read: 98.06% of
-    the training sampler's supervision sits at ``d ≤ 2``, so a pooled masked-BG
-    scalar improves as the mixture softens and must never select a checkpoint.
+    The POOLED figure that module also returns is deliberately not read: the
+    training sampler's supervision concentrates at small ``d``, so a pooled
+    masked-BG scalar improves as the mixture softens and must never select a
+    checkpoint.
 
     A fan the scorer's input contract rejects — non-ascending, non-finite, or in the
     wrong space — is reported and scored as nothing, so that eval selects nothing and
