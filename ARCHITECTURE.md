@@ -626,8 +626,12 @@ Runs every `VALIDATION_INTERVAL` steps on a fixed held-out pool of
 `VALIDATION_N_PATIENTS` patients, under EMA weights. Two artifacts: a row
 appended to `logs/validation_log.csv`, and a table printed to stdout with columns
 `Metric | Value | Prev`, coloured against published thresholds with a trend arrow
-against the previous run. Rows whose value is unavailable are omitted, and a
-section that loses every row loses its header.
+against the previous run. A section that loses every row loses its header.
+
+A row of a per-horizon, per-region or per-`d` family whose bin came out empty
+renders `—` and keeps its place; a standalone row whose value is unavailable is
+omitted. An empty bin is a measurement, and neither way of hiding it is honest: a
+vanished row reads as a metric nobody computes, and `0` reads as a rate of zero.
 
 The CSV is the record and the table is a reading surface: every metric reaches
 the CSV, while the table carries the families worth a glance at a 1000-step
@@ -702,8 +706,8 @@ The module defines no pass/fail threshold on any of them, and
 | --- | --- |
 | Training & internal losses | `val_loss_total` and `val_loss_Q`, the selection scalar and its pinball half |
 | BG forecast (RMSE / MAE) | Single-pass horizons, 30 / 60 / 120 min, both error measures |
-| BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample |
-| Quantile calibration | Marginal 90 % band coverage and inner-50 % coverage with their widths, `sign_balance` at the far horizon, the one-sided against two-sided pair at `d = 1`, and joint coverage of the whole path |
+| BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample, each with the count it was scored over, plus the roll's mean context and the two short-window skip counts against their own denominators |
+| Quantile calibration | Marginal 90 % band coverage and inner-50 % coverage with their widths, `sign_balance` at the far horizon, the one-sided against two-sided pair at `d = 1` — both arms `coverage_sharpness_by_d` over their own protocol's fan, so only sidedness separates them — and joint coverage of the whole path |
 | Relative error & derivative tracking | MARD per horizon, the rate-of-change correlation, and median roughness pooled and at the far patch |
 | Amplitude & excursion shape | The mean-collapse detectors: per-patch and per-excursion amplitude ratio, gain, correlation, and the overshoot/undershoot split |
 | Conformal probe @ excursion peaks | Raw against region-binned coverage, each with the width that bought it, and both hypo-escape rates |

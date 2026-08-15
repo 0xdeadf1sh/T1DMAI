@@ -339,6 +339,87 @@ def test_rows_dropped_from_the_table_are_still_recorded(val_metrics):
           f"value, are still declared as columns, and are absent from the page ✓")
 
 
+def test_percent_metrics_are_not_scaled_twice_on_the_page(val_metrics):
+    """A rate reaches the page once, at the scale its producer emits it.
+
+    ``_run_validation`` stores ``tod_acc_*`` and ``tod_gross_rate`` as
+    percentages — the CSV column, ``make_card.py`` and ``models/compare.py`` all
+    read them that way — while every other rate key is a fraction the table
+    scales itself. Getting that wrong is silent: the row still renders, still
+    tiers, and a 16.3% clock printed 1630.00% sat ABOVE its 60% bar and coloured
+    green. So the assertion is on the rendered cell, not on the dict.
+    """
+    percent_rows = {'tod acc ±1h': 'tod_acc_1h',
+                    'tod acc ±2h': 'tod_acc_2h',
+                    'tod acc (bin)': 'tod_acc_bin',
+                    'tod gross-error rate': 'tod_gross_rate'}
+    table = train._strip_ansi(train._render_validation_table(1, val_metrics, val_metrics))
+    checked = 0
+    for label, key in percent_rows.items():
+        assert isinstance(val_metrics.get(key), float), f'{key} not measured'
+        line = next((ln for ln in table.splitlines() if ln.lstrip('│ ').startswith(label)), None)
+        assert line is not None, f'{label!r} is not on the validation table'
+        cells = [c.strip() for c in line.strip('│').split('│')]
+        for cell in (cells[1], cells[2]):          # Value, then Prev
+            pct = re.search(r'(\d+\.\d+)%', cell)
+            assert pct is not None, f'{label!r} renders no percentage: {cell!r}'
+            assert float(pct.group(1)) == pytest.approx(val_metrics[key], abs=0.01), (
+                f'{label!r} renders {pct.group(1)}% for a stored {val_metrics[key]} — '
+                f'a percentage scaled a second time on the way to the page')
+            assert 0.0 <= float(pct.group(1)) <= 100.0, (
+                f'{label!r} renders {pct.group(1)}%, which is not a share of anything')
+        checked += 1
+    print(f"[DUMP] percent scale | {checked} tod rows render their stored percentage "
+          f"once, in Value and Prev alike ✓")
+
+
+def test_per_horizon_detection_bars_decline_with_horizon(val_metrics):
+    """The per-bucket excursion rows are COLOURED against the declining schedule.
+
+    Detection is not horizon-flat — the near call is largely fixed by insulin on
+    board and the two-hour call is information-limited — so ``train.py`` keeps a
+    per-horizon bar in ``EXCURSION_TARGET_*`` and ``_excursion_target``. Held at
+    the 30-minute bar instead, every far bucket reads red on every run and the
+    colour stops separating a good far horizon from a bad one.
+
+    The bar itself is asserted in ``tests/test_training.py``; what is pinned here
+    is that the TABLE cuts its tier against it. Those are separate failures: the
+    schedule sat in the module, unit-tested and correct, while the page passed a
+    flat literal — so a value the schedule calls good rendered red. Hence a value
+    placed between the far bar and the near one, which the two answer opposite
+    ways, and an assertion on the rendered colour rather than on the constants.
+    """
+    hs = train._excursion_bucket_horizons(PREDICTION_PATCHES)
+    assert len(hs) >= 2, 'one bucket cannot show a decline'
+    near, far = hs[0], hs[-1]
+    cases = (('hypo_recall', train.EXCURSION_TARGET_HYPO_RECALL),
+             ('hypo_precision', train.EXCURSION_TARGET_HYPO_PRECISION),
+             ('hyper_recall', train.EXCURSION_TARGET_HYPER_RECALL),
+             ('hyper_precision', train.EXCURSION_TARGET_HYPER_PRECISION))
+    for name, spec in cases:
+        bar_near = train._excursion_target(spec, near)
+        bar_far = train._excursion_target(spec, far)
+        assert bar_far < bar_near, (
+            f'{name} does not decline from {near} to {far} min: '
+            f'{bar_near} -> {bar_far}')
+        # Green under the far bar, red under the near one: ``higher_row``'s
+        # default warn gap is 10 points below the bar it is given.
+        probe = 0.5 * (bar_far + min(bar_near - 10.0, 100.0))
+        assert bar_far <= probe < bar_near - 10.0, (
+            f'{name}: no value separates the two bars, so the render below '
+            f'cannot tell which one coloured it')
+        table = train._render_validation_table(
+            1, {**val_metrics, f'{name}@{far}': probe / 100.0}, None)
+        line = next(ln for ln in table.splitlines()
+                    if f'{name} @{far}m' in train._strip_ansi(ln))
+        assert train._ANSI_GREEN in line, (
+            f'{name} @{far}m renders {probe:.1f}% uncoloured by its own '
+            f'{bar_far:.0f}% bar — the row is tiered against the {near}-minute '
+            f'bar instead: {train._strip_ansi(line).strip()}')
+    print(f"[DUMP] excursion bars | 4 families decline {near}->{far} min and the "
+          f"page tiers the far bucket against the far bar ✓")
+
+
 def test_families_restored_to_the_table_are_rendered_and_still_recorded(val_metrics):
     """The other half of the trim boundary: what was put BACK is on the page.
 

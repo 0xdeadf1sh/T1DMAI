@@ -904,6 +904,20 @@ def _render_validation_table(
     def _absent_cell() -> str:
         return _colored('—', _ANSI_GRAY)
 
+    def _absent_row(metric: str, prev_key: str | None, prev_scale: float,
+                    fmt: str, unit: str, target: str) -> None:
+        """An empty bin, rendered as absent rather than dropped.
+
+        A row of a per-horizon or per-``d`` family that simply vanishes reads as a
+        metric nobody computes; 0 reads as a measurement. Both are wrong about a
+        bin the run reached and found empty, so the row stays and the value is
+        ``—``. The previous validation's figure still renders beside it: what the
+        bin held last time is what says whether it has just emptied.
+        """
+        rows.append((metric, _absent_cell(),
+                     _prev_cell(prev_key, prev_scale, fmt, unit),
+                     '', target, ''))
+
     def _pct(v: float | None) -> float | None:
         """A [0, 1] fraction as a percentage, keeping None as None.
 
@@ -919,13 +933,8 @@ def _render_validation_table(
                  direction: str = 'lower',
                  show_absent: bool = False) -> None:
         if val is None:
-            # An empty bin is rendered as absent where the row is one of a
-            # per-``d`` family: a missing row would read as a missing metric,
-            # and 0 would read as a measurement.
             if show_absent:
-                rows.append((metric, _absent_cell(),
-                             _prev_cell(prev_key, prev_scale, fmt, unit),
-                             '', target, ''))
+                _absent_row(metric, prev_key, prev_scale, fmt, unit, target)
             return
         prev = _prev_val(prev_key, prev_scale) if prev_key else None
         prev_cell = _prev_cell(prev_key, prev_scale, fmt, unit)
@@ -937,9 +946,12 @@ def _render_validation_table(
                   fmt: str = '{:.2f}', unit: str = '',
                   warn_mult: float = 1.5,
                   prev_key: str | None = None,
-                  prev_scale: float = 1.0) -> None:
+                  prev_scale: float = 1.0,
+                  show_absent: bool = False) -> None:
         target = f"<{_fmt(fmt, sota)}{unit}"
         if val is None:
+            if show_absent:
+                _absent_row(metric, prev_key, prev_scale, fmt, unit, target)
             return
         prev = _prev_val(prev_key, prev_scale) if prev_key else None
         prev_cell = _prev_cell(prev_key, prev_scale, fmt, unit)
@@ -953,9 +965,12 @@ def _render_validation_table(
                    fmt: str = '{:.2f}', unit: str = '',
                    warn_gap: float | None = None,
                    prev_key: str | None = None,
-                   prev_scale: float = 1.0) -> None:
+                   prev_scale: float = 1.0,
+                   show_absent: bool = False) -> None:
         target = f">{_fmt(fmt, sota)}{unit}"
         if val is None:
+            if show_absent:
+                _absent_row(metric, prev_key, prev_scale, fmt, unit, target)
             return
         prev = _prev_val(prev_key, prev_scale) if prev_key else None
         prev_cell = _prev_cell(prev_key, prev_scale, fmt, unit)
@@ -970,9 +985,12 @@ def _render_validation_table(
                  fmt: str = '{:.3f}', unit: str = '',
                  warn_pad: float | None = None,
                  prev_key: str | None = None,
-                 prev_scale: float = 1.0) -> None:
+                 prev_scale: float = 1.0,
+                 show_absent: bool = False) -> None:
         target = f"{_fmt(fmt, lo)}–{_fmt(fmt, hi)}{unit}"
         if val is None:
+            if show_absent:
+                _absent_row(metric, prev_key, prev_scale, fmt, unit, target)
             return
         prev = _prev_val(prev_key, prev_scale) if prev_key else None
         prev_cell = _prev_cell(prev_key, prev_scale, fmt, unit)
@@ -1048,11 +1066,11 @@ def _render_validation_table(
     for h_min in (30, 60, 120):
         lower_row(f'bg_rmse @{h_min}m', val_metrics.get(f'bg_rmse_{h_min}'),
                   bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
-                  prev_key=f'bg_rmse_{h_min}')
+                  prev_key=f'bg_rmse_{h_min}', show_absent=True)
     for h_min in (30, 60, 120):
         lower_row(f'bg_mae  @{h_min}m', val_metrics.get(f'bg_mae_{h_min}'),
                   0.8 * bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL',
-                  warn_mult=1.5, prev_key=f'bg_mae_{h_min}')
+                  warn_mult=1.5, prev_key=f'bg_mae_{h_min}', show_absent=True)
     _blank()
 
     # Rolled rows, and the only rows on the page whose context is not n_ctx: the
@@ -1081,7 +1099,7 @@ def _render_validation_table(
         lower_row(f'night_bg_rmse @{h_min}m ({_n_h}n)',
                   val_metrics.get(f'night_bg_rmse_{h_min}'),
                   night_bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
-                  prev_key=f'night_bg_rmse_{h_min}')
+                  prev_key=f'night_bg_rmse_{h_min}', show_absent=True)
     if _roll_seen:
         # show_absent: an all-skipped validation has no mean context and renders
         # ``—``, which is the state that most needs saying. Dropping the row
@@ -1094,11 +1112,22 @@ def _render_validation_table(
         # near the origin, which is what used to drop ~88% of these. Both skip
         # counters stay on the page precisely so a return to that state is
         # visible rather than silent; the night-scored count is CSV-only.
-        info_row('night roll skipped (short window)', float(_night_roll_skipped),
+        #
+        # Each denominator rides in the row LABEL, not in the target column: the
+        # target column is not rendered, and a skip count over no denominator is
+        # not a rate. The mean context is the row that separates a full-context
+        # figure from a three-patch one, so it stays even when it is absent.
+        info_row(f'roll context (mean of {_roll_n} rolled)', _roll_ctx,
+                 fmt='{:.1f}', unit=' patches',
+                 target=f'{MIN_CONTEXT_PATCHES}–{MAX_CONTEXT_PATCHES} at full n_ctx',
+                 prev_key='roll_ctx_patches', direction='none', show_absent=True)
+        info_row(f'night roll skipped, short window (of {_night_seen} nocturnal)',
+                 float(_night_roll_skipped),
                  fmt='{:.0f}', unit=' samples',
                  target=f'of {_night_seen} nocturnal',
                  prev_key='night_roll_skipped', direction='lower', show_absent=True)
-        info_row('roll skipped (short window)', val_metrics.get('roll_skipped'),
+        info_row(f'roll skipped, short window (of {_roll_seen} seen)',
+                 val_metrics.get('roll_skipped'),
                  fmt='{:.0f}', unit=' samples', target=f'of {_roll_seen} seen',
                  prev_key='roll_skipped', direction='lower', show_absent=True)
     _blank()
@@ -1150,19 +1179,26 @@ def _render_validation_table(
              prev_key=f'sign_balance@{_sb_h}', prev_scale=100.0, direction='none')
 
     # ONE-SIDED vs TWO-SIDED at matched d. The forecast protocol is entirely
-    # one-sided and the infill protocol entirely two-sided, so the two coverages
-    # above and below are the same nominal level over the same d at different
-    # SIDEDNESS -- and that is the axis the sampler starves. Uniform placement
-    # leaves 0.82% of masked slots one-sided at d = 1, and the band there decays
-    # with training while every pooled figure holds; measured on the live nano
-    # run, one-sided d=1 covered 0.850 against two-sided 0.891 on the same
-    # windows, same patch, same anchor. Pairing them is what makes that legible
+    # one-sided and the infill protocol entirely two-sided, so the two rows below
+    # are the same nominal level over the same d at different SIDEDNESS -- and
+    # that is the axis the sampler starves. Uniform placement leaves 0.82% of
+    # masked slots one-sided at d = 1, and the band there decays with training
+    # while every pooled figure holds. Pairing them is what makes that legible
     # from the table instead of from a separate study.
-    _os = val_metrics.get(f'coverage90@{COVERAGE_HORIZONS_MIN[0]}')
+    #
+    # BOTH ARMS ARE THE SAME ESTIMATOR, and that is the whole point of the pair.
+    # ``_fan_cov90@h`` and the infill ``marginal90_cov@d`` are one call to
+    # ``metrics.scoring.coverage_sharpness_by_d`` over each protocol's own fan:
+    # coverage over EVERY step of the d-th masked patch. The ``coverage90@h`` row
+    # above is a different quantity — a single step, the last of that patch — so
+    # reading the one-sided arm off it compares sidedness and step position at
+    # once, and the gap stops being attributable to either.
+    _os = val_metrics.get(f'_fan_cov90@{_fan_eh[0]}') if _fan_eh else None
     _ts = val_metrics.get(_infill_column('marginal90_cov', 1))
     info_row('  ↳ one-sided cov90 @d1', (_os * 100.0) if _os is not None else None,
              fmt='{:.2f}', unit='%', target='vs two-sided below',
-             prev_key=f'coverage90@{COVERAGE_HORIZONS_MIN[0]}', prev_scale=100.0,
+             prev_key=f'_fan_cov90@{_fan_eh[0]}' if _fan_eh else None,
+             prev_scale=100.0,
              direction='none', show_absent=True)
     info_row('  ↳ two-sided cov90 @d1', (_ts * 100.0) if _ts is not None else None,
              fmt='{:.2f}', unit='%', target='gap ⇒ sidedness starved',
@@ -1198,7 +1234,7 @@ def _render_validation_table(
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         lower_row(f'mard @{h_min}m', val_metrics.get(f'evalfix_mard@{h_min}'),
                   mard_sota[h_min], fmt='{:.2f}', unit='%', warn_mult=2.0,
-                  prev_key=f'evalfix_mard@{h_min}')
+                  prev_key=f'evalfix_mard@{h_min}', show_absent=True)
     lower_row('roc_rmse', val_metrics.get('roc_rmse'),
               14.0, fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
               prev_key='roc_rmse')
@@ -1309,13 +1345,16 @@ def _render_validation_table(
             _k = f'evalfix_clarke_{_z}@{_h}'
             if _lo is not None:
                 higher_row(f'  ↳ clarke_{_z} @{_h}m', _v, _lo,
-                           fmt='{:.2f}', unit='%', warn_gap=5.0, prev_key=_k)
+                           fmt='{:.2f}', unit='%', warn_gap=5.0, prev_key=_k,
+                           show_absent=True)
             elif _hi is not None:
                 lower_row(f'  ↳ clarke_{_z} @{_h}m', _v, _hi,
-                          fmt='{:.2f}', unit='%', warn_mult=2.0, prev_key=_k)
+                          fmt='{:.2f}', unit='%', warn_mult=2.0, prev_key=_k,
+                          show_absent=True)
             else:
                 info_row(f'  ↳ clarke_{_z} @{_h}m', _v, fmt='{:.2f}', unit='%',
-                         target='the A+B remainder', prev_key=_k, direction='none')
+                         target='the A+B remainder', prev_key=_k, direction='none',
+                         show_absent=True)
     _blank()
 
     # ============================================================
@@ -1356,7 +1395,7 @@ def _render_validation_table(
             info_row(f'  ↳ dts_{_zn.upper()} @{_h}m',
                      val_metrics.get(f'dts_{_zn}@{_h}'), fmt='{:.2f}', unit='%',
                      target='no threshold published',
-                     prev_key=f'dts_{_zn}@{_h}', direction='none')
+                     prev_key=f'dts_{_zn}@{_h}', direction='none', show_absent=True)
     _blank()
 
     # ============================================================
@@ -1375,7 +1414,7 @@ def _render_validation_table(
         higher_row(f'cgega_AP @{_reg}',
                    (_ap * 100.0) if _ap is not None else None,
                    _ap_sota, fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'cgega_ap_{_reg}', prev_scale=100.0)
+                   prev_key=f'cgega_ap_{_reg}', prev_scale=100.0, show_absent=True)
     # BE completes the region: AP + BE + EP is 1, so a rising BE against a flat AP
     # is error moving into the harmless bucket rather than accuracy improving.
     for _reg in ('hypo', 'eu', 'hyper'):
@@ -1383,13 +1422,14 @@ def _render_validation_table(
         info_row(f'cgega_BE @{_reg}',
                  (_be * 100.0) if _be is not None else None,
                  fmt='{:.2f}', unit='%', target='benign remainder',
-                 prev_key=f'cgega_be_{_reg}', prev_scale=100.0, direction='none')
+                 prev_key=f'cgega_be_{_reg}', prev_scale=100.0, direction='none',
+                 show_absent=True)
     for _reg, _ep_sota in (('hypo', 10.0), ('eu', 2.0), ('hyper', 5.0)):
         _ep = val_metrics.get(f'cgega_ep_{_reg}')
         lower_row(f'cgega_EP @{_reg}',
                   (_ep * 100.0) if _ep is not None else None,
                   _ep_sota, fmt='{:.2f}', unit='%', warn_mult=2.0,
-                  prev_key=f'cgega_ep_{_reg}', prev_scale=100.0)
+                  prev_key=f'cgega_ep_{_reg}', prev_scale=100.0, show_absent=True)
     _blank()
 
     # ============================================================
@@ -1431,28 +1471,38 @@ def _render_validation_table(
     # 30-minute hypo and misses the 120-minute one reads as one healthy number.
     # Each row carries its own bucket count, because an empty bucket has no rate
     # and must render absent rather than as a rate of zero.
+    #
+    # The bar DECLINES with horizon (``_excursion_target`` over the module's four
+    # EXCURSION_TARGET_* specs) and is not the pooled bar repeated: near-term
+    # detection is largely fixed by insulin-on-board while the far horizon is
+    # information-limited, so holding the 30-minute bar up at 120 minutes paints
+    # every far bucket red on every run and the colour stops carrying anything.
     for _h in _excursion_bucket_horizons(PREDICTION_PATCHES):
         _hn = val_metrics.get(f'hypo_n_steps@{_h}')
         higher_row(f'  ↳ hypo_recall @{_h}m'
                    + (f'({int(_hn)}st)' if _hn else ''),
                    _pct(val_metrics.get(f'hypo_recall@{_h}')),
-                   90.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hypo_recall@{_h}', prev_scale=100.0)
+                   _excursion_target(EXCURSION_TARGET_HYPO_RECALL, _h),
+                   fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hypo_recall@{_h}', prev_scale=100.0, show_absent=True)
         higher_row(f'  ↳ hypo_precision @{_h}m{_ptol_sfx}',
                    _pct(val_metrics.get(f'hypo_precision@{_h}')),
-                   75.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hypo_precision@{_h}', prev_scale=100.0)
+                   _excursion_target(EXCURSION_TARGET_HYPO_PRECISION, _h),
+                   fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hypo_precision@{_h}', prev_scale=100.0, show_absent=True)
     for _h in _excursion_bucket_horizons(PREDICTION_PATCHES):
         _yn = val_metrics.get(f'hyper_n_steps@{_h}')
         higher_row(f'  ↳ hyper_recall @{_h}m'
                    + (f'({int(_yn)}st)' if _yn else ''),
                    _pct(val_metrics.get(f'hyper_recall@{_h}')),
-                   85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hyper_recall@{_h}', prev_scale=100.0)
+                   _excursion_target(EXCURSION_TARGET_HYPER_RECALL, _h),
+                   fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hyper_recall@{_h}', prev_scale=100.0, show_absent=True)
         higher_row(f'  ↳ hyper_precision @{_h}m{_ptol_sfx}',
                    _pct(val_metrics.get(f'hyper_precision@{_h}')),
-                   85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
-                   prev_key=f'hyper_precision@{_h}', prev_scale=100.0)
+                   _excursion_target(EXCURSION_TARGET_HYPER_PRECISION, _h),
+                   fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hyper_precision@{_h}', prev_scale=100.0, show_absent=True)
     _blank()
 
     # BOTH sides. The nocturnal hypo is the use case the long-horizon roll exists
@@ -1535,15 +1585,21 @@ def _render_validation_table(
     lower_row('  ↳ mae @high confidence', val_metrics.get('tod_mae_hiconf'), 1.0,
               fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_hiconf')
     # Chance at random phase: ±1h 8%, ±2h 17%, 4-bin 25%.
-    higher_row('tod acc ±1h', _pct(val_metrics.get('tod_acc_1h')),
+    #
+    # ALREADY PERCENTAGES. ``tod_acc_*`` and ``tod_gross_rate`` are the four tod
+    # figures ``_run_validation`` scales by 100 itself, and the CSV column, the
+    # model card and ``models/compare.py`` all read them as percent — so no
+    # ``_pct`` here and no ``prev_scale``. Applying either scales them twice: a
+    # 16.3% clock rendered 1630.00% and, being above the 60% bar, tiered GREEN.
+    higher_row('tod acc ±1h', val_metrics.get('tod_acc_1h'),
                60.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
-               prev_key='tod_acc_1h', prev_scale=100.0)
-    higher_row('tod acc ±2h', _pct(val_metrics.get('tod_acc_2h')),
+               prev_key='tod_acc_1h')
+    higher_row('tod acc ±2h', val_metrics.get('tod_acc_2h'),
                80.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
-               prev_key='tod_acc_2h', prev_scale=100.0)
-    higher_row('tod acc (bin)', _pct(val_metrics.get('tod_acc_bin')),
+               prev_key='tod_acc_2h')
+    higher_row('tod acc (bin)', val_metrics.get('tod_acc_bin'),
                70.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
-               prev_key='tod_acc_bin', prev_scale=100.0)
+               prev_key='tod_acc_bin')
     # Reliability: bias is signed and centred on zero, so it is a band rather
     # than a minimand — a clock 2 h fast is as broken as one 2 h slow.
     band_row('tod bias', val_metrics.get('tod_bias_h'), -0.50, 0.50,
@@ -1552,9 +1608,9 @@ def _render_validation_table(
               fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_std_h')
     lower_row('tod p90 (tail)', val_metrics.get('tod_p90_h'), 4.0,
               fmt='{:.2f}', unit=' h', warn_mult=1.5, prev_key='tod_p90_h')
-    lower_row('tod gross-error rate', _pct(val_metrics.get('tod_gross_rate')),
+    lower_row('tod gross-error rate', val_metrics.get('tod_gross_rate'),
               10.0, fmt='{:.2f}', unit='%', warn_mult=2.0,
-              prev_key='tod_gross_rate', prev_scale=100.0)
+              prev_key='tod_gross_rate')
     info_row('tod confidence (R)', val_metrics.get('tod_conf'),
              fmt='{:.3f}', target='resultant length, 0–1',
              prev_key='tod_conf', direction='none')
@@ -3087,10 +3143,19 @@ def _run_validation(
                         # general: window k's slot 0 is its first masked patch,
                         # window k+1's is its forecast origin. The true gap comes
                         # off the shipped per-slot clocks.
+                        #
+                        # BOTH terms are clock differences, so their difference is
+                        # circular too and takes a SECOND wrap. Subtracting two
+                        # values already folded into (-12, 12] straddles the seam:
+                        # a predicted step of +11.9 h against a true gap of -11.9 h
+                        # is a 0.2 h deviation and reads as 23.8 h without it. The
+                        # within-window twin ``_slot_jump_hours`` wraps the same
+                        # way; the pair is only comparable while both do.
                         _adv = circular_hour_residual(_nw_hour[:, 0], slot_hour[:, 0])
                         _hk, _ = time_of_day_decode_bins(time_pred[:, 0, :], TIME_PROBE_N_BINS)
                         _hn, _ = time_of_day_decode_bins(_time_pred_next[:, 0, :], TIME_PROBE_N_BINS)
-                        _xwin = (circular_hour_residual(_hn, _hk) - _adv).abs()   # (B,)
+                        _xwin = circular_hour_residual(
+                            circular_hour_residual(_hn, _hk), _adv).abs()         # (B,)
                         tod_xwin_vals.append(_xwin[_nw_valid].detach().cpu())
             n_samples += B_batch
 
