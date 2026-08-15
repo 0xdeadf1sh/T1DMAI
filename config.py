@@ -68,9 +68,9 @@ SAMPLER_ARM, _ARM = resolve_arm()
 # other code or comments.  PATCH_SIZE must divide 12 (so an integer number of
 # patches tiles the hour); changing it rescales the wall-clock span of
 # MIN/MAX_CONTEXT_PATCHES, which count patches, not hours.
-D_MODEL = 128                    # Hidden dimension throughout the transformer
-N_LAYERS = 8                     # Number of transformer blocks
-N_HEADS = 8                      # Number of temporal attention heads
+D_MODEL = 32                    # Hidden dimension throughout the transformer
+N_LAYERS = 2                     # Number of transformer blocks
+N_HEADS = 2                      # Number of temporal attention heads
 HEAD_DIM = D_MODEL // N_HEADS    # Per-head dimension for temporal attention
 FFN_DIM = 4 * D_MODEL                   # SwiGLU FFN inner dimension (default 4 × D_MODEL; override via resize_model.py --ffn-mult)
 PATCH_SIZE = 6                   # Timesteps per patch (6 × 5min = 30min)
@@ -317,7 +317,7 @@ MASTER_SEED = 11011922           # Default master seed for all training data
 DETERMINISTIC = False            # full-determinism toggle; True trades some speed (TF32 off, cuDNN deterministic) for reproducibility; set False for max throughput (GPU: data stream reproducible, SDPA backward not bit-exact)
 TOTAL_STEPS = 100000             # Total training steps
 BATCH_SIZE = 512                 # Training batch size
-NUM_WORKERS = 20                 # DataLoader worker processes
+NUM_WORKERS = 8                  # DataLoader worker processes
 
 # When training off a memory-mapped simulator cache (cache_format=npy-memmap),
 # each random row read faults pages of the multi-TB cache files into the kernel

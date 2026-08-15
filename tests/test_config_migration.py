@@ -9,10 +9,14 @@ of silently training at the wrong LR/batch.
 
 
 def test_active_config_migrated_values():
-    """The active config carries the migrated live values."""
+    """The active config carries the migrated live values.
+
+    ``NUM_WORKERS`` is not among them: it is a property of the machine the run is
+    on, not of the training recipe, and pinning it here fails on every host that
+    is not the one the value was written for. Its range is checked below.
+    """
     import config
     assert config.BATCH_SIZE == 512
-    assert config.NUM_WORKERS == 20
     assert config.PATIENT_UNIFORM_SAMPLE_PROB == 0.0
     assert config.PREDICTION_HORIZON_HOURS == 2
     assert config.NIGHT_LONG_HORIZON_HOURS == 8
