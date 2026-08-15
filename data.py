@@ -1084,9 +1084,10 @@ def _mask_slots(
     ``d`` is reporting a distance the anchor did not use.  THE ANCHOR IGNORES
     THE NEAR SIDE: it is one-sided and left-preferring, so the last slot of a
     two-sided 4-patch span is at ``d = 1`` off its right neighbour while
-    anchoring 4 patches to the left.  Over the sampler's own distribution
-    35.77% of supervision anchors farther than the nearest visible evidence
-    (exact enumeration over ``(T, n_spans, length vector, edge incidence)``).
+    anchoring 4 patches to the left.  A third of supervision anchors farther
+    than the nearest visible evidence; ``tests/test_mask_sampler.py`` enumerates
+    the share exactly over ``(T, n_spans, length vector, placement branch, gap
+    composition)`` and prints it, rather than anyone writing it down.
     That costs no information — masked rows attend to everything — it only
     makes the head's offset parameterisation work harder.
     """

@@ -42,8 +42,8 @@ interpretable: it is bought with width, and n windows drawn from two patients is
 not n independent observations.
 
 TWO PROTOCOLS, ONE OF WHICH SHIPS. The masked-BG objective supervises forecast,
-backcast and infill, and their residuals are not exchangeable — 98.06% of infill
-supervision sits at d <= 2, where the answer is bracketed by visible evidence on
+backcast and infill, and their residuals are not exchangeable — most infill
+supervision sits at small d, where the answer is bracketed by visible evidence on
 both sides. Conditioning on (region, d, sidedness) would multiply the bins by
 six against a floor already needing n >= 19, so the split is by REMIT instead:
 

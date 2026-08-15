@@ -686,9 +686,9 @@ def test_val_log_bins_masked_bg_on_d():
     """Every masked-BG family is reported per ``d``, and none is pooled.
 
     ``d`` is the distance in patches to the nearest visible evidence on either
-    side. Uniform mask placement puts 98.06% of supervision at ``d <= 2``, so a
-    pooled masked-BG scalar falls without the model improving and must not exist
-    to be selected on. The forecast protocol's per-patch end-horizons ARE
+    side. The sampler concentrates supervision at small ``d``, so a pooled
+    masked-BG scalar falls without the model improving and must not exist to be
+    selected on. The forecast protocol's per-patch end-horizons ARE
     ``d = 1..PREDICTION_PATCHES`` one-sided; infill carries its own namespace and
     its linear-interpolation baseline.
 

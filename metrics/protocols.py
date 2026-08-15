@@ -2,8 +2,10 @@
 The two fixed evaluation protocols, and the axes every masked-BG figure is
 reported on.
 
-Training places masks UNIFORMLY over the window (``data.sample_mask_spans``, no
-right-edge quota, no curriculum, no annealing).  Validation does not: a metric
+Training places masks over the window by ``data.sample_mask_spans``: uniformly,
+except that the last span is pinned flush right on ``MASK_RIGHT_EDGE_QUOTA`` of
+windows.  There is no curriculum and no annealing.  Validation does not follow
+that distribution at all: a metric
 averaged over the training mask distribution is dominated by the easy regime and
 improves for free.  Exactly two protocols are fixed here, and they are the only
 comparable figures:
@@ -22,7 +24,7 @@ and this module does not restate one.
 
 INFILL is scored against LINEAR INTERPOLATION between the bracketing visible BGs,
 and never against persistence.  Persistence is a FORECASTING baseline; against a
-two-sided infill task it is not a baseline at all but a strawman, and 92.87% of
+two-sided infill task it is not a baseline at all but a strawman, and most of
 training supervision is two-sided.  Infill's columns carry the ``infill_``
 prefix and are reported per ``d``, so the two protocols cannot be averaged
 together by accident — ``column()`` refuses to name an infill column without a
@@ -37,10 +39,12 @@ never on arm.  Forecast @30/@60/@90/@120 IS d = 1..4 one-sided.  The rule and th
 slot layout are ``data._mask_slots``, the single definition; nothing here
 restates them.
 
-POOLING IS FORBIDDEN.  Exact enumeration of the training sampler puts 98.06% of
-supervision at d <= 2 and 67.99% at d = 1 two-sided, against 0.605% at d = 4
-one-sided — the regime the alarm path consumes.  A pooled masked-BG scalar
-therefore improves for free and must never become a selection metric.
+POOLING IS FORBIDDEN.  The sampler concentrates supervision at small ``d`` and
+on the two-sided case.  ``SAMPLER_REFERENCE`` below carries the exact per-``d``
+shares and is the only copy of them in this repository; nothing else states a
+figure for the mixture.  A pooled masked-BG scalar is therefore an average over a
+mask distribution rather than over a difficulty: it improves for free and must
+never become a selection metric.
 
 What every run reports
 ----------------------
@@ -204,9 +208,9 @@ def column(protocol: Protocol, base: str, d: int | None = None) -> str:
         if d is None:
             raise ValueError(
                 f"infill column '{base}' must name its d. A pooled masked-BG "
-                f"scalar improves for free — 98.06% of supervision sits at "
-                f"d <= 2 — so it must never become a comparable figure or a "
-                f"selection metric."
+                f"scalar improves for free — the sampler concentrates supervision "
+                f"at small d (SAMPLER_REFERENCE) — so it must never become a "
+                f"comparable figure or a selection metric."
             )
         allowed = reachable_d(INFILL)
         if int(d) not in allowed:

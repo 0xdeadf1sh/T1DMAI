@@ -1007,7 +1007,7 @@ def _render_validation_table(
     # ============================================================
     # Everything here is binned on ``d``, the distance in patches to the nearest
     # visible evidence, and NOTHING here is pooled over it: the training sampler
-    # puts 98.06% of its supervision at d <= 2, so a pooled masked-BG figure is
+    # concentrates its supervision at small d, so a pooled masked-BG figure is
     # an average over a mask distribution rather than over a difficulty and
     # improves for free. The forecast protocol masks the trailing
     # PREDICTION_PATCHES, so @30/@60/@90/@120 IS d = 1..4 one-sided.
@@ -2871,9 +2871,9 @@ def _run_validation(
 
     Both protocols' fans are decoded to mg/dL once and handed to
     ``metrics.scoring`` for the five proper scoring rules. Every figure they
-    return is binned on ``d`` and NO pooled masked-BG scalar is emitted: exact
-    enumeration puts 98.06% of supervision at ``d <= 2``, so an average over a
-    mask distribution is dominated by interpolation and improves for free, and a
+    return is binned on ``d`` and NO pooled masked-BG scalar is emitted: the
+    sampler concentrates supervision at small ``d``, so an average over a mask
+    distribution is dominated by interpolation and improves for free, and a
     column for one would eventually be selected on.
 
     ``pred_bg = f_inv(median)`` is the SOLE BG forecast into the metric suite.

@@ -27,10 +27,11 @@ protocol's @30/@60/@90/@120 min columns ARE ``d = 1..4`` one-sided.
 
 POOLED FIGURES ARE NOT A SELECTION METRIC.  Every rule also reports a figure
 pooled over ``d``, and every one of those carries ``POOLED_NOT_COMPARABLE``.
-The training sampler places 98.06% of its supervision at ``d <= 2`` and 92.87%
-of it two-sided, so a pooled masked-BG scalar is an average over a mask
-distribution rather than over a difficulty: it improves when the mixture
-softens and moves between protocols that share no mixture.  Compare pooled
+The training sampler concentrates its supervision at small ``d`` and on the
+two-sided case (``metrics.protocols.SAMPLER_REFERENCE`` carries the enumerated
+shares), so a pooled masked-BG scalar is an average over a mask distribution
+rather than over a difficulty: it improves when the mixture softens and moves
+between protocols that share no mixture.  Compare pooled
 against pooled only within one fixed protocol, and select on nothing pooled.
 
 SCORING UNIT — a masked patch.  Arrays arrive as
