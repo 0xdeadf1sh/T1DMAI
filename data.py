@@ -15,7 +15,7 @@ of one batch:
                           bg_masked bit (feat 4, written into all PATCH_SIZE of its
                           step-major columns); carb (feat 1) / insulin (feat 2) /
                           exercise (feat 3) keep their true or announced values
-                          everywhere.
+                          everywhere, unless the dataset is ``blind`` (below).
 * ``targets``           — (MAX_MASKED_PATCHES, PATCH_SIZE) float tensor of
                           ground-truth BG (mg/dL), one row per head slot.  This is
                           the RAW ``bg_observed`` (the SAME raw signal fed as the
@@ -70,11 +70,18 @@ Conventions and gotchas
   intensity and never risk-transformed.  bg_masked (feat 4) is a BIT and is
   never normalized, so the feature count and the normalized-channel count are
   no longer the same number.
-* There is no conditioned/unconditioned dichotomy.  carb (feat 1), insulin
-  (feat 2) and exercise (feat 3) ALWAYS carry their true or announced values,
-  masked patches included; bg (feat 0) is zeroed exactly at the masked patches,
-  so the model cannot copy the signal it is asked to emit.  Feats 1-3 are PLAN
-  channels: nothing but what the patient announced is ever written into them.
+* carb (feat 1), insulin (feat 2) and exercise (feat 3) carry their true or
+  announced values, masked patches included; bg (feat 0) is zeroed exactly at
+  the masked patches, so the model cannot copy the signal it is asked to emit.
+  Feats 1-3 are PLAN channels: nothing but what the patient announced is ever
+  written into them.
+* ``blind=True`` is the ONE departure, and it is off by default.  It withholds
+  feats 1-3 on masked patches too, filling them with the per-channel zero-RAW
+  ``normalize(0)`` (``zero_dose_fill``), which is the same "no dose" baseline
+  ``inference.predict_rolling`` writes when nothing is announced.  It exists so
+  ``train_blind.py`` can measure the model with no conditioning at all; a model
+  only ever sees one convention, so feat 4 still announces the withholding and
+  there is no second bit.
 * Masking is NOT inferable from position, and z = 0 in a withheld bg slot
   decodes to an ordinary reading (~142 mg/dL on the balanced pool), not a
   sentinel — which is why feat 4 announces the masked set explicitly.
@@ -99,7 +106,7 @@ from typing import Any
 
 from config import (
     PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM,
-    CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
+    CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, MASKABLE_FEATS,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
     MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
     PATIENT_UNIFORM_SAMPLE_PROB,
@@ -108,7 +115,9 @@ from config import (
 )
 import utils
 from utils import compute_patient_seed, kovatchev_f_np
-from normalization import CHANNEL_NAMES, SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS
+from normalization import (
+    CHANNEL_NAMES, SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS, normalize,
+)
 
 # === The bg_masked announcement column ===
 # The input stack is [*CHANNEL_NAMES, bg_masked].  The leading
@@ -122,6 +131,86 @@ assert N_INPUT_FEATURES == len(CHANNEL_NAMES) + 1, (
     f"N_INPUT_FEATURES={N_INPUT_FEATURES} should be len(CHANNEL_NAMES)="
     f"{len(CHANNEL_NAMES)} normalized channels plus the bg_masked bit"
 )
+
+# === What a masked patch withholds ===
+# Two conventions, and a model only ever sees one of them.  Under ``announced`` a
+# masked patch withholds bg alone and the announced carb / insulin / exercise
+# ride through it; under ``blind`` it withholds those three as well.  The string
+# is the checkpoint's provenance — no parameter shape depends on it, so a strict
+# state-dict load accepts weights trained under either — and
+# ``finetune/finetune.py`` compares it against the policy it implements.  An
+# ABSENT key means ``announced``: the key was introduced with the blind trainer,
+# so every checkpoint written before it was conditioned.
+MASKED_CHANNEL_POLICY_ANNOUNCED = 'announced'
+MASKED_CHANNEL_POLICY_BLIND = 'blind'
+
+
+def masked_channel_policy(blind: bool) -> str:
+    """The masked-channel policy name a ``blind`` flag selects.
+
+    Args:
+        blind: True when masked patches withhold the dose channels too.
+
+    Returns:
+        ``MASKED_CHANNEL_POLICY_BLIND`` or ``MASKED_CHANNEL_POLICY_ANNOUNCED``.
+    """
+    return MASKED_CHANNEL_POLICY_BLIND if blind else MASKED_CHANNEL_POLICY_ANNOUNCED
+
+
+def zero_dose_fill(stats: dict[str, dict[str, float]]) -> dict[int, float]:
+    """Per-feat ``normalize(0)`` for every announceable channel, in z-space.
+
+    What a blind masked patch carries in feats 1-3.  NOT ``z = 0``: the sparse
+    channels are log1p'd before the z-score, so ``z = 0`` inverts to
+    ``expm1(mean)`` — a phantom dose of ~0.47 g/step of carb on the balanced
+    pool, not an absence of one.  ``normalize(0)`` is the channel's ``-mean/std``
+    and means "no dose"; it is also the baseline ``inference.predict_rolling``
+    writes into an un-overridden slot, so a blind roll is in-distribution with no
+    change to the inference path.
+
+    Derived from the loaded stats every time rather than written down: the values
+    are properties of the pool the stats were fit on.
+
+    Args:
+        stats: the run's normalization statistics.
+
+    Returns:
+        ``{feat_idx: z}`` over ``MASKABLE_FEATS``.
+    """
+    zero_raw = normalize(
+        np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats,
+    )[0]                                              # (n_channels,) z-space
+    return {feat: float(zero_raw[feat]) for feat in MASKABLE_FEATS}
+
+
+def blind_masked_doses(
+    patches: torch.Tensor,
+    masked: torch.Tensor,
+    fill: dict[int, float],
+) -> None:
+    """Withhold the dose channels of every masked patch, IN PLACE.
+
+    The one place the blind convention is implemented.  ``data._build_sample``
+    applies it to the sample's own masked set and to ``next_window``'s;
+    ``train_blind.py``'s two protocol forwards apply it to the sets they mask, so
+    validation scores the task the model was trained on.  Feat 0 and feat 4 are
+    untouched — the bg withholding and the announcement bit are the same under
+    either policy.
+
+    Args:
+        patches: ``(..., T, PATCH_DIM)`` step-major patch rows, modified in place.
+        masked: ``(..., T)`` bool, True at the patches that withhold.
+        fill: ``zero_dose_fill``'s ``{feat_idx: z}``.
+    """
+    assert patches.shape[-1] == PATCH_DIM, (
+        f"patch row width {patches.shape[-1]} != PATCH_DIM {PATCH_DIM}")
+    assert masked.shape == patches.shape[:-1], (
+        f"masked {tuple(masked.shape)} does not index patches "
+        f"{tuple(patches.shape)}")
+    withheld = masked.unsqueeze(-1)
+    for feat_idx, z in fill.items():
+        block = patches[..., feat_idx::N_INPUT_FEATURES]
+        patches[..., feat_idx::N_INPUT_FEATURES] = block.masked_fill(withheld, z)
 
 # === On-the-fly simulator request size ===
 # Each training sample needs at most
@@ -484,6 +573,10 @@ class T1DMDataset(Dataset):
             keeps the +10M val / +2M cal seed bands from collapsing onto train
             rows via ``patient_seed % pool_size``.  No effect on the on-the-fly
             path (distinct seed bands already never collide there).
+        blind: withhold the dose channels on masked patches too, filling feats
+            1-3 with ``zero_dose_fill``.  Default False — the announced policy,
+            byte-identical to what this dataset produced before the flag existed.
+            ``train_blind.py`` sets it; nothing else does.
     """
 
     def __init__(
@@ -498,8 +591,10 @@ class T1DMDataset(Dataset):
         seed_offset: int = 0,
         force_pred_start_hour: float | None = None,
         cache_partition: str = 'train',
+        blind: bool = False,
     ) -> None:
         self.master_seed = master_seed
+        self.blind = blind
         self.total_steps = total_steps
         self.batch_size = batch_size
         self.stats = normalization_stats
@@ -873,6 +968,7 @@ class T1DMDataset(Dataset):
             stats=self.stats,
             rng=rng,
             force_pred_start_hour=self.force_pred_start_hour,
+            blind=self.blind,
         )
 
 
@@ -882,6 +978,7 @@ def make_calibration_dataset(
     batch_size: int,
     normalization_stats: dict[str, dict[str, float]],
     cache_path: str | None = None,
+    blind: bool = False,
 ) -> T1DMDataset:
     """
     Construct the conformal-calibration dataset.
@@ -899,6 +996,9 @@ def make_calibration_dataset(
         batch_size: collation batch size (``len == n_patients`` when this is 1).
         normalization_stats: the SAME stats dict training uses.
         cache_path: optional simulator cache directory.
+        blind: the SAME masked-channel policy the run trained under — split
+            conformal is only valid on the distribution the model runs under, so
+            a blind checkpoint must be calibrated on blind windows.
 
     Returns:
         A ``T1DMDataset`` over the calibration seed band (no block masking).
@@ -911,6 +1011,7 @@ def make_calibration_dataset(
         cache_path=cache_path,
         seed_offset=CALIBRATION_SEED_OFFSET,
         cache_partition='cal',
+        blind=blind,
     )
 
 
@@ -924,10 +1025,11 @@ def sample_mask_spans(
     """
     Draw the masked spans of one sample, left to right.
 
-    A masked patch withholds bg (feat 0) while carb / insulin / exercise keep
-    their true or announced values, and the model emits a quantile fan for it.
-    A span ending at patch ``seq_len - 1`` is a forecast, one starting at patch
-    0 a backcast, anything else infill — one objective, three cases.
+    A masked patch withholds bg (feat 0) — and, under ``blind``, the dose
+    channels with it — and the model emits a quantile fan for it.  A span ending
+    at patch ``seq_len - 1`` is a forecast, one starting at patch 0 a backcast,
+    anything else infill — one objective, three cases.  Placement is the same
+    draw under either policy: nothing here reads the flag.
 
     Procedure::
 
@@ -1123,6 +1225,7 @@ def _build_sample(
     stats: dict[str, dict[str, float]],
     rng: np.random.Generator,
     force_pred_start_hour: float | None = None,
+    blind: bool = False,
 ) -> dict[str, Any]:
     """
     Convert a raw simulator output dict into one training sample.
@@ -1150,6 +1253,7 @@ def _build_sample(
         stats: Normalization statistics from ``load_normalization_stats``.
         rng: numpy Generator used for window selection.
         force_pred_start_hour: force the origin near this hour-of-day.
+        blind: withhold the dose channels on masked patches too (``blind_masked_doses``).
 
     Returns:
         Dict with keys ``patches``, ``targets``, ``n_context_patches``,
@@ -1333,6 +1437,14 @@ def _build_sample(
     # untouched whatever N_INPUT_FEATURES is.
     for feat_idx in NON_MASKABLE_FEATS:
         all_patches_t[masked_rows, feat_idx::N_INPUT_FEATURES] = 0.0
+    # Under the blind policy the same patches withhold their doses as well, at
+    # the zero-RAW "no dose" fill rather than at z = 0.  Off by default, and the
+    # loop above is what the default path runs — feats 1-3 pass through untouched.
+    blind_fill = zero_dose_fill(stats) if blind else None
+    if blind_fill is not None:
+        blind_flags = torch.zeros(seq_len, dtype=torch.bool)
+        blind_flags[masked_rows] = True
+        blind_masked_doses(all_patches_t, blind_flags, blind_fill)
     # Announce the masked set explicitly.  Masking is not inferable from
     # position any more, and z = 0 in a withheld bg slot decodes to an ordinary
     # reading (~142 mg/dL on the balanced pool), not a sentinel.  The bit is per
@@ -1498,6 +1610,13 @@ def _build_sample(
             next_anchor_bg = np.full(MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
             next_pred_start_hour = pred_start_hour
             next_slot_hour = np.full(MAX_MASKED_PATCHES, pred_start_hour, dtype=np.float32)
+        # Window k+1's own masked span withholds its doses under the blind policy
+        # too — both windows of the pair are drawn under one convention, and the
+        # placeholder branch's masked rows take the fill for the same reason.
+        if blind_fill is not None:
+            next_blind_flags = torch.zeros(seq_len, dtype=torch.bool)
+            next_blind_flags[next_masked_rows] = True
+            blind_masked_doses(next_patches_t, next_blind_flags, blind_fill)
         assert next_patches_t.shape == (seq_len, PATCH_DIM)
         sample['next_window'] = {
             'patches': next_patches_t.float(),
