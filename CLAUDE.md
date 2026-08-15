@@ -299,6 +299,7 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 - `model.py` — T1DMAI model class; `make_step_basis`, `build_rope_cache`, `apply_rope`
 - `data.py` — on-the-fly and cached sample generation; `sample_mask_spans`, `_anchor_step_for_span`, `_mask_slots`, `BG_MASKED_FEAT`
 - `train.py` — training loop entry point
+- `train_blind.py` — the unconditioned fork of `train.py` (all four signals withheld on masked patches via `data`'s `blind` flag, no counterfactual probe, unconditioned rolling validation, own `checkpoints_blind/` + `logs_blind/`); checkpoints stamp `masked_channel_policy`, which `finetune/finetune.py` and `calibrate_conformal.py` refuse to mix
 - `inference.py` — prediction functions (standard, what-if, rolling), each with an opt-in `return_time`; `predict` takes an explicit `mask_spans` masked set (`None` selects the trailing forecast), what-if and rolling are right-edge by construction
 - `normalization.py` — channel statistics; `CHANNEL_NAMES`, `SPARSE_LOG1P_CHANNELS`, `RISK_SPACE_CHANNELS`, `load_normalization_stats` (validating)
 - `muon.py` — Muon optimizer implementation
