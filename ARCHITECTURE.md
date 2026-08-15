@@ -731,6 +731,13 @@ hypo alarm operating curve, the infill protocol's columns, and the nocturnal
 duplicates of Clarke, MARD and CG-EGA (which repeat their all-sample counterparts
 on a subset).
 
+A row's colour band and its trend arrow are set separately, because on one row
+they disagree. A marginal coverage has its nominal inside its band, so movement
+toward the band's midpoint is improvement. Joint coverage does not: it is bounded
+above by the smallest marginal in scope and rises toward that bound, so it is
+trended as higher-is-better while still being coloured against the band where a
+joint figure is acceptable.
+
 The two point error grids are reported side by side and are not
 interchangeable. Clarke's zones describe the treatment error a wrong reading
 would cause; the DTS grid's are contours of a risk function elicited from 206

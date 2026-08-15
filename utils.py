@@ -788,7 +788,13 @@ def circular_std_hours(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> torc
     r_bar = torch.sqrt(
         torch.cos(delta).mean() ** 2 + torch.sin(delta).mean() ** 2
     ).clamp(1e-6, 1.0)
-    return torch.sqrt(-2.0 * torch.log(r_bar)) * (24.0 / two_pi)
+    # ``+ 0.0`` normalises the SIGN of zero. The perfectly-consistent case the
+    # upper clamp exists for gives ``log(1.0) = 0.0``, ``-2 * 0.0 = -0.0`` and
+    # ``sqrt(-0.0) = -0.0``, which formats as "-0.00 h" on the validation table —
+    # a negative standard deviation. ``clamp(min=0.0)`` does NOT fix it (it
+    # returns -0.0); IEEE addition of +0.0 is the operation that maps -0.0 to
+    # +0.0 and leaves every other value bit-identical.
+    return torch.sqrt(-2.0 * torch.log(r_bar)) * (24.0 / two_pi) + 0.0
 
 
 _GLOBAL_MEDIAN_BASIS_CACHE: "dict[tuple[int, int, str, torch.device, torch.dtype], torch.Tensor]" = {}

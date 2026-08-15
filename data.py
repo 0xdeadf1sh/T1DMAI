@@ -1441,9 +1441,22 @@ def _build_sample(
     # the zero-RAW "no dose" fill rather than at z = 0.  Off by default, and the
     # loop above is what the default path runs — feats 1-3 pass through untouched.
     blind_fill = zero_dose_fill(stats) if blind else None
+    unblinded_dose_rows = None
+    unblinded_dose_patches = None
     if blind_fill is not None:
         blind_flags = torch.zeros(seq_len, dtype=torch.bool)
         blind_flags[masked_rows] = True
+        # Keep what the patient ACTUALLY did on the withheld patches, before the
+        # fill overwrites it in place.  The blind policy is a property of the
+        # OBJECTIVE — of which patches the model may read — not of the history,
+        # and a caller that un-masks has to be able to un-blind with it.  The
+        # long-horizon roll is that caller: its context is observed CGM history,
+        # so restoring bg while leaving the fill in feats 1-3 hands the roll a
+        # history asserting that a meal and a bolus did not happen.  Saved for
+        # the masked rows only (at most MAX_MASKED_PATCHES of them) rather than
+        # for the whole window.
+        unblinded_dose_rows = np.asarray(masked_rows, dtype=np.int64).copy()
+        unblinded_dose_patches = all_patches_t[masked_rows].clone()
         blind_masked_doses(all_patches_t, blind_flags, blind_fill)
     # Announce the masked set explicitly.  Masking is not inferable from
     # position any more, and z = 0 in a withheld bg slot decodes to an ordinary
@@ -1542,6 +1555,19 @@ def _build_sample(
         'extended_insulin_raw': extended_insulin_raw.copy(),
         'extended_exercise_raw': extended_exercise_raw.copy(),
     }
+    if unblinded_dose_rows is not None:
+        # BLIND ONLY, and UN-COLLATED ONLY.  ``collate_fn`` builds its batched
+        # dict from an explicit allowlist and does not carry these, exactly as it
+        # does not carry the ``extended_*`` arrays above; both are consumed from a
+        # single ``dataset[i]`` sample by the validation roll.
+        #
+        # ABSENT rather than None under the announced policy, and that is
+        # load-bearing: feats 1-3 were never overwritten there so there is nothing
+        # to undo, and the announced sample has to stay byte-identical through the
+        # flag — ``tests/test_blind_dataset.py`` digests it and compares the two
+        # policies key by key.
+        bg_formula_data['unblinded_dose_rows'] = unblinded_dose_rows
+        bg_formula_data['unblinded_dose_patches'] = unblinded_dose_patches
 
     sample = {
         'patches': all_patches_t.float(),

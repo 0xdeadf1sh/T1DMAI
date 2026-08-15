@@ -420,6 +420,148 @@ def test_per_horizon_detection_bars_decline_with_horizon(val_metrics):
           f"page tiers the far bucket against the far bar ✓")
 
 
+def test_joint_coverage_is_trended_toward_its_bound_not_a_band_midpoint():
+    """A rise in joint coverage renders as an improvement.
+
+    ``joint90`` is the one coverage row whose colour band and whose improvement
+    direction disagree. 70–92 is where a joint figure is acceptable, but its
+    midpoint (81) is not a level the metric aims at: joint coverage is bounded
+    above by the smallest marginal in scope and higher is better up to that
+    bound. Trended as a band, a recovery from 82% to 88% moves AWAY from 81 and
+    renders a red arrow while the value itself stays green — the arrow and the
+    colour contradicting each other on the row that catches path-level failure.
+
+    ``coverage90 @120m`` is the control: same movement, same builder, and it must
+    keep reading green, so a fix that flipped every coverage row would fail here.
+    """
+    fan = {'_fan_joint_width@120': 60.0, 'sharp90@120': 60.0}
+
+    def arrow(key, label, cur, prev):
+        line = next(
+            ln for ln in train._render_validation_table(
+                1, {**fan, key: cur}, {**fan, key: prev}).splitlines()
+            if label in train._strip_ansi(ln))
+        sym = '↑' if '↑' in line else ('↓' if '↓' in line else '•')
+        hue = ('green' if f'{train._ANSI_GREEN}{sym}' in line
+               else 'red' if f'{train._ANSI_RED}{sym}' in line else 'none')
+        return sym, hue
+
+    for cur, prev, want in ((0.88, 0.82, 'green'), (0.82, 0.88, 'red')):
+        sym, hue = arrow('joint_cov90@120', 'joint90 whole path', cur, prev)
+        assert hue == want, (
+            f'joint90 {prev:.0%} -> {cur:.0%} renders {sym} {hue}, want {want}: '
+            f'the row is scored against a band midpoint (81%) that is not this '
+            f"metric's target")
+        ctrl_sym, ctrl_hue = arrow('coverage90@120', 'coverage90 @120m', cur, prev)
+        assert ctrl_hue == want, (
+            f'the marginal control moved too: coverage90 @120m renders '
+            f'{ctrl_sym} {ctrl_hue}')
+    print("[DUMP] joint90 trend | rise=green, fall=red, marginal control unchanged ✓")
+
+
+def test_a_sample_with_no_slot_pair_cannot_dilute_the_jump_row():
+    """``tod jump (within window)`` is a mean over rows that HAVE a pair.
+
+    ``_slot_jump_hours`` divides by ``pair.sum().clamp(min=1.0)``, so a sample
+    with one valid masked slot — no consecutive pair at all — comes back 0.0, the
+    best attainable value on a lower-is-better row barred at ``<1.000 h``.
+    Averaging those in measures how often the sampler drew one span of one patch,
+    not whether the clock is stable. The subject is constructed here rather than
+    drawn, because whether a 12-patient fixture happens to contain a no-pair
+    sample is luck, and an assertion whose subject the run never produces passes
+    on absence.
+    """
+    B, M, bins = 4, 3, train.TIME_PROBE_N_BINS
+    logits = torch.zeros(B, M, bins)
+    logits[:, :, 0] = 10.0                       # a pinned clock: deviation is the advance
+    mask_idx = torch.arange(M).expand(B, M).contiguous()
+    valid = torch.ones(B, M, dtype=torch.bool)
+    valid[0, 1:] = False                         # row 0: one slot, therefore no pair
+    hours, has_pair = train._slot_jump_hours(logits, mask_idx, valid, train._PATCH_HOURS)
+
+    assert has_pair.tolist() == [False, True, True, True], (
+        'the pair flag does not identify the single-slot row')
+    assert float(hours[0]) == 0.0, (
+        'the 0/0 guard no longer returns 0.0 — this test pins the dilution that '
+        'value causes, so it needs the guard to still be there')
+    assert float(hours[1:].min()) > 0.0, (
+        'the paired rows report no deviation, so including row 0 would not '
+        'change the mean and this test has no subject')
+
+    unfiltered = float(hours.mean())
+    filtered = float(hours[has_pair].mean())
+    assert filtered > unfiltered, 'filtering did not remove the zero'
+    assert unfiltered == pytest.approx(filtered * 3 / 4, rel=1e-6), (
+        'the dilution is not exactly the no-pair share, so the arithmetic this '
+        'test reasons about has changed')
+    print(f"[DUMP] jump dilution | 1 of {B} rows has no pair; unfiltered "
+          f"{unfiltered:.4f} h vs filtered {filtered:.4f} h ✓")
+
+
+def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
+    """And the VALIDATION does the filtering, not just the helper.
+
+    The test above pins ``_slot_jump_hours``' contract; a caller that takes the
+    tuple and then averages the whole vector satisfies it completely, which is
+    the shape the defect had. So this one runs the real ``_run_validation`` and
+    recomputes both candidate means from the same weights and the same batches:
+    ``tod_jump_h`` must be the filtered one.
+
+    The subject is asserted before it is used — this seed's 12-sample validation
+    contains exactly one window whose sampler drew a single one-patch span, and
+    if that ever stops being true the two means coincide and the assertion below
+    passes on nothing.
+    """
+    device = torch.device('cpu')
+    stats = load_normalization_stats()
+    torch.manual_seed(20_260_815)
+    model = T1DMAI().to(device)
+    weighting = KendallGalWeighting().to(device)
+    kw = dict(master_seed=20_000_017, total_steps=N_VAL, batch_size=1,
+              normalization_stats=stats, patient_uniform_sample_prob=0.0)
+
+    ds = T1DMDataset(**kw)
+    no_pair = sum(
+        1 for i in range(N_VAL)
+        if not bool((lambda v: v[1:] & v[:-1])(
+            torch.as_tensor(ds[i]['bg_formula_data']['valid']).bool()).any()))
+    assert no_pair > 0, (
+        'no window in this fixture lacks a slot pair, so the filtered and '
+        'unfiltered means are equal and this test has no subject')
+
+    metrics = train._run_validation(model, T1DMDataset(**kw), stats, device, weighting)
+    reported = metrics['tod_jump_h']
+
+    # The same forward, batched the same way, so the only difference between the
+    # two candidates is which rows they average.
+    from data import collate_fn
+    every, paired = [], []
+    with torch.no_grad():
+        for start in range(0, N_VAL, train.VAL_BATCH_SIZE):
+            batch = collate_fn([ds[i] for i in range(
+                start, min(start + train.VAL_BATCH_SIZE, N_VAL))])
+            bf = batch['bg_formula_data']
+            mask_idx = bf['mask_idx'].long()
+            _, _, time_pred = model(batch['patches'], batch['attn_mask'],
+                                    bf['anchor_bg'].float(), mask_idx, return_time=True)
+            j, has = train._slot_jump_hours(
+                time_pred, mask_idx, bf['valid'], train._PATCH_HOURS)
+            every.append(j)
+            paired.append(j[has])
+    unfiltered = float(torch.cat(every).mean())
+    filtered = float(torch.cat(paired).mean())
+
+    assert filtered != pytest.approx(unfiltered, rel=1e-9), (
+        'the two candidates coincide on this fixture, so the assertion below '
+        'cannot tell them apart')
+    assert reported == pytest.approx(filtered, rel=1e-5), (
+        f'the validation reports {reported:.4f} h; the filtered mean is '
+        f'{filtered:.4f} h and the diluted one {unfiltered:.4f} h — the caller '
+        f'is averaging over its own 0/0 guard')
+    print(f"[DUMP] jump row | {no_pair}/{N_VAL} windows have no pair; reported "
+          f"{reported:.4f} h == filtered {filtered:.4f} h, not {unfiltered:.4f} h ✓")
+
+
 def test_families_restored_to_the_table_are_rendered_and_still_recorded(val_metrics):
     """The other half of the trim boundary: what was put BACK is on the page.
 

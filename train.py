@@ -952,7 +952,8 @@ def _render_validation_table(
                       lo: float, hi: float, warn_pad: float | None = None,
                       prev_key: str | None = None,
                       n: float | None = None, n_unit: str = 'st',
-                      target: str | None = None) -> None:
+                      target: str | None = None,
+                      trend: str = 'band') -> None:
         """Coverage AND the width that bought it, on one line, always together.
 
         A coverage figure alone is not interpretable: any band widens to any
@@ -960,6 +961,15 @@ def _render_validation_table(
         one. The width rides gray beside the value so the two read as one
         measurement rather than two rows a reader may see apart. An empty bin
         renders absent on both halves — never 0.
+
+        ``trend`` is separate from the colour band because the two answer
+        different questions, and for one row they disagree. A MARGINAL coverage
+        has a nominal INSIDE its band, so moving toward the band's midpoint is
+        improvement and ``'band'`` is right. A JOINT coverage has no nominal
+        there: it is bounded above by the smallest marginal in its scope and
+        higher is better up to that bound, so scoring it against the midpoint
+        calls a rise toward the bound a regression. Pass ``'higher'`` for a row
+        whose target text reads as a ceiling rather than a level.
         """
         label = f"{metric}({int(n)}{n_unit})" if n is not None else metric
         tgt = target if target is not None else f"{lo:.0f}–{hi:.0f}% + width"
@@ -973,7 +983,7 @@ def _render_validation_table(
         prev = _prev_val(prev_key, 100.0) if prev_key else None
         rows.append((label,
                      _colored(f"{cov:.2f}%", color) + _colored(w, _ANSI_GRAY),
-                     prev_cell, _trend_cell(cov, prev, 'band', 0.5 * (lo + hi)),
+                     prev_cell, _trend_cell(cov, prev, trend, 0.5 * (lo + hi)),
                      tgt, ''))
 
     def text_row(metric: str, cell: str | None, target: str = '') -> None:
@@ -1166,13 +1176,18 @@ def _render_validation_table(
     _joint_h = _fan_eh[-1] if _fan_eh else None
     if _joint_h is not None:
         _j = val_metrics.get(f'joint_cov90@{_joint_h}')
+        # trend='higher', unlike every other coverage row on the page. The band
+        # 70–92 is where a joint figure is acceptable, but its midpoint (81) is
+        # not a level this metric aims at — it is bounded above by the smallest
+        # marginal in scope, so a rise from 82 to 88 is the band recovering and
+        # scoring it against 81 renders that as a red arrow.
         cov_sharp_row(f'joint90 whole path ≤{_joint_h}m',
                       (_j * 100.0) if _j is not None else None,
                       val_metrics.get(f'_fan_joint_width@{_joint_h}'),
                       70.0, 92.0, warn_pad=15.0,
                       n=_fan_n(_joint_h, '_fan_joint_n'), n_unit=' windows',
                       prev_key=f'joint_cov90@{_joint_h}',
-                      target='≤ marginal (simultaneous)')
+                      target='≤ marginal (simultaneous)', trend='higher')
     _blank()
 
 
@@ -3148,16 +3163,26 @@ def _slot_jump_hours(
         adv_per_patch: hours per patch (``PATCH_SIZE * STEP_MINUTES / 60``).
 
     Returns:
-        ``(B,)`` mean ``|advance deviation|`` in hours; 0 for a row with no pair.
+        ``(hours, has_pair)``. ``hours`` is ``(B,)`` mean ``|advance deviation|``,
+        ``has_pair`` ``(B,)`` bool, False where the row contributed no pair at all.
+
+        THE SECOND VALUE IS NOT OPTIONAL. A row with one valid slot has no
+        consecutive pair, and the ``clamp(min=1.0)`` that keeps 0/0 finite hands
+        it back 0.0 — the best attainable value on a lower-is-better row. Averaged
+        in, it does not measure a stable clock, it measures how often the sampler
+        drew one span of one patch. The flag rides out with the value so a caller
+        cannot take the mean without deciding what to do about it.
     """
     if logits.shape[1] < 2:
-        return logits.new_zeros(logits.shape[0])
+        return (logits.new_zeros(logits.shape[0]),
+                torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device))
     hours, _ = time_of_day_decode_bins(logits, TIME_PROBE_N_BINS)          # (B, M)
     step = circular_hour_residual(hours[:, 1:], hours[:, :-1])             # (B, M-1)
     expected = (mask_idx[:, 1:] - mask_idx[:, :-1]).to(step.dtype) * adv_per_patch
     pair = (valid[:, 1:] & valid[:, :-1]).to(step.dtype)
     dev = circular_hour_residual(step, expected).abs() * pair
-    return dev.sum(dim=-1) / pair.sum(dim=-1).clamp(min=1.0)
+    n_pair = pair.sum(dim=-1)
+    return dev.sum(dim=-1) / n_pair.clamp(min=1.0), n_pair > 0
 
 
 def _slot_cross_window_loss(
@@ -3336,9 +3361,16 @@ def _run_validation(
                 tod_pred_hours.append(hours0.detach().cpu())
                 tod_true_hours.append(slot_hour[:, 0].detach().cpu())
                 tod_conf_vals.append(R0.detach().cpu())
-                tod_jump_vals.append(
-                    _slot_jump_hours(time_pred, mask_idx, slot_valid, tod_adv).detach().cpu()
-                )
+                # Only the rows that HAVE a consecutive-slot pair — see
+                # ``_slot_jump_hours``, which returns the flag precisely so this
+                # mean cannot be taken over its own 0/0 guard. At the shipped
+                # VALIDATION_N_PATIENTS that is 45 of 1000 samples, an exact
+                # -4.5% on the rendered figure. The cross-window twin below has
+                # always filtered its own rows, so the pair was scored two ways.
+                _jump, _jump_pair = _slot_jump_hours(
+                    time_pred, mask_idx, slot_valid, tod_adv)
+                if bool(_jump_pair.any()):
+                    tod_jump_vals.append(_jump[_jump_pair].detach().cpu())
                 # Cross-window no-jump witness (diagnostic): a 2nd forward on window k+1
                 # (batch['next_window'], teacher-forced true shifted trajectory); measure
                 # |clock_{k+1,slot0} - clock_{k,slot0} - true gap| per valid sample. Full

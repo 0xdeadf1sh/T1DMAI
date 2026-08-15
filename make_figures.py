@@ -659,31 +659,40 @@ def fig_time_of_day(val, outdir: Path) -> None:
 
 
 def fig_tir(val, outdir: Path) -> None:
-    """Time-in-range: predicted vs true TIR and the signed TIR error."""
+    """Time-in-range: predicted vs true TIR and the mean absolute TIR error."""
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.4))
     s = val["step"]
 
+    # pred_tir / true_tir / tir_err are FRACTIONS in the log — the validation
+    # table renders them as `* 100.0`. Scaling here is what makes this panel and
+    # that table the same statistic instead of one reading 100x low against its
+    # own percentage axis.
     ax = axes[0]
     pred = val.get("pred_tir")
     true = val.get("true_tir")
     if pred is not None and np.isfinite(pred).any():
-        ax.plot(s, pred, color="#1f4e8c", linewidth=1.4, label="predicted TIR")
+        ax.plot(s, 100.0 * pred, color="#1f4e8c", linewidth=1.4, label="predicted TIR")
     if true is not None and np.isfinite(true).any():
-        ax.plot(s, true, color="#2a8a3e", linewidth=1.4, label="true TIR")
+        ax.plot(s, 100.0 * true, color="#2a8a3e", linewidth=1.4, label="true TIR")
     ax.set_xlabel("training step")
     ax.set_ylabel("time in range  [%]")
     ax.set_title("Time-in-range: predicted vs true")
     ax.legend(loc="best")
 
+    # ABSOLUTE, not signed. The producer is `(pred_frac - true_frac).abs()`
+    # accumulated per window, so the two directions cancelled inside it and the
+    # series cannot be negative: a "pred - true" title invites reading a sign
+    # that is not carried, and a zero line the series can never reach reads as a
+    # target rather than as an unattainable bound.
     ax = axes[1]
     err = val.get("tir_err")
     if err is not None and np.isfinite(err).any():
-        ax.plot(s, err, color="#c5343c", linewidth=1.4)
-        _annotate_best(ax, s, np.abs(err), "best |err| {val:.2f} @ {step}", color="#c5343c")
-    ax.axhline(0.0, color="k", linestyle=":", linewidth=0.9)
+        ax.plot(s, 100.0 * err, color="#c5343c", linewidth=1.4)
+        _annotate_best(ax, s, 100.0 * np.abs(err), "best {val:.2f} pp @ {step}",
+                       color="#c5343c")
     ax.set_xlabel("training step")
-    ax.set_ylabel("TIR error  [pp]")
-    ax.set_title("TIR error (pred − true)")
+    ax.set_ylabel("mean |TIR error|  [pp]")
+    ax.set_title("TIR error (mean absolute, per window)")
 
     _suptitle(fig, "Time-in-range error")
     fig.tight_layout()
