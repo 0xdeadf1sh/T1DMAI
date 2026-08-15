@@ -1,6 +1,51 @@
 """
-T1DMAI Training Loop — Muon + AdamW (risk-space BG redesign).
-=============================================================
+T1DMAI Blind Training Loop — the UNCONDITIONED fork of ``train.py``.
+====================================================================
+
+What this file is
+-----------------
+A copy of ``train.py``, forked at commit ``d1bbe7c``, answering one question:
+how good is the model with NO conditioning at all — no announced carbs, insulin
+or exercise on the patches it predicts.  Architecture, loss, sampler (right-edge
+quota included), EMA and ``val_loss_total`` selection are identical, so the
+conditioned and blind runs differ in exactly one thing and their validation
+tables are directly comparable.
+
+The one thing::
+
+    train.py        a masked patch withholds bg;   carb/insulin/exercise
+                    ride through it at their announced values
+    train_blind.py  a masked patch withholds bg AND carb/insulin/exercise,
+                    which take data.zero_dose_fill's per-channel normalize(0)
+
+Feat 4 announces the withholding under both — a model only ever sees one
+convention, so there is no second bit.
+
+It is NOT kept in sync with ``train.py``.  A change to the conditioned trainer
+must be applied here deliberately or not at all; nothing checks.  The complete
+intended divergence is these seven items and nothing else:
+
+1. how the file identifies itself — this docstring, the ``--help`` text and the
+   resolved-config banner;
+2. every ``T1DMDataset`` is built ``blind=True`` (train, val, night-onset val);
+3. the FORECAST and INFILL protocol forwards blind the dose channels of the
+   patches they mask (``data.blind_masked_doses``), so validation scores the
+   task the model was trained on;
+4. the counterfactual probe is GONE — it perturbs announced doses, and a blind
+   model cannot see the perturbation, so every ``cf_*`` row would read zero by
+   construction;
+5. long-horizon rolling validation is UNCONDITIONED: no ``overrides_fn``, so
+   ``predict_rolling`` writes its zero-RAW no-dose baseline, which is exactly the
+   blind fill.  The conditioned trainer's OOD-runaway concern does not apply —
+   an unconditioned roll IS this model's training distribution;
+6. the policy is stamped ``'blind'`` — into ``training_config``, which
+   ``finetune/finetune.py`` refuses to mix with a conditioned fine-tune, and
+   onto the banner, so it is visible before the run rather than after it;
+7. output directories are ``checkpoints_blind/`` and ``logs_blind/``, so a
+   conditioned run may be live in the same checkout.
+
+Everything else — the time probe, EMA, Kendall-Gal, DILATE, the quota sampler,
+the conformal probe, the trimmed console table — is ``train.py``'s verbatim.
 
 What this file does
 -------------------
@@ -51,16 +96,16 @@ Numerical care taken (fp32-native — no autocast / bf16):
       before training continues.
 
 Logs written:
-    ``logs/training_log.csv``       — per-step (loss_total, loss_Q, loss_D[+
-                                       shape/tdi], log_sigma_Q, log_sigma_D, …).
-    ``logs/validation_log.csv``     — every validation step.
-    ``logs/training_summary.json``  — periodic snapshot of progress.
-    ``logs/resolved_config.json``   — the resolved CLI > config.py config.
+    ``logs_blind/training_log.csv``       — per-step (loss_total, loss_Q, loss_D[+
+                                             shape/tdi], log_sigma_Q, log_sigma_D, …).
+    ``logs_blind/validation_log.csv``     — every validation step.
+    ``logs_blind/training_summary.json``  — periodic snapshot of progress.
+    ``logs_blind/resolved_config.json``   — the resolved CLI > config.py config.
 
 Usage::
 
-    python train.py
-    python train.py --master-seed 42 --total-steps 100000 --batch-size 512
+    python train_blind.py
+    python train_blind.py --master-seed 42 --total-steps 100000 --batch-size 512
 """
 
 import argparse
@@ -89,11 +134,10 @@ from config import (                                           # noqa: E402
     MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
     VALIDATION_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
-    N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
+    N_INPUT_FEATURES, NON_MASKABLE_FEATS,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
-    CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
     HYPO_ALARM_QUANTILE_TAU, HYPER_ALARM_QUANTILE_TAU,
     EXCURSION_PRECISION_TOLERANCE_MGDL,
@@ -147,7 +191,7 @@ _HYPER_BAND_IDX = QUANTILE_LEVELS.index(HYPER_ALARM_QUANTILE_TAU)
 # Per-horizon excursion-detection DISPLAY targets ``(base@30min, slope_per_30min,
 # floor)`` for the `Excursions by Horizon` table section. DISPLAY-ONLY (they set
 # row colour / Target text, never the loss / CSV / checkpoint selection), so they
-# live in train.py rather than config.py, since they are display-only. The target
+# live in the trainer rather than config.py, since they are display-only. The target
 # declines with horizon (near-term detection is largely fixed by insulin-on-board;
 # long-horizon is information-limited).
 EXCURSION_TARGET_HYPO_RECALL = (90.0, 10.0, 50.0)
@@ -223,7 +267,10 @@ from normalization import (
     load_normalization_stats, compute_normalization_stats,
     save_normalization_stats, CHANNEL_NAMES, normalize, denormalize,
 )
-from data import T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy
+from data import (
+    T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy,
+    blind_masked_doses, zero_dose_fill,
+)
 from risk_loss import risk_total_loss, KendallGalWeighting
 import cg_ega
 
@@ -727,11 +774,12 @@ def _render_validation_table(
 ) -> str:
     """Render a SOTA-target validation table with ANSI colors.
 
-    Three columns: ``Metric | Value | Prev``. The model is always conditioned (the
-    prediction-zone carbs, insulin and exercise are all announced — the announced
-    set is ``tuple(CHANNEL_TO_FEAT)``), so there is a single validation pass and
-    one value per metric — colored by SOTA tier with a trend arrow against the
-    previous validation. Section-title rows span the full inner width and are
+    Three columns: ``Metric | Value | Prev``. The model reads no announced dose,
+    so there is a single validation pass and one value per metric — colored by
+    SOTA tier with a trend arrow against the previous validation. The tiers are
+    ``train.py``'s and are NOT re-cut for the blind regime: a row that reads
+    amber here against a conditioned model's green is the measurement this file
+    exists to take. Section-title rows span the full inner width and are
     excluded from column-width measurement.
 
     This is a READING surface, not the record. ``validation_log.csv`` carries
@@ -951,7 +999,7 @@ def _render_validation_table(
     # Rolled rows, and the only rows on the page whose context is not n_ctx: the
     # roll starts from the visible patch run reaching the forecast origin. The
     # coverage rows under them are what says which samples the RMSEs were
-    # measured over — the same numbers reach logs/validation_log.csv, but a
+    # measured over — the same numbers reach logs_blind/validation_log.csv, but a
     # reader of the table would otherwise take a 3-patch-context figure for a
     # full-context one, and these are the nocturnal-hypo rows.
     #
@@ -1196,31 +1244,10 @@ def _render_validation_table(
                prev_key='night_hypo_precision', prev_scale=100.0)
     _blank()
 
-    # ============================================================
-    # 8. Counterfactual dose-response probe (uncoloured diagnostics)
-    # ============================================================
-    _cf_n = int(val_metrics.get('cf_n', 0) or 0)
-    # Three rows: the two directions and the harder of the two monotonicity
-    # checks. The magnitudes (cf_*_dbg), carb monotonicity and the two rescue
-    # rates are CSV-only. These stay on the page because they are the check that
-    # the model responds to dose AT ALL — risk-v3 scored 0.56 on insulin
-    # monotonicity, a coin flip, with every accuracy metric looking healthy, and
-    # nothing else here would have said so.
-    _section(f'Counterfactual Dose-Response ({_cf_n} samples)')
-    _ccd = val_metrics.get('cf_carb_dir')
-    info_row('carb→BG direction', (_ccd * 100.0) if _ccd is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_carb_dir', prev_scale=100.0, direction='none')
-    _cid = val_metrics.get('cf_insulin_dir')
-    info_row('insulin→BG direction', (_cid * 100.0) if _cid is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_insulin_dir', prev_scale=100.0, direction='none')
-    _cim = val_metrics.get('cf_insulin_monotonic')
-    info_row('insulin monotonic', (_cim * 100.0) if _cim is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_insulin_monotonic', prev_scale=100.0, direction='none')
-    _blank()
-
+    # The counterfactual dose-response section of ``train.py``'s table has no
+    # subject here: it perturbs the announced doses of the masked span, which this
+    # model does not read, so every row would report the perturbation's own
+    # absence.
     # ============================================================
     # Time-of-day probe (tier-coloured; co-trains the trunk but never feeds loss
     # or selection). Thresholds are clock-usability judgements, NOT external
@@ -1558,12 +1585,9 @@ def _write_training_summary(
 
 VAL_BATCH_SIZE = 8
 
-# Output-channel indices every evaluation path announces. Training windows carry
-# the true future carb / insulin / exercise plan, so an eval announcing a strict
-# subset measures the model on a plan it never trained under: an un-announced
-# maskable slot reads as ``normalize(0)``, which is a legal value rather than a
-# missing one, so nothing raises.
-_ANNOUNCE_CHANNELS = tuple(sorted(CHANNEL_TO_FEAT))
+# ``train.py``'s ``_ANNOUNCE_CHANNELS`` has no subject here: no evaluation path in
+# this file announces a dose, so there is no announced set to check for
+# completeness. The blind fill IS the un-announced value.
 
 
 def _reconstruct_context_from_patch(
@@ -1687,60 +1711,6 @@ def _is_nocturnal(hour: float) -> bool:
         return hour >= NOCTURNAL_START_HOUR or hour < NOCTURNAL_END_HOUR
 
 
-def _make_long_horizon_overrides_fn(bf: dict):
-    """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for
-    ``predict_rolling``, built from the sample's shipped future plan
-    (``extended_{carb,insulin,exercise}_{norm,raw}``).
-
-    The long-horizon (nocturnal) roll is the KNOWN-PLAN regime: the future insulin
-    curve (basal + boluses), carb curve and exercise curve are announced each roll,
-    so the rolling forecast is conditioned on them (mask bits flipped to 1 by the
-    inference bridge) while ``predict_rolling`` stays BG-AUTOREGRESSIVE — it still
-    re-feeds the model's OWN median BG, since no true BG is observed yet. Returns
-    ``None`` past the end of the shipped future, so that roll falls back to its
-    unconditional prediction.
-
-    The announced set is exactly ``tuple(CHANNEL_TO_FEAT)``: announcing a strict
-    subset would train on the true future plan and evaluate against a silently
-    absent one (an un-announced maskable slot reads as ``normalize(0)``, a legal
-    "no session"), so the roll would be measured on a plan the model never saw.
-
-    Returns ``None`` (the whole builder) when the sample lacks the extended-plan
-    keys, so the caller can fall back to an unconditioned roll.
-    """
-    keys = ('extended_carb_norm', 'extended_insulin_norm', 'extended_exercise_norm',
-            'extended_carb_raw', 'extended_insulin_raw', 'extended_exercise_raw')
-    if not all(k in bf for k in keys):
-        return None
-    _ps = PREDICTION_PATCHES * PATCH_SIZE
-    norm_ch = {
-        0: np.asarray(bf['extended_carb_norm'], dtype=np.float32),
-        1: np.asarray(bf['extended_insulin_norm'], dtype=np.float32),
-        2: np.asarray(bf['extended_exercise_norm'], dtype=np.float32),
-    }
-    raw_ch = {
-        0: np.asarray(bf['extended_carb_raw'], dtype=np.float32),
-        1: np.asarray(bf['extended_insulin_raw'], dtype=np.float32),
-        2: np.asarray(bf['extended_exercise_raw'], dtype=np.float32),
-    }
-    assert tuple(sorted(norm_ch)) == _ANNOUNCE_CHANNELS, (
-        f"announced set {tuple(sorted(norm_ch))} != CHANNEL_TO_FEAT {_ANNOUNCE_CHANNELS}"
-    )
-    n_avail = min(int(v.shape[0]) for v in norm_ch.values())
-
-    def fn(roll_idx, mu_np, abs_n_ctx):
-        a = roll_idx * _ps
-        b = a + _ps
-        if b > n_avail:
-            return None
-
-        def rs(x):
-            return x[a:b].reshape(PREDICTION_PATCHES, PATCH_SIZE)
-        return ({ch: rs(v) for ch, v in norm_ch.items()},
-                {ch: rs(v) for ch, v in raw_ch.items()})
-    return fn
-
-
 def _accumulate_long_horizon_bg_metrics(
     model: T1DMAI,
     samples: list[dict[str, Any]],
@@ -1755,11 +1725,12 @@ def _accumulate_long_horizon_bg_metrics(
     forward pass. ``predict_rolling`` is BG-autoregressive: its ``pred_bg`` is
     ``f_inv(median)`` carried across rolls (no physics constants needed).
 
-    The long-horizon roll is CONDITIONED on each sample's announced future
-    insulin (basal+boluses) + carb curve via ``_make_long_horizon_overrides_fn``
-    — the known-plan regime the rolling forecast is built for (the nocturnal-hypo
-    use case knows the programmed basal ahead of time). BG stays autoregressive
-    (the model re-feeds its own median); only the doses are announced.
+    The roll is UNCONDITIONED — no ``overrides_fn``, so ``predict_rolling`` leaves
+    every future dose slot at its zero-RAW ``normalize(0)`` baseline, which is
+    exactly what a masked patch carries under the blind policy. ``train.py``
+    announces the future plan here to tame a zero-basal OOD runaway; that concern
+    does not apply to this model, for which the unconditioned roll IS the training
+    distribution. BG stays autoregressive either way.
 
     Each roll runs on the sample's OBSERVED context (``_observed_patches``), so
     the run reaching the origin is the whole ``n_ctx`` rather than whatever the
@@ -1815,7 +1786,6 @@ def _accumulate_long_horizon_bg_metrics(
             model, context, patient_seed=None, n_rolls=n_rolls,
             normalization_stats=norm_stats,
             device=device,
-            overrides_fn=_make_long_horizon_overrides_fn(bf),
         )
         pred_bg = result['pred_bg'].detach().cpu()
         true_bg_extended = bf['extended_true_bg_trajectory']
@@ -1865,10 +1835,11 @@ def _run_night_onset_validation(
     band fan in ``result['bands']``); truth stays off the TRUE bg. Returns
     ``night_onset_{hypo,hyper}_{recall,precision}`` (+ counts).
 
-    The roll is always conditioned on the night's ANNOUNCED carbs+insulin+exercise
-    via an ``overrides_fn`` (keys are output-channel space {0:carb, 1:insulin,
-    2:exercise}; the inference bridge maps them onto feats 1/2/3 through
-    ``CHANNEL_TO_FEAT``) — the model is always conditioned.
+    The roll is UNCONDITIONED: nothing about the night's carbs, insulin or
+    exercise is announced, so every future dose slot stays at the zero-RAW
+    ``normalize(0)`` baseline — the same fill the blind policy writes into a
+    masked patch. What the night rows measure is therefore the nocturnal-hypo
+    call made from CGM history alone.
 
     Three counts travel with the rates, because none of them is derivable from
     another: ``night_onset_n_nights`` is how many nights were scored and
@@ -1914,7 +1885,6 @@ def _run_night_onset_validation(
             result = predict_rolling(
                 model, context, patient_seed=None, n_rolls=n_rolls,
                 normalization_stats=norm_stats, device=device,
-                overrides_fn=_make_long_horizon_overrides_fn(bf),
             )
             pred_bg = result['pred_bg'].detach().cpu()
             bands = result['bands'].detach().cpu()             # (rolls*P, S, N_QUANTILES) mg/dL
@@ -1951,218 +1921,6 @@ def _run_night_onset_validation(
         out[f'night_onset_{side}_n_true'] = tr
         out[f'night_onset_{side}_n_pred'] = pr
     return out
-
-
-def _run_counterfactual_probe(
-    model: T1DMAI,
-    val_dataset: T1DMDataset,
-    norm_stats: dict,
-    device: torch.device,
-    hypo_threshold: float = BG_HYPO_THRESHOLD,
-    hyper_threshold: float = BG_HYPER_THRESHOLD,
-    samples: list[dict] | None = None,
-) -> dict[str, Any]:
-    """Counterfactual dose-response probe.
-
-    For up to ``VALIDATION_N_PATIENTS`` validation samples, forecast a BASELINE on
-    each sample's TRUE announced pred-zone carbs+insulin+exercise, then perturb a
-    single dose (a RAW bolus added to the FIRST pred-zone patch, spread across its
-    PATCH_SIZE steps, then renormalized through the channel's log1p z-transform)
-    and re-forecast. Reports, over the probed samples:
-
-    * ``cf_carb_dbg`` / ``cf_insulin_dbg`` — mean over samples of the
-      mean-over-horizon ΔBG (mg/dL) from a ``+CF_CARB_BOLUS_G`` carb /
-      ``+CF_INSULIN_BOLUS_U`` insulin bolus vs baseline. Carbs should raise BG
-      (>0); insulin should lower it (<0).
-    * ``cf_carb_dir`` / ``cf_insulin_dir`` — fraction of samples with the
-      clinically-correct sign (carb mean ΔBG > 0; insulin mean ΔBG < 0). Target ~1.
-    * ``cf_carb_monotonic`` / ``cf_insulin_monotonic`` — fraction of samples for
-      which the horizon-peak (carb: max BG, non-decreasing) / horizon-min
-      (insulin: min BG, non-increasing) moves monotonically across bolus levels
-      ``[0, B/2, B]``.
-    * ``cf_hypo_rescue`` — among samples whose baseline MIN predicted BG dips below
-      ``hypo_threshold``, the fraction where ``+CF_CARB_BOLUS_G`` carb lifts the min
-      predicted BG to ``>= hypo_threshold``. ``cf_hypo_n`` counts those samples.
-    * ``cf_hyper_rescue`` — among samples whose baseline MAX predicted BG exceeds
-      ``hyper_threshold``, the fraction where ``+CF_INSULIN_BOLUS_U`` insulin lowers
-      the max predicted BG to ``<= hyper_threshold``. ``cf_hyper_n`` counts those.
-
-    All forecasts go through ``inference.predict`` (the SOLE risk->mg/dL bridge);
-    the whole announced plan rides on the ``overrides`` dict (output-channel space
-    {0: carb, 1: insulin, 2: exercise}) — exercise is held at its TRUE announced
-    curve in every arm, so a carb or insulin ΔBG is not contaminated by a session
-    the probe silently dropped. Runs under ``model.eval()`` + ``torch.no_grad()``.
-
-    ``samples`` optionally supplies the already-materialized ``val_dataset[i]``
-    dicts (index-ordered) from the main validation loop; when given they are
-    reused verbatim (samples are deterministic in ``i``) instead of re-indexing
-    the dataset — which would re-run the simulator. ``None`` falls back to
-    per-index ``val_dataset[i]``.
-
-    Returns:
-        dict with the ``cf_*`` keys above plus ``cf_n`` (samples probed).
-    """
-    from inference import predict
-
-    _ps = PREDICTION_PATCHES * PATCH_SIZE
-    carb_m = float(norm_stats['carb_intake']['mean'])
-    carb_s = float(norm_stats['carb_intake']['std'])
-    ins_m = float(norm_stats['insulin_combined']['mean'])
-    ins_s = float(norm_stats['insulin_combined']['std'])
-    carb_B = float(CF_CARB_BOLUS_G)
-    ins_B = float(CF_INSULIN_BOLUS_U)
-
-    def _renorm(raw: np.ndarray, m: float, s: float) -> torch.Tensor:
-        """Raw per-step (P*S,) → normalized (P, S) torch tensor via log1p z."""
-        norm = (np.log1p(np.maximum(raw, 0.0)) - m) / (s + 1e-8)
-        return torch.from_numpy(
-            norm.reshape(PREDICTION_PATCHES, PATCH_SIZE).astype(np.float32))
-
-    def _perturb_raw(raw: np.ndarray, bolus: float) -> np.ndarray:
-        """Add ``bolus`` to the first pred-zone patch, spread across its steps."""
-        out = raw.copy()
-        out[:PATCH_SIZE] = out[:PATCH_SIZE] + bolus / float(PATCH_SIZE)
-        return out
-
-    def _forecast(carb_t: torch.Tensor, ins_t: torch.Tensor,
-                  ex_t: torch.Tensor) -> np.ndarray:
-        overrides = {0: carb_t, 1: ins_t, 2: ex_t}
-        assert tuple(sorted(overrides)) == _ANNOUNCE_CHANNELS, (
-            f"announced set {tuple(sorted(overrides))} != CHANNEL_TO_FEAT "
-            f"{_ANNOUNCE_CHANNELS}"
-        )
-        res = predict(model, context, normalization_stats=norm_stats,
-                      device=device, overrides=overrides)
-        return res['median_bg'].detach().cpu().numpy()      # (P*S,) mg/dL
-
-    n_val = min(len(val_dataset), VALIDATION_N_PATIENTS)
-    if samples is not None:
-        n_val = min(n_val, len(samples))
-
-    carb_dbg_sum = 0.0
-    carb_dir_hits = 0
-    ins_dbg_sum = 0.0
-    ins_dir_hits = 0
-    carb_mono_hits = 0
-    ins_mono_hits = 0
-    hypo_n = 0
-    hypo_rescue_hits = 0
-    hyper_n = 0
-    hyper_rescue_hits = 0
-    n_probed = 0
-
-    was_training = model.training
-    model.eval()
-    with torch.no_grad():
-        for i in range(n_val):
-            sample = samples[i] if samples is not None else val_dataset[i]
-            n_ctx = int(sample['n_context_patches'])
-            bf = sample['bg_formula_data']
-            # Baseline and perturbed arms share this context, so a masked patch
-            # inside it would move both by the same fabricated reading and the
-            # ΔBG would still look clean. ``cf_n`` counts what was probed.
-            #
-            # No length floor here, unlike the two rolling sites: what this probe
-            # reports is a DIFFERENCE between two arms over one shared context,
-            # so a short run shifts both arms together and the sign, the
-            # monotonicity and the rescue rate survive it. A single forward, too
-            # — nothing is re-fed, so a short run does not compound.
-            context = _reconstruct_context_from_patch(
-                _observed_patches(sample, norm_stats), n_ctx,
-                np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool),
-                min_patches=1)
-            if context is None:
-                continue
-
-            keys = ('extended_carb_norm', 'extended_insulin_norm',
-                    'extended_exercise_norm', 'extended_carb_raw',
-                    'extended_insulin_raw', 'extended_exercise_raw')
-            if not all(k in bf for k in keys):
-                continue
-
-            carb_norm = np.asarray(bf['extended_carb_norm'], dtype=np.float32)[:_ps]
-            ins_norm = np.asarray(bf['extended_insulin_norm'], dtype=np.float32)[:_ps]
-            ex_norm = np.asarray(bf['extended_exercise_norm'], dtype=np.float32)[:_ps]
-            carb_raw = np.asarray(bf['extended_carb_raw'], dtype=np.float32)[:_ps]
-            ins_raw = np.asarray(bf['extended_insulin_raw'], dtype=np.float32)[:_ps]
-            if (carb_norm.shape[0] < _ps or ins_norm.shape[0] < _ps
-                    or ex_norm.shape[0] < _ps):
-                continue
-
-            carb_true_t = torch.from_numpy(
-                carb_norm.reshape(PREDICTION_PATCHES, PATCH_SIZE))
-            ins_true_t = torch.from_numpy(
-                ins_norm.reshape(PREDICTION_PATCHES, PATCH_SIZE))
-            # Exercise is never perturbed: it is the patient's announced plan, held
-            # at truth in every arm so the probed ΔBG is the dose's alone.
-            ex_true_t = torch.from_numpy(
-                ex_norm.reshape(PREDICTION_PATCHES, PATCH_SIZE))
-
-            baseline = _forecast(carb_true_t, ins_true_t, ex_true_t)     # (P*S,)
-
-            # +full carb bolus, insulin at truth.
-            carb_full = _renorm(_perturb_raw(carb_raw, carb_B), carb_m, carb_s)
-            carb_pert = _forecast(carb_full, ins_true_t, ex_true_t)
-            carb_dbg = float(np.mean(carb_pert - baseline))
-            carb_dbg_sum += carb_dbg
-            carb_dir_hits += int(carb_dbg > 0.0)
-
-            # +full insulin bolus, carb at truth.
-            ins_full = _renorm(_perturb_raw(ins_raw, ins_B), ins_m, ins_s)
-            ins_pert = _forecast(carb_true_t, ins_full, ex_true_t)
-            ins_dbg = float(np.mean(ins_pert - baseline))
-            ins_dbg_sum += ins_dbg
-            ins_dir_hits += int(ins_dbg < 0.0)
-
-            # Monotonicity across [0, B/2, B].
-            carb_half = _renorm(_perturb_raw(carb_raw, carb_B / 2.0), carb_m, carb_s)
-            carb_peaks = [
-                float(baseline.max()),
-                float(_forecast(carb_half, ins_true_t, ex_true_t).max()),
-                float(carb_pert.max()),
-            ]
-            carb_mono_hits += int(
-                carb_peaks[1] >= carb_peaks[0] - 1e-6
-                and carb_peaks[2] >= carb_peaks[1] - 1e-6)
-
-            ins_half = _renorm(_perturb_raw(ins_raw, ins_B / 2.0), ins_m, ins_s)
-            ins_mins = [
-                float(baseline.min()),
-                float(_forecast(carb_true_t, ins_half, ex_true_t).min()),
-                float(ins_pert.min()),
-            ]
-            ins_mono_hits += int(
-                ins_mins[1] <= ins_mins[0] + 1e-6
-                and ins_mins[2] <= ins_mins[1] + 1e-6)
-
-            # Hypo rescue: baseline-hypo samples lifted out by +carb.
-            if float(baseline.min()) < hypo_threshold:
-                hypo_n += 1
-                hypo_rescue_hits += int(float(carb_pert.min()) >= hypo_threshold)
-
-            # Hyper rescue: baseline-hyper samples brought down by +insulin.
-            if float(baseline.max()) > hyper_threshold:
-                hyper_n += 1
-                hyper_rescue_hits += int(float(ins_pert.max()) <= hyper_threshold)
-
-            n_probed += 1
-
-    model.train(was_training)
-
-    nz = max(n_probed, 1)
-    return {
-        'cf_carb_dbg': carb_dbg_sum / nz if n_probed else None,
-        'cf_carb_dir': carb_dir_hits / nz if n_probed else None,
-        'cf_insulin_dbg': ins_dbg_sum / nz if n_probed else None,
-        'cf_insulin_dir': ins_dir_hits / nz if n_probed else None,
-        'cf_carb_monotonic': carb_mono_hits / nz if n_probed else None,
-        'cf_insulin_monotonic': ins_mono_hits / nz if n_probed else None,
-        'cf_hypo_rescue': (hypo_rescue_hits / hypo_n) if hypo_n > 0 else None,
-        'cf_hyper_rescue': (hyper_rescue_hits / hyper_n) if hyper_n > 0 else None,
-        'cf_n': n_probed,
-        'cf_hypo_n': hypo_n,
-        'cf_hyper_n': hyper_n,
-    }
 
 
 _CONF_MEDIAN_IDX = QUANTILE_LEVELS.index(0.5)
@@ -2273,6 +2031,7 @@ def _forecast_protocol(
     mask_idx: torch.Tensor,
     valid: torch.Tensor,
     n_context_patches: torch.Tensor,
+    blind_fill: dict[int, float],
 ) -> "dict[str, torch.Tensor] | None":
     """The FORECAST protocol, rebuilt from a collated batch.
 
@@ -2303,6 +2062,8 @@ def _forecast_protocol(
         mask_idx: ``(B, M)`` int64 masked-patch index per slot, PADDED axis.
         valid: ``(B, M)`` bool, False on padded slots.
         n_context_patches: ``(B,)`` long, each row's ``n_ctx``.
+        blind_fill: ``data.zero_dose_fill``'s ``{feat: z}``, applied to every
+            masked patch of the built window.
 
     Returns:
         ``{rows, patches, attn_mask, mask_idx}`` where ``rows`` are the kept
@@ -2333,6 +2094,11 @@ def _forecast_protocol(
 
     fc_masked = masked[rows].clone()
     fc_masked[:, T - P:] = True
+    # Blind the whole masked set, not just the zone this protocol adds: the
+    # sample's own masked patches already carry the fill, so the write is
+    # idempotent there and the invariant — no masked patch carries a dose — holds
+    # over the built window rather than over the part of it built here.
+    blind_masked_doses(fc_patches, fc_masked, blind_fill)
     lens = n_context_patches.to(device).reshape(-1) + P
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
               < (T - lens).unsqueeze(1))[rows]
@@ -2401,6 +2167,7 @@ def _infill_protocol(
     n_context_patches: torch.Tensor,
     norm_stats: dict,
     rng: "np.random.Generator",
+    blind_fill: dict[int, float],
 ) -> "dict[str, Any] | None":
     """The INFILL protocol, rebuilt from a collated batch.
 
@@ -2429,6 +2196,8 @@ def _infill_protocol(
         n_context_patches: ``(B,)`` long, each row's ``n_ctx``.
         norm_stats: the run's normalization statistics.
         rng: generator for the interior-span draw.
+        blind_fill: ``data.zero_dose_fill``'s ``{feat: z}``, applied to every
+            patch this protocol masks.
 
     Returns:
         ``{patches, attn_mask, mask_idx, anchor_bg, sets, bg_mgdl}`` where
@@ -2503,6 +2272,11 @@ def _infill_protocol(
     assert bool(((inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] > 0.5)
                  == withheld).all()), (
         "feat 4 does not reproduce the infill protocol's masked set")
+    # The doses go with the bg. This protocol replaces the training mask rather
+    # than keeping it, so the fill has to be written against ITS masked set —
+    # a patch this protocol reveals stays at whatever the sample left there, and
+    # a patch it masks is blinded whether or not the sampler had masked it.
+    blind_masked_doses(inf_patches, inf_masked, blind_fill)
 
     lens = n_context_patches.to(device).reshape(-1)[rows] + P
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
@@ -2901,10 +2675,6 @@ def _run_validation(
     conf_true_list: list[np.ndarray] = []
     conf_last_list: list[np.ndarray] = []
 
-    # Materialized (index-ordered) val samples, reused by the counterfactual probe
-    # instead of re-indexing the dataset (which would re-run the simulator).
-    val_samples_ordered: list[dict] = []
-
     # The INFILL protocol's accumulator (metrics.protocols) and the fixed
     # generator its interior spans are drawn from.
     from metrics.protocols import InfillScores
@@ -2929,11 +2699,15 @@ def _run_validation(
     tod_jump_vals: list[torch.Tensor] = []
     tod_xwin_vals: list[torch.Tensor] = []
 
+    # The blind fill, derived once from the run's own stats. Both protocols place
+    # their own masked sets, so both have to write it themselves — the dataset's
+    # blinding covers the sample's mask, not theirs.
+    blind_fill = zero_dose_fill(norm_stats)
+
     with torch.no_grad():
         for batch_start in range(0, n_val, VAL_BATCH_SIZE):
             batch_end = min(batch_start + VAL_BATCH_SIZE, n_val)
             samples = [val_dataset[i] for i in range(batch_start, batch_end)]
-            val_samples_ordered.extend(samples)
             batch = collate_fn(samples)
 
             patches = batch['patches'].to(device, non_blocking=True)
@@ -3016,7 +2790,8 @@ def _run_validation(
 
             # --- Forecast-protocol forward: the horizon-keyed clinical suite ---
             fc = _forecast_protocol(
-                patches, mask_idx, slot_valid, batch['n_context_patches'])
+                patches, mask_idx, slot_valid, batch['n_context_patches'],
+                blind_fill)
             if fc is None:
                 continue
             fc_rows = fc['rows']
@@ -3099,7 +2874,7 @@ def _run_validation(
             # and UNSCORED — that patch is the forecast protocol's business.
             infill = _infill_protocol(
                 patches, mask_idx, slot_valid, targets,
-                batch['n_context_patches'], norm_stats, infill_rng)
+                batch['n_context_patches'], norm_stats, infill_rng, blind_fill)
             if infill is not None:
                 q_inf, median_inf = model(
                     infill['patches'], infill['attn_mask'],
@@ -3449,14 +3224,6 @@ def _run_validation(
     for _k, _v in cg_ega.cg_ega_fractions(_night_cgega_counts).items():
         result[f'night_cgega_{_k}'] = _v
 
-    # Counterfactual dose-response probe (diagnostic; one pass over the same
-    # validation samples, conditioned on the announced plan).
-    result.update(_run_counterfactual_probe(
-        model, val_dataset, norm_stats, device,
-        hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
-        samples=val_samples_ordered,
-    ))
-
     return result
 
 
@@ -3539,7 +3306,7 @@ def _tau_tag(tau: float) -> str:
 
 
 def _train_log_columns() -> "list[tuple[str, int]]":
-    """``logs/training_log.csv`` columns as ``(name, decimals)``.
+    """``logs_blind/training_log.csv`` columns as ``(name, decimals)``.
 
     DILATE is now one call per span-length bucket, and it is not scale-free in
     ``H = L * PATCH_SIZE`` — the shape term grows with ``H`` while the normalised
@@ -3563,7 +3330,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
 
 
 def _val_log_columns() -> "list[tuple[str, int]]":
-    """``logs/validation_log.csv`` columns as ``(name, decimals)``.
+    """``logs_blind/validation_log.csv`` columns as ``(name, decimals)``.
 
     Three axes are in play and they are not interchangeable.
 
@@ -3640,11 +3407,8 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         # anti-oscillation witness the headline RMSE structurally masks. Pooled
         # over the horizon and over the last patch (where the zigzag concentrated).
         ('median_roughness', 6), ('median_roughness_far', 6),
-        # Counterfactual dose-response probe (diagnostic).
-        ('cf_carb_dbg', 4), ('cf_carb_dir', 4), ('cf_insulin_dbg', 4), ('cf_insulin_dir', 4),
-        ('cf_carb_monotonic', 4), ('cf_insulin_monotonic', 4),
-        ('cf_hypo_rescue', 4), ('cf_hyper_rescue', 4),
-        ('cf_n', 4), ('cf_hypo_n', 4), ('cf_hyper_n', 4),
+        # ``train.py``'s cf_* block is absent: the blind model reads no announced
+        # dose, so a dose perturbation is invisible to it by construction.
         # Time-of-day probe (point accuracy + clock reliability + no-jumping witness).
         ('tod_mae_h', 4), ('tod_acc_1h', 4), ('tod_acc_2h', 4), ('tod_acc_bin', 4), ('tod_conf', 4),
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),
@@ -3792,8 +3556,8 @@ def train(
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
+    os.makedirs('checkpoints_blind', exist_ok=True)
+    os.makedirs('logs_blind', exist_ok=True)
 
     train_start_time = time.time()
 
@@ -3862,19 +3626,21 @@ def train(
         patient_uniform_sample_prob=patient_uniform_sample_prob,
         simulator_warmup_hours=simulator_warmup_hours,
         cache_path=cache_path,
+        blind=True,
     )
     val_dataset = T1DMDataset(
         master_seed=master_seed + 10_000_000,
         total_steps=VALIDATION_N_PATIENTS,
         batch_size=1,
         normalization_stats=norm_stats,
-        # The model is always conditioned: the prediction-zone carbs, insulin and
-        # exercise are announced (the future plan rides on each sample's
-        # bg_formula_data and is fed through the inference override path).
+        # Nothing is announced: a masked patch withholds its carbs, insulin and
+        # exercise along with its bg, here as in training. Validation on
+        # announced windows would score a task this model was never given.
         patient_uniform_sample_prob=patient_uniform_sample_prob,
         simulator_warmup_hours=simulator_warmup_hours,
         cache_path=cache_path,
         cache_partition='val',
+        blind=True,
     )
     val_dataset_night_onset = T1DMDataset(
         master_seed=master_seed + 10_000_000,
@@ -3884,6 +3650,7 @@ def train(
         patient_uniform_sample_prob=patient_uniform_sample_prob,
         simulator_warmup_hours=simulator_warmup_hours, cache_path=cache_path,
         cache_partition='val',
+        blind=True,
     )
 
     sampler = _OffsetSampler(len(dataset), offset=start_step * batch_size)
@@ -3918,11 +3685,12 @@ def train(
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
         'mask_right_edge_quota': MASK_RIGHT_EDGE_QUOTA,
-        # What a masked patch withheld — bg alone here.  ``train_blind.py`` is the
-        # same run under the other policy and stamps 'blind'; a loader compares
-        # the two and reads an ABSENT key as this one, which is what every
-        # checkpoint written before the key existed was trained under.
-        'masked_channel_policy': masked_channel_policy(blind=False),
+        # What a masked patch withheld — bg AND the three dose channels here.  A
+        # blind checkpoint's weights are shaped by a supervision regime no
+        # parameter shape records, so a strict state-dict load accepts them
+        # anywhere; this stamp is what makes them un-confusable with a
+        # conditioned run's, and finetune/finetune.py refuses to mix the two.
+        'masked_channel_policy': masked_channel_policy(blind=True),
         'master_seed': master_seed, 'total_steps': total_steps, 'batch_size': batch_size,
         'num_workers': num_workers,
         'd_model': _CFG_D_MODEL, 'n_layers': _CFG_N_LAYERS, 'n_heads': _CFG_N_HEADS,
@@ -3943,14 +3711,14 @@ def train(
         'bg_hyper_threshold': bg_hyper_threshold,
         'cache_path': cache_path,
     }
-    with open('logs/resolved_config.json', 'w') as f:
+    with open('logs_blind/resolved_config.json', 'w') as f:
         json.dump(training_config, f, indent=2)
 
     # ------------------------------------------------------------------ #
     # Training log CSV — header and row from the one shared column spec.
     # ------------------------------------------------------------------ #
     _train_columns = _train_log_columns()
-    train_log_path = 'logs/training_log.csv'
+    train_log_path = 'logs_blind/training_log.csv'
     # A run always starts fresh, so always write a fresh header.
     train_log_exists = False
     train_log_file = open(train_log_path, 'a' if train_log_exists else 'w', newline='')
@@ -3962,7 +3730,7 @@ def train(
     # Validation log CSV — rewritten header (risk schema). A run always starts
     # fresh, so the header is always (re)written.
     # ------------------------------------------------------------------ #
-    val_log_path = 'logs/validation_log.csv'
+    val_log_path = 'logs_blind/validation_log.csv'
     _val_columns = _val_log_columns()
     # A run always starts fresh, so always write a fresh header.
     val_log_exists = False
@@ -4114,7 +3882,7 @@ def train(
             # as ``pred_start_hour + 0.5 * j`` it is off by
             # ``(mask_idx[j] - n_ctx - j) * 0.5`` h under the general masked set,
             # with every shape still matching — and the only witness is loss_tod
-            # in logs/training_log.csv, which nothing gates on. Padded slots are
+            # in logs_blind/training_log.csv, which nothing gates on. Padded slots are
             # dropped rather than trained against patch 0's clock.
             _tod_extra = loss_total.new_zeros(())
             _tod_loss_val = float('nan')    # per-slot CE (logged as loss_tod)
@@ -4368,17 +4136,6 @@ def train(
                 'conf_n': val_metrics.get('conf_n'),
                 'median_roughness': _r(val_metrics.get('median_roughness'), 6),
                 'median_roughness_far': _r(val_metrics.get('median_roughness_far'), 6),
-                'cf_carb_dbg': _r(val_metrics.get('cf_carb_dbg')),
-                'cf_carb_dir': _r(val_metrics.get('cf_carb_dir')),
-                'cf_insulin_dbg': _r(val_metrics.get('cf_insulin_dbg')),
-                'cf_insulin_dir': _r(val_metrics.get('cf_insulin_dir')),
-                'cf_carb_monotonic': _r(val_metrics.get('cf_carb_monotonic')),
-                'cf_insulin_monotonic': _r(val_metrics.get('cf_insulin_monotonic')),
-                'cf_hypo_rescue': _r(val_metrics.get('cf_hypo_rescue')),
-                'cf_hyper_rescue': _r(val_metrics.get('cf_hyper_rescue')),
-                'cf_n': val_metrics.get('cf_n'),
-                'cf_hypo_n': val_metrics.get('cf_hypo_n'),
-                'cf_hyper_n': val_metrics.get('cf_hyper_n'),
                 'tod_mae_h': _r(val_metrics.get('tod_mae_h')),
                 'tod_acc_1h': _r(val_metrics.get('tod_acc_1h')),
                 'tod_acc_2h': _r(val_metrics.get('tod_acc_2h')),
@@ -4409,13 +4166,13 @@ def train(
 
             # Protocol namespaces and d axes come from metrics.protocols, the same
             # source _val_log_columns builds the header from. Imported here rather
-            # than at module scope so train.py keeps importing without it.
+            # than at module scope so this file keeps importing without it.
             from metrics import protocols as _protocols
 
             # The families the CSV carried and this record did not: 24 per-horizon
             # excursion buckets, 12 nocturnal, 7 night-onset and 6 nocturnal RMSE.
             # A run's checkpoint was the only surviving copy of a validation once
-            # logs/ was overwritten, and every one of these was absent from it.
+            # logs_blind/ was overwritten, and every one of these was absent from it.
             _eh_rec = _excursion_bucket_horizons(PREDICTION_PATCHES)
             for h in _eh_rec:
                 for _k in ('hypo_recall', 'hypo_precision', 'hypo_n_steps',
@@ -4478,13 +4235,13 @@ def train(
                                       loss_history, training_config, norm_stats,
                                       master_seed, val_history, best_val_loss, best_val_step,
                                       loss_ema, ema=ema),
-                    'checkpoints/t1dmai_best.pt'
+                    'checkpoints_blind/t1dmai_best.pt'
                 )
                 print(f"  [Checkpoint] saved best model (val_loss={val_total:.4f})")
 
         # ---- Checkpointing ----
         if checkpoint_interval < 999999 and step % checkpoint_interval == 0 and step > 0:
-            path = f'checkpoints/t1dmai_step_{step}.pt'
+            path = f'checkpoints_blind/t1dmai_step_{step}.pt'
             torch.save(
                 _build_checkpoint(model, weighting, muon_opt, adam_opt, step,
                                   loss_history, training_config, norm_stats,
@@ -4495,7 +4252,7 @@ def train(
             print(f"  [Checkpoint] saved {path}")
 
             _write_training_summary(
-                log_dir='logs', step=step, total_steps=total_steps,
+                log_dir='logs_blind', step=step, total_steps=total_steps,
                 loss_history=loss_history, best_val_loss=best_val_loss,
                 best_val_step=best_val_step, training_config=training_config,
                 train_start_time=train_start_time, val_history=val_history, device=device,
@@ -4513,7 +4270,7 @@ def train(
 
     if _interrupted:
         interrupted_step = step - 1
-        path = f'checkpoints/t1dmai_interrupted_step_{interrupted_step}.pt'
+        path = f'checkpoints_blind/t1dmai_interrupted_step_{interrupted_step}.pt'
         torch.save(
             _build_checkpoint(model, weighting, muon_opt, adam_opt, interrupted_step,
                               loss_history, training_config, norm_stats,
@@ -4529,7 +4286,7 @@ def train(
         if checkpoint_interval < 999999 and final_step > 0:
             already_saved = final_step % checkpoint_interval == 0
             if not already_saved:
-                path = f'checkpoints/t1dmai_step_{final_step}.pt'
+                path = f'checkpoints_blind/t1dmai_step_{final_step}.pt'
                 torch.save(
                     _build_checkpoint(model, weighting, muon_opt, adam_opt, final_step,
                                       loss_history, training_config, norm_stats,
@@ -4540,7 +4297,7 @@ def train(
                 print(f"  [Checkpoint] saved final model → {path}")
 
     _write_training_summary(
-        log_dir='logs', step=step - 1, total_steps=total_steps,
+        log_dir='logs_blind', step=step - 1, total_steps=total_steps,
         loss_history=loss_history, best_val_loss=best_val_loss,
         best_val_step=best_val_step, training_config=training_config,
         train_start_time=train_start_time, val_history=val_history, device=device,
@@ -4568,7 +4325,7 @@ class HelpfulParser(argparse.ArgumentParser):
 
 if __name__ == '__main__':
     parser = HelpfulParser(
-        description='Train T1DMAI. Parameters are resolved in this order: '
+        description='Train T1DMAI with NO conditioning — a masked patch withholds its carbs, insulin and exercise as well as its bg. Writes to checkpoints_blind/ and logs_blind/. Parameters are resolved in this order: '
                     'CLI args > config.py.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -4683,10 +4440,13 @@ if __name__ == '__main__':
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
     rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))
     rows.append(('mask_right_edge_quota', str(MASK_RIGHT_EDGE_QUOTA), 'config.py'))
+    # The one thing that separates this run from train.py's, on the page the
+    # operator reads before launching it rather than in the checkpoint afterwards.
+    rows.append(('masked_channel_policy', masked_channel_policy(blind=True), 'train_blind.py'))
     key_w = max(len(k) for k, _, _ in rows)
     val_w = max(len(v) for _, v, _ in rows)
     body = [f"  {k:<{key_w}}  {v:<{val_w}}  [{s}]" for k, v, s in rows]
-    header = "  T1DMAI — Resolved training configuration"
+    header = "  T1DMAI (BLIND) — Resolved training configuration"
     cfg_line = "  Config: config.py"
     width = max(len(line) for line in (*body, header, cfg_line))
     print("=" * width)

@@ -72,6 +72,7 @@ from risk_loss import risk_total_loss, KendallGalWeighting
 from utils import ModelEMA, time_of_day_bin_ce, time_cross_window_consistency_loss
 from data import (
     collate_fn, BG_MASKED_FEAT, _anchor_step_for_span, _mask_slots,
+    masked_channel_policy,
 )
 from realdata import load_dataset
 from realdata.features import build_feature_stack, smoothed_cgm
@@ -356,6 +357,59 @@ def _sampler_guard(ckpt: dict[str, Any]) -> None:
         )
 
 
+# What a masked patch withholds in the windows THIS script builds: bg alone, with
+# the announced carb / insulin / exercise riding through it (``_mask_window``
+# touches ``NON_MASKABLE_FEATS`` only). ``train_blind.py`` pretrains the other
+# policy.
+LIVE_MASKED_CHANNEL_POLICY = masked_channel_policy(blind=False)
+
+
+def _stored_masked_channel_policy(tc: dict[str, Any]) -> str:
+    """The masked-channel policy a checkpoint was trained under.
+
+    An ABSENT key reads as ``announced`` unconditionally — not as "unknown", and
+    without the sampler-key precondition ``_stored_quota`` needs. The key was
+    introduced WITH the blind trainer, and a blind run always stamps it, so no
+    checkpoint that lacks it can be a blind one.
+    """
+    return str(tc.get('masked_channel_policy', masked_channel_policy(blind=False)))
+
+
+def _policy_guard(ckpt: dict[str, Any]) -> None:
+    """Raise ``SystemExit`` if the checkpoint's masked-channel policy is not this
+    script's.
+
+    Nothing else catches this. No parameter shape depends on the policy, so the
+    strict state-dict load accepts weights trained under either, and both
+    directions fine-tune to completion behind a plausible held-out curve:
+
+    * a BLIND checkpoint fine-tuned here would be handed announced doses on the
+      patches it must predict — a channel it was trained to read as constant
+      suddenly carrying signal, which the fine-tune would spend its budget
+      learning rather than adapting to the patient;
+    * a conditioned checkpoint fine-tuned blind would lose the conditioning its
+      weights were shaped around, and the held-out score would report the loss as
+      a property of the patient.
+    """
+    tc = ckpt.get('training_config', {}) or {}
+    stored = _stored_masked_channel_policy(tc)
+    if stored != LIVE_MASKED_CHANNEL_POLICY:
+        raise SystemExit(
+            "Masked-channel policy mismatch: the checkpoint was pretrained under a "
+            "different convention for what a masked patch withholds.\n"
+            f"  checkpoint: masked_channel_policy={stored!r}"
+            + ('' if 'masked_channel_policy' in tc else
+               ' (absent — every checkpoint predating the blind trainer)')
+            + f"\n  this script: masked_channel_policy={LIVE_MASKED_CHANNEL_POLICY!r}\n"
+            "'announced' withholds bg alone and lets the carb / insulin / exercise "
+            "plan ride through a masked patch; 'blind' withholds those three as "
+            "well, at data.zero_dose_fill's normalize(0). No parameter shape "
+            "records which, so the weights load either way and the fine-tune "
+            "reports a plausible number for the wrong regime.\n"
+            "Fine-tune a checkpoint pretrained under this script's policy."
+        )
+
+
 def load_checkpoint(
     path: str, device: torch.device,
 ) -> tuple[T1DMAI, dict[str, Any], dict[str, Any]]:
@@ -378,6 +432,7 @@ def load_checkpoint(
 
     _arch_guard(ckpt)
     _sampler_guard(ckpt)
+    _policy_guard(ckpt)
 
     model = T1DMAI().to(device)
     try:

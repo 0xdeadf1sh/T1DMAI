@@ -26,6 +26,12 @@ on a held-out slice of that cohort (coverage validity needs cal/test exchangeabi
 
 Usage:
     python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt [--n-cal 64]
+    python calibrate_conformal.py --checkpoint checkpoints_blind/t1dmai_best.pt --blind
+
+``--blind`` fits under the unconditioned policy ``train_blind.py`` trains, and the
+flag must agree with the checkpoint's own ``masked_channel_policy`` — a mismatch
+is refused, because the delta that would ship was fitted on a distribution the
+model does not run in.
 """
 from __future__ import annotations
 
@@ -44,6 +50,7 @@ import config
 import conformal
 import mondrian
 from model import T1DMAI
+from data import blind_masked_doses, masked_channel_policy, zero_dose_fill
 from inference import predict
 from normalization import load_normalization_stats
 
@@ -86,7 +93,67 @@ assert ANNOUNCE == tuple(config.CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(config.CHANNEL_TO_FEAT)}")
 
 
-def _collect(model, seeds, stats, device, infill: bool = True) -> dict:
+def _check_policy(ckpt: dict, blind: bool) -> str:
+    """The checkpoint's masked-channel policy, or ``SystemExit`` if it is not
+    the one this fit would run.
+
+    A conformal delta is valid only under cal/test exchangeability with the
+    distribution the model runs in, and the two policies ARE different
+    distributions — one announces the future plan, the other withholds it. The
+    delta lands in ``ckpt['conformal_delta']``, which is the band that ships, so
+    a fit under the wrong policy is not a bad number on a page: it is a wrong
+    interval on the phone.
+
+    An absent key reads as announced. The key was introduced with the blind
+    trainer, which always stamps it, so nothing that lacks it is blind.
+
+    Args:
+        ckpt: the loaded checkpoint dict.
+        blind: whether ``--blind`` was passed.
+
+    Returns:
+        The checkpoint's policy string, when it matches.
+    """
+    stored = str((ckpt.get('training_config') or {}).get(
+        'masked_channel_policy', masked_channel_policy(blind=False)))
+    wanted = masked_channel_policy(blind=blind)
+    if stored != wanted:
+        raise SystemExit(
+            f"masked_channel_policy mismatch: the checkpoint was trained "
+            f"{stored!r} and this fit would run {wanted!r}. The delta lands in "
+            "ckpt['conformal_delta'] and every inference call handed it applies "
+            "it, so a band fitted on the other regime would ship. "
+            + ('Drop --blind.' if blind else 'Pass --blind.')
+        )
+    return stored
+
+
+def _blind_context(ctx, fill: dict[int, float]):
+    """A copy of ``ctx`` with the infill span's dose channels withheld.
+
+    The interior span this script masks sits INSIDE the context, so its doses
+    arrive through ``context_window`` rather than through an override, and
+    ``inference._build_patches_tensor`` withholds only bg there — the announced
+    policy. Under the blind policy they go with the bg, and this is where.
+
+    Args:
+        ctx: ``(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)`` context patches.
+        fill: ``data.zero_dose_fill``'s ``{feat: z}``.
+
+    Returns:
+        A new tensor of the same shape; ``ctx`` is not modified.
+    """
+    import torch
+    n_ctx = ctx.shape[0]
+    flat = ctx.reshape(n_ctx, config.PATCH_SIZE * config.N_INPUT_FEATURES).clone()
+    masked = torch.zeros(n_ctx, dtype=torch.bool)
+    masked[INFILL_START_PATCH:INFILL_START_PATCH + INFILL_SPAN_LEN] = True
+    blind_masked_doses(flat, masked, fill)
+    return flat.reshape(n_ctx, config.PATCH_SIZE, config.N_INPUT_FEATURES)
+
+
+def _collect(model, seeds, stats, device, infill: bool = True,
+             blind: bool = False) -> dict:
     """Run the model over fresh sim patients under both protocols.
 
     Returns a dict of stacked arrays:
@@ -99,6 +166,13 @@ def _collect(model, seeds, stats, device, infill: bool = True) -> dict:
     The infill pass masks the interior span AND the forecast zone in one forward
     (the future zone carries no observed BG, so it is never left visible), then
     keeps the interior rows only: ``mask_idx < MAX_CONTEXT_PATCHES``.
+
+    ``blind`` calibrates under the unconditioned policy ``train_blind.py`` trains:
+    nothing is announced in the future zone (which leaves it at the same
+    ``normalize(0)`` the blind fill is), and the interior span's doses are
+    withheld with its bg. Split conformal is only valid on the distribution the
+    model runs under, so this has to match the checkpoint — ``main`` refuses a
+    mismatch rather than fitting a band on the wrong regime.
     """
     import sim_data as S
     from sim_data import build_sim_feature_stack, _smooth_sim_bg, _future_overrides
@@ -108,6 +182,7 @@ def _collect(model, seeds, stats, device, infill: bool = True) -> dict:
     spans = [(INFILL_START_PATCH, INFILL_SPAN_LEN), (n_ctx, config.PREDICTION_PATCHES)]
     # Window-relative first step of the infill span; the context block ends at ps.
     infill_step0 = -CTX_STEPS + INFILL_START_PATCH * config.PATCH_SIZE
+    fill = zero_dose_fill(stats) if blind else None
     Q, T, J, E, P = [], [], [], [], []
     IQ, IT, IP = [], [], []
     for pid, d in S.make_sim_runs(seeds, 96.0):
@@ -120,7 +195,9 @@ def _collect(model, seeds, stats, device, infill: bool = True) -> dict:
             if len(tr) < H:
                 continue
             ctx = context_window(feats, ps, n_ctx)
-            ov = _future_overrides(feats, ps, ANNOUNCE)
+            # Blind: announce nothing, so every future dose slot stays at the
+            # zero-RAW baseline the blind fill IS.
+            ov = None if blind else _future_overrides(feats, ps, ANNOUNCE)
             out = predict(model, ctx, normalization_stats=stats, device=device,
                           overrides=ov)
             Q.append(out['bands'].detach().cpu().numpy().reshape(H, config.N_QUANTILES))
@@ -129,7 +206,8 @@ def _collect(model, seeds, stats, device, infill: bool = True) -> dict:
             E.append(tr.max() - tr.min() > 25)
             P.append(pid)
             if infill:
-                iout = predict(model, ctx, normalization_stats=stats, device=device,
+                ictx = _blind_context(ctx, fill) if fill is not None else ctx
+                iout = predict(model, ictx, normalization_stats=stats, device=device,
                                overrides=ov, mask_spans=spans)
                 midx = iout['mask_idx'].detach().cpu().numpy()
                 keep = np.flatnonzero(midx < n_ctx)
@@ -179,6 +257,11 @@ def main() -> None:
     ap.add_argument('--no-infill', action='store_true',
                     help='skip the infill protocol (halves the forward passes); the '
                          'shipped forecast delta is unaffected either way')
+    ap.add_argument('--blind', action='store_true',
+                    help="fit under the unconditioned policy train_blind.py trains: "
+                         "nothing announced in the future zone, and the infill span's "
+                         "doses withheld with its bg. Must match the checkpoint's "
+                         "masked_channel_policy — a mismatch is refused")
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -190,13 +273,15 @@ def main() -> None:
     model.eval()
     stats = ckpt.get('normalization_stats') or load_normalization_stats()
 
+    print(f"masked_channel_policy: {_check_policy(ckpt, args.blind)}")
+
     ms = config.MASTER_SEED
     cal_seeds = tuple(ms + config.CALIBRATION_RESERVE_SEED_OFFSET + i for i in range(args.n_cal))
     test_seeds = tuple(range(8000, 8012))   # disjoint test band (the sim eval seeds)
     print(f"fitting conformal on {args.n_cal} reserved patients; evaluating on {len(test_seeds)} test patients…")
     do_infill = not args.no_infill
-    cal = _collect(model, cal_seeds, stats, device, infill=do_infill)
-    test = _collect(model, test_seeds, stats, device, infill=do_infill)
+    cal = _collect(model, cal_seeds, stats, device, infill=do_infill, blind=args.blind)
+    test = _collect(model, test_seeds, stats, device, infill=do_infill, blind=args.blind)
 
     # ------------------------------------------------------------------ #
     # The FORECAST protocol — the only one that ships.

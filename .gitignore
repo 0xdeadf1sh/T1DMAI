@@ -35,6 +35,7 @@ htmlcov/
 *.pt
 *.pth
 checkpoints/
+checkpoints_blind/
 
 # --- Exported runtime artifacts (regenerable from a checkpoint; keep exporters/*.py) ---
 *.pte
@@ -79,6 +80,7 @@ metrics/*.json
 
 # --- Training outputs / logs / generated stats ---
 logs/
+logs_blind/
 *.log
 training_log.csv
 validation_log.csv
