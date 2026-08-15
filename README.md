@@ -242,14 +242,15 @@ Other details worth knowing:
 
 Validation runs every `VALIDATION_INTERVAL` steps. Every metric is appended to
 `logs/validation_log.csv`, which is the record. The table printed beside it is a
-reading surface at that cadence and carries a subset: per-horizon RMSE and MARD,
-band coverage with the width that bought it, the Clarke A+B zone, all five zones
-of the DTS error grid, CG-EGA by glycemic region, hypo and hyper detection off
-the band edges, time-in-range error, a counterfactual dose-response probe and the
-clock probe's error. The
-[proper scoring rules](#scoring-rules-and-protocols), the hypo alarm operating
-curve, the infill columns, excursion amplitude and the night-onset section are in
-the CSV and not on the page.
+reading surface at that cadence and carries a subset: per-horizon RMSE, MAE and
+MARD, band coverage with the width that bought it, median roughness, the
+amplitude and excursion-shape block, the in-training conformal probe, all five
+zones of both error grids (Clarke and DTS), CG-EGA by glycemic region, hypo and
+hyper detection off the band edges both pooled and per 30-minute bucket,
+time-in-range error, a counterfactual dose-response probe and the clock probe's
+error. The [proper scoring rules](#scoring-rules-and-protocols), the hypo alarm
+operating curve, the infill columns, the nocturnal duplicates and the night-onset
+section are in the CSV and not on the page.
 
 Each validation batch runs three forwards. The selection loss is read off the
 sample's own masked set, so the checkpoint is chosen on the validation value of

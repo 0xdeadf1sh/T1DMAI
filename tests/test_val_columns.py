@@ -69,15 +69,30 @@ CSV_ONLY = {
     'fa/day': 'alarm_hypo_fa_day@q25',
     'Infill Protocol': 'infill_rmse@d1',
     'infill crps': 'infill_crps@d1',
-    'conf cov90@peak': 'conf_cov90_raw',
-    'conf hypo-escape': 'conf_hypo_esc_raw',
-    'exc_undershoot_frac': 'exc_undershoot_frac',
-    'amplitude (trend_amp_ratio)': 'trend_amp_ratio',
-    'clarke_A @': 'evalfix_clarke_A@30',
     'pred_tir': 'pred_tir',
     'tod acc': 'tod_acc_1h',
     'night_hyper_recall': 'night_hyper_recall',
     'night-onset': 'night_onset_hypo_recall',
+}
+
+# Families that WERE trimmed and have since been RESTORED to the page, each pinned
+# to a label the table must now render.  Listed rather than simply deleted from
+# CSV_ONLY above: where the trim boundary sits is a decision, and a family
+# drifting back OFF the page unnoticed is the same defect as one drifting on.
+# Every entry here must also still be a declared column, so a restored row cannot
+# quietly stop being recorded either.
+RESTORED_TO_THE_TABLE = {
+    'conf cov90 raw': 'conf_cov90_raw',
+    'conf hypo-escape raw': 'conf_hypo_esc_raw',
+    'exc_undershoot_frac': 'exc_undershoot_frac',
+    'trend_amp_ratio': 'trend_amp_ratio',
+    'clarke_A @30m': 'evalfix_clarke_A@30',
+    'clarke_C': 'clarke_C_pct',
+    'cgega_BE @hypo': 'cgega_be_hypo',
+    'median_roughness': 'median_roughness',
+    'bg_mae  @30m': 'bg_mae_30',
+    'hypo_recall @30m': 'hypo_recall@30',
+    'hyper_precision @30m': 'hyper_precision@30',
 }
 
 # The conformal probe is the one CSV_ONLY family the fixture cannot produce:
@@ -317,3 +332,31 @@ def test_rows_dropped_from_the_table_are_still_recorded(val_metrics):
             f"move it out of CSV_ONLY rather than leaving the two disagreeing")
     print(f"[DUMP] csv-only families | {len(CSV_ONLY)} trimmed families carry a "
           f"value, are still declared as columns, and are absent from the page ✓")
+
+
+def test_families_restored_to_the_table_are_rendered_and_still_recorded(val_metrics):
+    """The other half of the trim boundary: what was put BACK is on the page.
+
+    ``CSV_ONLY`` above pins families to their absence. This pins the families that
+    were moved the other way — they must render AND still be declared columns, so
+    a restored row cannot quietly fall off the page again, and cannot stop being
+    recorded either. Without it, moving an entry out of ``CSV_ONLY`` would be
+    enough to satisfy every assertion in this file whether or not the row exists.
+    """
+    metrics = {**val_metrics, **SYNTHETIC_CONFORMAL}
+    table = train._strip_ansi(train._render_validation_table(1, metrics, None))
+    declared = {c for c, _ in train._val_log_columns()}
+    for label, column in RESTORED_TO_THE_TABLE.items():
+        assert column in declared, (
+            f"{label!r} is rendered but {column!r} is not a declared column — the "
+            f"page would be the only copy")
+        assert metrics.get(column) is not None, (
+            f"{column!r} has no value in the render input, so finding {label!r} "
+            f"on the page would not show the metric is measured")
+        assert label in table, (
+            f"{label!r} is not on the validation table; if it was trimmed again, "
+            f"move it back into CSV_ONLY rather than leaving the two disagreeing")
+    overlap = set(CSV_ONLY) & set(RESTORED_TO_THE_TABLE)
+    assert not overlap, f"a family is claimed both trimmed and restored: {overlap}"
+    print(f"[DUMP] restored families | {len(RESTORED_TO_THE_TABLE)} render on the "
+          f"page and are still declared columns ✓")

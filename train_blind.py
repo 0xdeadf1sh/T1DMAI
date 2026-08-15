@@ -891,6 +891,14 @@ def _render_validation_table(
     def _absent_cell() -> str:
         return _colored('—', _ANSI_GRAY)
 
+    def _pct(v: float | None) -> float | None:
+        """A [0, 1] fraction as a percentage, keeping None as None.
+
+        None is not 0 here: an unmeasured bin must render absent rather than as a
+        measurement of zero.
+        """
+        return None if v is None else v * 100.0
+
     def info_row(metric: str, val: float | None, fmt: str = '{:+.4f}',
                  unit: str = '', target: str = 'Minimize',
                  prev_key: str | None = None,
@@ -1017,13 +1025,21 @@ def _render_validation_table(
     # ============================================================
     # 2. Formula-Reconstructed BG (RMSE)
     # ============================================================
-    _section('BG Forecast (RMSE)')
+    _section('BG Forecast (RMSE / MAE)')
     bg_rmse_sota = {30: 15.0, 60: 25.0, 120: 36.0}
+    # MAE targets are the RMSE ones scaled by the ratio a roughly-Gaussian error
+    # gives (E|e| = sqrt(2/pi)·sigma ≈ 0.8·RMSE). They are a reading aid, not a
+    # published figure — the literature quotes RMSE — so a run that misses one
+    # while hitting its RMSE has a heavier tail, not a worse model.
     night_bg_rmse_sota = {180: 50.0, 360: 62.0, 480: 72.0}
     for h_min in (30, 60, 120):
         lower_row(f'bg_rmse @{h_min}m', val_metrics.get(f'bg_rmse_{h_min}'),
                   bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
                   prev_key=f'bg_rmse_{h_min}')
+    for h_min in (30, 60, 120):
+        lower_row(f'bg_mae  @{h_min}m', val_metrics.get(f'bg_mae_{h_min}'),
+                  0.8 * bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL',
+                  warn_mult=1.5, prev_key=f'bg_mae_{h_min}')
     _blank()
 
     # Rolled rows, and the only rows on the page whose context is not n_ctx: the
@@ -1176,24 +1192,103 @@ def _render_validation_table(
     higher_row('direction (roc_corr)', val_metrics.get('roc_corr'),
                0.650, fmt='{:+.3f}', warn_gap=0.20,
                prev_key='roc_corr')
-    # The amplitude / excursion-shape block (trend_amp_ratio, trend_gain_beta,
-    # bg_curve_corr, exc_*) and the in-training conformal probe (conf_*) are
-    # CSV-only. None is a selection metric, and conf_hypo_esc in particular reads
-    # as a calibration figure while being a WIDTH figure: sweeping one global
+    # Median roughness: the anti-oscillation witness the headline RMSE
+    # structurally masks. It used to print on its own line under the table.
+    lower_row('median_roughness', val_metrics.get('median_roughness'),
+              0.010, fmt='{:.6f}', warn_mult=2.0, prev_key='median_roughness')
+    lower_row('  ↳ far (last patch)', val_metrics.get('median_roughness_far'),
+              0.010, fmt='{:.6f}', warn_mult=2.0, prev_key='median_roughness_far')
+    _blank()
+
+    # ============================================================
+    # 4b. Amplitude & excursion shape
+    # ============================================================
+    # None of these is a selection metric; they are the mean-collapse detectors.
+    # A model that forecasts the mean scores well on RMSE and reports an
+    # amplitude ratio near zero, which is the one place that shows.
+    _section('Amplitude & Excursion Shape')
+    band_row('trend_amp_ratio', val_metrics.get('trend_amp_ratio'),
+             0.80, 1.20, fmt='{:.3f}', warn_pad=0.30, prev_key='trend_amp_ratio')
+    band_row('trend_gain_beta', val_metrics.get('trend_gain_beta'),
+             0.80, 1.20, fmt='{:.3f}', warn_pad=0.30, prev_key='trend_gain_beta')
+    higher_row('bg_curve_corr', val_metrics.get('bg_curve_corr'),
+               0.700, fmt='{:+.3f}', warn_gap=0.20, prev_key='bg_curve_corr')
+    _exc_n = val_metrics.get('exc_n')
+    band_row(f"exc_amp_ratio({int(_exc_n)}exc)" if _exc_n else 'exc_amp_ratio',
+             val_metrics.get('exc_amp_ratio'), 0.80, 1.20, fmt='{:.3f}',
+             warn_pad=0.30, prev_key='exc_amp_ratio')
+    band_row('exc_gain_beta', val_metrics.get('exc_gain_beta'),
+             0.80, 1.20, fmt='{:.3f}', warn_pad=0.30, prev_key='exc_gain_beta')
+    higher_row('exc_corr', val_metrics.get('exc_corr'),
+               0.700, fmt='{:+.3f}', warn_gap=0.20, prev_key='exc_corr')
+    # The two halves of the amplitude error, which the ratio alone cannot
+    # separate: a model that overshoots as often as it undershoots reports a
+    # ratio near 1.
+    _eo = val_metrics.get('exc_overshoot_frac')
+    info_row('exc_overshoot_frac', (_eo * 100.0) if _eo is not None else None,
+             fmt='{:.2f}', unit='%', target='≈ 50% against undershoot',
+             prev_key='exc_overshoot_frac', prev_scale=100.0, direction='none')
+    _eu = val_metrics.get('exc_undershoot_frac')
+    info_row('exc_undershoot_frac', (_eu * 100.0) if _eu is not None else None,
+             fmt='{:.2f}', unit='%', target='≈ 50% against overshoot',
+             prev_key='exc_undershoot_frac', prev_scale=100.0, direction='none')
+    _blank()
+
+    # ============================================================
+    # 4c. In-training conformal probe
+    # ============================================================
+    # Raw against region-binned split-conformal at excursion PEAKS, on a held-out
+    # 40% of the val windows. It used to print above the table; the marginal arm
+    # and the per-region bin table stay on stdout, since neither has a column.
+    #
+    # Read the coverage WITH its width. conf_hypo_esc in particular reads as a
+    # calibration figure while being a WIDTH figure: sweeping one global
     # half-width factor over a fixed model takes it 0.250 -> 0.079 as coverage
     # goes 0.888 -> 0.981, so it cannot be compared across two models whose bands
-    # differ in width, which is exactly what it was being used for.
+    # differ in width. The sample is ~100 windows — read it as directional.
+    _conf_n = val_metrics.get('conf_n')
+    _section(f"Conformal Probe @ excursion peaks"
+             f"{f' ({int(_conf_n)} windows)' if _conf_n else ''}")
+    cov_sharp_row('conf cov90 raw', _pct(val_metrics.get('conf_cov90_raw')),
+                  val_metrics.get('conf_width_raw'), 85.0, 95.0,
+                  prev_key='conf_cov90_raw', target='≈ 90% + width')
+    cov_sharp_row('conf cov90 binned', _pct(val_metrics.get('conf_cov90_cal')),
+                  val_metrics.get('conf_width_cal'), 85.0, 95.0,
+                  prev_key='conf_cov90_cal', target='≈ 90% + width')
+    band_row('conf hypo-escape raw', _pct(val_metrics.get('conf_hypo_esc_raw')),
+             5.0, 15.0, fmt='{:.2f}', unit='%', warn_pad=5.0,
+             prev_key='conf_hypo_esc_raw', prev_scale=100.0)
+    band_row('conf hypo-escape binned', _pct(val_metrics.get('conf_hypo_esc_cal')),
+             5.0, 15.0, fmt='{:.2f}', unit='%', warn_pad=5.0,
+             prev_key='conf_hypo_esc_cal', prev_scale=100.0)
     _blank()
 
     # ============================================================
     # 5. Clinical Error Grid Analysis (Clarke)
     # ============================================================
-    # Per-horizon clarke_A and clarke_D are CSV-only; A+B is the one that carries
-    # the grid's clinical claim in a single number.
+    # Every zone, then the A+B the literature quotes, then zone A per horizon.
+    # A+B alone hides which side of it moved: a run trading A for B holds A+B flat
+    # while its point accuracy decays, and D and E are the two that are dangerous
+    # rather than merely wrong.
     _section('Clinical Error Grid Analysis (Clarke)')
+    higher_row('clarke_A', val_metrics.get('clarke_A_pct'),
+               90.0, fmt='{:.2f}', unit='%', warn_gap=5.0, prev_key='clarke_A_pct')
+    info_row('clarke_B (benign)', val_metrics.get('clarke_B_pct'),
+             fmt='{:.2f}', unit='%', target='the A+B remainder',
+             prev_key='clarke_B_pct', direction='none')
+    lower_row('clarke_C', val_metrics.get('clarke_C_pct'),
+              1.0, fmt='{:.2f}', unit='%', warn_mult=2.0, prev_key='clarke_C_pct')
+    lower_row('clarke_D (dangerous)', val_metrics.get('clarke_D_pct'),
+              1.0, fmt='{:.2f}', unit='%', warn_mult=2.0, prev_key='clarke_D_pct')
+    lower_row('clarke_E (dangerous)', val_metrics.get('clarke_E_pct'),
+              0.1, fmt='{:.2f}', unit='%', warn_mult=2.0, prev_key='clarke_E_pct')
     higher_row('clarke_A+B', val_metrics.get('clarke_AB_pct'),
                98.0, fmt='{:.2f}', unit='%', warn_gap=2.0,
                prev_key='clarke_AB_pct')
+    for _h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
+        higher_row(f'  ↳ clarke_A @{_h}m', val_metrics.get(f'evalfix_clarke_A@{_h}'),
+                   90.0, fmt='{:.2f}', unit='%', warn_gap=5.0,
+                   prev_key=f'evalfix_clarke_A@{_h}')
     _blank()
 
     # ============================================================
@@ -1245,6 +1340,14 @@ def _render_validation_table(
                    (_ap * 100.0) if _ap is not None else None,
                    _ap_sota, fmt='{:.2f}', unit='%', warn_gap=10.0,
                    prev_key=f'cgega_ap_{_reg}', prev_scale=100.0)
+    # BE completes the region: AP + BE + EP is 1, so a rising BE against a flat AP
+    # is error moving into the harmless bucket rather than accuracy improving.
+    for _reg in ('hypo', 'eu', 'hyper'):
+        _be = val_metrics.get(f'cgega_be_{_reg}')
+        info_row(f'cgega_BE @{_reg}',
+                 (_be * 100.0) if _be is not None else None,
+                 fmt='{:.2f}', unit='%', target='benign remainder',
+                 prev_key=f'cgega_be_{_reg}', prev_scale=100.0, direction='none')
     for _reg, _ep_sota in (('hypo', 10.0), ('eu', 2.0), ('hyper', 5.0)):
         _ep = val_metrics.get(f'cgega_ep_{_reg}')
         lower_row(f'cgega_EP @{_reg}',
@@ -1286,6 +1389,34 @@ def _render_validation_table(
                (yp * 100.0) if yp is not None else None,
                85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
                prev_key='hyper_precision', prev_scale=100.0)
+
+    # Per-horizon, over the DISJOINT 30-min patch buckets. The pooled pair above
+    # mixes them, and detection is not horizon-flat: a model that calls the
+    # 30-minute hypo and misses the 120-minute one reads as one healthy number.
+    # Each row carries its own bucket count, because an empty bucket has no rate
+    # and must render absent rather than as a rate of zero.
+    for _h in _excursion_bucket_horizons(PREDICTION_PATCHES):
+        _hn = val_metrics.get(f'hypo_n_steps@{_h}')
+        higher_row(f'  ↳ hypo_recall @{_h}m'
+                   + (f'({int(_hn)}st)' if _hn else ''),
+                   _pct(val_metrics.get(f'hypo_recall@{_h}')),
+                   90.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hypo_recall@{_h}', prev_scale=100.0)
+        higher_row(f'  ↳ hypo_precision @{_h}m{_ptol_sfx}',
+                   _pct(val_metrics.get(f'hypo_precision@{_h}')),
+                   75.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hypo_precision@{_h}', prev_scale=100.0)
+    for _h in _excursion_bucket_horizons(PREDICTION_PATCHES):
+        _yn = val_metrics.get(f'hyper_n_steps@{_h}')
+        higher_row(f'  ↳ hyper_recall @{_h}m'
+                   + (f'({int(_yn)}st)' if _yn else ''),
+                   _pct(val_metrics.get(f'hyper_recall@{_h}')),
+                   85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hyper_recall@{_h}', prev_scale=100.0)
+        higher_row(f'  ↳ hyper_precision @{_h}m{_ptol_sfx}',
+                   _pct(val_metrics.get(f'hyper_precision@{_h}')),
+                   85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
+                   prev_key=f'hyper_precision@{_h}', prev_scale=100.0)
     _blank()
 
     # Nocturnal: two rows. The night RMSEs live in the rolled @180+ section, the
@@ -2065,17 +2196,18 @@ def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) 
     cov_marg, hypo_marg, wid_marg = _stats(bt_marg)
     cov_cal, hypo_cal, wid_cal = _stats(bt_cal)
 
-    # Coverage is never printed without its n, its distinct-patient count and the
-    # width it was bought with; the per-bin rows carry the excursion subset only,
-    # which is what the headline conf_* figures are measured on.
+    # The raw and binned arms are ROWS on the validation table now, with the width
+    # that bought each. What stays here is what has no column and so cannot be a
+    # row: the MARGINAL arm — the correction `conformal.py` alone would give, and
+    # the fallback for any bin under `mondrian.MIN_N_OWN_FIT` — and the per-bin
+    # table. Coverage is never printed without its n, its distinct-patient count
+    # and its width; the per-bin rows carry the excursion subset only, which is
+    # what the headline conf_* figures are measured on.
     print(f"[conformal] excursion-peak, n={len(idx)} windows ({len(idx)} patients), "
           f"region edges {meta['region_edges']} mg/dL on the forecast destination")
-    print(f"[conformal]   cov90 raw {100*cov_raw:5.1f}%  marginal {100*cov_marg:5.1f}%  "
-          f"binned {100*cov_cal:5.1f}%   (target 90.0%)")
-    print(f"[conformal]   width raw {wid_raw:6.1f}  marginal {wid_marg:6.1f}  "
-          f"binned {wid_cal:6.1f}  mg/dL")
-    print(f"[conformal]   hypo-esc raw {100*hypo_raw:5.1f}%  marginal {100*hypo_marg:5.1f}%  "
-          f"binned {100*hypo_cal:5.1f}%   (target 10.0%)")
+    print(f"[conformal]   MARGINAL arm (no column, table shows raw vs binned): "
+          f"cov90 {100*cov_marg:5.1f}%  width {wid_marg:6.1f} mg/dL  "
+          f"hypo-esc {100*hypo_marg:5.1f}%")
     for rec in meta['bins']:
         n_exc = int((test_bin[idx] == rec['bin']).sum())
         print(f"[conformal]   region {rec['label']:>12}  cal n={rec['n']:<5} "
@@ -3108,9 +3240,12 @@ def _run_validation(
         result[f'cgega_{_k}'] = _v
 
     clarke_total = max(agg.get('clarke_total', 0.0), 1.0)
+    # Every zone, from the counts already staged. A+B is kept beside them because
+    # it is the figure the Clarke literature quotes, not because A and B are
+    # interchangeable: B is a clinically benign error and A is no error at all.
+    for _z in ('A', 'B', 'C', 'D', 'E'):
+        result[f'clarke_{_z}_pct'] = 100.0 * agg.get(f'clarke_{_z}', 0.0) / clarke_total
     result['clarke_AB_pct'] = 100.0 * (agg.get('clarke_A', 0.0) + agg.get('clarke_B', 0.0)) / clarke_total
-    result['clarke_D_pct'] = 100.0 * agg.get('clarke_D', 0.0) / clarke_total
-    result['clarke_E_pct'] = 100.0 * agg.get('clarke_E', 0.0) / clarke_total
 
     # DTS zones, every one of them: the paper's position is that pZA alone is the
     # measure of clinical performance and that presenting A+B as acceptable is
@@ -3462,9 +3597,13 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('tbr_err', 4), ('tar_err', 4),
         ('hypo_recall', 4), ('hypo_precision', 4), ('hypo_n_steps', 4),
         ('hyper_recall', 4), ('hyper_precision', 4), ('hyper_n_steps', 4),
-        *[(f'cgega_{m}_{r}', 4) for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'ep')],
+        # All three CG-EGA verdicts per region, not just the two extremes: AP + BE
+        # + EP is 1 by construction, so logging AP and EP alone left the benign
+        # share derivable but never stated.
+        *[(f'cgega_{m}_{r}', 4) for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'be', 'ep')],
         *[(f'evalfix_clarke_A@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
-        ('clarke_AB_pct', 4), ('clarke_D_pct', 4), ('clarke_E_pct', 4),
+        *[(f'clarke_{z}_pct', 4) for z in ('A', 'B', 'C', 'D', 'E')],
+        ('clarke_AB_pct', 4),
         # DTS Error Grid: every zone, plus pZA per horizon. No A+B column — the
         # paper is explicit that presenting one is inappropriate.
         *[(f'dts_{z}_pct', 4) for z in dts_grid.ZONE_NAMES],
@@ -4140,14 +4279,8 @@ def train(
                 _csv_row(_val_columns, {**val_metrics, 'step': step}))
             val_log_file.flush()
 
-            def _f4(x: Any) -> str:
-                return f"{x:.4f}" if isinstance(x, (int, float)) else "n/a"
-
-            print(
-                f"  [Val | median roughness |Δ²| risk] "
-                f"all={_f4(val_metrics.get('median_roughness'))}  "
-                f"far(last patch)={_f4(val_metrics.get('median_roughness_far'))}"
-            )
+            # median_roughness / _far are rows in the validation table now, in the
+            # relative-error section, rather than a line printed under it.
 
             def _r(x: float | None, n: int = 4) -> float | None:
                 return round(x, n) if isinstance(x, (int, float)) else None
@@ -4189,10 +4322,10 @@ def train(
                 # exactly and the key was a second copy of a fact the record
                 # already carried.
                 **{f'cgega_{m}_{r}': _r(val_metrics.get(f'cgega_{m}_{r}'))
-                   for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'ep')},
+                   for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'be', 'ep')},
+                **{f'clarke_{_z}_pct': _r(val_metrics.get(f'clarke_{_z}_pct'))
+                   for _z in ('A', 'B', 'C', 'D', 'E')},
                 'clarke_AB_pct': _r(val_metrics.get('clarke_AB_pct')),
-                'clarke_D_pct': _r(val_metrics.get('clarke_D_pct')),
-                'clarke_E_pct': _r(val_metrics.get('clarke_E_pct')),
                 **{f'dts_{_z}_pct': _r(val_metrics.get(f'dts_{_z}_pct'))
                    for _z in dts_grid.ZONE_NAMES},
                 'roc_rmse': _r(val_metrics.get('roc_rmse'), 6),

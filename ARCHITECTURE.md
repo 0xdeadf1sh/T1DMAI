@@ -701,24 +701,25 @@ The module defines no pass/fail threshold on any of them, and
 | Section | What it carries |
 | --- | --- |
 | Training & internal losses | `val_loss_total` and `val_loss_Q`, the selection scalar and its pinball half |
-| BG forecast (RMSE) | Single-pass horizons, 30 / 60 / 120 min |
+| BG forecast (RMSE / MAE) | Single-pass horizons, 30 / 60 / 120 min, both error measures |
 | BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample |
 | Quantile calibration | Marginal 90 % band coverage and inner-50 % coverage with their widths, `sign_balance` at the far horizon, the one-sided against two-sided pair at `d = 1`, and joint coverage of the whole path |
-| Relative error & derivative tracking | MARD and the rate-of-change correlation |
-| Clinical error grid (Clarke) | Pooled zone A+B |
+| Relative error & derivative tracking | MARD per horizon, the rate-of-change correlation, and median roughness pooled and at the far patch |
+| Amplitude & excursion shape | The mean-collapse detectors: per-patch and per-excursion amplitude ratio, gain, correlation, and the overshoot/undershoot split |
+| Conformal probe @ excursion peaks | Raw against region-binned coverage, each with the width that bought it, and both hypo-escape rates |
+| Clinical error grid (Clarke) | All five zone shares, A+B, and zone A per horizon |
 | Clinical error grid (DTS) | All five pooled zone shares, uncoloured |
-| Clinical accuracy (CG-EGA) | Per-region accurate and erroneous fractions |
-| Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error |
+| Clinical accuracy (CG-EGA) | Per-region accurate, benign and erroneous fractions |
+| Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error, and the same detection per 30-minute bucket |
 | Nocturnal | The nocturnal hypo recall and precision pair |
-| Counterfactual dose-response | The two dose directions and insulin monotonicity |
+| Counterfactual dose-response | The two dose directions and insulin monotonicity (`train.py` only — the blind fork removes the probe) |
 | Time-of-day probe | Mean absolute clock error |
 
 `validation_log.csv` carries every metric on every row, this table included and
 the families it does not print besides: the proper scoring rules per `d`, the
-hypo alarm operating curve, the infill protocol's columns, the excursion
-amplitude block, the in-training conformal probe, per-horizon Clarke zones and
-per-horizon DTS zone A, the night-onset call and the clock probe's reliability
-rows.
+hypo alarm operating curve, the infill protocol's columns, per-horizon DTS zone
+A, the nocturnal duplicates of Clarke, MARD and CG-EGA, the night-onset call, the
+time-in-range internals, and the clock probe's reliability rows.
 
 The two point error grids are reported side by side and are not
 interchangeable. Clarke's zones describe the treatment error a wrong reading
@@ -732,10 +733,9 @@ measure.
 Level metrics all read `pred_bg = f_inv(median)`, asserted inside the physical
 range on entry. The exception is excursion detection, below.
 
-The CSV is wider than the table. The pooled rolled horizons, Clarke zone E and the
-DILATE shape/TDI split are computed and logged but not displayed; the two log-σ
-appear in the table and in the per-step training log rather than the validation
-CSV.
+The CSV is wider than the table. The pooled rolled horizons and the DILATE
+shape/TDI split are computed and logged but not displayed; the two log-σ appear in
+the per-step training log rather than the validation CSV.
 
 ### Band-edge detection
 
