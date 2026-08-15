@@ -226,6 +226,7 @@ from normalization import (
 from data import T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy
 from risk_loss import risk_total_loss, KendallGalWeighting
 import cg_ega
+import dts_grid
 
 # EMA smoothing factor for loss trend (higher = slower/smoother)
 LOSS_EMA_ALPHA = 0.98
@@ -520,14 +521,29 @@ def compute_learning_metrics(
     # for where it departs from the publication). Per-region AP/BE/EP counts,
     # accumulated across batches then finalized to fractions. true_bg FIRST: it is
     # the reference on every axis, including the rate-dependent mod widening.
+    _true_np = true_bg.detach().cpu().numpy()
+    _pred_np = pred_bg.detach().cpu().numpy()
     cg = cg_ega.cg_ega_counts(
-        true_bg.detach().cpu().numpy(),
-        pred_bg.detach().cpu().numpy(),
+        _true_np,
+        _pred_np,
         last_bg.detach().cpu().numpy(),
         freq_min=dt,
     )
     for _ck, _cv in cg.items():
         out[f'cgega_{_ck}'] = float(_cv)
+
+    # DTS Error Grid (Klonoff et al. 2024) — a SECOND point grid beside Clarke,
+    # not a replacement. The two disagree by construction: Clarke's zones are
+    # descriptions of the treatment error, DTS's are contours of an elicited risk
+    # function, and DTS penalises an overestimate harder than an underestimate
+    # where Clarke is symmetric in its A band. Reported per zone and never as
+    # A+B, which the paper calls inappropriate. true_bg FIRST — the reference
+    # axis, as in Clarke and CG-EGA above; ``dts_grid`` carries the units
+    # tripwire that catches a transposed or risk-space argument.
+    _dts_zones = dts_grid.dts_zones(_true_np, _pred_np)          # (B, P*S) 0..4
+    for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
+        out[f'dts_{_zn}'] = float((_dts_zones == _zi).sum())
+    out['dts_total'] = float(_dts_zones.size)
 
     # Clarke Error Grid (Clarke et al. 1987), reference = true_bg, pred = pred_bg.
     pb = pred_bg.clamp(min=1.0)
@@ -551,7 +567,10 @@ def compute_learning_metrics(
     _stage('clarke_E', zone_E.sum())
     out['clarke_total'] = float(in_A.numel())
 
-    # Per-horizon Clarke-A and MARD (read-only diagnostic).
+    # Per-horizon Clarke-A, DTS zone A and MARD (read-only diagnostics). The
+    # pooled zone shares mix every horizon, so they move when the horizon mixture
+    # moves; pZA at a stated horizon is what a published figure can be read
+    # against.
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         h_idx = (h_min // int(dt)) - 1
         if 0 <= h_idx < total_steps_h:
@@ -559,11 +578,15 @@ def compute_learning_metrics(
             out[f'evalfix_clarke_A@{h_min}_cnt'] = float(B)
             _stage(f'evalfix_mard@{h_min}_sum', abs_rel[:, h_idx].sum())
             out[f'evalfix_mard@{h_min}_cnt'] = float(B)
+            out[f'dts_a@{h_min}'] = float((_dts_zones[:, h_idx] == 0).sum())
+            out[f'dts_a@{h_min}_cnt'] = float(B)
         else:
             out[f'evalfix_clarke_A@{h_min}'] = 0.0
             out[f'evalfix_clarke_A@{h_min}_cnt'] = 0.0
             out[f'evalfix_mard@{h_min}_sum'] = 0.0
             out[f'evalfix_mard@{h_min}_cnt'] = 0.0
+            out[f'dts_a@{h_min}'] = 0.0
+            out[f'dts_a@{h_min}_cnt'] = 0.0
 
     # roc_corr / roc_rmse / trend_gain_beta / trend_amp_ratio on the per-PATCH
     # (30-min) ΔBG (mean-collapse detectors — more important now). Five-sum
@@ -1116,6 +1139,38 @@ def _render_validation_table(
     higher_row('clarke_A+B', val_metrics.get('clarke_AB_pct'),
                98.0, fmt='{:.2f}', unit='%', warn_gap=2.0,
                prev_key='clarke_AB_pct')
+    _blank()
+
+    # ============================================================
+    # 5a. Clinical Error Grid Analysis (DTS)
+    # ============================================================
+    # Klonoff et al. 2024 — a second point grid beside Clarke, kept whole rather
+    # than reduced to one row: the zones are contours of an elicited risk
+    # function, so the SHAPE of the distribution across them is the reading, and
+    # a run that starts moving mass from B into D says something no single
+    # summary of it does.
+    #
+    # UNCOLOURED, and that is deliberate. No acceptance threshold exists for this
+    # grid — no ISO or FDA criterion references it — so a tier here would be an
+    # invented pass mark on a clinical figure. The paper's one calibration anchor
+    # (pZA 90% ~ MARD 10%, from an empirical fit over 31 studies) rides in zone
+    # A's target column as the conversion it is.
+    #
+    # There is no A+B row: the paper states in terms that presenting zone A+B as
+    # if both were clinically acceptable is inappropriate, and that pZA alone is
+    # the measure of performance.
+    _section('Clinical Error Grid Analysis (DTS)')
+    _DTS_ROWS = (
+        ('a', 'pZA — no risk', 'pZA 90% ≈ MARD 10% (no threshold published)'),
+        ('b', 'zone B — mild risk', 'minimize'),
+        ('c', 'zone C — moderate risk', 'minimize'),
+        ('d', 'zone D — high risk', 'minimize'),
+        ('e', 'zone E — extreme risk', 'minimize'),
+    )
+    for _zn, _label, _target in _DTS_ROWS:
+        _zv = val_metrics.get(f'dts_{_zn}_pct')
+        info_row(_label, _zv, fmt='{:.2f}', unit='%', target=_target,
+                 prev_key=f'dts_{_zn}_pct', direction='none', show_absent=True)
     _blank()
 
     # ============================================================
@@ -3275,6 +3330,14 @@ def _run_validation(
     result['clarke_D_pct'] = 100.0 * agg.get('clarke_D', 0.0) / clarke_total
     result['clarke_E_pct'] = 100.0 * agg.get('clarke_E', 0.0) / clarke_total
 
+    # DTS zones, every one of them: the paper's position is that pZA alone is the
+    # measure of clinical performance and that presenting A+B as acceptable is
+    # not, so there is no dts_AB_pct to be read that way by habit.
+    _dts_fr = dts_grid.dts_zone_fractions(
+        {k: agg.get(f'dts_{k}', 0.0) for k in (*dts_grid.ZONE_NAMES, 'total')})
+    for _zn, _fr in _dts_fr.items():
+        result[f'dts_{_zn}_pct'] = None if _fr is None else 100.0 * _fr
+
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         c_cnt = agg.get(f'evalfix_clarke_A@{h_min}_cnt', 0.0)
         result[f'evalfix_clarke_A@{h_min}'] = (
@@ -3282,6 +3345,9 @@ def _run_validation(
         m_cnt = agg.get(f'evalfix_mard@{h_min}_cnt', 0.0)
         result[f'evalfix_mard@{h_min}'] = (
             100.0 * agg.get(f'evalfix_mard@{h_min}_sum', 0.0) / m_cnt if m_cnt > 0 else None)
+        d_cnt = agg.get(f'dts_a@{h_min}_cnt', 0.0)
+        result[f'dts_a@{h_min}'] = (
+            100.0 * agg.get(f'dts_a@{h_min}', 0.0) / d_cnt if d_cnt > 0 else None)
 
     # Marginal per-(h, τ) coverage of the 90% band.
     for h_min in COVERAGE_HORIZONS_MIN:
@@ -3625,6 +3691,10 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         *[(f'cgega_{m}_{r}', 4) for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'ep')],
         *[(f'evalfix_clarke_A@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
         ('clarke_AB_pct', 4), ('clarke_D_pct', 4), ('clarke_E_pct', 4),
+        # DTS Error Grid: every zone, plus pZA per horizon. No A+B column — the
+        # paper is explicit that presenting one is inappropriate.
+        *[(f'dts_{z}_pct', 4) for z in dts_grid.ZONE_NAMES],
+        *[(f'dts_a@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
         ('roc_rmse', 6), ('roc_corr', 4), ('trend_gain_beta', 4), ('trend_amp_ratio', 4),
         ('bg_curve_corr', 4),
         # Excursion-magnitude amplitude (NET peak deviation vs last_bg — the
@@ -4348,6 +4418,8 @@ def train(
                 'clarke_AB_pct': _r(val_metrics.get('clarke_AB_pct')),
                 'clarke_D_pct': _r(val_metrics.get('clarke_D_pct')),
                 'clarke_E_pct': _r(val_metrics.get('clarke_E_pct')),
+                **{f'dts_{_z}_pct': _r(val_metrics.get(f'dts_{_z}_pct'))
+                   for _z in dts_grid.ZONE_NAMES},
                 'roc_rmse': _r(val_metrics.get('roc_rmse'), 6),
                 'roc_corr': _r(val_metrics.get('roc_corr')),
                 'trend_gain_beta': _r(val_metrics.get('trend_gain_beta')),
@@ -4406,6 +4478,7 @@ def train(
                 val_record[f'bg_mae_{h}'] = _r(val_metrics.get(f'bg_mae_{h}'))
             for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
                 val_record[f'evalfix_clarke_A@{h}'] = _r(val_metrics.get(f'evalfix_clarke_A@{h}'))
+                val_record[f'dts_a@{h}'] = _r(val_metrics.get(f'dts_a@{h}'))
 
             # Protocol namespaces and d axes come from metrics.protocols, the same
             # source _val_log_columns builds the header from. Imported here rather

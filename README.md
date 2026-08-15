@@ -243,9 +243,10 @@ Other details worth knowing:
 Validation runs every `VALIDATION_INTERVAL` steps. Every metric is appended to
 `logs/validation_log.csv`, which is the record. The table printed beside it is a
 reading surface at that cadence and carries a subset: per-horizon RMSE and MARD,
-band coverage with the width that bought it, the Clarke A+B zone, CG-EGA by
-glycemic region, hypo and hyper detection off the band edges, time-in-range
-error, a counterfactual dose-response probe and the clock probe's error. The
+band coverage with the width that bought it, the Clarke A+B zone, all five zones
+of the DTS error grid, CG-EGA by glycemic region, hypo and hyper detection off
+the band edges, time-in-range error, a counterfactual dose-response probe and the
+clock probe's error. The
 [proper scoring rules](#scoring-rules-and-protocols), the hypo alarm operating
 curve, the infill columns, excursion amplitude and the night-onset section are in
 the CSV and not on the page.
@@ -729,6 +730,20 @@ alone.
   *Evaluating clinical accuracy of systems for self-monitoring of blood
   glucose.* Diabetes Care 10(5), 622–628 (1987). doi:10.2337/diacare.10.5.622 —
   the Clarke Error Grid.
+- Klonoff, D. C., Freckmann, G., Pleus, S., Kovatchev, B. P., Kerr, D., et al.
+  *The Diabetes Technology Society Error Grid and Trend Accuracy Matrix for
+  Glucose Monitors.* Journal of Diabetes Science and Technology 18(6),
+  1346–1361 (2024). doi:10.1177/19322968241275701 — the DTS Error Grid, whose
+  five zones are contours of the risk function fitted to the Surveillance Error
+  Grid. The grid is in the public domain. It is defined for glucose monitors,
+  where reference and monitor are simultaneous; scoring a forecast against the
+  truth at its horizon is the same substitution made here for Clarke, and is not
+  a use the source sanctions.
+- Sivananthan, S., Naumova, V., Dalla Man, C., Facchinetti, A., Renard, E.,
+  Cobelli, C., and Pereverzyev, S. V. *Assessment of blood glucose predictors:
+  the prediction-error grid analysis.* Diabetes Technology & Therapeutics 13(8),
+  787–796 (2011). doi:10.1089/dia.2011.0033 — PRED-EGA, the grid built for
+  predictors rather than monitors. Not implemented here.
 
 **Objective**
 

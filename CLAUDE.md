@@ -307,6 +307,7 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 - `risk_loss.py` — `risk_total_loss` (pinball + per-span DILATE + Kendall-Gal combine; f-target applied once)
 - `dilate.py` — vectorized batched soft-DTW (`SoftDTWBatch`); TDI is its directional derivative via a finite difference
 - `cg_ega.py` — vectorized CG-EGA (Kovatchev 2004) clinical-accuracy metric
+- `dts_grid.py` — the DTS Error Grid (Klonoff 2024): the closed-form risk function, its five zones, and the 50 mg/dL clamp that is a reading of the paper's prose rather than of its formula; reported beside Clarke and never as A+B
 - `conformal.py` — marginal split-conformal recalibration (`fit_quantile_conformal` / `apply_quantile_conformal` / `band_coverage`); median-fixed, monotone, zero-delta identity
 - `mondrian.py` — region-binned conformal: `forecast_destination`, `region_bin`, `fit_mondrian`, `fit_infill_conformal`, `apply_mondrian`, `bin_report`
 - `calibrate_conformal.py` — post-training fit of the shipped forecast `conformal_delta` (and the unshipped infill one) on the reserved partition

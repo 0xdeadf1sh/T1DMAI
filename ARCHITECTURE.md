@@ -706,6 +706,7 @@ The module defines no pass/fail threshold on any of them, and
 | Quantile calibration | Marginal 90 % band coverage and inner-50 % coverage with their widths, `sign_balance` at the far horizon, the one-sided against two-sided pair at `d = 1`, and joint coverage of the whole path |
 | Relative error & derivative tracking | MARD and the rate-of-change correlation |
 | Clinical error grid (Clarke) | Pooled zone A+B |
+| Clinical error grid (DTS) | All five pooled zone shares, uncoloured |
 | Clinical accuracy (CG-EGA) | Per-region accurate and erroneous fractions |
 | Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error |
 | Nocturnal | The nocturnal hypo recall and precision pair |
@@ -715,8 +716,18 @@ The module defines no pass/fail threshold on any of them, and
 `validation_log.csv` carries every metric on every row, this table included and
 the families it does not print besides: the proper scoring rules per `d`, the
 hypo alarm operating curve, the infill protocol's columns, the excursion
-amplitude block, the in-training conformal probe, per-horizon Clarke zones, the
-night-onset call and the clock probe's reliability rows.
+amplitude block, the in-training conformal probe, per-horizon Clarke zones and
+per-horizon DTS zone A, the night-onset call and the clock probe's reliability
+rows.
+
+The two point error grids are reported side by side and are not
+interchangeable. Clarke's zones describe the treatment error a wrong reading
+would cause; the DTS grid's are contours of a risk function elicited from 206
+clinicians, asymmetric between over- and under-estimation, so the two disagree by
+construction on the same pair. The DTS rows are uncoloured because no acceptance
+threshold is published for that grid, and no zone A+B figure is derived: its
+source states that presenting one is inappropriate and that zone A alone is the
+measure.
 
 Level metrics all read `pred_bg = f_inv(median)`, asserted inside the physical
 range on entry. The exception is excursion detection, below.
