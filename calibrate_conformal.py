@@ -167,7 +167,14 @@ def _peak_coverage(q, true, j, exc):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
-    ap.add_argument('--n-cal', type=int, default=64, help='reserved-partition patients to fit on')
+    ap.add_argument('--n-cal', type=int, default=512,
+                    help="reserved-partition patients to fit on. The fitted band's OWN "
+                         "coverage is a random variable in this: over 60 random splits, "
+                         "test coverage has sd 0.036 at 64 (p5-p95 0.838-0.946), 0.020 "
+                         "at 256, 0.015 at 512, 0.011 at 1024. At 64 the mondrian "
+                         "low-BG bin also draws ~14 windows, under its own "
+                         "min_n_own_fit of 39, and silently falls back to the marginal "
+                         "delta")
     ap.add_argument('--no-write', action='store_true', help='report only; do not modify the checkpoint')
     ap.add_argument('--no-infill', action='store_true',
                     help='skip the infill protocol (halves the forward passes); the '
