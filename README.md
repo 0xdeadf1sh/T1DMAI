@@ -91,7 +91,7 @@ reach the shared trunk, which pushes the same representations the glucose head
 reads to encode circadian phase.
 
 The model is patient-agnostic. There is no learned per-patient vector; identity
-is whatever the 8–24 hour context window implies.
+is whatever the 24–48 hour context window implies.
 
 Every dimension lives in `config.py`, and `resize_model.py` rewrites it. The
 capacities on the ladder run from 38 k to 17 M parameters on the same code.
@@ -116,11 +116,14 @@ Where the span sits is the whole difference between the three cases:
 They are three cases of one objective, not three modes.
 
 Training re-samples the spans per window: between one and `MASK_MAX_SPANS` of
-them, each of a length drawn from the arm's length set, placed uniformly over the
-window with at least one visible patch between neighbours and a cap on the total
-masked. Nothing biases placement toward the right edge, and there is no
-curriculum or annealing — `data.sample_mask_spans` is the sampler, and `--arm`
-selects the settings it draws from.
+them, each of a length drawn from `MASK_SPAN_LENGTHS`, placed over the window
+with at least one visible patch between neighbours and a cap on the total masked.
+Placement is uniform except for one thing: on `MASK_RIGHT_EDGE_QUOTA` of windows
+the last span is pinned flush against the final patch, so the forecast case is
+drawn deliberately rather than left to fall out of uniform placement at about 3 %
+of windows. The length law is the same in both branches. There is no curriculum
+and no annealing — `data.sample_mask_spans` is the sampler, and `config.py` holds
+its constants.
 
 The contract this implements — the masked set, the attention rule, the anchor,
 the decode — is specified once for the whole suite in
@@ -198,7 +201,7 @@ every consumer indexes the fan positionally. Inference inverts it to mg/dL.
 
 Batches are simulated on the fly, or drawn from a pre-generated cache. Each
 sample is a fresh random window: the context length is re-rolled per sample
-between 8 and 24 hours, the window may start at any patch-aligned position in the
+between 24 and 48 hours, the window may start at any patch-aligned position in the
 day, so day and night are learned by one model without a band restriction, and
 the masked spans are drawn per sample.
 
@@ -259,21 +262,16 @@ python train.py --master-seed 42 --total-steps 100000 --batch-size 512
 python train.py --cache-path simulator_cache --total-steps 100000
 ```
 
-### Sampler arms
+### The mask sampler
 
-`--arm` picks the mask sampler's settings: the span lengths it draws from, the
-number of head slots, and whether the loss is reweighted per `d`. The three move
-together, `arms.py` holds them and nothing else defines them, and the default is
-`a`. An unknown name raises before the run starts.
+`config.py` holds the sampler's constants: the span lengths it draws from
+(`MASK_SPAN_LENGTHS`), the head's slot count and cap on masked patches
+(`MAX_MASKED_PATCHES`), and the share of windows whose last span is pinned flush
+against the final patch (`MASK_RIGHT_EDGE_QUOTA`).
 
-```bash
-python arms.py                                 # the table, and what each arm is for
-python train.py --arm b --total-steps 100000
-```
-
-The arm is resolved once, at import, so it is fixed for a whole run. A checkpoint
-stamps both the name and the three values it bound, and fine-tuning refuses a
-checkpoint whose values are not the live ones.
+They are bound at import, so they are fixed for a whole run. Every checkpoint
+stamps them, and fine-tuning refuses a checkpoint whose sampler is not the live
+one — no parameter shape depends on the sampler, so nothing else would catch it.
 
 
 ## Fine-tuning on real CGM
@@ -368,7 +366,7 @@ suite-wide specification in
 [T1DMCOMMON](https://github.com/0xdeadf1sh/T1DMCOMMON), which is what a
 non-PyTorch runtime implements against.
 
-**Single pass.** Given 8–24 hours of context, forecast the next two hours as
+**Single pass.** Given 24–48 hours of context, forecast the next two hours as
 seven quantiles per 5-minute step. Upcoming carbohydrate, insulin and exercise
 can be announced to condition the forecast. `mask_spans` moves the masked
 patches elsewhere — a backcast or an infill — through the same call; the future

@@ -21,7 +21,7 @@ What follows is only what is true of **this repository**.
 | Risk transform and its guards, the attention masks, `assemble_quantiles`, the per-span median basis | `utils.py` |
 | Per-channel normalize / denormalize | `normalization.py` |
 | Single-window, rolling and what-if inference | `inference.py` |
-| Dimensions and released defaults | `config.py`, resolving the sampler arm from `arms.py` at import |
+| Dimensions and released defaults, including the mask-sampler constants | `config.py` |
 | The conformal fit and apply, and its region bins | `conformal.py`, `mondrian.py`, run by `calibrate_conformal.py` |
 | Physical BG bounds | `T1DMSIM/simulator.py`, through the symlinked checkout |
 

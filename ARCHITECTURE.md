@@ -91,13 +91,13 @@ back to the math kernel and materialises the full `T × T` matrix — and unless
 | `MIN_CONTEXT_PATCHES` | `--min-context-patches` | Shortest sampled context |
 | `MAX_CONTEXT_PATCHES` | `--max-context-patches` | Longest context, and the left-pad ceiling |
 
-Set by the sampler arm (see [The masked objective](#the-masked-objective)):
+The mask sampler (see [The masked objective](#the-masked-objective)):
 
 | Constant | Meaning |
 | --- | --- |
 | `MASK_SPAN_LENGTHS` | The pool each masked span's length is drawn from |
 | `MAX_MASKED_PATCHES` | `M` — the sampler's cap on masked patches per sample, and the head's fixed slot count |
-| `D_BALANCED_LOSS` | Whether the loss carries per-`d` weights |
+| `MASK_RIGHT_EDGE_QUOTA` | Share of windows whose last span is pinned flush against the final patch |
 
 Derived, not settable:
 
@@ -110,11 +110,11 @@ Derived, not settable:
 | `N_QUANTILES` | `len(QUANTILE_LEVELS)` — `SPEC/invariants.md` §6 fixes the levels and their ascending order for the whole suite |
 | `N_SPREADS` | 3 — spreads per side; the head emits `1 + 2·N_SPREADS` values per step |
 
-At the released defaults a patch is 30 minutes, the context runs 16–48 patches
-(8–24 h), and the forecast protocol's span is 4 patches (2 h). The 8-hour floor
-sits above every autocorrelation length `T1DMSIM/diff/README.md` §0.5 measures;
-the 24-hour ceiling covers one full basal cycle and leaves enough real context
-for the 8-hour nocturnal roll.
+At the released defaults a patch is 30 minutes, the context runs 48–96 patches
+(24–48 h), and the forecast protocol's span is 4 patches (2 h). The floor sits
+well above every autocorrelation length `T1DMSIM/diff/README.md` §0.5 measures,
+covers one full basal cycle, and leaves enough real context for the 8-hour
+nocturnal roll.
 
 
 ## The masked objective
@@ -126,14 +126,23 @@ draws its masked set:
 n_spans   ~ U{1 .. MASK_MAX_SPANS}
 each L_i  ~ U(MASK_SPAN_LENGTHS), independently
 sum(L) > MAX_MASKED_PATCHES  ⇒  resample the WHOLE length vector
-placement:  stars-and-bars over the n_spans + 1 gaps
+placement, with probability MASK_RIGHT_EDGE_QUOTA:
+            the LAST span flush against patch T-1, the rest over the prefix
+placement, otherwise:
+            stars-and-bars over the n_spans + 1 gaps
 ```
 
 The over-budget rejection redraws the whole length vector rather than one
 element: per-element redrawing yields a different length distribution, and so a
-different `d` histogram. Placement spreads the slack uniformly over the gaps and
-is rejected on nothing — there is no right-edge quota, no curriculum and no
-annealing. One **mandatory visible separator** sits between neighbouring spans,
+different `d` histogram. Placement is rejected on nothing, and there is no
+curriculum and no annealing. The right-edge quota is the one departure from
+uniform placement, and it changes only where the last span lands: both branches
+draw `n_spans` and the length vector identically, so the span-length histogram is
+quota-independent and only the `d` histogram moves. Under uniform placement alone
+a forecast — the case the model is deployed as — falls out as an accident of
+about 3 % of windows, and the band it emits there loses coverage over training
+while every selection scalar improves. One **mandatory visible separator** sits
+between neighbouring spans,
 so two masked spans never abut; the separator is what makes the anchor, the
 per-span median basis and the DILATE length bucket well defined per span.
 
@@ -145,25 +154,24 @@ loss and metric path discards it by the `(B, M)` `valid` flag.
 `d` — a masked patch's distance in patches to the nearest visible evidence on
 **either** side — is the difficulty axis every masked-BG metric bins on. It is
 never span length, which confounds one-sided and two-sided cases at equal
-difficulty, and never the arm. Under the forecast protocol slot `j` sits at
+difficulty. Under the forecast protocol slot `j` sits at
 `d = j + 1` one-sided, which is what makes the 30 / 60 / 90 / 120-minute columns
 `d = 1..4`.
 
-### Sampler arms
+### The sampler's `d` histogram
 
-`arms.py` carries three arms — `a`, `b`, `c` — each fixing `MASK_SPAN_LENGTHS`,
-`MAX_MASKED_PATCHES` and `D_BALANCED_LOSS`, with the evidence behind it and the
-denominators that evidence was measured on. `config.py` resolves one at **import**
-from `$T1DMAI_ARM`, defaulting to `a`, and republishes the name as
-`SAMPLER_ARM`; `data.py`, `risk_loss.py` and `metrics/protocols.py` bind the
-three values at their own import, so nothing rewritten on the config module
-afterwards reaches them. `train.py --arm X` works by writing the
-environment variable before `config` is imported. An unknown name raises before
-the run starts rather than falling back to the default. `python arms.py` prints
-the table `train.py --help` renders.
+`d_balance.d_distribution` enumerates both placement branches exactly, over the
+window-length mixture the sampler draws from. It is an enumeration rather than a
+measurement: at 10⁵ draws the per-position 1σ is several times the effect being
+measured, so a correct sampler misreports the histogram in every replicate.
+`metrics/protocols.py`'s `SAMPLER_REFERENCE` is produced from it and pinned to
+the knobs it was enumerated under, and `sampler_reference_applies()` refuses the
+comparison once one of those knobs moves.
 
-The three values ride in every checkpoint's `training_config` beside the arm
-name, since the name alone stops pinning them the moment the table is edited.
+The three sampler constants ride in every checkpoint's `training_config`, and a
+loader compares them against the live config before accepting the weights: no
+parameter shape depends on the sampler, so a strict state-dict load accepts
+weights trained under any of them.
 
 
 ## Inputs
@@ -480,12 +488,6 @@ The reduction is per masked patch. A padded slot is removed from the
 by `B·M·S·Q` and rescales `L_Q` against `L_D` by the padded fraction, a level
 `log_σ_Q` then absorbs while every loss curve looks unchanged.
 
-Under `D_BALANCED_LOSS` each masked patch additionally carries its per-`d` weight
-from `d_balance`, flattening `d = 1, 2, 3` and `d ≥ 4` to equal loss mass.
-Placement is untouched — this reweights the loss only — and it costs variance:
-`d_balance.effective_sample_size()` quantifies the cost at the active arm and
-belongs beside any result produced under it.
-
 ### DILATE
 
 Shape and time distortion on the median only, evaluated **once per masked span**.
@@ -610,8 +612,8 @@ then halves the optimizer state or restores from the EMA and continues.
 
 `t1dmai_best.pt` is written whenever `val_loss_total` reaches a new minimum.
 Periodic `t1dmai_step_{N}.pt` snapshots are independent of it. Each checkpoint
-carries its architecture in `training_config` — including the sampler arm and the
-three values it bound — plus the normalization statistics, the EMA shadow, the
+carries its architecture in `training_config` — including the three mask-sampler
+constants — plus the normalization statistics, the EMA shadow, the
 weighting module, and `arch_version` / `loss_schema` provenance tags. Clinical
 metrics stay read-only diagnostics; there is no separate clinically-selected
 checkpoint, because the risk-space loss geometry and the band-edge detectors
@@ -620,12 +622,18 @@ already carry the clinical bias structurally.
 
 ## Validation
 
-Runs every `VALIDATION_INTERVAL` steps on a fixed held-out patient pool, under
-EMA weights. Two artifacts: a row appended to `logs/validation_log.csv`, and a
-table printed to stdout with columns `Metric | Value | Prev | Target`, coloured
-against published thresholds with a trend arrow against the previous run. Rows
-whose value is unavailable are omitted, and a section that loses every row loses
-its header.
+Runs every `VALIDATION_INTERVAL` steps on a fixed held-out pool of
+`VALIDATION_N_PATIENTS` patients, under EMA weights. Two artifacts: a row
+appended to `logs/validation_log.csv`, and a table printed to stdout with columns
+`Metric | Value | Prev`, coloured against published thresholds with a trend arrow
+against the previous run. Rows whose value is unavailable are omitted, and a
+section that loses every row loses its header.
+
+The CSV is the record and the table is a reading surface: every metric reaches
+the CSV, while the table carries the families worth a glance at a 1000-step
+cadence — the calibration section above all, since `val_loss_total` is the
+objective on each sample's own mask and improves monotonically whether or not the
+deployed one-sided band holds its stated level.
 
 Because the model is always conditioned, there is one value per metric — no
 second unconditional pass, and no `uncond_*` columns.
@@ -763,7 +771,7 @@ what makes the always-on what-if path trustworthy. Diagnostic only.
 windows and measures excursion-peak coverage on the disjoint 40 %, reporting raw
 against calibrated with the mean band width that bought each. The fit is
 region-binned, and the marginal fit is measured on the same windows in the same
-call so the two arms are never compared across runs. The validation sample is
+call so the two fits are never compared across runs. The validation sample is
 small, so the figures are directional; the deployable correction is fit after
 training by `calibrate_conformal.py`.
 

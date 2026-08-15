@@ -5,7 +5,7 @@
 ```bash
 pip install -r requirements.txt         # torch, numpy, blosc2, matplotlib, pygame, pytest
 python normalization.py                 # must run once before training (or --from-cache DIR)
-python train.py                         # train; --arm {a,b,c} picks the mask sampler
+python train.py                         # train
 python -m pytest tests/ -v -s           # test (-s required: DUMP lines catch silent numerical bugs)
 ```
 
@@ -14,10 +14,10 @@ python -m pytest tests/ -v -s           # test (-s required: DUMP lines catch si
 restating them.
 
 **Config is a single plain file.** `config.py` is a plain file, not a symlink, and there is no
-JSON config tier. Every training value lives there — `BATCH_SIZE = 512`, `NUM_WORKERS = 20`, the
-Muon/AdamW LRs, `LR_MIN_RATIO`, `PATIENT_UNIFORM_SAMPLE_PROB = 0.0`, `PREDICTION_HORIZON_HOURS`.
-The exception is the three mask-sampler constants, which come from the active arm (see *Sampler
-arms*). Edit `config.py` directly, or `resize_model.py` for the architecture knobs.
+JSON config tier. Every training value lives there — `BATCH_SIZE = 512`, `NUM_WORKERS = 8`, the
+Muon/AdamW LRs, `LR_MIN_RATIO`, `PATIENT_UNIFORM_SAMPLE_PROB = 0.0`, `PREDICTION_HORIZON_HOURS`,
+and the mask-sampler constants. Edit `config.py` directly, or `resize_model.py` for the
+architecture knobs.
 
 The Kovatchev risk transform bakes the clinical hypo>hyper asymmetry into the loss geometry itself
 (equal risk-distance is a larger danger at low BG), so there is no focal or composite hypo-weighting
@@ -56,8 +56,13 @@ region of a training sample.
   each `L_i ~ U(MASK_SPAN_LENGTHS)` independently; `sum(L) > MAX_MASKED_PATCHES` resamples the
   **whole length vector**, never one element (per-element redrawing yields a different length
   distribution and so a different `d` histogram); placement is stars-and-bars over the `n_spans + 1`
-  gaps. Placement is uniform — **no right-edge quota, no curriculum, no annealing** — and there is
-  no rejection on placement.
+  gaps, **except** that with probability `MASK_RIGHT_EDGE_QUOTA` (0.35) the LAST span is pinned
+  flush against patch `T-1` and the rest composed over the prefix, which holds the same slack. That
+  is the one departure from uniform placement: `n_spans` and the length law are drawn identically in
+  both branches, so only the `d` histogram moves. There is no curriculum, no annealing and no
+  rejection on placement. At quota 0 the branch draw is short-circuited, so the rng stream is the
+  pre-quota one exactly. `d_balance.d_distribution` enumerates both branches, and
+  `metrics/protocols.py`'s `SAMPLER_REFERENCE` is produced from it.
 - **Two masked spans never abut.** One mandatory visible separator is charged up front. The
   separator is what makes the anchor, the per-span median basis and the DILATE length bucket well
   defined per span; two spans with nothing between them are one longer span, and `utils._span_layout`
@@ -73,7 +78,7 @@ region of a training sample.
   value. It reaches the model as `(B, M)` mg/dL — not one value broadcast across the window.
 - **`d` is the distance in patches to the nearest visible evidence on EITHER side**
   (`data._mask_slots`), and it is the only axis a masked-BG metric bins on — never span length,
-  which confounds one-sided and two-sided cases at equal difficulty, and never arm. `d` and the
+  which confounds one-sided and two-sided cases at equal difficulty. `d` and the
   anchor disagree by construction: the anchor ignores the near side, so a two-sided span's last slot
   can sit at `d = 1` while anchoring `L` patches to the left. `_mask_slots` states the exact
   fraction; do not re-derive it.
@@ -83,34 +88,10 @@ region of a training sample.
   `metrics/scoring.py` stamps every pooled figure with `POOLED_NOT_COMPARABLE`; `metrics/protocols.py`
   carries the enumerated percentages. Compare pooled against pooled only within one fixed protocol.
 
-## Sampler arms
-
-`arms.py` holds three arms — `a`, `b`, `c` — each a `(mask_span_lengths, max_masked_patches,
-d_balanced_loss)` triple plus the evidence behind it. Read them before running anything.
-
-- `config` calls `arms.resolve_arm()` **once, during its own import**, from `$T1DMAI_ARM`, default
-  `'a'` = `MASK_SPAN_LENGTHS (1,2,3,4)`, `MAX_MASKED_PATCHES 8`, `D_BALANCED_LOSS False`. It
-  republishes the name as `config.SAMPLER_ARM`. An unknown name **raises** before a model, a dataset
-  or a log file exists — it never falls back to the default.
-- `train.py --arm X` works only because train.py reads `--arm` out of `sys.argv` and writes
-  `$T1DMAI_ARM` **above** `import config`. `data`, `risk_loss` and `metrics.protocols` bind the
-  three constants at THEIR import, so rewriting `config.MASK_SPAN_LENGTHS` at runtime reaches
-  none of them. `arms.arm_from_argv` documents the pattern for any new entry point.
-- The checkpoint and the resolved-config table carry `sampler_arm` read off `config`, not off
-  `arms.ARMS`, so a run records what it actually trained with.
-- **`a` against `b` or `c` is not a paired comparison.** The forecast protocol drops every row whose
-  context-edge patch that sample's own training mask covered, and the mask comes from the arm's
-  sampler, so each arm scores its own denominator. `b` against `c` is paired — same sampler,
-  different loss weights. `arms.EVIDENCE` states the run conditions; `python arms.py` prints the
-  table exactly as `train.py --help` renders it.
-- `d_balance.py` owns the per-`d` loss weights `D_BALANCED_LOSS` turns on: four groups (`d = 1, 2, 3`
-  and a pooled `d >= 4` tail). Quote `d_balance.effective_sample_size()` beside any figure from an
-  arm that enables them.
-
 ## Architecture gotchas
 
-- **Capacity.** `D_MODEL = 128`, `N_LAYERS = 8`, `N_HEADS = 8`, `FFN_DIM = 4×D_MODEL`,
-  `BG_HEAD_HIDDEN = 1×D_MODEL` — 2,157,345 parameters plus one 18-element `step_basis` buffer.
+- **Capacity.** `D_MODEL = 32`, `N_LAYERS = 2`, `N_HEADS = 2`, `FFN_DIM = 4×D_MODEL`,
+  `BG_HEAD_HIDDEN = 1×D_MODEL` — 38,241 parameters plus one 18-element `step_basis` buffer.
   `ARCH_VERSION = 'risk-v4'`. Don't bake those numbers into other code or comments: `resize_model.py`
   rewrites them, preserving `HEAD_DIM = D_MODEL // N_HEADS` and the symbolic `FFN_DIM = k·D_MODEL` /
   `BG_HEAD_HIDDEN = k·D_MODEL` relations.
@@ -169,7 +150,7 @@ d_balanced_loss)` triple plus the evidence behind it. Read them before running a
   the model level and shared across layers. QK-norm is KEPT — per-head RMSNorm on Q and K
   (`q_norm`/`k_norm`), applied BEFORE RoPE so the normalized norms are not undone by the rotation.
   There is no additive per-head distance bias on the logits.
-- **Context window is variable 8–24 h** (`MIN_CONTEXT_PATCHES = 16`, `MAX_CONTEXT_PATCHES = 48` at 2 patches/hour, since `PATCH_SIZE = 6` makes one patch 30 min). Each training sample draws `n_ctx` uniformly in `[MIN, MAX]`; `collate_fn` left-pads to the batch maximum. The simulator's own ACF analysis in `T1DMSIM/diff/README.md` §0.5 measures pooled-CGM ACF₀.₂ at 5.3 h for the simulator and 2.4–4.8 h across the three real cohorts, so the 8 h `MIN` sits above the autocorrelation rather than being derived from it. 24 h is held as the working ceiling to span one full basal dose cycle — both analogues are injected on a fixed 24 h interval with no jitter (they differ in *action* duration, glargine 26 h / degludec 42 h, not in dosing) — and to preserve GT context through the 8 h night long-horizon rolling validation (`inference.predict_rolling` slides the window once it exceeds `MAX_CONTEXT_PATCHES`). At inference time the model accepts any `n_ctx ≥ MIN_CONTEXT_PATCHES`.
+- **Context window is variable 24–48 h** (`MIN_CONTEXT_PATCHES = 48`, `MAX_CONTEXT_PATCHES = 96` at 2 patches/hour, since `PATCH_SIZE = 6` makes one patch 30 min). Each training sample draws `n_ctx` uniformly in `[MIN, MAX]`; `collate_fn` left-pads to the batch maximum. The simulator's own ACF analysis in `T1DMSIM/diff/README.md` §0.5 measures pooled-CGM ACF₀.₂ at 5.3 h for the simulator and 2.4–4.8 h across the three real cohorts, so the `MIN` sits well above the autocorrelation rather than being derived from it. The 24 h floor spans one full basal dose cycle — both analogues are injected on a fixed 24 h interval with no jitter (they differ in *action* duration, glargine 26 h / degludec 42 h, not in dosing) — and preserves GT context through the 8 h night long-horizon rolling validation (`inference.predict_rolling` slides the window once it exceeds `MAX_CONTEXT_PATCHES`). At inference time the model accepts any `n_ctx ≥ MIN_CONTEXT_PATCHES`.
 - **No patient embedding.** The model is patient-agnostic — no learned patient identity vector and no `patient_seeds` argument to `model.forward()`. Patient identity is implicit in the context window. `compute_patient_seed` exists only as a deterministic key for picking simulator runs in `data.py`.
 - **Unified day + night training.** One model covers both. A window's masked spans may sit at any patch-aligned position in the trajectory — there is no day/night band restriction and no time-of-day input feature; day vs night dynamics are learned from the glucose/carb/insulin/exercise trajectory shape alone. `PREDICTION_PATCHES = PREDICTION_HORIZON_HOURS × _PATCHES_PER_HOUR` is derived in `config.py`; change the hours, not the patch count.
 - **No dynamics output channels.** There is no `N_OUTPUT_CHANNELS`, no per-channel head, no MDN, no IS/HGO/carb/insulin output, no `bg_delta` anywhere. The model emits a single BG quantile head.
@@ -242,8 +223,8 @@ d_balanced_loss)` triple plus the evidence behind it. Read them before running a
 - **fp32 everywhere.** Forward and loss are both fp32 — no autocast, no bf16, no gradient checkpointing. The isfinite / `_halve_optimizer_state` / `_maybe_restore_from_ema` resilience is kept verbatim (soft-DTW in fp32 can still Inf).
 - **NaN propagation, not crash.** A non-finite intermediate must REACH train.py's isfinite / `_maybe_restore_from_ema` guard rather than abort the step inside a deep assert. (a) `dilate.py` keeps only pure SHAPE asserts, so a non-finite median/cost flows out to the loss. (b) `utils.kovatchev_f_inv` scrubs a non-finite risk input before the clamp so it can never silently emit NaN mg/dL. (c) `utils.ModelEMA.update` skips blending non-finite incoming weights per tensor, so a single NaN cannot permanently poison the shadow. (d) train.py's resilience guard wraps forward + loss + backward together.
 - **Live vs EMA weights**: training runs on live weights; validation runs under the EMA shadow (`ModelEMA.apply_to(model)`). The shadow updates only on accepted steps. **The two Kendall-Gal log-variance parameters are EMA-EXCLUDED** structurally — they live on a separate `KendallGalWeighting` module that is never passed to `ModelEMA` (train.py wraps only `model`); there is no name filter in `ModelEMA.__init__`, whose signature is `(model, decay)`.
-- **Loss = `risk_loss.risk_total_loss(q_tau, median, true_bg_mgdl, weighting, valid, mask_idx, d)`** (soft-DTW DP in `dilate.py`). The target is f-transformed exactly once, at the top: `y_risk = kovatchev_f_target(true_bg_mgdl)`, shared by the pinball and DILATE terms. `valid` and `mask_idx` default to `None`, which means the dense right-edge case — pass them on every real call.
-  - **`L_Q` (pinball)** over all `(slot, step, τ)`: `mean rho_τ(y_risk, q_tau)`, `rho_τ(a,b) = (a-b)·(τ − 1[a<b])`, masked by `valid` and weighted per `d` when `D_BALANCED_LOSS`. τ=0.5 is kept as the pointwise level anchor.
+- **Loss = `risk_loss.risk_total_loss(q_tau, median, true_bg_mgdl, weighting, valid, mask_idx)`** (soft-DTW DP in `dilate.py`). The target is f-transformed exactly once, at the top: `y_risk = kovatchev_f_target(true_bg_mgdl)`, shared by the pinball and DILATE terms. `valid` and `mask_idx` default to `None`, which means the dense right-edge case — pass them on every real call.
+  - **`L_Q` (pinball)** over all `(slot, step, τ)`: `mean rho_τ(y_risk, q_tau)`, `rho_τ(a,b) = (a-b)·(τ − 1[a<b])`, masked by `valid`. There is no per-`d` reweighting: the sampler's right-edge quota corrects the mixture by PLACEMENT, and weights on top of it buy nothing. τ=0.5 is kept as the pointwise level anchor.
   - **`L_D` (DILATE on the median only), computed ONCE PER MASKED SPAN**, not once per sample. Spans are bucketed by length `L`, each bucket stacked to `(n_b, L·PATCH_SIZE)` **C-contiguous patch-major** via `_to_patch_major` for one `dilate_loss` call. Gathering only a span's slots is also what makes a padded slot's gradient exactly zero here — no grad path to it exists at all.
     - **An empty bucket is never dispatched.** `dilate_loss` reduces over the batch axis with `.mean()`, so a `(0, H)` input returns NaN with no exception and no shape assert, and a fixed protocol can leave a bucket empty in *every* batch. That NaN flows through the running totals and past `val_total < best_val_loss` — False for NaN against `inf` — ending the run with no best checkpoint. A span-count-weighted mean does not rescue it: `0.0 * nan = nan`.
     - **Buckets combine by a span-count-weighted mean of the per-bucket scalars**, never by concatenation and never unweighted. DILATE is not scale-free in `H = L·S`: the shape term grows with `H` while the normalised TDI does not, so `DILATE_ALPHA` weights a different mixture in each bucket and `log_sigma_D` absorbs it silently. The per-bucket `loss_D_L{L}` and the span-length histogram `n_spans_L{L}` are logged beside the combined value — two runs are comparable only at an equal span-length mixture.
@@ -254,15 +235,15 @@ d_balanced_loss)` triple plus the evidence behind it. Read them before running a
 - **No carb-noise augmentation.** There is no `CARB_NOISE_AUG_*` and no `data._jitter_carb_norm`; the carb input is the post-noise simulator value, unjittered.
 - **Validation runs THREE forwards per batch**, and they are not interchangeable:
   1. the **OBJECTIVE** forward, on the sample's own masked set — `val_loss_total` and therefore checkpoint selection are read off this one, so the selection scalar stays the validation value of the training objective;
-  2. the **FORECAST protocol** forward, masking the trailing `PREDICTION_PATCHES` — the whole horizon-keyed clinical suite is read off this one. Those names are defined against a right-edge zone, and training mask placement is uniform, so scoring them over the objective forward's slots reads a different patch on every row;
+  2. the **FORECAST protocol** forward, masking the trailing `PREDICTION_PATCHES` — the whole horizon-keyed clinical suite is read off this one. Those names are defined against a right-edge zone, and a training mask lands there only on the quota's share of windows, so scoring them over the objective forward's slots reads a different patch on most rows;
   3. the **INFILL protocol** forward, masking sampled interior spans — fills the `infill_*` columns, scored against **linear interpolation** between the bracketing visible readings.
 - **The two protocols live in `metrics/protocols.py`** and nowhere else. Forecast is scored against **persistence**; infill against **linear interpolation and never persistence** — persistence is a forecasting baseline, and against a two-sided task it is a strawman. Forecast supplies exactly one masked patch at each of `d = 1..4` per window, which is what makes per-`d` calibration well populated there; `@30/@60/@90/@120` min IS `d = 1..4` one-sided. `column()` refuses to name an infill column without a `d`. Forecast columns keep the names `realdata.metrics.compute_suite` defines; `protocols.py` restates none of them.
 - **The five proper scoring rules live in `metrics/scoring.py`** and nowhere else: `crps_by_d`, `winkler_by_d`, `coverage_sharpness_by_d` (coverage and the width that bought it, never apart), `joint_coverage_by_d` (simultaneous horizon coverage, distinct from the per-step marginal), and `alarm_operating_curve` (hypo detection rate vs false alarms/day, carrying the **median lead time in minutes** — a detection rate bought at a two-minute lead is not a usable alarm, and neither rate can show that alone). Every rule bins on `d`.
 - **Band-edge hypo/hyper detectors.** The headline clinical `hypo_recall`/`hypo_precision` and `hyper_recall`/`hyper_precision` key off the **band edges**, not the median. Derive the edges once: `lo_idx = QUANTILE_LEVELS.index(HYPO_ALARM_QUANTILE_TAU)` (0.25) and `hi_idx = QUANTILE_LEVELS.index(HYPER_ALARM_QUANTILE_TAU)` (0.75) — never a bare literal; then `pred_lo = kovatchev_f_inv(q_tau[..., lo_idx])`, `pred_hi = kovatchev_f_inv(q_tau[..., hi_idx])` (both asserted physical). `pred_hypo = pred_lo < BG_HYPO_THRESHOLD`, `pred_hyper = pred_hi > BG_HYPER_THRESHOLD` — the clinically conservative call on each side. `true_hypo`/`true_hyper` stay off the TRUE bg. **Recall is strict** (`TP/#true`). **Precision forgives near-boundary false alarms** within `EXCURSION_PRECISION_TOLERANCE_MGDL`, so CGM noise near a threshold doesn't deflate it; precision rows carry a `±k` suffix, recall rows don't.
-- **Diagnostics that are not selection metrics.** `sign_balance@{30,60,120}` (fraction of true BG strictly below the median, target 0.5 — a directional-bias / mean-collapse witness); `inner50_cov@{30,60,120}` (empirical coverage of `[τ.25, τ.75]`, target 0.5); the central-90% marginal per-`(h,τ)` coverage; `median_roughness` / `median_roughness_far`; the excursion-amplitude block `exc_*`; the counterfactual `cf_*` rows; the in-training conformal probe `conf_*`. All uncoloured, none feeds the loss or selection.
+- **Diagnostics that are not selection metrics.** `sign_balance@{30,60,90,120}` (fraction of true BG strictly below the median, target 0.5 — a directional-bias / mean-collapse witness); `inner50_cov@{30,60,90,120}` (empirical coverage of `[τ.25, τ.75]`, target 0.5); the central-90% marginal per-`(h,τ)` coverage; `median_roughness` / `median_roughness_far`; the excursion-amplitude block `exc_*`; the counterfactual `cf_*` rows; the in-training conformal probe `conf_*`. All uncoloured, none feeds the loss or selection.
 - **Counterfactual probe.** `train._run_counterfactual_probe` perturbs the masked-span doses against a baseline forecast over the SAME context and reports whether the dose response is physiologically correct: `cf_carb_dbg`/`cf_carb_dir` (a `CF_CARB_BOLUS_G` carb bolus must RAISE BG), `cf_insulin_dbg`/`cf_insulin_dir` (a `CF_INSULIN_BOLUS_U` bolus must LOWER it), `cf_*_monotonic` over a dose sweep, `cf_hypo_rescue` / `cf_hyper_rescue`. Every figure is a DIFFERENCE between the baseline and the perturbed forecast over one shared context, so a short run shifts both together and the sign survives. `CF_EXERCISE_G` is derived from T1DMSIM's two exercise constants, not restated.
 - **Time-of-day probe (co-trains the trunk; PER-SLOT categorical).** A 2-layer SiLU MLP over EVERY gathered masked-slot hidden state (no mean-pool) emits `time_pred (B, M, TIME_PROBE_N_BINS)` circular hour-of-day logits, so every per-slot representation the BG head also reads is forced to encode the absolute clock. It is **built under a saved/restored RNG state and re-inited LAST in `_init_weights`**, so every forecast-weight RNG draw is byte-identical with or without it (regression-tested by `test_probe_construction_preserves_forecast_init_rng`). With `TIME_PROBE_DETACH = False` its loss co-trains the shared trunk; the forward VALUE of `q_tau`/`median` is unchanged either way, since the head never feeds them. `TIME_PROBE_N_BINS = round(24 / PREDICTION_HORIZON_HOURS)` and `TIME_PROBE_BIN_HOURS` tiles 24 h exactly. **Slot `j` is patch `mask_idx[:, j]`, so its hour target follows `mask_idx`, not a fixed offset from the context end.** Loss = per-slot CE against a wrapped-Gaussian circular soft label (`utils.time_of_day_bin_ce`, `TIME_PROBE_LABEL_SMOOTH_BINS`; `<=0` ⇒ one-hot), plus a separate teacher-forced **cross-window** penalty (`TIME_PROBE_CROSS_WINDOW_WEIGHT`) coupling consecutive INDEPENDENT-forward windows: `data.py` ships `batch['next_window']`, train.py runs a 2nd forward on it, and `utils.time_cross_window_consistency_loss` rotates window k's origin resultant by `2π·PREDICTION_HORIZON_HOURS/24` and matches window k+1's in the raw `(cos, sin)` plane (atan2-free). Both terms are scaled by `TIME_PROBE_LOSS_WEIGHT` in the TRAINING backward ONLY — never in `risk_total_loss`, `val_loss_total` or checkpoint selection. **Decode** via `utils.time_of_day_decode_bins(logits, n_bins) -> (hour, R)`: softmax, probability-weighted resultant, `hour = atan2(sin, cos)`, `R = hypot(cos, sin) ∈ [0,1]` as the confidence. Reported: `tod_mae_h` / `tod_acc_*` / `tod_conf`, the clock-reliability rows `tod_bias_h` / `tod_std_h` / `tod_p90_h` / `tod_gross_rate` / `tod_mae_hiconf`, and the jump witnesses `tod_jump_h` and `tod_xwin_jump_h`. These need the full residual distribution, so `_run_validation` accumulates per-sample arrays and finalizes once; circular stats via `utils.circular_bias_hours` / `circular_std_hours` (naive angle averaging breaks at the 24 h wrap). **Clock-face surfaces** are diagnostic-only: `inference.predict` / `predict_what_if` / `predict_rolling` take a trailing opt-in `return_time=False` whose default adds no key. The geometry lives in ONE tested numpy place — `utils.aggregate_origin_belief` and `utils.clock_wedge_geometry` — consumed by two thin no-math adapters, `gui_renderer.draw_clock_face` (pygame) and `clock_face.draw_clock_axis` (matplotlib).
-- **Checkpoint selection (single "best" snapshot).** `t1dmai_best.pt` is saved on the minimum `val_loss_total` (= `risk_total_loss` on the objective forward); the periodic `t1dmai_step_{N}.pt` snapshots are independent. There is no clinical-composite selector and no resume / checkpoint-loading path. The checkpoint carries `arch_version`, `loss_schema` and `sampler_arm` as provenance.
+- **Checkpoint selection (single "best" snapshot).** `t1dmai_best.pt` is saved on the minimum `val_loss_total` (= `risk_total_loss` on the objective forward); the periodic `t1dmai_step_{N}.pt` snapshots are independent. There is no clinical-composite selector and no resume / checkpoint-loading path. The checkpoint carries `arch_version`, `loss_schema` and the three sampler constants (`mask_span_lengths`, `max_masked_patches`, `mask_right_edge_quota`) as provenance; `finetune/finetune.py` refuses a checkpoint whose recorded sampler differs from the live one.
 - **CSV/log keys.** `training_log.csv` carries `loss_total`, `loss_Q`, `loss_D` (with `loss_D_shape` / `loss_D_tdi`, the per-bucket `loss_D_L{L}` and `n_spans_L{L}`), and the two Kendall-Gal weights `log_sigma_Q` / `log_sigma_D`, at `LOG_INTERVAL` cadence with an EMA-smoothed total. `validation_log.csv` carries the protocol columns, the `infill_*` columns, the diagnostics above and the `cf_*` / `conf_*` blocks. Update the header AND the row writer together.
 - **Conformal-calibration partition — ACTIVE.** A third `T1DMDataset` on a disjoint seed band (`master_seed + CALIBRATION_RESERVE_SEED_OFFSET`, disjoint from the train hashed seeds and from normalization's own offset band) feeds split-conformal recalibration of the BG bands. It touches neither the loss nor the headline validation metrics.
 - **Conformal layer (`conformal.py`, pure numpy, mg/dL).** `fit_quantile_conformal(cal_q (N,S,K), cal_true (N,S), levels, median_idx) -> delta (S,K)` — per-(step, quantile) ASYMMETRIC split-conformal: `delta[s,k]` is the side-aware empirical τ-quantile of the residual `true − q_k` (`_conformal_offset`: `ceil((n+1)τ)` for an UPPER edge τ≥0.5, `floor((n+1)τ)` for a LOWER edge τ<0.5 — `ceil` on a lower edge is anti-conservative). `apply_quantile_conformal` adds `delta` and re-enforces the three LOAD-BEARING invariants (unit-tested): MEDIAN held FIXED, fan kept MONOTONE, all-zero delta = identity. The delta is mg/dL (downstream of `f_inv`) and must be RE-FIT per target distribution — validity rests on cal/test exchangeability.
@@ -313,12 +294,11 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 
 ## Key files
 
-- `config.py` — all hyperparameters as uppercase constants (single source of truth); resolves the sampler arm at import
-- `arms.py` — the three mask-sampler arms, their evidence and the `--arm` help text; `resolve_arm` raises on an unknown name
-- `d_balance.py` — per-`d` supervision weights and `effective_sample_size()`
+- `config.py` — all hyperparameters as uppercase constants (single source of truth)
+- `d_balance.py` — the exact two-branch `d` histogram of the sampler; `metrics/protocols.py`'s `SAMPLER_REFERENCE` is produced from it
 - `model.py` — T1DMAI model class; `make_step_basis`, `build_rope_cache`, `apply_rope`
 - `data.py` — on-the-fly and cached sample generation; `sample_mask_spans`, `_anchor_step_for_span`, `_mask_slots`, `BG_MASKED_FEAT`
-- `train.py` — training loop entry point; `--arm` is read out of `sys.argv` above `import config`
+- `train.py` — training loop entry point
 - `inference.py` — prediction functions (standard, what-if, rolling), each with an opt-in `return_time`; `predict` takes an explicit `mask_spans` masked set (`None` selects the trailing forecast), what-if and rolling are right-edge by construction
 - `normalization.py` — channel statistics; `CHANNEL_NAMES`, `SPARSE_LOG1P_CHANNELS`, `RISK_SPACE_CHANNELS`, `load_normalization_stats` (validating)
 - `muon.py` — Muon optimizer implementation

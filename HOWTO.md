@@ -75,9 +75,16 @@ A patch is 30 minutes, so the window is set in patches.
 
 | window | `--max-context-patches` | `MAX_SEQ_LEN` | `d ≥ 3` share | Ohio segments kept |
 | --- | ---: | ---: | ---: | ---: |
-| 24 h | 48 | 52 | 1.94% | 82 of 156 |
-| 48 h | 96 | 100 | 1.26% | 51 of 156 |
-| 72 h | 144 | 148 | 0.96% | 29 of 156 |
+| 24 h | 48 | 52 | 27.90% | 82 of 156 |
+| 48 h | 96 | 100 | 27.11% | 51 of 156 |
+| 72 h | 144 | 148 | 26.87% | 29 of 156 |
+
+The `d ≥ 3` share is `d_balance.d_distribution` at the live sampler constants,
+with `--min-context-patches` at half the ceiling on every row. It barely moves
+across the table because the right-edge quota, not the window width, is what
+supplies the far horizons: at quota 0 the same three rows read 22.79 / 21.72 /
+21.39%, and under the pre-quota sampler's four-patch span ceiling they read
+1.94 / 1.26 / 0.96%.
 
 ```bash
 venv/bin/python resize_model.py --min-context-patches 48 --max-context-patches 96
@@ -146,24 +153,26 @@ It is advisory. Nothing calls it for you.
 
 ---
 
-## 4. Sampler arm
+## 4. Mask sampler
 
-The arm fixes `MASK_SPAN_LENGTHS`, `MAX_MASKED_PATCHES` and `D_BALANCED_LOSS`
-together. It is a flag, not a `config.py` edit:
+`MASK_SPAN_LENGTHS`, `MAX_MASKED_PATCHES` and `MASK_RIGHT_EDGE_QUOTA` are plain
+`config.py` constants, bound at import and fixed for a whole run. There is no
+flag: edit `config.py`.
 
 ```bash
-venv/bin/python train.py --arm c --cache-path ~/Desktop/T1DMSIM/cache_balanced_cf
+venv/bin/python d_balance.py    # the d histogram the live constants produce
 ```
 
-`venv/bin/python arms.py` prints the table with the measured differences. Arm `a`
-is the default. On the archived runs, `a` scores highest on the hypo pool and `c`
-on the balanced pool — one seed each at 5000 steps, with 4 to 76 events per
-horizon, so the ordering is a starting point rather than a tuned result.
+Moving any of the three invalidates `metrics/protocols.py`'s
+`SAMPLER_REFERENCE`, which is enumerated from `d_balance.d_distribution` at the
+knobs it names; `sampler_reference_applies()` then refuses the comparison rather
+than reporting against a mixture the sampler does not draw. Re-enumerate and
+update it in the same change.
 
-The arm resolves at `config` import from `$T1DMAI_ARM`; `train.py` reads `--arm`
-out of `argv` and sets that variable above the import. An unknown name raises
-before the run starts. The resolved arm is stamped into the checkpoint, and
-`finetune/` refuses a checkpoint whose arm disagrees with the live one.
+The three are stamped into every checkpoint, and `finetune/` refuses a checkpoint
+whose recorded sampler is not the live one — no parameter shape depends on the
+sampler, so a strict state-dict load would accept the weights and nothing else
+would notice.
 
 ---
 
@@ -179,7 +188,6 @@ configuration and its source before it starts:
 ```bash
 venv/bin/python train.py \
     --cache-path ~/Desktop/T1DMSIM/cache_balanced_cf \
-    --arm a \
     --total-steps 5000 \
     --batch-size 128 \
     --validation-interval 500 \
@@ -202,11 +210,13 @@ error. Run one at a time, and move `logs/` aside between runs worth keeping.
 | `logs/training_log.csv` | per-step losses |
 | `logs/validation_log.csv` | one row per validation |
 
-The validation table prints every `--validation-interval` steps, with per-`d`
-scoring rows. `@30/@60/@90/@120` minutes are `d = 1/2/3/4` — the distance in
-patches to the nearest visible evidence. A parenthesised count such as `(76st)`
-is that row's event count; some bins are small enough that the count changes how
-the percentage reads.
+The validation table prints every `--validation-interval` steps. `@30/@60/@90/@120`
+minutes are `d = 1/2/3/4` — the distance in patches to the nearest visible
+evidence. A parenthesised count such as `(76st)` is that row's event count; some
+bins are small enough that the count changes how the percentage reads.
+
+The table is a reading surface, not the record: `logs/validation_log.csv` carries
+every metric on every row, including the families the table does not print.
 
 Selection is on `val_loss_total`, computed from the full-window forward.
 
