@@ -70,6 +70,7 @@ CSV_ONLY = {
     'Infill Protocol': 'infill_rmse@d1',
     'infill crps': 'infill_crps@d1',
     'conf cov90@peak': 'conf_cov90_raw',
+    'conf hypo-escape': 'conf_hypo_esc_raw',
     'exc_undershoot_frac': 'exc_undershoot_frac',
     'amplitude (trend_amp_ratio)': 'trend_amp_ratio',
     'clarke_A @': 'evalfix_clarke_A@30',
@@ -77,6 +78,20 @@ CSV_ONLY = {
     'tod acc': 'tod_acc_1h',
     'night_hyper_recall': 'night_hyper_recall',
     'night-onset': 'night_onset_hypo_recall',
+}
+
+# The conformal probe is the one CSV_ONLY family the fixture cannot produce:
+# ``train._conformal_val_probe`` returns nothing under 50 validation windows and
+# N_VAL is 12, so its keys are absent from ``val_metrics`` entirely. An absence
+# check over a family the run never populates passes on nothing — exactly the
+# state the module docstring says this file exists to prevent — so the render
+# below is fed these values, at the scale a real probe returns, to give the
+# assertion a subject.
+SYNTHETIC_CONFORMAL = {
+    'conf_cov90_raw': 0.7213, 'conf_width_raw': 44.2,
+    'conf_cov90_cal': 0.8967, 'conf_width_cal': 61.5,
+    'conf_hypo_esc_raw': 0.191, 'conf_hypo_esc_cal': 0.104,
+    'conf_n': 37.0,
 }
 
 
@@ -285,14 +300,20 @@ def test_rows_dropped_from_the_table_are_still_recorded(val_metrics):
     carries it — and to its absence from the page, so a row quietly restored
     without its width or its ``n`` is caught as well.
     """
-    table = train._strip_ansi(train._render_validation_table(1, val_metrics, None))
+    # Every CSV_ONLY family must have a VALUE in the dict the table renders from,
+    # or its absence from the page says nothing about the trim.
+    metrics = {**val_metrics, **SYNTHETIC_CONFORMAL}
+    table = train._strip_ansi(train._render_validation_table(1, metrics, None))
     declared = {c for c, _ in train._val_log_columns()}
     for label, column in CSV_ONLY.items():
         assert column in declared, (
             f"{label!r} was dropped from the table and {column!r} is not a "
             f"declared column either — the metric is gone, not moved")
+        assert metrics.get(column) is not None, (
+            f"{column!r} has no value in the render input, so {label!r} being "
+            f"absent from the table is not evidence of anything")
         assert label not in table, (
             f"{label!r} is back on the validation table; if that is deliberate, "
             f"move it out of CSV_ONLY rather than leaving the two disagreeing")
-    print(f"[DUMP] csv-only families | {len(CSV_ONLY)} trimmed families still "
-          f"declared as columns and absent from the page ✓")
+    print(f"[DUMP] csv-only families | {len(CSV_ONLY)} trimmed families carry a "
+          f"value, are still declared as columns, and are absent from the page ✓")

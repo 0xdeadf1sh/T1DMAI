@@ -48,11 +48,11 @@ coordinates.
 Worked example, asserted nowhere: at ``MASK_SPAN_LENGTHS = (1, 2, 3, 4)`` with
 ``MAX_MASKED_PATCHES = 8`` the enumeration reads span-length shares
 29.55 / 27.27 / 23.86 / 19.32%, ``E[#masked] = 4.659091``,
-``P(#masked = 8) = 11.17%``, 41.76% of head slots padded, an interior flat to
-1.504 / 0.829 / 0.548% at ``T = 20 / 36 / 52`` and 35.77% of supervised slots
-anchoring farther than the nearest evidence.  At ``(1, ..., 8)`` with
-``MAX_MASKED_PATCHES = 12`` the same quantities read 7.402896 masked patches and
-39.23%.
+``P(#masked = 8) = 11.17%``, 41.76% of head slots padded and an interior flat to
+1.504 / 0.829 / 0.548% at ``T = 20 / 36 / 52``.  At ``(1, ..., 8)`` with
+``MAX_MASKED_PATCHES = 12`` the masked-patch mean reads 7.402896.  Every one of
+those moves with the knobs, and each is derived where it is used rather than
+compared against a figure written here.
 """
 
 from collections import Counter
@@ -560,11 +560,15 @@ def test_right_edge_draws_are_flush_and_still_separated(T):
     flush = multi = 0
     for _ in range(20_000):
         spans = sample_mask_spans(T, rng)
+        # It is the LAST span the branch pins, never an earlier one: an interior
+        # span reaching T-1 would mean the composition ran past the prefix it was
+        # given, and the pinned span would sit on top of it.
+        assert all(s + L < T for s, L in spans[:-1]), \
+            f"a span other than the last reaches the window edge: {spans} at T={T}"
         start, length = spans[-1]
         if start + length != T:
             continue
         flush += 1
-        assert start == T - length, f"flush span {spans[-1]} is not pinned at T-L"
         if len(spans) > 1:
             multi += 1
             prev_s, prev_L = spans[-2]
@@ -678,8 +682,7 @@ def test_anchor_is_farther_than_the_nearest_evidence_for_a_third_of_slots():
     ``(T, n_spans, length vector, placement branch, gap composition)`` with ``T``
     uniform over the window lengths the picker draws, and cross-checked against
     ``_mask_slots`` itself; it moves with the span ceiling and the quota and is
-    never pinned.  (At ``MASK_SPAN_LENGTHS = (1,2,3,4)``, ``MAX_MASKED_PATCHES = 8``
-    and no quota it evaluates to 35.77%; at ``(1,...,8)`` with 12, to 39.23%.)"""
+    never pinned — the test prints the live value rather than asserting one."""
     lengths_T = [n + PREDICTION_PATCHES
                  for n in range(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1)]
     p_T = 1.0 / len(lengths_T)
@@ -821,6 +824,28 @@ def test_sampler_agrees_with_the_closed_form_coarsely():
             f"d_balance's enumerated {ref[g] * 100:.3f}% ({zg:.2f}σ) — every "
             "d-binned metric is being read against a mixture the sampler does not "
             "draw")
+    # metrics.protocols.SAMPLER_REFERENCE is a FROZEN copy of this same histogram,
+    # written down so a realised figure can be read against it without re-running
+    # the enumeration. sampler_reference_applies() compares only the KNOBS, so
+    # nothing else would notice the numbers going stale under a knob that did not
+    # move — a widened span ceiling, say, or a quota retuned at equal ceiling.
+    from metrics.protocols import SAMPLER_REFERENCE
+    for g in range(N_D_GROUPS):
+        frozen = SAMPLER_REFERENCE['share_pct'][g + 1] / 100.0
+        assert abs(frozen - ref[g]) < 1e-5, (
+            f"SAMPLER_REFERENCE['share_pct'][{g + 1}] is {frozen * 100:.3f}% against "
+            f"d_balance's {ref[g] * 100:.3f}% — the frozen copy has gone stale; "
+            f"re-enumerate it at the live knobs")
+    exact_mean = float(_masked_patch_mean())
+    assert abs(SAMPLER_REFERENCE['mean_masked'] - exact_mean) < 1e-3, (
+        f"SAMPLER_REFERENCE['mean_masked'] {SAMPLER_REFERENCE['mean_masked']} vs the "
+        f"enumerated {exact_mean:.4f}")
+    for g in range(N_D_GROUPS):
+        frozen_pps = SAMPLER_REFERENCE['patches_per_sample'][g + 1]
+        assert abs(frozen_pps - ref[g] * exact_mean) < 1e-3, (
+            f"SAMPLER_REFERENCE['patches_per_sample'][{g + 1}] {frozen_pps} vs the "
+            f"enumerated {ref[g] * exact_mean:.4f}")
+
     print(f"\n[DUMP] sampler vs closed form | T={T}, {n_draws} draws: worst position "
           f"{float(np.abs(z).max()):.2f}σ (tol {_Z_TOL}σ); mean masked {mean_masked:.4f} "
           f"vs {exact_masked:.4f}; d groups "
