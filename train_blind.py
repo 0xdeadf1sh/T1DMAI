@@ -25,8 +25,10 @@ It is NOT kept in sync with ``train.py``.  A change to the conditioned trainer
 must be applied here deliberately or not at all; nothing checks.  The complete
 intended divergence is these seven items and nothing else:
 
-1. how the file identifies itself — this docstring, the ``--help`` text and the
-   resolved-config banner;
+1. how the file identifies itself — this docstring, the ``--help`` text, the
+   resolved-config banner, and the validation table's own subtitle, which in
+   ``train.py`` reads "Conditioned (announced carbs+insulin+exercise)" and would
+   otherwise label every page of this run as the thing it is not;
 2. every ``T1DMDataset`` is built ``blind=True`` (train, val, night-onset val);
 3. the FORECAST and INFILL protocol forwards blind the dose channels of the
    patches they mask (``data.blind_masked_doses``), so validation scores the
@@ -588,8 +590,10 @@ def compute_learning_metrics(
     # function, and DTS penalises an overestimate harder than an underestimate
     # where Clarke is symmetric in its A band. Reported per zone and never as
     # A+B, which the paper calls inappropriate. true_bg FIRST — the reference
-    # axis, as in Clarke and CG-EGA above; ``dts_grid`` carries the units
-    # tripwire that catches a transposed or risk-space argument.
+    # axis, as in Clarke and CG-EGA above. NOTHING CATCHES A TRANSPOSE: both
+    # arguments are legal mg/dL either way, so a swap here scores a well-formed
+    # table of a different statistic. ``dts_grid``'s units tripwire catches only
+    # the other error, a risk-space or normalized array.
     _dts_zones = dts_grid.dts_zones(_true_np, _pred_np)          # (B, P*S) 0..4
     for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
         out[f'dts_{_zn}'] = float((_dts_zones == _zi).sum())
@@ -1384,7 +1388,7 @@ def _render_validation_table(
     title_top = f"┌─{'─' * inner_w}─┐"
     title_lines = [
         f"Validation @ step {step} — {PREDICTION_HORIZON_HOURS}h window",
-        "Conditioned (announced carbs+insulin+exercise)",
+        "BLIND (masked patches withhold carbs+insulin+exercise too)",
     ]
     title_inner = [
         f"│ {_ANSI_BOLD}{_ANSI_CYAN}{_pad(t, inner_w, 'c')}{_ANSI_RESET} │"
@@ -3466,20 +3470,6 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         *[(f'dts_{z}_pct', 4) for z in dts_grid.ZONE_NAMES],
         *[(f'dts_a@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
         ('roc_rmse', 6), ('roc_corr', 4), ('trend_gain_beta', 4), ('trend_amp_ratio', 4),
-        ('bg_curve_corr', 4),
-        # Excursion-magnitude amplitude (NET peak deviation vs last_bg — the
-        # over/under-dispersion the per-PATCH trend_amp_ratio misses).
-        ('exc_amp_ratio', 4), ('exc_gain_beta', 4), ('exc_corr', 4),
-        ('exc_overshoot_frac', 4), ('exc_undershoot_frac', 4), ('exc_n', 4),
-        # Conformal coverage probe (raw vs calibrated band coverage at excursion
-        # peaks), each coverage with the mean band width, mg/dL, that bought it.
-        ('conf_cov90_raw', 4), ('conf_cov90_cal', 4),
-        ('conf_width_raw', 4), ('conf_width_cal', 4),
-        ('conf_hypo_esc_raw', 4), ('conf_hypo_esc_cal', 4), ('conf_n', 4),
-        # Median forecast roughness (risk-space mean |Δ²median|): the
-        # anti-oscillation witness the headline RMSE structurally masks. Pooled
-        # over the horizon and over the last patch (where the zigzag concentrated).
-        ('median_roughness', 6), ('median_roughness_far', 6),        ('roc_rmse', 6), ('roc_corr', 4), ('trend_gain_beta', 4), ('trend_amp_ratio', 4),
         ('bg_curve_corr', 4),
         # Excursion-magnitude amplitude (NET peak deviation vs last_bg — the
         # over/under-dispersion the per-PATCH trend_amp_ratio misses).

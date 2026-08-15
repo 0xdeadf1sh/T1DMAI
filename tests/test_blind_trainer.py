@@ -100,6 +100,14 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
         "the announced protocol built the same tensor — this batch announces no "
         "dose in its forecast zone, so the assertions above have no subject")
 
+    # "and only there": outside the zone this protocol masks, its window must be
+    # the announced protocol's byte for byte. Blinding the whole window satisfies
+    # every assertion above and destroys the context the forecast reads.
+    T_all = list(range(T - PREDICTION_PATCHES))
+    assert torch.equal(fc['patches'][:, T_all], fc_announced['patches'][:, T_all]), (
+        "the forecast protocol changed a patch outside its masked zone")
+    print(f"[DUMP] {len(T_all)} context patches identical to the announced build")
+
 
 def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
     """The interior spans this protocol places are blinded, and only they are.
@@ -131,6 +139,22 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
         expected = torch.full_like(got, float(fill[feat]))
         assert torch.equal(got, expected), (
             f"feat {feat} on a patch this protocol masks is not the fill")
+
+    # "and ONLY they are" — the half the first draft of this test left out. An
+    # implementation that wiped the dose channels of the whole window satisfies
+    # everything above, and would blind the visible evidence the infill task is
+    # defined against. The revealed patches must still carry what the sample left
+    # there, which is what the untouched input says.
+    _revealed = ~masked
+    for feat in MASKABLE_FEATS:
+        got = p[:, :, feat::N_INPUT_FEATURES][_revealed]
+        was = blind_batch['patches'][
+            torch.tensor([b for b, _ms, _c in infill['sets']])
+        ][:, :, feat::N_INPUT_FEATURES][_revealed]
+        assert torch.equal(got, was), (
+            f"feat {feat} moved on a patch this protocol REVEALS — the blinding "
+            "reached past its own masked set")
+    print(f"[DUMP] {int(_revealed.sum())} revealed patches unchanged")
 
 
 def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatch):
@@ -187,11 +211,24 @@ def test_no_counterfactual_column_survives(blind_batch):
         f"blind header still carries {[c for c in blind_cols if c.startswith('cf_')]}")
     dropped = [c for c in plain_cols if c.startswith('cf_')]
     assert dropped, "train.py's header has no cf_* column — this test has no subject"
-    assert set(blind_cols) == set(plain_cols) - set(dropped), (
-        "the two headers differ by something other than the cf_* block: "
-        f"{sorted(set(blind_cols) ^ (set(plain_cols) - set(dropped)))}")
+
+    # SEQUENCE equality, not set equality. A set comparison cannot see a
+    # duplicated column, and a duplicate is exactly what a copy-paste edit to
+    # this list produces: the two logs then differ in width and every column
+    # after the duplication sits at a different index, so a positional reader
+    # silently reports one metric under another's name. That defect was here.
+    assert len(blind_cols) == len(set(blind_cols)), (
+        "the blind header repeats a column: "
+        f"{sorted({c for c in blind_cols if blind_cols.count(c) > 1})}")
+    assert len(plain_cols) == len(set(plain_cols)), (
+        "train.py's header repeats a column: "
+        f"{sorted({c for c in plain_cols if plain_cols.count(c) > 1})}")
+    assert blind_cols == [c for c in plain_cols if not c.startswith('cf_')], (
+        "the blind header is not train.py's minus the cf_* block, in order — "
+        "the two runs' CSVs are no longer positionally comparable")
     print(f"\n[DUMP] {len(dropped)} cf_* columns dropped, "
-          f"{len(blind_cols)} of {len(plain_cols)} columns kept")
+          f"{len(blind_cols)} of {len(plain_cols)} columns kept, in order, "
+          "no duplicates")
 
     # Feed the values that WOULD render, so the absence is evidence.
     synthetic = {'cf_n': 96, 'cf_carb_dir': 0.94, 'cf_insulin_dir': 0.88,

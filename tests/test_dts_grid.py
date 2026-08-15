@@ -6,11 +6,13 @@ border vertices for drawing the grid, and that table is an independent statement
 of the same geometry — so it is the oracle here. Every one of the 16 edge
 vertices of Table A1 is checked against the function.
 
-They agree to 1.11 mg/dL, not exactly, and that is a property of the table rather
-than of the implementation: the sloped part of each true contour is a ray through
-the origin, while the table gives a chord whose two endpoints are rounded in
-opposite directions. ``VERTEX_TOL_MGDL`` is set just above the worst observed gap
-and is deliberately tight enough that a wrong coefficient, a dropped clamp or a
+They agree to 1.11 mg/dL, not exactly. The gap is largest on the VERTICAL
+below-clamp segments, where the border is not a chord of anything, so it is not a
+drawing artefact; it is consistent with the paper's coefficients being rounded
+("after rounding and simplification", Appendix 2) while Table A1 was drawn from
+the unrounded fit. Either way it is a property of the table rather than of the
+implementation. ``VERTEX_TOL_MGDL`` is set just above the worst observed gap and
+is deliberately tight enough that a wrong coefficient, a dropped clamp or a
 transposed axis fails it — each of those moves a vertex by tens of mg/dL.
 
 The 50 mg/dL clamp is the one part of ``dts_grid`` that is a reading of the

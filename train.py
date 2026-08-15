@@ -538,8 +538,10 @@ def compute_learning_metrics(
     # function, and DTS penalises an overestimate harder than an underestimate
     # where Clarke is symmetric in its A band. Reported per zone and never as
     # A+B, which the paper calls inappropriate. true_bg FIRST — the reference
-    # axis, as in Clarke and CG-EGA above; ``dts_grid`` carries the units
-    # tripwire that catches a transposed or risk-space argument.
+    # axis, as in Clarke and CG-EGA above. NOTHING CATCHES A TRANSPOSE: both
+    # arguments are legal mg/dL either way, so a swap here scores a well-formed
+    # table of a different statistic. ``dts_grid``'s units tripwire catches only
+    # the other error, a risk-space or normalized array.
     _dts_zones = dts_grid.dts_zones(_true_np, _pred_np)          # (B, P*S) 0..4
     for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
         out[f'dts_{_zn}'] = float((_dts_zones == _zi).sum())

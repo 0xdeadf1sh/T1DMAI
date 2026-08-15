@@ -29,12 +29,19 @@ THE DEFINITION IS THE RISK FUNCTION, NOT THE VERTEX TABLE
 ---------------------------------------------------------
 The paper publishes both a closed-form risk function (Supplemental Appendix 2)
 and a table of border vertices (Table A1) for drawing. This module implements the
-FUNCTION. The table's sloped borders are chords whose endpoints are rounded
-inconsistently — low end up, high end down — so a polygon built from it has a
-slightly different slope than the contour it is meant to trace, and the two
-disagree by up to ~1.1 mg/dL. ``tests/test_dts_grid.py`` pins the function
-against all 16 published edge vertices at that tolerance, which makes the table
-an ORACLE rather than a second implementation.
+FUNCTION, and ``tests/test_dts_grid.py`` pins it against all 16 published edge
+vertices — which makes the table an ORACLE rather than a second implementation.
+
+The two disagree by up to 1.11 mg/dL, and the reason is NOT that the sloped
+borders are chords of a curve: every contour here is a ray through the origin, so
+a chord through two of its points is the ray. The gap appears on the vertical
+below-clamp segments too, where there is no chord at all, and it is largest
+exactly there (D-lower and E-lower, 1.11 mg/dL each). What it is consistent with
+is the paper's own rounding: Appendix 2 introduces the coefficients with "after
+rounding and simplification", so 2.75 and 2.25 are themselves rounded, and Table
+A1 appears to have been drawn from the unrounded fit. That is an inference, not
+something the paper states. Either way the tolerance belongs to the table, not to
+this implementation.
 
     Risk = 2.75 * ln(monitor / reference)   when monitor > reference
            2.25 * ln(monitor / reference)   when monitor <= reference
@@ -123,8 +130,13 @@ from __future__ import annotations
 
 import numpy as np
 
+# The physical BG floor, the single source of truth for it in this suite. Used
+# below as the units tripwire; see DTS_UNITS_FLOOR_MGDL.
+from T1DMSIM.simulator import BG_CLAMP_MIN
+
 __all__ = [
     "DTS_LOW_CLAMP_MGDL",
+    "DTS_UNITS_FLOOR_MGDL",
     "DTS_OVERESTIMATE_COEFF",
     "DTS_UNDERESTIMATE_COEFF",
     "DTS_ZONE_EDGES",
@@ -151,13 +163,21 @@ ZONE_NAMES: tuple[str, ...] = ("a", "b", "c", "d", "e")
 assert len(ZONE_NAMES) == len(DTS_ZONE_EDGES) + 1
 
 # The published domain of the grid and of the SEG it derives from: 1-600 mg/dL.
-# The floor is the UNITS TRIPWIRE — every legal mg/dL glucose clears it, and a
-# risk-space or z-space array does not, which matters here more than usual: the
-# clamp above would take an array of z-scores to 50 mg/dL in every cell and
-# report a flawless 100% zone A. The ceiling only warns, since the function
-# extrapolates cleanly above it and the paper simply does not say.
+# Both ends only WARN. The ceiling because the risk function extrapolates cleanly
+# above it and the paper simply does not say; the floor because 1 mg/dL is far too
+# low to serve as a units check — Kovatchev risk over the legal BG range reaches
+# +3.16, so a whole risk-space array can sit above 1.0 and clear it.
 DTS_DOMAIN_MIN_MGDL: float = 1.0
 DTS_DOMAIN_MAX_MGDL: float = 600.0
+
+# The UNITS TRIPWIRE is the repository's physical BG floor, NOT the grid's domain
+# floor, and it is imported rather than restated. It matters here more than in
+# most places: the 50 mg/dL clamp above would take an array of z-scores or risk
+# values to 50 in every cell, score zero risk, and report a flawless 100% zone A
+# with nothing downstream able to tell. Every legal mg/dL glucose clears
+# BG_CLAMP_MIN by construction, and the whole realised risk range [-6.82, +3.16]
+# sits below it, so a risk-space array trips loudly.
+DTS_UNITS_FLOOR_MGDL: float = BG_CLAMP_MIN
 
 
 def _as_mgdl(x: np.ndarray, name: str) -> np.ndarray:
@@ -172,17 +192,18 @@ def _as_mgdl(x: np.ndarray, name: str) -> np.ndarray:
     """
     a = np.asarray(x, dtype=np.float64)
     assert np.isfinite(a).all(), f"dts_grid: {name} carries non-finite values"
-    assert a.min() >= DTS_DOMAIN_MIN_MGDL, (
-        f"dts_grid: {name} has a minimum of {a.min():.4g}, below the grid's "
-        f"{DTS_DOMAIN_MIN_MGDL} mg/dL domain floor — this is the units tripwire, "
-        "and a risk-space or normalized array is what usually trips it"
+    assert a.min() >= DTS_UNITS_FLOOR_MGDL, (
+        f"dts_grid: {name} has a minimum of {a.min():.4g}, below the physical BG "
+        f"floor of {DTS_UNITS_FLOOR_MGDL} mg/dL — this is the units tripwire, and "
+        "a risk-space or normalized array is what usually trips it"
     )
-    if a.max() > DTS_DOMAIN_MAX_MGDL:
-        import warnings
+    import warnings
+    if a.min() < DTS_DOMAIN_MIN_MGDL or a.max() > DTS_DOMAIN_MAX_MGDL:
         warnings.warn(
-            f"dts_grid: {name} reaches {a.max():.4g} mg/dL, above the grid's "
-            f"published {DTS_DOMAIN_MAX_MGDL} mg/dL domain; the risk function "
-            "extrapolates but the paper does not define zones there",
+            f"dts_grid: {name} spans [{a.min():.4g}, {a.max():.4g}] mg/dL, outside "
+            f"the grid's published [{DTS_DOMAIN_MIN_MGDL}, {DTS_DOMAIN_MAX_MGDL}] "
+            "domain; the risk function extrapolates but the paper does not define "
+            "zones there",
             RuntimeWarning, stacklevel=3,
         )
     return a

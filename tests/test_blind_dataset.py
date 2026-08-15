@@ -181,6 +181,51 @@ def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
     assert torch.equal(plain['targets'], blind['targets'])
 
 
+def test_the_dataset_honours_the_flag_end_to_end():
+    """``T1DMDataset(blind=True)[i]`` is blind — through ``__getitem__``, not
+    through ``_build_sample`` called by hand.
+
+    Every other test here builds its sample by calling the private builder
+    directly with ``blind=`` passed explicitly, which tests the builder and says
+    nothing about the THREADING: a ``T1DMDataset`` that stored the flag and never
+    passed it on, or passed ``blind=False``, would satisfy all of them. That
+    threading is the fork's delta 2 — every dataset the blind trainer builds is
+    ``blind=True`` — so it needs a subject of its own.
+
+    Both directions are checked on the same index, because "the blind dataset
+    produced blind samples" is only evidence if the plain dataset did not.
+    """
+    from data import BG_MASKED_FEAT, T1DMDataset, zero_dose_fill
+
+    stats = _get_stats()
+    kw = dict(master_seed=BLIND_SEED, total_steps=4, batch_size=1,
+              normalization_stats=stats, patient_uniform_sample_prob=0.0)
+    plain = T1DMDataset(**kw)[0]
+    blind = T1DMDataset(**kw, blind=True)[0]
+    fill = zero_dose_fill(stats)
+
+    p, b = plain['patches'], blind['patches']
+    bit = b[:, BG_MASKED_FEAT::N_INPUT_FEATURES][:, 0] > 0.5
+    assert int(bit.sum()) > 0, "the dataset drew no masked patch at this index"
+    print(f"\n[DUMP] dataset index 0: {int(bit.sum())} masked patches of {b.shape[0]}")
+
+    for feat_idx in MASKABLE_FEATS:
+        cells = b[bit, feat_idx::N_INPUT_FEATURES]
+        assert torch.equal(cells, torch.full_like(cells, float(fill[feat_idx]))), (
+            f"T1DMDataset(blind=True) did not blind feat {feat_idx} — the flag is "
+            "stored but not threaded to the sample builder")
+    # The default is still the announced policy on the same index, asserted over
+    # the three dose channels TOGETHER rather than one at a time: a sparse channel
+    # with no event in this span legitimately carries normalize(0) already — feat
+    # 3 does here — so per-feature the two policies coincide by accident.
+    dose_cols = [f for feat in MASKABLE_FEATS
+                 for f in range(feat, PATCH_DIM, N_INPUT_FEATURES)]
+    assert not torch.equal(p[bit][:, dose_cols], b[bit][:, dose_cols]), (
+        "the DEFAULT dataset produced the same masked dose cells as the blind one "
+        "— either blind=False is not the announced policy, or this index announces "
+        "nothing at all and the assertions above have no subject")
+
+
 def test_next_window_is_blinded_too():
     """The cross-window time probe's second window follows the same policy.
 
