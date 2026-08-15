@@ -36,16 +36,22 @@ python finetune_personal.py --checkpoint large.pt --db ~/t1dm-backup-20260726.db
 # python finetune/finetune_personal.py --checkpoint models/small/weights_sim.pt --db ~/Desktop/T1DMSERVER/data/t1dm.db --exclude-range 2026-07-30T11:10 2026-07-31T08:10 --out models/small/weights_personal.pt --steps 600 --batch-size 32 --lr-scale 0.30 --warmup 30 --eval-interval 20 --device cuda --seed 0
 
 # Export each capacity to both backends, from .venv-export (executorch 1.3.1 / torch 2.12.0), with config.py aligned to that capacity first.
-# .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint models/nano/weights_personal.pt  --model-id nano-personal  --out-dir exported
-# .venv-export/bin/python -m exporters.executorch_vulkan  --checkpoint models/nano/weights_personal.pt  --model-id nano-personal  --out-dir exported --write-pte --fp16
-# .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint models/small/weights_personal.pt --model-id small-personal --out-dir exported
-# .venv-export/bin/python -m exporters.executorch_vulkan  --checkpoint models/small/weights_personal.pt --model-id small-personal --out-dir exported --write-pte --fp16
-# .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint models/large/weights_personal.pt --model-id large-personal --out-dir exported
-# .venv-export/bin/python -m exporters.executorch_vulkan  --checkpoint models/large/weights_personal.pt --model-id large-personal --out-dir exported --write-pte --fp16
 #
-# A first xnnpack export of a RETRAINED model reports RESULT: FAIL on d_regress — that check
+# The model id is DATE-STAMPED, and that is load-bearing rather than decorative. The phone keys its
+# on-device conformal correction on the model id alone, so re-exporting new weights under an id it
+# has already fitted against leaves the old delta attached to them — and only a SUFFICIENT fit ever
+# replaces one, so the stale correction persists looking healthy. A fresh id per fine-tune run makes
+# that impossible, and costs only the accuracy history the new weights had no claim to anyway.
+# .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint models/nano/weights_personal.pt  --model-id nano-personal-20260806  --out-dir exported
+# .venv-export/bin/python -m exporters.executorch_vulkan  --checkpoint models/nano/weights_personal.pt  --model-id nano-personal-20260806  --out-dir exported --write-pte --fp16
+# .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint models/small/weights_personal.pt --model-id small-personal-20260806 --out-dir exported
+# .venv-export/bin/python -m exporters.executorch_vulkan  --checkpoint models/small/weights_personal.pt --model-id small-personal-20260806 --out-dir exported --write-pte --fp16
+# .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint models/large/weights_personal.pt --model-id large-personal-20260806 --out-dir exported
+# .venv-export/bin/python -m exporters.executorch_vulkan  --checkpoint models/large/weights_personal.pt --model-id large-personal-20260806 --out-dir exported --write-pte --fp16
+#
+# Re-exporting an EXISTING id with retrained weights reports RESULT: FAIL on d_regress — that check
 # compares against whatever .pte already sits in exported/, and new weights are meant to differ.
-# Re-run it once the new file is in place and d_regress falls to 0.
+# Re-run it once the new file is in place and d_regress falls to 0. A fresh id reports n/a instead.
 
 # Align to medium, sweep it, and take lr 0.30 — the only capacity to improve on 7/7 folds at every metric.
 # python resize_model.py --d-model 128 --heads 8 --layers 8
@@ -64,7 +70,7 @@ python finetune_personal.py --checkpoint large.pt --db ~/t1dm-backup-20260726.db
 # python resize_model.py --d-model 256 --heads 16 --layers 16
 
 # Deploy: the server pairs each artifact with a SIBLING <stem>.json, so the descriptor loses its .descriptor infix.
-# for V in nano-personal small-personal large-personal; do for E in xnnpack vulkan; do
+# for V in nano-personal-20260806 small-personal-20260806 large-personal-20260806; do for E in xnnpack vulkan; do
 #   cp exported/$V.$E.pte ~/Desktop/T1DMSERVER/data/models/$V.$E.pte
 #   cp exported/$V.$E.descriptor.json ~/Desktop/T1DMSERVER/data/models/$V.$E.json
 # done; done
