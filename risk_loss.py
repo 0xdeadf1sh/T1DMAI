@@ -47,14 +47,12 @@ Everything here is fp32-native (no autocast, no bf16).  ``kovatchev_f_target`` i
 the *only* (b)→(c) bridge on the target path and is applied exactly once.
 """
 
-from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 import config
-from config import D_BALANCED_LOSS
 from dilate import dilate_loss
 from utils import kovatchev_f_target
 
@@ -98,36 +96,11 @@ class KendallGalWeighting(nn.Module):
 _TAU_CACHE: Dict[Tuple, torch.Tensor] = {}
 
 
-@lru_cache(maxsize=1)
-def _N_D_GROUPS() -> int:
-    from d_balance import N_D_GROUPS
-
-    return int(N_D_GROUPS)
-
-
-@lru_cache(maxsize=8)
-def _d_weight_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """``d``-indexed lookup of the per-group weight, index 0 unused (padding).
-
-    Built once per (device, dtype).  Index by the (B, M) ``d`` tensor directly;
-    every ``d`` at or above ``N_D_GROUPS`` reads the pooled tail weight, so the
-    table is short and no ``d`` can fall off it.
-    """
-    from d_balance import N_D_GROUPS, d_weights
-
-    w = d_weights()
-    # Slot 0 is the padded-slot value; ``valid`` zeroes those anyway, so its
-    # magnitude is irrelevant and 1.0 keeps the table free of surprises.
-    table = [1.0] + [w[min(d, N_D_GROUPS) - 1] for d in range(1, N_D_GROUPS + 1)]
-    return torch.tensor(table, dtype=dtype, device=device)
-
-
 def pinball_loss(
     q_tau: torch.Tensor,
     y_risk: torch.Tensor,
     levels: Tuple[float, ...],
     valid: Optional[torch.Tensor] = None,
-    d: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pinball (quantile / check) loss over all quantile levels, in risk space.
 
@@ -193,23 +166,6 @@ def pinball_loss(
     if valid is None:
         return rho.mean()
     w = valid.to(rho.dtype)  # (B,M)
-    if d is not None and D_BALANCED_LOSS:
-        # Uniform PLACEMENT is not uniform DIFFICULTY. Under the sampler d = 1
-        # carries 47% of masked patches and d >= 4 carries 7.7%, while the
-        # deployed forecast needs one patch at each of d = 1..4. Reweighting
-        # here — and only here — gives each d group equal mass without touching
-        # the sampler or its placement.
-        #
-        # The table is normalised so E[w] == 1 under the sampler, which keeps
-        # this loss on the same scale as the unweighted form. A rescale would be
-        # absorbed by log_sigma_Q as a level and quietly shift the converged Q:D
-        # balance, with nothing in the loss curves looking wrong.
-        # Clamp the INDEX, not just the table: d reaches the span ceiling on an
-        # edge-touching span (8 at MASK_SPAN_LENGTHS[-1] = 8), well past the
-        # pooled tail group, and an unclamped gather is an out-of-bounds read —
-        # a device-side assert on CUDA, silent garbage on CPU.
-        idx = d.clamp(min=0, max=_N_D_GROUPS())
-        w = w * _d_weight_table(rho.device, rho.dtype)[idx]
     # Denominator is the WEIGHT MASS · S · Q — clamped at 1 so an all-padded
     # batch returns an exact 0.0 (numerator is 0 too) instead of 0/0. It tracks
     # the numerator's weights rather than counting slots; counting slots here
@@ -338,7 +294,6 @@ def risk_total_loss(
     weighting: KendallGalWeighting,
     valid: Optional[torch.Tensor] = None,
     mask_idx: Optional[torch.Tensor] = None,
-    d: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Total risk-space BG loss: pinball + DILATE, Kendall-Gal weighted.
 
@@ -434,7 +389,7 @@ def risk_total_loss(
     y_risk = kovatchev_f_target(true_bg_mgdl)  # (B,M,S) risk space
 
     # --- L_Q: pinball over all quantile levels (incl. τ=0.5), per masked patch ---
-    loss_Q = pinball_loss(q_tau, y_risk, config.QUANTILE_LEVELS, valid=valid, d=d)
+    loss_Q = pinball_loss(q_tau, y_risk, config.QUANTILE_LEVELS, valid=valid)
 
     # --- L_D: DILATE on the median only, one call per span-length bucket ---
     buckets = _span_buckets(mask_idx, valid, b_size, n_slots)

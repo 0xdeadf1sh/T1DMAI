@@ -80,42 +80,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
 
-# =========================================================================== #
-# --arm — resolved HERE, above ``import config``, and nowhere else.
-# =========================================================================== #
-# ``config`` binds MASK_SPAN_LENGTHS / MAX_MASKED_PATCHES / D_BALANCED_LOSS from
-# the arm during ITS import, and data / risk_loss / utils / metrics.protocols
-# bind them from ``config`` during theirs. The argparse block sits under
-# ``__main__`` at the bottom of this file, thousands of lines and every one of
-# those imports later, so a ``--arm`` parsed there would reach nothing and would
-# train the default arm while the resolved-config table said otherwise.
-#
-# The flag therefore travels through the environment, and this is the whole
-# mechanism: read ``--arm`` out of ``sys.argv``, write ``$T1DMAI_ARM``, then
-# import config. ``arms.arm_from_argv`` validates the name, so an unknown arm
-# stops the process before a model, a dataset or a log file exists. The flag is
-# left in ``argv`` and declared to argparse below as well, so ``--help`` lists it
-# and the arm table is printed with the rest of the help.
-from arms import (                                             # noqa: E402
-    ARM_ENV_VAR as _ARM_ENV_VAR, arm_from_argv as _arm_from_argv,
-)
-
-_ARM_ENV_AT_IMPORT = os.environ.get(_ARM_ENV_VAR)
-try:
-    ARM_FROM_ARGV = _arm_from_argv(sys.argv)
-except ValueError as _exc:
-    sys.stderr.write(f"error: {_exc}\n")
-    raise SystemExit(2)
-if ARM_FROM_ARGV is not None:
-    os.environ[_ARM_ENV_VAR] = ARM_FROM_ARGV
-
-# Where the active arm came from, for the resolved-configuration table.
-ARM_SOURCE = (
-    'CLI --arm' if ARM_FROM_ARGV is not None
-    else f'${_ARM_ENV_VAR}' if _ARM_ENV_AT_IMPORT is not None
-    else 'arms.py default'
-)
-
 from config import (                                           # noqa: E402
     MASTER_SEED, DETERMINISTIC, TOTAL_STEPS, BATCH_SIZE, NUM_WORKERS,
     MUON_LR, MUON_MOMENTUM, MUON_NS_ITERATIONS, MUON_WEIGHT_DECAY,
@@ -126,7 +90,7 @@ from config import (                                           # noqa: E402
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
     VALIDATION_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
     N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
-    SAMPLER_ARM, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, D_BALANCED_LOSS,
+    MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
     CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
@@ -2673,7 +2637,7 @@ def _infill_protocol(
     ``infill_masked_set``; nothing here re-derives one.
 
     The sample's own training mask is REPLACED rather than kept. A protocol has
-    to place its own spans to mean anything across arms, and an interior span
+    to place its own spans to mean anything across runs, and an interior span
     abutting a training-masked patch would not be two-sided at the ``d`` the slot
     layout reports. ``_window_bg_mgdl`` writes the withheld BG back first, so the
     window this protocol masks is the fully-observed one it is defined on.
@@ -2804,7 +2768,7 @@ def _infill_column(base: str, d: int) -> str:
 
 
 def _infill_reachable_d() -> "tuple[int, ...]":
-    """The ``d`` bins the infill protocol can populate at the active arm."""
+    """The ``d`` bins the infill protocol can populate at the live sampler."""
     from metrics.protocols import INFILL, reachable_d
     return reachable_d(INFILL)
 
@@ -3204,7 +3168,6 @@ def _run_validation(
             targets = batch['targets'].to(device, non_blocking=True).float()   # (B, M, S) mg/dL
             mask_idx = bg_formula['mask_idx'].long()                      # (B, M) padded axis
             slot_valid = bg_formula['valid']                              # (B, M) bool
-            slot_d = bg_formula.get('d')                                  # (B, M) int64
             anchor_bg = bg_formula['anchor_bg'].float()                   # (B, M) mg/dL
             slot_hour = bg_formula['slot_hour'].float()                   # (B, M) hours
 
@@ -3220,7 +3183,7 @@ def _run_validation(
             # against patch 0 behind a plausible neighbouring anchor.
             loss_total, parts = risk_total_loss(
                 q_tau_obj.float(), median_obj.float(), targets, weighting,
-                valid=slot_valid, mask_idx=mask_idx, d=slot_d,
+                valid=slot_valid, mask_idx=mask_idx,
             )
 
             totals['loss_total'] += float(loss_total) * B_batch
@@ -4175,13 +4138,10 @@ def train(
     )
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA,
-        # The mask-sampler arm, and the three constants it bound at config
-        # import. The name alone would stop pinning the values the moment
-        # arms.py's table is edited, so the checkpoint carries what actually ran.
-        'sampler_arm': SAMPLER_ARM,
+        # The sampler constants the run trained under — the provenance a loader
+        # compares its live config against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
-        'd_balanced_loss': D_BALANCED_LOSS,
         'master_seed': master_seed, 'total_steps': total_steps, 'batch_size': batch_size,
         'num_workers': num_workers,
         'd_model': _CFG_D_MODEL, 'n_layers': _CFG_N_LAYERS, 'n_heads': _CFG_N_HEADS,
@@ -4272,7 +4232,6 @@ def train(
         # head slot, not a trailing trajectory.
         mask_idx = bg_formula['mask_idx'].long()                      # (B, M)
         slot_valid = bg_formula['valid']                              # (B, M) bool
-        slot_d = bg_formula.get('d')                                  # (B, M) int64
         anchor_bg = bg_formula['anchor_bg'].float()                   # (B, M) mg/dL
         slot_hour = bg_formula['slot_hour'].float()                   # (B, M) hours
         targets = batch['targets'].to(device, non_blocking=True).float()   # (B, M, S)
@@ -4357,7 +4316,7 @@ def train(
             # spans for the per-span DILATE buckets and median basis.
             loss_total, parts = risk_total_loss(
                 q_tau, median, targets, weighting,
-                valid=slot_valid, mask_idx=mask_idx, d=slot_d,
+                valid=slot_valid, mask_idx=mask_idx,
             )
 
             # Time-of-day probe loss — added to the BACKWARD tensor ONLY. It never
@@ -4813,11 +4772,7 @@ def train(
 class HelpfulParser(argparse.ArgumentParser):
     """argparse.ArgumentParser that prints the full --help on any error.
 
-    Prefix abbreviation is OFF. ``--arm`` is read a second time, out of
-    ``sys.argv`` and above the config import, by ``arms.arm_from_argv``, which
-    matches the flag in full only. Abbreviated, the flag would parse here and be
-    invisible there: the sampler would bind the default arm and stamp it into the
-    checkpoint while ``args.arm`` named another.
+    Prefix abbreviation is OFF: every flag is written in full.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -4830,34 +4785,12 @@ class HelpfulParser(argparse.ArgumentParser):
         sys.exit(2)
 
 
-class _ArmTableHelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
-                             argparse.RawDescriptionHelpFormatter):
-    """Defaults on every flag, and the arm table in the epilog left as written.
-
-    ``ArgumentDefaultsHelpFormatter`` alone rewraps the epilog and collapses the
-    per-arm blocks into one paragraph; ``RawDescriptionHelpFormatter`` alone
-    drops the defaults. The arm table is a table, so both are needed.
-    """
-
-
 if __name__ == '__main__':
-    from arms import DEFAULT_ARM as _DEFAULT_ARM, arm_names as _arm_names
-    from arms import help_text as _arm_help_text
-
     parser = HelpfulParser(
         description='Train T1DMAI. Parameters are resolved in this order: '
                     'CLI args > config.py.',
-        epilog=("mask-sampler arms (--arm), their three constants and what each "
-                f"one is for.\nDefault: {_DEFAULT_ARM}.\n\n" + _arm_help_text()),
-        formatter_class=_ArmTableHelpFormatter,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--arm', type=str, default=None, choices=_arm_names(),
-                        help='Mask-sampler arm: MASK_SPAN_LENGTHS, '
-                             'MAX_MASKED_PATCHES and D_BALANCED_LOSS together. '
-                             'Read out of argv above the config import (arms.py '
-                             'is the table); see the arm table at the end of '
-                             'this help for the measured differences and their '
-                             'error bars.')
     parser.add_argument('--master-seed', type=int, default=None)
     parser.add_argument('--total-steps', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=None)
@@ -4890,16 +4823,6 @@ if __name__ == '__main__':
     parser.add_argument('--cache-path', type=str, default=None,
                         help='Path to a simulator cache directory produced by T1DMSIM/cache_simulator.py.')
     args = parser.parse_args()
-
-    # ``--arm`` is parsed twice — here, and above the config import by
-    # ``arms.arm_from_argv``, which is the only one of the two that reaches the
-    # sampler. Nothing else compares them, so a form only one reader accepts
-    # trains one arm and reports another: a repeated ``--arm`` takes the last
-    # occurrence here and the first there.
-    if args.arm is not None and args.arm != SAMPLER_ARM:
-        parser.error(f"--arm {args.arm} was parsed here, but the sampler bound "
-                     f"arm {SAMPLER_ARM} [{ARM_SOURCE}] — pass --arm once, "
-                     f"written in full")
 
     # ------------------------------------------------------------------ #
     # Layer 1: code defaults (from config.py)
@@ -4974,13 +4897,10 @@ if __name__ == '__main__':
     rows.append(('prediction_patches', str(PREDICTION_PATCHES), 'derived'))
     rows.append(('arch_version', str(ARCH_VERSION), 'config.py'))
     rows.append(('loss_schema', str(LOSS_SCHEMA), 'config.py'))
-    # The active arm and the three constants it bound, read back off ``config``
-    # rather than off ``arms.ARMS`` — what the run trains with is what config
-    # published, and printing the table's copy would hide a disagreement.
-    rows.append(('sampler_arm', str(SAMPLER_ARM), ARM_SOURCE))
-    rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), f'arm {SAMPLER_ARM}'))
-    rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), f'arm {SAMPLER_ARM}'))
-    rows.append(('d_balanced_loss', str(D_BALANCED_LOSS), f'arm {SAMPLER_ARM}'))
+    # The sampler constants, read back off ``config`` — what the run trains with
+    # is what config published, and these are what the checkpoint records.
+    rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
+    rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))
     key_w = max(len(k) for k, _, _ in rows)
     val_w = max(len(v) for _, v, _ in rows)
     body = [f"  {k:<{key_w}}  {v:<{val_w}}  [{s}]" for k, v, s in rows]

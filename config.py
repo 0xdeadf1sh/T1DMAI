@@ -20,7 +20,7 @@ Sections (top → bottom):
     Patient sampling     — uniform-skill mixing (RETIRED; PATIENT_UNIFORM_SAMPLE_PROB pinned 0.0)
     Optimizer (Muon)     — LR, momentum, NS iterations, weight decay
     Optimizer (AdamW)    — LR, betas, weight decay, eps
-    Loss                 — gradient clip, per-d balancing, Kendall-Gal dynamic PINBALL/DILATE weighting
+    Loss                 — gradient clip, Kendall-Gal dynamic PINBALL/DILATE weighting
     Excursion thresholds — hypo / hyper clinical cutoffs (CG-EGA / Clarke / TIR) + band-edge alarm τ
     EMA                  — shadow weight decay for stable validation
     Checkpoints / logs   — intervals
@@ -28,8 +28,7 @@ Sections (top → bottom):
     Calibration reserve  — conformal-calibration seed band / count
 
 Resolution order at training time (high → low):
-    CLI flags > the values in this file.  The three mask-sampler knobs come from
-    the arm named by ``$T1DMAI_ARM`` (``arms.py``), resolved at import.
+    CLI flags > the values in this file.
 ``train.py`` prints the resolved config on startup so the user can confirm
 what's being used.
 """
@@ -45,17 +44,6 @@ from T1DMSIM.simulator import (
     EXERCISE_CARB_EQUIV_PER_MIN as _EX_G_PER_MIN,
     EXERCISE_DURATION_MEAN_MIN as _EX_DUR_MEAN_MIN,
 )
-
-# The mask-sampler arm, resolved ONCE here from ``$T1DMAI_ARM`` and never
-# afterwards.  ``MASK_SPAN_LENGTHS``, ``MAX_MASKED_PATCHES`` and
-# ``D_BALANCED_LOSS`` below are the arm's three values, and data.py, risk_loss.py,
-# utils.py and metrics/protocols.py bind them at THEIR import, so rewriting one on
-# the config module object after that reaches none of them.  ``arms.py`` carries
-# the arms, the evidence behind each and the --help text; an unknown name raises
-# there.
-from arms import resolve_arm
-
-SAMPLER_ARM, _ARM = resolve_arm()
 
 # === Model Architecture ===
 # D_MODEL, N_LAYERS, N_HEADS, PATCH_SIZE, FFN_DIM and BG_HEAD_HIDDEN (plus
@@ -169,14 +157,14 @@ MAX_SEQ_LEN = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
 # per-span median basis and the DILATE length bucket well defined per span; two
 # spans with nothing between them are one longer span.
 MASK_MAX_SPANS = 3                             # spans per sample, drawn U{1..MASK_MAX_SPANS}
-MASK_SPAN_LENGTHS = _ARM['mask_span_lengths']  # per arm SAMPLER_ARM (arms.py)
+MASK_SPAN_LENGTHS = (1, 2, 3, 4, 5, 6, 7, 8)   # span length law, drawn U(MASK_SPAN_LENGTHS)
 # MAX_MASKED_PATCHES is two things at once: the sampler's cap on sum(L), and M,
 # the BG head's fixed slot count. The head always emits M slots, so a sample with
 # fewer masked patches pads the surplus; a padded slot gathers patch 0, which
 # makes its output a real number against a real target. Every loss and metric
 # path MUST discard padded slots by their ``valid`` flag, or they train against
 # patch 0's BG behind a plausible neighbouring anchor.
-MAX_MASKED_PATCHES = _ARM['max_masked_patches']   # per arm SAMPLER_ARM (arms.py)
+MAX_MASKED_PATCHES = 12          # sampler cap on sum(L), and M, the head's slot count
 
 # === Night long-horizon validation ===
 # Validation rolls ``predict_rolling`` out to ``NIGHT_LONG_HORIZON_HOURS`` hours
@@ -393,17 +381,6 @@ WEIGHT_DECAY_SCHEDULE_CORRECTION = True
 
 # === Loss ===
 GRADIENT_CLIP_NORM = 1.0         # Max gradient norm
-
-# Per-d loss balancing. Uniform mask PLACEMENT is not uniform supervision by
-# DIFFICULTY: d — a masked patch's distance in patches to the nearest visible
-# evidence on either side — is heavily concentrated at d = 1 under the sampler,
-# while the deployed forecast needs one patch at each d it spans. With this on,
-# risk_loss multiplies each masked patch by the per-d weight from d_balance, so
-# d = 1, 2, 3 and d >= 4 each carry equal loss mass. It reweights the LOSS only:
-# the sampler and its uniform placement are untouched. It costs variance, by a
-# factor the span ceiling sets: quote d_balance.effective_sample_size() at the
-# active arm with any result produced under it.
-D_BALANCED_LOSS = _ARM['d_balanced_loss']         # per arm SAMPLER_ARM (arms.py)
 
 # === Risk-space BG loss (DILATE + pinball, Kendall-Gal uncertainty-weighted) ===
 # The BG forecast is supervised entirely in Kovatchev RISK space (see

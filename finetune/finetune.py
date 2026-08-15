@@ -53,7 +53,6 @@ import csv
 import math
 import os
 import re
-import shlex
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,7 +65,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-import arms
 import config
 from model import T1DMAI
 from muon import Muon
@@ -250,7 +248,7 @@ def _arch_guard(ckpt: dict[str, Any]) -> None:
 
     Only keys present in ``ckpt['training_config']`` are compared (the schema does
     not persist ``bg_head_hidden``, so it is verified by the strict state-dict load
-    instead).  The mask-sampler arm is ``_arm_guard``'s; it changes no dimension
+    instead).  The mask sampler is ``_sampler_guard``'s; it changes no dimension
     here and needs a different remedy.
     """
     tc = ckpt.get('training_config', {}) or {}
@@ -266,67 +264,38 @@ def _arch_guard(ckpt: dict[str, Any]) -> None:
         raise SystemExit(_alignment_message(ckpt))
 
 
-def _arm_message(tc: dict[str, Any]) -> str:
-    """Build the operator-facing message for a mask-sampler arm mismatch.
+def _sampler_message(tc: dict[str, Any]) -> str:
+    """Build the operator-facing message for a mask-sampler mismatch.
 
-    Separate from ``_alignment_message`` because the remedy is: ``resize_model.py``
-    has no flag for any of the three values and no ``config.py`` edit sets them
-    either — ``config`` binds them at import from ``$T1DMAI_ARM`` (``arms.py``).
+    Separate from ``_alignment_message`` because the remedy is different:
+    ``resize_model.py`` has no flag for any of these, and the fix is a
+    ``config.py`` edit back to the values the checkpoint records.
     """
     lengths = tc.get('mask_span_lengths')
-    stored = (
-        tuple(lengths) if lengths is not None else None,
-        tc.get('max_masked_patches'),
-        tc.get('d_balanced_loss'),
-    )
-    # Ask arms.py which name reproduces the checkpoint's VALUES rather than
-    # trusting the stored name: a table edited since the run is exactly the case
-    # where that name now selects a different sampler than the one that trained
-    # these weights, and following it would re-enter the mismatch.
-    named = [
-        name for name, arm in arms.ARMS.items()
-        if (tuple(arm['mask_span_lengths']), arm['max_masked_patches'],
-            arm['d_balanced_loss']) == stored
-    ]
-    if named:
-        fix = (
-            "Re-run under the checkpoint's arm:\n"
-            f"  {arms.ARM_ENV_VAR}={named[0]} {shlex.join(sys.argv)}"
-            + (f"\n  ({' and '.join(named)} hold the same values.)"
-               if len(named) > 1 else "")
-        )
-    else:
-        fix = (
-            f"No arm in arms.py holds those values, so {arms.ARM_ENV_VAR} cannot "
-            "select them. Restore the checkpoint's arm in arms.py, or fine-tune a "
-            "checkpoint trained under an arm the table still holds."
-        )
     return (
-        "Mask-sampler arm mismatch: the live arm is not the one the checkpoint was "
+        "Mask-sampler mismatch: the live sampler is not the one the checkpoint was "
         "trained under.\n"
-        f"  checkpoint: arm={tc.get('sampler_arm')!r} mask_span_lengths={stored[0]} "
-        f"max_masked_patches={stored[1]} d_balanced_loss={stored[2]}\n"
-        f"  live:       arm={config.SAMPLER_ARM!r} "
-        f"mask_span_lengths={tuple(config.MASK_SPAN_LENGTHS)} "
+        f"  checkpoint: mask_span_lengths={tuple(lengths) if lengths is not None else None} "
+        f"max_masked_patches={tc.get('max_masked_patches')} "
+        f"mask_right_edge_quota={tc.get('mask_right_edge_quota')}\n"
+        f"  live:       mask_span_lengths={tuple(config.MASK_SPAN_LENGTHS)} "
         f"max_masked_patches={config.MAX_MASKED_PATCHES} "
-        f"d_balanced_loss={config.D_BALANCED_LOSS}\n"
-        "Nothing else catches this: no parameter shape depends on the arm, so the "
-        "strict state-dict load accepts weights from any of them. The live values "
-        "bind all the same — MAX_MASKED_PATCHES is M in this script's slot tensors, "
-        "and risk_total_loss reads D_BALANCED_LOSS and, under it, weights derived "
-        "from MASK_SPAN_LENGTHS and MAX_MASKED_PATCHES (d_balance.d_weights).\n"
-        + fix
+        f"mask_right_edge_quota={config.MASK_RIGHT_EDGE_QUOTA}\n"
+        "Nothing else catches this: no parameter shape depends on the sampler, so "
+        "the strict state-dict load accepts weights trained under any of them. The "
+        "live values bind all the same — MAX_MASKED_PATCHES is M in this script's "
+        "slot tensors, and the span-length law and the quota together set the d "
+        "mixture the fine-tune supervises.\n"
+        "Restore the checkpoint's values in config.py, or fine-tune a checkpoint "
+        "trained under the live ones."
     )
 
 
-def _arm_guard(ckpt: dict[str, Any]) -> None:
-    """Raise ``SystemExit`` if the live mask-sampler arm is not the checkpoint's.
+def _sampler_guard(ckpt: dict[str, Any]) -> None:
+    """Raise ``SystemExit`` if the live mask sampler is not the checkpoint's.
 
-    The three VALUES are compared, not ``sampler_arm``: ``train.py`` stamps both
-    because the name stops pinning the values the moment ``arms.py``'s table is
-    edited, and it is the values that reach the sampler, the slot tensors and the
-    loss.  A name that moved over unchanged values changes nothing and is reported
-    rather than raised on.
+    The recorded sampler CONSTANTS are compared, so the check is true provenance:
+    it is those values that reach the sampler, the slot tensors and the loss.
 
     Only keys present in ``ckpt['training_config']`` are compared, as in
     ``_arch_guard``.
@@ -338,16 +307,10 @@ def _arm_guard(ckpt: dict[str, Any]) -> None:
     checks = [
         ('mask_span_lengths', config.MASK_SPAN_LENGTHS, tuple),
         ('max_masked_patches', config.MAX_MASKED_PATCHES, int),
-        ('d_balanced_loss', config.D_BALANCED_LOSS, bool),
+        ('mask_right_edge_quota', config.MASK_RIGHT_EDGE_QUOTA, float),
     ]
     if any(norm(tc[k]) != norm(live) for k, live, norm in checks if k in tc):
-        raise SystemExit(_arm_message(tc))
-
-    stored_name = tc.get('sampler_arm')
-    if stored_name is not None and stored_name != config.SAMPLER_ARM:
-        print(f"[finetune] checkpoint arm {stored_name!r} vs live arm "
-              f"{config.SAMPLER_ARM!r}; the three values are identical, so the "
-              f"name moved in arms.py and the sampler did not")
+        raise SystemExit(_sampler_message(tc))
 
 
 def load_checkpoint(
@@ -371,7 +334,7 @@ def load_checkpoint(
     stats = ckpt['normalization_stats']
 
     _arch_guard(ckpt)
-    _arm_guard(ckpt)
+    _sampler_guard(ckpt)
 
     model = T1DMAI().to(device)
     try:
@@ -1515,12 +1478,12 @@ def main() -> None:
     model, ckpt, stats = load_checkpoint(args.checkpoint, device)
     arch_version = ckpt.get('arch_version')
     loss_schema = ckpt.get('loss_schema')
-    # The base checkpoint's resolved config — architecture, mask-sampler arm, and
-    # what pretraining ran under. The fine-tune changes none of it, and the two
-    # guards above have just confirmed the live config agrees on every key it
-    # carries, so it travels to the output verbatim rather than being rebuilt from
-    # the live config. Without it the arm provenance ends at this script and the
-    # output cannot be guarded, exported or carded. What is specific to THIS run —
+    # The base checkpoint's resolved config — architecture, mask sampler, and what
+    # pretraining ran under. The fine-tune changes none of it, and the two guards
+    # above have just confirmed the live config agrees on every key it carries, so
+    # it travels to the output verbatim rather than being rebuilt from the live
+    # config. Without it the provenance ends at this script and the output cannot
+    # be guarded, exported or carded. What is specific to THIS run —
     # steps, LR scale, dataset, holdout, selection — is finetune_meta's.
     base_training_config = ckpt.get('training_config', {}) or {}
 

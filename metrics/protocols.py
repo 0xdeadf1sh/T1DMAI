@@ -54,7 +54,7 @@ What every run reports
   a bare ``continue``, segments are cut at every CGM gap over 30 min, and the
   survivors are the longest gap-free wears — so each context width would
   otherwise evaluate a different window set).  Eligibility is PINNED to the 24 h
-  footprint here, which is what fixes the set across arms.
+  footprint here, which is what fixes the set across runs.
 
 ``RunReport`` bundles the three so a caller integrates in three lines.
 """
@@ -584,8 +584,8 @@ def sampler_d_histogram(n_draws: int = 20000, seed: int = 0) -> DHistogram:
 # MAX_CONTEXT_PATCHES.  ``realdata/calibrate.py`` drops any segment shorter than
 # context + horizon with a bare ``continue``, and segments are cut at every CGM
 # gap over 30 min, so the survivors are the longest gap-free wears — a wider
-# context silently re-selects the cohort under the arm.  Pinning the footprint is
-# what makes the evaluated set the same set across arms.
+# context silently re-selects the cohort.  Pinning the footprint is what makes
+# the evaluated set the same set across runs.
 ELIGIBILITY_HOURS = 24.0
 ELIGIBILITY_CONTEXT_PATCHES = int(round(ELIGIBILITY_HOURS * _PATCHES_PER_HOUR))
 ELIGIBILITY_STEPS = (ELIGIBILITY_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
