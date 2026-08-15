@@ -90,7 +90,7 @@ from config import (                                           # noqa: E402
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
     VALIDATION_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
     N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
-    MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
+    MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
     CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
@@ -4142,6 +4142,7 @@ def train(
         # compares its live config against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
+        'mask_right_edge_quota': MASK_RIGHT_EDGE_QUOTA,
         'master_seed': master_seed, 'total_steps': total_steps, 'batch_size': batch_size,
         'num_workers': num_workers,
         'd_model': _CFG_D_MODEL, 'n_layers': _CFG_N_LAYERS, 'n_heads': _CFG_N_HEADS,
@@ -4901,6 +4902,7 @@ if __name__ == '__main__':
     # is what config published, and these are what the checkpoint records.
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
     rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))
+    rows.append(('mask_right_edge_quota', str(MASK_RIGHT_EDGE_QUOTA), 'config.py'))
     key_w = max(len(k) for k, _, _ in rows)
     val_w = max(len(v) for _, v, _ in rows)
     body = [f"  {k:<{key_w}}  {v:<{val_w}}  [{s}]" for k, v, s in rows]

@@ -318,22 +318,32 @@ def test_val_cal_rows_never_reproject_onto_train():
 
 
 def test_train_inference_anchor_identical():
-    """C-anchor: training and inference must compute the SAME ``last_bg`` — a
-    mismatch makes the head learn a delta against an anchor it never sees at
-    deployment, wrecking short-horizon accuracy.
+    """C-anchor: training and inference must compute the SAME anchor — a mismatch
+    makes the head learn a delta against an anchor it never sees at deployment,
+    wrecking short-horizon accuracy.
 
     No-smoothing pipeline: inputs/target/anchor are raw post-noise signals.
-    ``data._build_sample`` sets ``last_bg = bg[pred_start-1]`` — the LAST context
-    BG INPUT (raw, clamped to the physical range) — and inference's
-    ``utils.last_bg_mgdl_from_context`` simply denormalizes that same last context
-    cell, so the two anchors are identical by construction.  We build a REAL
-    sample, reconstruct its context, and assert they agree to ~machine-zero.
+    ``data._build_sample`` reads each slot's anchor off the raw mg/dL array at
+    ``anchor_step``; inference has no raw array and reconstructs the same cell out
+    of the normalized window through ``utils.last_bg_mgdl_from_context``, so the
+    two agree to a round-trip ulp.  We build REAL samples and assert the parity on
+    every valid slot.
+
+    The claim is per SLOT, not on ``last_bg`` alone.  Reading the context's last
+    cell is legal only while that patch is VISIBLE — feat 0 of a masked patch is a
+    legal-looking ``z`` decoding to ~142 mg/dL on the balanced pool — and masking
+    is not positional, so the last context patch is masked on a real share of
+    windows.  ``anchor_step`` never points at one: the mandatory separator makes
+    the patch left of a span visible, and a span at patch 0 reads its right
+    neighbour instead.  The right-edge case is asserted separately, gated on that
+    visibility, because it is the one the deployed forecast uses.
     """
     import os
     import numpy as np
     from utils import last_bg_mgdl_from_context
-    from data import _build_sample, _make_simulator, simulate_discard_warmup
-    from config import PATCH_SIZE, N_INPUT_FEATURES
+    from data import (_anchor_step_for_span, _build_sample, _make_simulator,
+                      simulate_discard_warmup)
+    from config import PATCH_SIZE, N_INPUT_FEATURES, PREDICTION_PATCHES
     from normalization import load_normalization_stats, NORM_STATS_FILE
 
     if not os.path.exists(NORM_STATS_FILE):
@@ -344,19 +354,51 @@ def test_train_inference_anchor_identical():
     data = simulate_discard_warmup(sim, 33.0)
     icr = float(sim.patient.icr)
 
-    # Several windows: the parity must hold for every drawn n_ctx / pred_start.
-    for seed in range(8):
+    n_slots = n_right_edge = 0
+    # Several windows: the parity must hold for every drawn n_ctx / pred_start and
+    # every masked set the sampler places in it.
+    for seed in range(16):
         sample = _build_sample(data=data, icr=icr, stats=stats,
                                rng=np.random.default_rng(seed))
         n_ctx = int(sample['n_context_patches'])
-        ctx = sample['patches'][:n_ctx].reshape(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)
+        bf = sample['bg_formula_data']
+        mask_idx, valid = bf['mask_idx'], bf['valid']
+        seq_len = n_ctx + PREDICTION_PATCHES
+        window = sample['patches'].reshape(seq_len, PATCH_SIZE, N_INPUT_FEATURES)
 
-        a_train = float(sample['bg_formula_data']['last_bg'])      # bg[pred_start-1]
-        a_infer = float(last_bg_mgdl_from_context(ctx, stats).item())
+        # Spans are the maximal runs of adjacent masked patches, which is how
+        # `utils._span_layout` recovers them too; each carries one anchor step.
+        idx = mask_idx[valid].tolist()
+        steps: list[int] = []
+        run_start = idx[0]
+        for prev, cur in zip(idx, idx[1:] + [None]):
+            if cur != prev + 1:
+                steps += [_anchor_step_for_span(run_start, prev - run_start + 1)] \
+                    * (prev - run_start + 1)
+                run_start = cur
+        assert len(steps) == len(idx)
 
-        assert abs(a_infer - a_train) < 1e-2, (seed, a_infer, a_train)
-        print(f"[DUMP] anchor parity | seed={seed} train={a_train:.4f} "
-              f"infer={a_infer:.4f} Δ={abs(a_infer - a_train):.2e} ✓")
+        a_train = bf['anchor_bg'][valid]
+        a_infer = last_bg_mgdl_from_context(
+            window, stats,
+            patch_idx=np.asarray(steps) // PATCH_SIZE,
+            step_idx=np.asarray(steps) % PATCH_SIZE).numpy()
+        worst = float(np.abs(a_infer - a_train).max())
+        assert worst < 1e-2, (seed, worst, a_train.tolist(), a_infer.tolist())
+        n_slots += len(idx)
+
+        # The deployed right-edge read, where the last context patch is visible.
+        if (n_ctx - 1) not in idx:
+            n_right_edge += 1
+            ctx = window[:n_ctx]
+            edge = float(last_bg_mgdl_from_context(ctx, stats).item())
+            assert abs(edge - float(bf['last_bg'])) < 1e-2, (seed, edge, bf['last_bg'])
+
+    assert n_right_edge > 0, \
+        "no window left its context edge visible — the right-edge read is untested"
+    print(f"[DUMP] anchor parity | {n_slots} slots over 16 windows agree to <1e-2 "
+          f"mg/dL; {n_right_edge} of 16 had a visible context edge and matched "
+          f"last_bg there ✓")
 
 
 # ---------------------------------------------------------------------------

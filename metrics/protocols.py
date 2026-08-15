@@ -76,7 +76,8 @@ if _ROOT not in sys.path:
 
 from config import (                                     # noqa: E402
     PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
-    MASK_MAX_SPANS, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, _PATCHES_PER_HOUR,
+    MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
+    _PATCHES_PER_HOUR,
     QUANTILE_LEVELS,
 )
 # The masked set's slot layout, the ``d`` rule and the anchor rule are ONE
@@ -419,21 +420,25 @@ def baseline_for(masked_set: MaskedSet, cgm: np.ndarray,
 # The d histogram, and the sampler's exactly-enumerated reference.
 # --------------------------------------------------------------------------- #
 # Exact enumeration of ``data.sample_mask_spans`` over the training window-length
-# mixture (n_ctx ~ U{MIN_CONTEXT_PATCHES..MAX_CONTEXT_PATCHES}) at
-# MAX_CONTEXT_PATCHES = 48.  Enumeration, not measurement: a realised histogram
-# that departs from these figures means the SAMPLER changed, not that the run was
+# mixture (n_ctx ~ U{MIN_CONTEXT_PATCHES..MAX_CONTEXT_PATCHES}), both placement
+# branches included.  Enumeration, not measurement: a realised histogram that
+# departs from these figures means the SAMPLER changed, not that the run was
 # unlucky.  They are pinned to the knobs they were enumerated under, and
 # ``sampler_reference_applies`` refuses to compare against them once a knob moves.
+# Produced by ``d_balance.d_distribution`` at the knobs below, and checked against
+# 4e5 draws of the live sampler at every quota (agreement within 1 sigma at each
+# ``d``); re-run both if any knob here moves.
 SAMPLER_REFERENCE = {
-    'max_context_patches': 48,
-    'min_context_patches': 16,
+    'max_context_patches': 96,
+    'min_context_patches': 48,
     'prediction_patches': 4,
     'mask_max_spans': 3,
-    'mask_span_lengths': (1, 2, 3, 4),
-    'max_masked_patches': 8,
-    'share_pct': {1: 71.012, 2: 27.044, 3: 1.339, 4: 0.605},
-    'patches_per_sample': {1: 3.3085, 2: 1.2600, 3: 0.0624, 4: 0.0282},
-    'mean_masked': 4.6591,
+    'mask_span_lengths': (1, 2, 3, 4, 5, 6, 7, 8),
+    'max_masked_patches': 12,
+    'mask_right_edge_quota': 0.35,
+    'share_pct': {1: 44.532, 2: 28.361, 3: 15.623, 4: 11.484},
+    'patches_per_sample': {1: 3.2966, 2: 2.0996, 3: 1.1566, 4: 0.8501},
+    'mean_masked': 7.4029,
 }
 
 
@@ -450,6 +455,7 @@ def sampler_reference_applies() -> tuple[bool, str]:
         'mask_max_spans': MASK_MAX_SPANS,
         'mask_span_lengths': tuple(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
+        'mask_right_edge_quota': MASK_RIGHT_EDGE_QUOTA,
     }
     diffs = [f"{k}: live {v} vs reference {SAMPLER_REFERENCE[k]}"
              for k, v in live.items() if v != SAMPLER_REFERENCE[k]]

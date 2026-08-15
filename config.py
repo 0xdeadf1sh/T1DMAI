@@ -145,13 +145,14 @@ MAX_SEQ_LEN = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
 #     n_spans  ~ U{1 .. MASK_MAX_SPANS}
 #     each L_i ~ U(MASK_SPAN_LENGTHS), independently
 #     sum(L) > MAX_MASKED_PATCHES  ⇒  resample the WHOLE length vector
-#     placement: stars-and-bars over the n_spans + 1 gaps
+#     with prob MASK_RIGHT_EDGE_QUOTA: last span flush right, rest over the prefix
+#     otherwise:                       stars-and-bars over the n_spans + 1 gaps
 # The over-budget rejection redraws the whole length vector, never one element:
 # per-element redrawing yields a different length distribution, and so a
 # different d histogram. Placement spreads the slack T - sum(L) - (n_spans - 1)
 # uniformly over the gaps, with one MANDATORY visible separator between
 # neighbouring spans. Rejection is on LENGTHS and there is none on PLACEMENT;
-# placement is uniform — no right-edge quota, no curriculum, no annealing.
+# there is no curriculum and no annealing.
 #
 # Two masked spans never abut. The separator is what makes the anchor, the
 # per-span median basis and the DILATE length bucket well defined per span; two
@@ -165,6 +166,18 @@ MASK_SPAN_LENGTHS = (1, 2, 3, 4, 5, 6, 7, 8)   # span length law, drawn U(MASK_S
 # path MUST discard padded slots by their ``valid`` flag, or they train against
 # patch 0's BG behind a plausible neighbouring anchor.
 MAX_MASKED_PATCHES = 12          # sampler cap on sum(L), and M, the head's slot count
+# Fraction of windows whose LAST span is placed flush against the final patch —
+# drawn as a FORECAST rather than left to be an accident of uniform placement. At
+# 0 the deployed right-edge case is ~3% of windows, and its 90% band decays with
+# training while every selection scalar improves: paired from one step-6000
+# resume, cov90@30 reaches 0.9149 here against the control's 0.8805 at step
+# 12000, and the control keeps falling to 0.8547 by 100k. The value sits on a
+# plateau — most of the correction is already bought at 0.15 (0.9053) and 0.60
+# returns none of it (0.9087) — while interpolation accuracy pays monotonically,
+# so the low end of the plateau is the cheap end. The span-length law is
+# untouched: only where the last span lands changes. Moving this invalidates
+# metrics.protocols.SAMPLER_REFERENCE, which reads it.
+MASK_RIGHT_EDGE_QUOTA = 0.35     # share of windows whose last span is flush right
 
 # === Night long-horizon validation ===
 # Validation rolls ``predict_rolling`` out to ``NIGHT_LONG_HORIZON_HOURS`` hours

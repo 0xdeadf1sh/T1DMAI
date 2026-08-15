@@ -7,8 +7,11 @@ mixture exactly from the sampler's own knobs; ``metrics.protocols.SAMPLER_REFERE
 is produced from it and checked against it.  ``python d_balance.py`` prints the
 live figures.
 
-A change to the sampler that is not mirrored here silently moves every
-``d``-binned figure's reference.
+The enumeration covers BOTH of ``data.sample_mask_spans``' placement branches.
+Uniform placement alone leaves the deployed one-sided forecast case at ~3% of
+masked slots, which is what ``config.MASK_RIGHT_EDGE_QUOTA`` corrects; a change
+to the sampler that is not mirrored here silently moves every ``d``-binned
+figure's reference.
 
 The tail is POOLED, not binned: ``d = 1, 2, 3`` and ``d >= 4``.  ``d >
 N_D_GROUPS`` needs an edge-touching span longer than ``N_D_GROUPS`` patches, and
@@ -23,6 +26,7 @@ from math import comb
 
 from config import (
     MASK_MAX_SPANS,
+    MASK_RIGHT_EDGE_QUOTA,
     MASK_SPAN_LENGTHS,
     MAX_CONTEXT_PATCHES,
     MAX_MASKED_PATCHES,
@@ -66,12 +70,20 @@ def d_distribution(
     min_ctx: int,
     max_ctx: int,
     pred: int,
+    right_edge_quota: float = 0.0,
 ) -> tuple[float, ...]:
     """Exact share of masked patches in each ``d`` group, by enumeration.
 
     Enumerated rather than sampled: at 1e5 draws the per-position 1-sigma is
     about 0.99 % of the mean, several times the effect being measured, so a
     correct sampler still reports the wrong answer in every replicate.
+
+    Both of ``data.sample_mask_spans``' placement branches are enumerated. Under
+    the right-edge branch the LAST span is pinned at ``T - L_last`` and the rest
+    are composed over the prefix that clears it and its separator, which holds
+    the same ``slack`` the uniform branch spreads over one more gap. Both branches
+    draw ``n_spans`` and the lengths identically, so the quota moves this
+    histogram and nothing else.
 
     Returns a tuple of ``N_D_GROUPS`` shares summing to 1.
     """
@@ -87,6 +99,7 @@ def d_distribution(
     pT = 1.0 / len(Ts)
     mass = [0.0] * N_D_GROUPS
     total = 0.0
+    q = float(right_edge_quota)
 
     def compose(m: int, slack: int, weight: float, lengths: tuple[int, ...],
                 T: int) -> float:
@@ -109,7 +122,19 @@ def d_distribution(
             slack = T - sum(L) - (n - 1)
             if slack < 0:
                 continue
-            total += compose(n, slack, pT * w, L, T)
+            last = L[-1]
+            w_right = q * w
+            w_unif = w - w_right
+
+            if w_unif > 0.0:
+                total += compose(n, slack, pT * w_unif, L, T)
+
+            if w_right > 0.0:
+                wr = pT * w_right
+                # The pinned span first, then the prefix composition (if any).
+                total += _accumulate_span(mass, wr, T - last, last, T)
+                if n > 1:
+                    total += compose(n - 1, slack, wr, L[:-1], T)
 
     return tuple(m / total for m in mass)
 
@@ -122,6 +147,7 @@ def _current_distribution() -> tuple[float, ...]:
         int(MIN_CONTEXT_PATCHES),
         int(MAX_CONTEXT_PATCHES),
         int(PREDICTION_PATCHES),
+        float(MASK_RIGHT_EDGE_QUOTA),
     )
 
 
@@ -133,7 +159,8 @@ def summary() -> str:
     )
     return (
         f"MASK_SPAN_LENGTHS={tuple(MASK_SPAN_LENGTHS)} "
-        f"MAX_MASKED_PATCHES={MAX_MASKED_PATCHES}\n  {rows}"
+        f"MAX_MASKED_PATCHES={MAX_MASKED_PATCHES} "
+        f"MASK_RIGHT_EDGE_QUOTA={MASK_RIGHT_EDGE_QUOTA}\n  {rows}"
     )
 
 

@@ -101,7 +101,7 @@ from config import (
     PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM,
     CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
-    MASK_MAX_SPANS, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
+    MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
     PATIENT_UNIFORM_SAMPLE_PROB,
     SIMULATOR_WARMUP_HOURS, NIGHT_LONG_HORIZON_PATCHES, CACHE_MADVISE_DONTNEED,
     TIME_PROBE_ENABLED, TIME_PROBE_CROSS_WINDOW_WEIGHT,
@@ -934,14 +934,28 @@ def sample_mask_spans(
         n_spans      ~ U{1 .. MASK_MAX_SPANS}
         each L_i     ~ U(MASK_SPAN_LENGTHS), independently
         if sum(L) > MAX_MASKED_PATCHES: resample the WHOLE length vector
-        placement     stars-and-bars over n_spans + 1 gaps
+        with prob MASK_RIGHT_EDGE_QUOTA: last span flush right, rest over the
+                                         prefix by stars-and-bars
+        otherwise:                       stars-and-bars over n_spans + 1 gaps
 
     The over-budget rejection redraws the whole vector, never one element:
     per-element redrawing yields a different length distribution and hence a
     different ``d`` histogram.  Placement is a uniform composition of the slack
     over the gaps, with a MANDATORY visible patch between neighbouring spans —
-    there is no rejection loop on placement, and there is no right-edge quota,
-    curriculum or annealing.
+    there is no rejection loop on placement, and no curriculum or annealing.
+
+    ``MASK_RIGHT_EDGE_QUOTA`` is the one departure from uniform placement, and it
+    changes ONLY where the last span lands: ``n_spans`` and the length law are
+    drawn identically in both branches, so the span-length histogram is
+    quota-independent and only the ``d`` histogram moves.  Under uniform
+    placement a FORECAST — the case the model is deployed as — is an accident
+    worth ~3% of windows, and the band it emits there decays with training while
+    every selection scalar improves.  ``config.MASK_RIGHT_EDGE_QUOTA`` carries
+    the paired evidence for the value.
+
+    Both branches are enumerated exactly in ``d_balance.d_distribution``; a change
+    here that is not mirrored there silently moves every ``d``-binned figure's
+    reference.
 
     Two masked spans never abut.  The separator is what makes the anchor, the
     per-span median basis and the DILATE length bucket well defined per span;
@@ -975,28 +989,57 @@ def sample_mask_spans(
             f"total length {total_masked} with separators"
         )
 
-    # Stars and bars: `slack` indistinguishable stars into n_spans + 1 ordered
-    # bins, uniform over compositions.  Choosing the n_spans bar positions out
-    # of slack + n_spans slots without replacement is exactly that uniform draw.
-    n_gaps = n_spans + 1
-    bars = np.sort(rng.choice(slack + n_gaps - 1, size=n_gaps - 1, replace=False))
-    gaps = np.empty(n_gaps, dtype=np.int64)
-    gaps[0] = bars[0]
-    gaps[1:-1] = bars[1:] - bars[:-1] - 1
-    gaps[-1] = slack + n_gaps - 2 - bars[-1]
+    def _compose(slack_: int, n_gaps_: int) -> np.ndarray:
+        """Stars and bars: ``slack_`` indistinguishable stars into ``n_gaps_``
+        ordered bins, uniform over compositions.  Choosing the ``n_gaps_ - 1``
+        bar positions out of ``slack_ + n_gaps_ - 1`` slots without replacement
+        is exactly that uniform draw."""
+        if n_gaps_ == 1:
+            return np.array([slack_], dtype=np.int64)
+        bars_ = np.sort(rng.choice(slack_ + n_gaps_ - 1, size=n_gaps_ - 1,
+                                   replace=False))
+        g = np.empty(n_gaps_, dtype=np.int64)
+        g[0] = bars_[0]
+        g[1:-1] = bars_[1:] - bars_[:-1] - 1
+        g[-1] = slack_ + n_gaps_ - 2 - bars_[-1]
+        return g
 
     spans: list[tuple[int, int]] = []
-    pos = 0
-    for i in range(n_spans):
-        pos += int(gaps[i])
-        spans.append((pos, int(span_lengths[i])))
-        pos += int(span_lengths[i])
-        if i < n_spans - 1:
-            pos += 1                      # the mandatory visible separator
+    # The right-edge branch reserves the LAST span at the window's final patch and
+    # composes the rest over the prefix that stays clear of it and its separator.
+    # That prefix has exactly ``slack`` free patches — pinning the last span is the
+    # uniform arrangement with its trailing gap fixed at 0, and fixing a gap frees
+    # the separator it no longer needs — so the branch is feasible whenever the
+    # window holds the spans at all, and needs no feasibility test of its own.
+    last = int(span_lengths[-1])
+    right_edge = MASK_RIGHT_EDGE_QUOTA > 0.0 and rng.random() < MASK_RIGHT_EDGE_QUOTA
+
+    if right_edge and n_spans == 1:
+        spans.append((seq_len - last, last))
+    elif right_edge:
+        gaps = _compose(slack, n_spans)          # n_spans-1 spans -> n_spans gaps
+        pos = 0
+        for i in range(n_spans - 1):
+            pos += int(gaps[i])
+            spans.append((pos, int(span_lengths[i])))
+            pos += int(span_lengths[i]) + 1
+        spans.append((seq_len - last, last))
+    else:
+        gaps = _compose(slack, n_spans + 1)
+        pos = 0
+        for i in range(n_spans):
+            pos += int(gaps[i])
+            spans.append((pos, int(span_lengths[i])))
+            pos += int(span_lengths[i])
+            if i < n_spans - 1:
+                pos += 1                  # the mandatory visible separator
+        assert pos + int(gaps[-1]) == seq_len
+
     assert all(
         spans[i][0] > spans[i - 1][0] + spans[i - 1][1] for i in range(1, n_spans)
     ), f"abutting masked spans {spans} at seq_len={seq_len}"
-    assert pos + int(gaps[-1]) == seq_len
+    assert spans[0][0] >= 0 and spans[-1][0] + spans[-1][1] <= seq_len, (
+        f"masked spans {spans} fall outside a {seq_len}-patch window")
     return spans
 
 
