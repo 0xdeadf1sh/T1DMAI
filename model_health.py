@@ -51,7 +51,8 @@ With ``--data N`` the script additionally streams ``N`` cached simulator
 samples through the model with forward hooks and measures *activation* dead
 fractions (FFN / BG-head units that fire ~never), residual-stream per-dimension
 variance, and per-head output-activation norm — corroborating the weight-only
-verdicts with the model's actual behaviour.
+verdicts with the model's actual behaviour.  Those samples are built under the
+checkpoint's own ``masked_channel_policy``, which the report header echoes.
 
 Usage::
 
@@ -83,7 +84,9 @@ from config import N_INPUT_FEATURES
 # The bg_masked column index, from its single definition.  ``data`` imports torch,
 # config and normalization and nothing heavier — blosc2 and T1DMSIM are pulled in
 # lazily, inside the cache reader — so this stays on the data-free path.
-from data import BG_MASKED_FEAT
+from data import (
+    BG_MASKED_FEAT, MASKED_CHANNEL_POLICY_BLIND, checkpoint_masked_channel_policy,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -791,11 +794,18 @@ def run_data_pass(
         if not Path(cache_path, 'meta.json').exists():
             print(f"[data] cache {cache_path!r} unavailable — skipping data pass")
             return None
+        # The masked-channel policy is the CHECKPOINT's, not this script's: a
+        # blind checkpoint streamed through an announced dataset reads a dose
+        # channel it was trained to see pinned at the no-dose fill, and every
+        # activation figure below is then measured off-distribution.  No
+        # parameter shape records the policy, so nothing else would catch it.
+        policy = checkpoint_masked_channel_policy(ckpt)
         ds = T1DMDataset(
             master_seed=int(ckpt.get('master_seed', 0)),
             total_steps=max(1, n_samples), batch_size=1,
             normalization_stats=ckpt['normalization_stats'],
             cache_path=cache_path, seed_offset=7_000_000,  # disjoint from train/norm/conformal bands
+            blind=(policy == MASKED_CHANNEL_POLICY_BLIND),
         )
     except Exception as e:  # noqa: BLE001 — data pass is best-effort
         print(f"[data] could not initialize data pass: {type(e).__name__}: {e}")
@@ -924,6 +934,8 @@ def print_report(
     if bvl is not None:
         print(f"  best_val_loss {bvl:.5f} @ step {bvs}   "
               f"arch_version {ckpt.get('arch_version','?')}   loss_schema {ckpt.get('loss_schema','?')}")
+    print(f"  masked_channel_policy {checkpoint_masked_channel_policy(ckpt)}"
+          f"   (absent stamp reads as announced)")
     av = arch.view()
     print("  arch: " + "  ".join(f"{k}={v}" for k, v in av.items())
           + f"  N_SPREADS={arch.n_spreads}")
@@ -1077,6 +1089,7 @@ def main() -> None:
     if args.json:
         payload = {
             'checkpoint': str(path), 'step': ckpt.get('step'),
+            'masked_channel_policy': checkpoint_masked_channel_policy(ckpt),
             'using_ema': args.ema, 'param_count': param_count,
             'undertrained': detail['undertrained'],
             'arch': asdict(arch), 'spectra': detail['spectra'],
