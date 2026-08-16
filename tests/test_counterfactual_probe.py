@@ -35,7 +35,7 @@ def test_counterfactual_probe_smoke():
     stats = _get_stats()
     device = torch.device('cpu')
 
-    # ~4 samples is enough — the probe iterates min(len, VALIDATION_N_PATIENTS).
+    # ~4 samples is enough — the probe iterates min(len, VALIDATION_PROBE_N_PATIENTS).
     val_dataset = T1DMDataset(master_seed=777, total_steps=4, batch_size=1,
                               normalization_stats=stats, cache_path=None)
 

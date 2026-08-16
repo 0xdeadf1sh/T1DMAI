@@ -542,6 +542,24 @@ LOG_INTERVAL = 100               # Log to CSV every N steps
 # per-sample rolling long-horizon loop, which runs on every window.
 VALIDATION_N_PATIENTS = 1000     # Number of patients in the validation set
 
+# The two PER-SAMPLE probes — the long-horizon BG accumulation and the
+# counterfactual dose-response — are the only parts of validation not scored over
+# the batched window loop. Each spends its forwards one window at a time: the
+# long horizon rolls four of them autoregressively, the counterfactual runs five
+# conditioned arms over one fixed context (nothing re-fed). So the two together
+# cost ~77% of a validation while every windowed metric costs the rest. They are read for direction, not as
+# coverage rows whose interval has to be tight, and every figure they emit
+# travels with its own denominator — ``cf_n``, and ``bg_rmse_{h}_n`` /
+# ``night_bg_rmse_{h}_n`` at the horizons past the single forward — so a
+# smaller sample reads off the row rather than being assumed away.
+#
+# What this does NOT touch: every metric scored inside the batched window loop,
+# which stays at VALIDATION_N_PATIENTS. The split is the horizon — a BG error at
+# 30/60/120 min comes off the single forward over the whole val set, one at
+# 180/360/480 off the long-horizon probe over this many. Set equal to
+# VALIDATION_N_PATIENTS to probe every window.
+VALIDATION_PROBE_N_PATIENTS = 250
+
 # === Normalization ===
 # The normalization pass mirrors the cache / on-the-fly DATA GENERATION so the
 # saved per-channel stats match the distribution the model actually trains on:

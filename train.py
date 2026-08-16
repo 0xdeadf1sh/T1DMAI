@@ -88,7 +88,7 @@ from config import (                                           # noqa: E402
     PREDICTION_PATCHES,
     MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
-    VALIDATION_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
+    VALIDATION_N_PATIENTS, VALIDATION_PROBE_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
     N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
@@ -2202,7 +2202,7 @@ def _run_counterfactual_probe(
 ) -> dict[str, Any]:
     """Counterfactual dose-response probe.
 
-    For up to ``VALIDATION_N_PATIENTS`` validation samples, forecast a BASELINE on
+    For up to ``VALIDATION_PROBE_N_PATIENTS`` validation samples, forecast a BASELINE on
     each sample's TRUE announced pred-zone carbs+insulin+exercise, then perturb a
     single dose (a RAW bolus added to the FIRST pred-zone patch, spread across its
     PATCH_SIZE steps, then renormalized through the channel's log1p z-transform)
@@ -2273,7 +2273,10 @@ def _run_counterfactual_probe(
                       device=device, overrides=overrides)
         return res['median_bg'].detach().cpu().numpy()      # (P*S,) mg/dL
 
-    n_val = min(len(val_dataset), VALIDATION_N_PATIENTS)
+    # Capped at VALIDATION_PROBE_N_PATIENTS, not VALIDATION_N_PATIENTS: this runs
+    # five conditioned forwards per WINDOW rather than per batch — one context, five
+    # arms, nothing re-fed — and ``cf_n`` carries the sample it was read over.
+    n_val = min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS)
     if samples is not None:
         n_val = min(n_val, len(samples))
 
@@ -2300,7 +2303,7 @@ def _run_counterfactual_probe(
             # inside it would move both by the same fabricated reading and the
             # ΔBG would still look clean. ``cf_n`` counts what was probed.
             #
-            # No length floor here, unlike the two rolling sites: what this probe
+            # No length floor here, unlike the rolling long-horizon pass: what this probe
             # reports is a DIFFERENCE between two arms over one shared context,
             # so a short run shifts both arms together and the sign, the
             # monotonicity and the rescue rate survive it. A single forward, too
@@ -3363,12 +3366,19 @@ def _run_validation(
                     )
                     infill_windows += 1
 
-            # Long-horizon rolling pass (night-only accumulation inside).
+            # Long-horizon rolling pass (night-only accumulation inside).  Capped
+            # at VALIDATION_PROBE_N_PATIENTS: it rolls each window forward on its
+            # own, so it is the one metric here whose cost is per SAMPLE rather
+            # than per batch.  The cap is applied on the window index, not by
+            # truncating the loop, so the windows it reads stay the leading
+            # prefix of the same ordered val set every run.  Each bg_rmse_{h}
+            # carries the count it was accumulated over.
             n_rolls = math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
-            if n_rolls > 1:
+            probe_end = min(batch_end, VALIDATION_PROBE_N_PATIENTS)
+            if n_rolls > 1 and batch_start < probe_end:
                 _accumulate_long_horizon_bg_metrics(
-                    model, samples, norm_stats, device, n_rolls, agg,
-                    night_agg=night_agg,
+                    model, samples[:probe_end - batch_start], norm_stats, device,
+                    n_rolls, agg, night_agg=night_agg,
                 )
 
             # Nocturnal subset of the forecast protocol (no third forward).
@@ -3467,6 +3477,12 @@ def _run_validation(
         else:
             result[f'bg_rmse_{h_min}'] = None
             result[f'bg_mae_{h_min}'] = None
+        # The denominator, for every horizon and not just the night-filtered
+        # ones. Horizons past the single forward are accumulated by the rolling
+        # probe, which reads VALIDATION_PROBE_N_PATIENTS windows rather than
+        # VALIDATION_N_PATIENTS, so this column is what separates a horizon
+        # scored over the whole val set from one scored over the probe's share.
+        result[f'bg_rmse_{h_min}_n'] = cnt
 
     _rc = agg.get('median_rough_cnt', 0.0)
     result['median_roughness'] = (agg['median_rough_abs_sum'] / _rc) if _rc > 0 else None
@@ -3878,6 +3894,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         *[(f'inner50_cov@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
         *[(f'bg_rmse_{h}', 4) for h in BG_HORIZONS_MIN],
         *[(f'bg_mae_{h}', 4) for h in BG_HORIZONS_MIN],
+        *[(f'bg_rmse_{h}_n', 4) for h in BG_HORIZONS_MIN],
         *[(f'evalfix_mard@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
         ('pred_tir', 4), ('true_tir', 4), ('tir_err', 4),
         ('tbr_err', 4), ('tar_err', 4),
@@ -3926,8 +3943,9 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         # patch is masked has no visible anchor and is dropped); roll_ctx_patches
         # is the mean VISIBLE context the rolling passes ran on, which is shorter
         # than n_ctx by however far the nearest masked patch sits from the
-        # origin. roll_n and roll_skipped split the whole val set into the
-        # samples the roll measured and the samples whose visible run was under
+        # origin. roll_n and roll_skipped split the windows the roll was OFFERED —
+        # the leading VALIDATION_PROBE_N_PATIENTS, not the whole val set — into the
+        # samples it measured and the samples whose visible run was under
         # MIN_CONTEXT_PATCHES; night_roll_n and night_roll_skipped are that same
         # split over the nocturnal samples the night_bg_rmse_* family is scored
         # on, several times smaller. Without both pairs, two runs' night rows are
@@ -4652,6 +4670,10 @@ def train(
             for h in BG_HORIZONS_MIN:
                 val_record[f'bg_rmse_{h}'] = _r(val_metrics.get(f'bg_rmse_{h}'))
                 val_record[f'bg_mae_{h}'] = _r(val_metrics.get(f'bg_mae_{h}'))
+                # The denominator travels with the figure here too: past the single
+                # forward these come off VALIDATION_PROBE_N_PATIENTS windows, and
+                # this record is the only copy once logs/ is overwritten.
+                val_record[f'bg_rmse_{h}_n'] = val_metrics.get(f'bg_rmse_{h}_n')
             for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
                 val_record[f'evalfix_clarke_A@{h}'] = _r(val_metrics.get(f'evalfix_clarke_A@{h}'))
                 val_record[f'dts_a@{h}'] = _r(val_metrics.get(f'dts_a@{h}'))

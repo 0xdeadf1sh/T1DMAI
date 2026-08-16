@@ -623,10 +623,24 @@ already carry the clinical bias structurally.
 ## Validation
 
 Runs every `VALIDATION_INTERVAL` steps on a fixed held-out pool of
-`VALIDATION_N_PATIENTS` patients, under EMA weights. Two artifacts: a row
-appended to `logs/validation_log.csv`, and a table printed to stdout with columns
-`Metric | Value | Prev`, coloured against published thresholds with a trend arrow
-against the previous run. A section that loses every row loses its header.
+`VALIDATION_N_PATIENTS` patients, under EMA weights.
+
+Two sample sizes, not one. Everything scored inside the batched window loop reads
+the whole pool. The two per-sample probes — the long-horizon BG accumulation and
+the counterfactual dose-response — read the leading `VALIDATION_PROBE_N_PATIENTS`
+windows instead, because each spends its forwards one window at a time and so
+costs per sample where the rest costs per batch. The long horizon rolls four
+forwards autoregressively; the counterfactual runs five conditioned arms over one
+fixed context. The horizon is the dividing line: a BG error at 30 / 60 / 120 min
+comes off the single forward over the whole pool, one at 180 / 360 / 480 min off
+the probe. Every figure either probe emits carries its own denominator — `cf_n`,
+`bg_rmse_{h}_n`, `night_bg_rmse_{h}_n` — so the narrower sample is read off the
+row rather than assumed.
+
+Two artifacts: a row appended to `logs/validation_log.csv`, and a table printed
+to stdout with columns `Metric | Value | Prev`, coloured against published
+thresholds with a trend arrow against the previous run. A section that loses
+every row loses its header.
 
 A row of a per-horizon, per-region or per-`d` family whose bin came out empty
 renders `—` and keeps its place; a standalone row whose value is unavailable is
