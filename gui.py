@@ -191,6 +191,22 @@ OVERRIDE_POINT_RADIUS = ui_px(6)
 CURVE_EVENT_FILL_ALPHA = 60
 CONTROL_POINT_HIT_RADIUS = ui_px(12)
 
+# ---- Free-form masking ----
+# A masked span hides the true BG under it: the model is being asked to fill
+# that stretch, so leaving the curve drawn there invites reading the answer off
+# the chart. The overlay is what marks the span; the context curve is clipped
+# out of it in _draw_chart.
+MASK_SPAN_COLOR = (150, 120, 210)
+MASK_SPAN_ALPHA = 46
+MASK_SPAN_SELECTED_ALPHA = 78
+MASK_DRAG_ALPHA = 30
+MASK_EDGE_COLOR = (185, 160, 240)
+MASK_OOD_COLOR = (240, 175, 70)
+# Buttons that write an announced dose; disabled under a blind checkpoint.
+_DOSE_PAINTING_BUTTONS = frozenset({
+    "What-If", "Pencil", "Basal +1 U/h", "Basal -1 U/h",
+})
+
 # Visual smoothing windows applied to the predicted curves, in timesteps
 # (5 min each). Both are purely cosmetic — the underlying prediction is
 # unchanged. The σ envelope gets a wider window because edge wobble is
@@ -878,6 +894,41 @@ def _preview_horizon_patches_for_state(state) -> int:
     return int(n)
 
 
+def _masked_context(state, spans: list[tuple[int, int]]):
+    """``state.context`` with the masked CONTEXT spans' dose channels withheld.
+
+    Only under the blind policy, and only for spans inside the context: the
+    trailing forecast zone is seeded to ``normalize(0)`` by
+    ``inference._build_patches_tensor`` already, which IS the blind fill.
+    ``inference`` withholds bg alone on a masked context patch — the announced
+    convention — so under ``blind`` this is where the dose channels go with it,
+    the same place ``calibrate_conformal._blind_context`` puts them.
+
+    Args:
+        state: the GUI state.
+        spans: the emitted masked set, trailing span included.
+
+    Returns:
+        A new tensor under ``blind``; ``state.context`` itself otherwise.
+    """
+    from config import N_INPUT_FEATURES, PATCH_SIZE
+    from data import blind_masked_doses
+    from gui_state import mask_dose_fill
+
+    fill = mask_dose_fill(state.masked_channel_policy, state.norm_stats)
+    if fill is None:
+        return state.context
+    n_ctx = int(state.context.shape[0])
+    flat = state.context.reshape(n_ctx, PATCH_SIZE * N_INPUT_FEATURES).clone()
+    masked = torch.zeros(n_ctx, dtype=torch.bool)
+    for start, length in spans:
+        lo, hi = max(0, start), min(n_ctx, start + length)
+        if hi > lo:
+            masked[lo:hi] = True
+    blind_masked_doses(flat, masked, fill)
+    return flat.reshape(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)
+
+
 def _run_prediction(
     state,
     model,
@@ -886,7 +937,8 @@ def _run_prediction(
     basal_ramp_down_h: float,
     basal_duration_h: float,
 ) -> None:
-    from inference import predict, predict_what_if
+    import inference
+    from inference import predict
     from config import PATCH_SIZE, PREDICTION_PATCHES
 
     state.is_computing = True
@@ -896,12 +948,21 @@ def _run_prediction(
         hour = _hour_at_pred_start(state)
         state.active_band_label = f"{hour:0.1f}h"
         n_ctx = state.context.shape[0]
-        # The masked span's ANCHOR, for the chart's readout. The anchor rule is
-        # one-sided and LEFT-PREFERRING: every slot of a span takes the last step
-        # of the left neighbour patch (the first step of the right neighbour only
-        # when the span starts at patch 0), and every slot of one span gets the
-        # same value. For the GUI's right-edge span that is step n_ctx*PATCH_SIZE-1.
-        # The anchor is not the distance a metric bins on: it ignores the near side.
+        # The masked set: the user's context spans plus the mandatory trailing
+        # forecast span. ``inference.PREDICTION_PATCHES`` (not config's) is the
+        # window ``predict`` builds — ``main`` rewrites it to the checkpoint's
+        # horizon — so the trailing span has to be measured against that one.
+        n_pred = int(inference.PREDICTION_PATCHES)
+        mask_spans = state.emitted_mask_spans(n_pred)
+        ctx = _masked_context(state, mask_spans)
+        # The context edge, which is the trailing forecast span's own anchor. The
+        # anchor rule is one-sided and LEFT-PREFERRING: every slot of a span takes
+        # the last step of the left neighbour patch (the first step of the right
+        # neighbour only when the span starts at patch 0), and every slot of one
+        # span gets the same value. Per-span anchors are read off
+        # ``gui_state.span_anchor_cell`` for the chart's readout; this scalar
+        # stays what it always was. The anchor is not the distance a metric bins
+        # on: it ignores the near side.
         last_bg_idx = n_ctx * PATCH_SIZE - 1
         if state.bg_raw is not None and last_bg_idx >= 0:
             state.last_bg = float(state.bg_raw[last_bg_idx])
@@ -942,11 +1003,17 @@ def _run_prediction(
                 )
             # Re-run predict with the announced carb/insulin/exercise INPUT perturbed;
             # the model's median BG forecast shifts in response.
-            result = predict_what_if(
-                model, state.context, state.patient_seed,
+            # ``predict_what_if`` is right-edge by construction — it takes no
+            # ``mask_spans`` — and it is otherwise a conditioned ``predict``, so
+            # the masked-set call goes straight to ``predict`` with the same
+            # overrides rather than widening the wrapper. Painting still writes
+            # the trailing zone only: the overrides are (n_pred, PATCH_SIZE).
+            result = predict(
+                model, ctx, state.patient_seed,
                 overrides=torch_overrides,
                 normalization_stats=state.norm_stats,
                 device=device,
+                mask_spans=mask_spans,
             )
             state.prediction.is_what_if = True
             state.mode_label = f"What-If · {state.active_band_label}"
@@ -955,9 +1022,10 @@ def _run_prediction(
             probe_overrides = torch_overrides
         else:
             result = predict(
-                model, state.context, state.patient_seed,
+                model, ctx, state.patient_seed,
                 normalization_stats=state.norm_stats,
                 device=device,
+                mask_spans=mask_spans,
             )
             state.prediction.is_what_if = False
             state.mode_label = f"Standard · {state.active_band_label}"
@@ -968,6 +1036,11 @@ def _run_prediction(
         # Headline forecast: median_bg (mg/dL) + per-τ quantile bands.
         state.prediction.median_bg = result['median_bg'].cpu().numpy()
         state.prediction.bands = result['bands'].cpu().numpy()
+        # WHICH patch each band row predicts. The head reads its slots by gather
+        # over an arbitrary masked set, so slot j is patch mask_idx[j] and the
+        # chart must place the row there — a fixed offset from the context end is
+        # right only for the forecast.
+        state.prediction.span_patches = result['mask_idx'].cpu().numpy()
         state.prediction.n_rolls = 1
 
         # Diagnostic time-of-day probe: decode the prediction-origin hour +
@@ -1064,6 +1137,67 @@ def _smooth_1d(x: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode='valid').astype(x.dtype, copy=False)
 
 
+def _contiguous_runs(patches: np.ndarray) -> list[tuple[int, int]]:
+    """Group ascending patch indices into ``[lo, hi)`` runs of consecutive ones.
+
+    The head's ``mask_idx`` is one slot per masked patch in span order, and the
+    sampler guarantees a visible separator between spans, so a break in the
+    sequence IS a span boundary — the same adjacency rule ``utils._span_layout``
+    uses to group slots for the per-span median basis.
+
+    Args:
+        patches: ``(P,)`` ascending patch indices.
+
+    Returns:
+        ``[(lo, hi), ...]`` half-open index ranges into ``patches``.
+    """
+    if len(patches) == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    lo = 0
+    for i in range(1, len(patches)):
+        if int(patches[i]) != int(patches[i - 1]) + 1:
+            runs.append((lo, i))
+            lo = i
+    runs.append((lo, len(patches)))
+    return runs
+
+
+def _split_at_masked(
+    times: np.ndarray, values: np.ndarray, spans,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Break a context curve into the stretches that are NOT masked.
+
+    ``times`` are in patch units, so a sample belongs to patch ``floor(t)``.
+
+    Args:
+        times: ``(N,)`` x values in absolute patch units.
+        values: ``(N,)`` chart-y values.
+        spans: the user's ``MaskSpan`` list.
+
+    Returns:
+        ``[(times, values), ...]`` for each visible run of 2+ samples.
+    """
+    if len(times) == 0:
+        return []
+    hidden = np.zeros(len(times), dtype=bool)
+    patch_of = np.floor(times).astype(np.int64)
+    for s in spans:
+        hidden |= (patch_of >= s.start) & (patch_of <= s.last)
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    start = None
+    for i, h in enumerate(hidden):
+        if not h and start is None:
+            start = i
+        elif h and start is not None:
+            if i - start >= 2:
+                out.append((times[start:i], values[start:i]))
+            start = None
+    if start is not None and len(times) - start >= 2:
+        out.append((times[start:], values[start:]))
+    return out
+
+
 def _draw_band_polygon(
     surf,
     transform,
@@ -1109,6 +1243,7 @@ class T1DMAIGui:
         basal_ramp_up_h: float = 0.5,
         basal_ramp_down_h: float = 0.5,
         basal_duration_h: float = 4.0,
+        masked_channel_policy: str | None = None,
     ) -> None:
         self.pygame = _safe_import_pygame()
         self.model = model
@@ -1125,6 +1260,8 @@ class T1DMAIGui:
         self.state = GUIState()
         self.state.norm_stats = norm_stats
         self.state.patient_seed = patient_seed
+        if masked_channel_policy is not None:
+            self.state.masked_channel_policy = masked_channel_policy
 
         right_panel_w = self._right_panel_w()
         chart_x = SIDEBAR_WIDTH + CHART_PADDING
@@ -1207,7 +1344,19 @@ class T1DMAIGui:
                    callback=self._do_basal_plus),
             Button(10 + btn_w + 10, 0, btn_w, bh, "Basal -1 U/h",
                    callback=self._do_basal_minus),
+            Button(10, 0, btn_w, bh, "Mask [M]", callback=self._do_mask_tool),
+            Button(10 + btn_w + 10, 0, btn_w, bh, "Clear Masks",
+                   callback=self._do_clear_masks),
         ]
+        # Dose painting is inert under a blind checkpoint (the masked-patch dose
+        # channels were pinned at the no-dose fill throughout training), so the
+        # controls that write one are disabled rather than left to do nothing
+        # visible. Matched by label, since the list above is positional.
+        from gui_state import dose_painting_enabled
+        if not dose_painting_enabled(self.state.masked_channel_policy):
+            for b in self._buttons:
+                if b.label.split(' [')[0] in _DOSE_PAINTING_BUTTONS:
+                    b.enabled = False
 
         # Modal sub-windows. They auto-center on the screen each frame
         # via their own _layout, so no rect plumbing is needed here.
@@ -1308,7 +1457,80 @@ class T1DMAIGui:
         if not self.state.is_computing:
             self._run_prediction_async()
 
+    def _n_pred(self) -> int:
+        """The trailing forecast span's length, in patches.
+
+        Read off ``inference``, not ``config``: ``main`` rewrites
+        ``inference.PREDICTION_PATCHES`` to the loaded checkpoint's horizon and
+        leaves ``config`` alone, and this is the window ``predict`` actually
+        builds — the one the masked set has to fit.
+        """
+        import inference
+        return int(inference.PREDICTION_PATCHES)
+
+    def _dose_painting_blocked(self) -> str:
+        """Why a painted dose cannot reach this model, or ``''``.
+
+        The blind policy pinned the masked-patch dose channels at
+        ``data.zero_dose_fill`` for the whole of training, so an override written
+        there is a channel the weights learned carries no information: the
+        forecast would not move and the user would read that as a model result.
+        """
+        from gui_state import dose_painting_enabled
+        if dose_painting_enabled(self.state.masked_channel_policy):
+            return ''
+        return ("Dose painting is off: this checkpoint was trained blind, with "
+                "masked-patch carb / insulin / exercise pinned at the no-dose "
+                "fill — a painted override is invisible to it.")
+
+    def _do_mask_tool(self) -> None:
+        from gui_state import TOOL_MASK, TOOL_NONE
+        if self.state.active_tool == TOOL_MASK:
+            self.state.set_tool(TOOL_NONE)
+            self.state.status_message = "Mask tool off"
+        else:
+            self.state.set_tool(TOOL_MASK)
+            left = self.state.mask_budget_left(self._n_pred())
+            self.state.status_message = (
+                f"Mask ON — drag over the context to mask patches ({left} free). "
+                "1/2/3 on the numpad row = forecast / begin-fill / infill preset."
+            )
+        self._needs_redraw = True
+
+    def _do_clear_masks(self) -> None:
+        self.state.clear_mask_spans()
+        self._clear_prediction()
+        self.state.status_message = "Masks cleared — forecast only"
+        self._needs_redraw = True
+
+    def _do_mask_preset(self, preset: str) -> None:
+        from gui_state import MASK_PRESET_LABELS
+        if self.state.context is None:
+            return
+        self.state.apply_mask_preset(preset, self._n_pred())
+        self._clear_prediction()
+        spans = self.state.emitted_mask_spans(self._n_pred())
+        self.state.status_message = (
+            f"{MASK_PRESET_LABELS[preset]} preset — masked set {spans}"
+        )
+        self._needs_redraw = True
+
+    def _clear_prediction(self) -> None:
+        """Drop the shown forecast.
+
+        Any change to the masked set or the context invalidates it: the rows are
+        keyed to the patches the head was asked about, so keeping them would draw
+        one masked set's fan over another's spans.
+        """
+        self.state.prediction.median_bg = None
+        self.state.prediction.bands = None
+        self.state.prediction.span_patches = None
+        self.state.prediction.overrides_raw = None
+        self.state.prediction_rolls = 1
+
     def _do_what_if(self) -> None:
+        if self._refuse_dose_painting():
+            return
         from gui_state import TOOL_CURVE_EDITOR, TOOL_NONE
         if self.state.active_tool == TOOL_CURVE_EDITOR:
             self.state.set_tool(TOOL_NONE)
@@ -1322,6 +1544,8 @@ class T1DMAIGui:
         self._needs_redraw = True
 
     def _do_pencil(self) -> None:
+        if self._refuse_dose_painting():
+            return
         from gui_state import TOOL_PENCIL, TOOL_NONE
         if self.state.active_tool == TOOL_PENCIL:
             self.state.set_tool(TOOL_NONE)
@@ -1394,11 +1618,12 @@ class T1DMAIGui:
         if n_added <= 0:
             self.state.status_message = "Sim advance produced no new patches"
             return
-        self.state.prediction_rolls = 1
         self.state.clear_overrides()
-        self.state.prediction.median_bg = None
-        self.state.prediction.bands = None
-        self.state.prediction.overrides_raw = None
+        # The context just grew, so every masked span now sits on different data
+        # than the user drew it over and the trailing forecast span has moved.
+        # Reset to the forecast preset rather than re-anchor silently.
+        self.state.clear_mask_spans()
+        self._clear_prediction()
         # Preserve the user's current zoom/pan — they may be inspecting a
         # specific window and don't want it snapped back to the full context.
         # Press R to reset the view explicitly. Predictions only happen on
@@ -1477,11 +1702,10 @@ class T1DMAIGui:
 
         # The just-evaluated window is now context with real data; clear
         # the stale prediction so the chart doesn't keep drawing a band
-        # built for a different prediction zone.
-        self.state.prediction.median_bg = None
-        self.state.prediction.bands = None
-        self.state.prediction.overrides_raw = None
-        self.state.prediction_rolls = 1
+        # built for a different prediction zone, and the masked spans with it —
+        # the simulator advanced, so they no longer cover what they were drawn on.
+        self._clear_prediction()
+        self.state.clear_mask_spans()
 
         self.state.status_message = (
             f"Eval: MAE {mae:.1f} · RMSE {rmse:.1f} · "
@@ -1520,25 +1744,21 @@ class T1DMAIGui:
         if self.state.bg_raw is not None:
             self.state.bg_raw[:] = DISPLAY_CHANNEL_CLEAR_DEFAULTS[0]
         self.state.clear_overrides()
-        self.state.prediction_rolls = 1
-        self.state.prediction.median_bg = None
-        self.state.prediction.bands = None
-        self.state.prediction.overrides_raw = None
+        self.state.clear_mask_spans()
+        self._clear_prediction()
         self.state.status_message = "Cleared all curves — paint and press Enter"
         self._needs_redraw = True
 
     def _do_new_patient(self) -> None:
         import random
         self.state.patient_seed = random.randint(0, 100000)
-        self.state.prediction_rolls = 1
         self.state.clear_overrides()
+        self.state.clear_mask_spans()
         self.state.last_eval = None
         # Drop the previous patient's prediction so the chart doesn't render a
         # stale forecast overlay (built for a different context / last_bg)
         # against the new patient until the async worker finishes.
-        self.state.prediction.median_bg = None
-        self.state.prediction.bands = None
-        self.state.prediction.overrides_raw = None
+        self._clear_prediction()
         if self.state.norm_stats:
             try:
                 (ctx, summ, bg_raw, ctx_raw,
@@ -1788,6 +2008,140 @@ class T1DMAIGui:
         self._active_stroke = None
         self._compile_curve_overrides()
 
+    # ------------------------------------------------------------------
+    # Free-form masking — drag, select, remove
+    # ------------------------------------------------------------------
+
+    def _patch_at(self, mx: int) -> int:
+        """The patch under screen x, floored.
+
+        Masking is PATCH-aligned because a patch is the head's unit: it emits one
+        slot per masked patch, so a half-patch mask has no representation.
+        """
+        cx, _cy = self.chart_transform.screen_to_chart(float(mx), float(self.chart_transform.sy))
+        return int(math.floor(cx))
+
+    def _handle_mask_down(self, mx: int, my: int) -> None:
+        """Begin a drag, or select / remove an existing span.
+
+        A click inside a span selects it (the anchor readout follows the
+        selection); ctrl-click removes it. A click on bare context starts a new
+        span.
+        """
+        if self.state.context is None or not self._is_in_chart(mx, my):
+            return
+        patch = self._patch_at(mx)
+        for idx, span in enumerate(self.state.mask_spans):
+            if span.start <= patch <= span.last:
+                if self.pygame.key.get_mods() & self.pygame.KMOD_CTRL:
+                    self.state.remove_mask_span(idx)
+                    self._clear_prediction()
+                    self.state.status_message = "Span removed"
+                else:
+                    self.state.selected_mask_idx = idx
+                    self.state.status_message = self._anchor_readout()
+                self._needs_redraw = True
+                return
+        self.state.mask_drag_start = patch
+        self.state.mask_drag_end = patch
+        self._needs_redraw = True
+
+    def _handle_mask_motion(self, mx: int, my: int) -> None:
+        if self.state.mask_drag_start < 0:
+            return
+        self.state.mask_drag_end = self._patch_at(mx)
+        self._needs_redraw = True
+
+    def _handle_mask_release(self, mx: int, my: int) -> None:
+        """Commit the drag as one span, or report why it was refused."""
+        if self.state.mask_drag_start < 0:
+            return
+        lo = min(self.state.mask_drag_start, self.state.mask_drag_end)
+        hi = max(self.state.mask_drag_start, self.state.mask_drag_end)
+        self.state.mask_drag_start = -1
+        self.state.mask_drag_end = -1
+        n_ctx = self.state.n_ctx()
+        # Clamp to the maskable stretch before asking: the trailing forecast span
+        # is already masked and patch n_ctx-1 is its mandatory separator, so a
+        # drag that runs off the right edge should mask what it legally can
+        # rather than be refused whole.
+        lo = max(0, lo)
+        hi = min(hi, n_ctx - 2)
+        if hi < lo:
+            self.state.status_message = (
+                f"Nothing to mask there — the forecast already covers patch "
+                f"{n_ctx} on, and patch {n_ctx - 1} is its separator"
+            )
+            self._needs_redraw = True
+            return
+        reason = self.state.add_mask_span(lo, hi - lo + 1, self._n_pred())
+        if reason:
+            self.state.status_message = f"Refused: {reason}"
+        else:
+            from config import MAX_MASKED_PATCHES
+            self._clear_prediction()
+            left = self.state.mask_budget_left(self._n_pred())
+            self.state.status_message = (
+                f"Masked patches {lo}–{hi} · "
+                f"{self.state.masked_patch_count(self._n_pred())}/"
+                f"{MAX_MASKED_PATCHES} slots, {left} free"
+            )
+        self._needs_redraw = True
+
+    def _forecast_rows(self) -> tuple[np.ndarray | None, int]:
+        """The prediction's FORECAST steps, and how many other patches it filled.
+
+        The masked set may hold backcast and infill spans as well, and those rows
+        are not on the forecast's timeline: pooling them would make the sidebar's
+        horizon the total masked patch count and its time-in-range a mixture of
+        two different questions. ``span_patches`` is what separates them — rows
+        at patch ``>= n_ctx`` are the trailing span.
+
+        Returns:
+            ``(median_bg over the forecast rows, count of other masked patches)``,
+            or ``(None, 0)`` when there is no prediction.
+        """
+        pred = self.state.prediction
+        if pred.median_bg is None or len(pred.median_bg) == 0:
+            return None, 0
+        patches = pred.span_patches
+        if patches is None or pred.bands is None:
+            return pred.median_bg, 0
+        P = pred.bands.shape[0]
+        if len(patches) != P or len(pred.median_bg) % P:
+            return pred.median_bg, 0
+        rows = np.asarray(pred.median_bg).reshape(P, -1)
+        keep = np.asarray(patches) >= self.state.n_ctx()
+        if not keep.any():
+            return pred.median_bg, 0
+        return rows[keep].reshape(-1), int((~keep).sum())
+
+    def _anchor_readout(self) -> str:
+        """The SELECTED span's anchor, in mg/dL, or the forecast's when none is.
+
+        The anchor rule is one-sided and left-preferring, so this is the last
+        step of the span's left neighbour — or the first step of its right
+        neighbour for a span at patch 0. Showing the context edge for every span,
+        as the readout did when the forecast was the only masked set, would name
+        a cell the forward never read.
+        """
+        from config import PATCH_SIZE
+        if self.state.bg_raw is None:
+            return "Anchor: —"
+        patch, step = self.state.selected_anchor_cell(self._n_pred())
+        idx = patch * PATCH_SIZE + step
+        if not 0 <= idx < len(self.state.bg_raw):
+            return "Anchor: —"
+        idx_sel = self.state.selected_mask_idx
+        if 0 <= idx_sel < len(self.state.mask_spans):
+            span = self.state.mask_spans[idx_sel]
+            which = f"span {span.start}–{span.last}"
+            side = "right" if span.start == 0 else "left"
+        else:
+            which, side = "forecast", "left"
+        return (f"Anchor: {float(self.state.bg_raw[idx]):.0f} mg/dL "
+                f"({which}, {side} · patch {patch})")
+
     def _compile_curve_overrides(self) -> None:
         """Recompile the painted carb / insulin / exercise announcement for
         the canvas preview.
@@ -1856,14 +2210,27 @@ class T1DMAIGui:
         self._needs_redraw = True
 
     def _do_basal_plus(self) -> None:
+        if self._refuse_dose_painting():
+            return
         self._snapshot_for_undo()
         self.state.basal_rate_delta += 1.0
         self._compile_curve_overrides()
 
     def _do_basal_minus(self) -> None:
+        if self._refuse_dose_painting():
+            return
         self._snapshot_for_undo()
         self.state.basal_rate_delta -= 1.0
         self._compile_curve_overrides()
+
+    def _refuse_dose_painting(self) -> bool:
+        """Surface the blind-policy reason and return True when painting is off."""
+        blocked = self._dose_painting_blocked()
+        if not blocked:
+            return False
+        self.state.status_message = blocked
+        self._needs_redraw = True
+        return True
 
     def _run_prediction_async(self) -> None:
         if self.state.context is None or self.model is None:
@@ -1888,6 +2255,15 @@ class T1DMAIGui:
     def _run_rolling_async(self) -> None:
         if self.state.context is None or self.model is None:
             return
+        # ``predict_rolling`` is right-edge by construction and takes no masked
+        # set, so a user span would be silently ignored while the chart still
+        # shaded it. Drop the spans rather than show a fan that does not answer
+        # what the overlay says was asked.
+        if self.state.mask_spans:
+            self.state.clear_mask_spans()
+            self.state.status_message = (
+                "Rolling is right-edge only — masked spans cleared"
+            )
         # Claim the compute slot synchronously (see _run_prediction_async): closes
         # the double-thread window AND prevents a second _do_roll_forward in the
         # same batch from over-incrementing prediction_rolls before the flag is set.
@@ -1958,6 +2334,11 @@ class T1DMAIGui:
                 # quantile envelope.
                 self.state.prediction.median_bg = result['pred_bg'].cpu().numpy()
                 self.state.prediction.bands = result['bands'].cpu().numpy()
+                # Rolling is right-edge by construction: its rows ARE the
+                # trailing zone, roll after roll. Clear any per-span mapping a
+                # previous masked prediction left, or the chart would place these
+                # rows over that set's spans.
+                self.state.prediction.span_patches = None
                 self.state.prediction.n_rolls = self.state.prediction_rolls
 
                 # Time-of-day probe: the prediction origin is fixed across
@@ -2216,6 +2597,49 @@ class T1DMAIGui:
             cy += TOGGLE_ROW_PITCH
         y += ch_card_h + ui_px(10)
 
+        # ---- Mask card ----
+        # The masked set is what the model was asked about, so it belongs beside
+        # the patient rather than buried in the tool's help text.
+        from config import MAX_MASKED_PATCHES
+        from gui_state import MASK_PRESET_LABELS
+        n_pred_ui = self._n_pred()
+        span_rows = self.state.mask_spans[:4]
+        mask_card_h = (
+            ui_px(14)
+            + self._font_large.get_height() + ui_px(4)
+            + (3 + len(span_rows)) * LINE_GAP_SM
+            + ui_px(8)
+        )
+        self._draw_panel_card(surface, inner_x, y, inner_w, mask_card_h)
+        cy = y + ui_px(10)
+        cx = inner_x + ui_px(12)
+        cw = inner_w - ui_px(24)
+        cy = self._draw_section_header(surface, cx, cy, "Mask", ACCENT_ACTIONS)
+        self._draw_kv(surface, cx, cy, cw, "Preset",
+                      MASK_PRESET_LABELS.get(self.state.mask_preset, "custom"))
+        cy += LINE_GAP_SM
+        self._draw_kv(
+            surface, cx, cy, cw, "Slots",
+            f"{self.state.masked_patch_count(n_pred_ui)} / {MAX_MASKED_PATCHES}"
+            f"  ({self.state.mask_budget_left(n_pred_ui)} free)",
+        )
+        cy += LINE_GAP_SM
+        self._draw_kv(surface, cx, cy, cw, "Doses",
+                      self.state.masked_channel_policy,
+                      val_color=(MASK_OOD_COLOR
+                                 if self.state.masked_channel_policy != 'announced'
+                                 else TEXT_COLOR))
+        cy += LINE_GAP_SM
+        for i, span in enumerate(span_rows):
+            sel = (i == self.state.selected_mask_idx)
+            self._draw_kv(
+                surface, cx, cy, cw,
+                f"{'▸' if sel else ' '} patches", f"{span.start}–{span.last}",
+                val_color=MASK_EDGE_COLOR if sel else TEXT_DIM_COLOR,
+            )
+            cy += LINE_GAP_SM
+        y += mask_card_h + ui_px(10)
+
         # ---- Display options (smoothing toggles, no card bg) ----
         display_label = self._font_small.render(
             "DISPLAY", True, ACCENT_ACTIONS,
@@ -2230,7 +2654,11 @@ class T1DMAIGui:
         y += ui_px(8)
 
         # ---- Prediction summary card (only when a prediction exists) ----
-        pred_bg = self.state.prediction.median_bg
+        # Scoped to the FORECAST rows. This card is about what comes next —
+        # horizon, TIR, the value at the end — and a backcast or infill row is
+        # not on that timeline: pooling them would make the horizon the total
+        # masked patch count and the TIR a mixture of two different questions.
+        pred_bg, n_filled = self._forecast_rows()
         if pred_bg is not None and len(pred_bg) > 0:
             from config import PATCH_SIZE
             n_steps = len(pred_bg)
@@ -2245,7 +2673,7 @@ class T1DMAIGui:
                 + self._font_large.get_height() + ui_px(4)
                 + bar_h + ui_px(6)               # TIR bar
                 + self._font_small.get_height() + ui_px(8)  # TIR label
-                + 4 * LINE_GAP_SM
+                + (5 if n_filled else 4) * LINE_GAP_SM
                 + SECTION_GAP_SM + 3 * LINE_GAP_SM  # Clock sub-block (up to 3 rows)
                 + ui_px(8)
             )
@@ -2280,6 +2708,11 @@ class T1DMAIGui:
 
             self._draw_kv(surface, cx, cy, cw, "Horizon", f"{horizon_h:.1f} h")
             cy += LINE_GAP_SM
+            if n_filled:
+                self._draw_kv(surface, cx, cy, cw, "Also filled",
+                              f"{n_filled} masked patches",
+                              val_color=MASK_EDGE_COLOR)
+                cy += LINE_GAP_SM
             self._draw_kv(surface, cx, cy, cw, "Range",
                           f"{pred_min:.0f} – {pred_max:.0f} mg/dL",
                           val_color=TEXT_COLOR)
@@ -2670,6 +3103,8 @@ class T1DMAIGui:
         for kind, meal_name, rect in self._event_create_rects:
             x, y, w, h = rect
             if x <= mx < x + w and y <= my < y + h:
+                if self._refuse_dose_painting():
+                    return True
                 self._open_event_editor(kind, meal_name=meal_name)
                 return True
         for idx, row_rect, del_rect in self._event_row_rects:
@@ -2800,31 +3235,58 @@ class T1DMAIGui:
                         ctx_vals[visible_start:visible_end],
                         raw_min, raw_max, cy_min, cy_max,
                     )
-                    draw_curve(surf, local_transform, ctx_times, y_ctx, color, width=2)
+                    if disp_ch == 0 and self.state.mask_spans:
+                        # BG under a masked span is what the model is being asked
+                        # to produce; drawing the truth there turns the fan into
+                        # a comparison the user did not ask for. Break the line
+                        # over each span instead. The other channels ride through
+                        # a masked patch under the announced policy, so they stay
+                        # whole; under 'blind' the model does not see them, but
+                        # what the chart shows is the patient's record either way.
+                        for seg_t, seg_y in _split_at_masked(
+                            ctx_times, y_ctx, self.state.mask_spans,
+                        ):
+                            draw_curve(surf, local_transform, seg_t, seg_y,
+                                       color, width=2)
+                    else:
+                        draw_curve(surf, local_transform, ctx_times, y_ctx,
+                                   color, width=2)
 
             # --- BG forecast: median_bg line + per-τ quantile envelope ---
+            # One fan PER SPAN, placed where the head read it. ``span_patches`` is
+            # ``predict``'s own ``mask_idx``: slot j is patch mask_idx[j], so a
+            # fixed offset from the context end is right only for the forecast.
             if has_pred and disp_ch == 0:
-                pred_bg = np.asarray(median_bg, dtype=np.float32).flatten()
-                pred_bg_drawn = (
-                    _smooth_1d(pred_bg, MU_SMOOTH_STEPS)
-                    if self.state.smooth_mu else pred_bg
-                )
-                # Outermost quantile pair (ascending τ) is the widest band; use
-                # it as the ~95% uncertainty envelope.
-                bands_flat = bands.reshape(-1, bands.shape[-1])
-                upper_raw = bands_flat[:, -1].astype(np.float32)
-                lower_raw = bands_flat[:, 0].astype(np.float32)
-                if self.state.smooth_band:
-                    upper_raw = _smooth_1d(upper_raw, CONFIDENCE_BAND_SMOOTH_STEPS)
-                    lower_raw = _smooth_1d(lower_raw, CONFIDENCE_BAND_SMOOTH_STEPS)
-                pred_times = n_ctx + np.arange(len(pred_bg_drawn), dtype=np.float32) / S
-                y_up = _scale_to_chart_y(upper_raw, raw_min, raw_max, cy_min, cy_max)
-                y_lo = _scale_to_chart_y(lower_raw, raw_min, raw_max, cy_min, cy_max)
-                _draw_band_polygon(surf, local_transform, pred_times, y_up, y_lo,
-                                   color, alpha=CONFIDENCE_ALPHA)
-                y_pred = _scale_to_chart_y(pred_bg_drawn, raw_min, raw_max, cy_min, cy_max)
-                draw_curve(surf, local_transform, pred_times, y_pred, color,
-                           width=2, alpha=PREDICTION_LINE_ALPHA)
+                pred_bg = np.asarray(median_bg, dtype=np.float32)
+                P = bands.shape[0]
+                rows = pred_bg.reshape(P, -1)
+                patches = self.state.prediction.span_patches
+                if patches is None or len(patches) != P:
+                    patches = n_ctx + np.arange(P, dtype=np.int64)
+                for lo, hi in _contiguous_runs(np.asarray(patches, dtype=np.int64)):
+                    seg = rows[lo:hi].reshape(-1)
+                    seg_drawn = (
+                        _smooth_1d(seg, MU_SMOOTH_STEPS)
+                        if self.state.smooth_mu else seg
+                    )
+                    # Outermost quantile pair (ascending τ) is the widest band;
+                    # use it as the ~95% uncertainty envelope.
+                    bflat = bands[lo:hi].reshape(-1, bands.shape[-1])
+                    upper_raw = bflat[:, -1].astype(np.float32)
+                    lower_raw = bflat[:, 0].astype(np.float32)
+                    if self.state.smooth_band:
+                        upper_raw = _smooth_1d(upper_raw, CONFIDENCE_BAND_SMOOTH_STEPS)
+                        lower_raw = _smooth_1d(lower_raw, CONFIDENCE_BAND_SMOOTH_STEPS)
+                    start_patch = float(patches[lo])
+                    pred_times = start_patch + np.arange(
+                        len(seg_drawn), dtype=np.float32) / S
+                    y_up = _scale_to_chart_y(upper_raw, raw_min, raw_max, cy_min, cy_max)
+                    y_lo = _scale_to_chart_y(lower_raw, raw_min, raw_max, cy_min, cy_max)
+                    _draw_band_polygon(surf, local_transform, pred_times, y_up, y_lo,
+                                       color, alpha=CONFIDENCE_ALPHA)
+                    y_pred = _scale_to_chart_y(seg_drawn, raw_min, raw_max, cy_min, cy_max)
+                    draw_curve(surf, local_transform, pred_times, y_pred, color,
+                               width=2, alpha=PREDICTION_LINE_ALPHA)
 
             # --- Announced carb / insulin / exercise input in the pred zone ---
             out_ch = DISPLAY_TO_OUTPUT_CH.get(disp_ch)
@@ -2838,11 +3300,72 @@ class T1DMAIGui:
                            width=2, alpha=PREDICTION_LINE_ALPHA)
 
         self._draw_curve_events(surf, local_transform, n_ctx)
+        self._draw_mask_spans(surf, local_transform, n_ctx)
 
         draw_now_line(surf, local_transform, n_ctx,
                       font=self._font_small, text_color=TEXT_DIM_COLOR)
 
         return surf
+
+    def _draw_mask_spans(
+        self,
+        surf: 'pygame.Surface',
+        local_transform,
+        n_ctx: int,
+    ) -> None:
+        """Shade the user's masked spans, and the drag in flight.
+
+        The trailing forecast span is not drawn here — the NOW line and the
+        prediction-zone shading already mark it, and it is not something the user
+        can remove.
+        """
+        pygame = self.pygame
+        h = int(local_transform.sh)
+        w = int(local_transform.sw)
+        if h <= 0 or w <= 0:
+            return
+
+        ood = {}
+        if self.state.mask_spans and self.state.context is not None:
+            from gui_state import mask_span_ood
+            n_pred = self._n_pred()
+            try:
+                emitted = self.state.emitted_mask_spans(n_pred)
+                ood = mask_span_ood(emitted, n_ctx, n_pred)
+            except AssertionError:
+                ood = {}
+
+        def _shade(lo: float, hi: float, alpha: int, edge: bool) -> None:
+            sx_l = int(max(0.0, local_transform.x_to_screen(lo)))
+            sx_r = int(min(float(w), local_transform.x_to_screen(hi)))
+            if sx_r <= sx_l:
+                return
+            band = pygame.Surface((sx_r - sx_l, h), pygame.SRCALPHA)
+            band.fill((*MASK_SPAN_COLOR, alpha))
+            surf.blit(band, (sx_l, 0))
+            if edge:
+                pygame.draw.line(surf, MASK_EDGE_COLOR, (sx_l, 0), (sx_l, h), 1)
+                pygame.draw.line(surf, MASK_EDGE_COLOR, (sx_r - 1, 0), (sx_r - 1, h), 1)
+
+        for idx, span in enumerate(self.state.mask_spans):
+            selected = (idx == self.state.selected_mask_idx)
+            _shade(float(span.start), float(span.end),
+                   MASK_SPAN_SELECTED_ALPHA if selected else MASK_SPAN_ALPHA,
+                   edge=True)
+            label = f"{span.start}–{span.last}"
+            sx = int(local_transform.x_to_screen(float(span.start))) + 4
+            img = self._font_small.render(label, True, MASK_EDGE_COLOR)
+            surf.blit(img, (sx, 4))
+            # OOD is a HINT, never a block: the fan is still drawn, it is simply
+            # not calibrated by anything the sampler supervised.
+            if idx in ood:
+                warn = self._font_small.render("OOD", True, MASK_OOD_COLOR)
+                surf.blit(warn, (sx, 4 + img.get_height() + 2))
+
+        if self.state.mask_drag_start >= 0:
+            lo = min(self.state.mask_drag_start, self.state.mask_drag_end)
+            hi = max(self.state.mask_drag_start, self.state.mask_drag_end)
+            _shade(float(lo), float(hi + 1), MASK_DRAG_ALPHA, edge=False)
 
     def _draw_curve_events(
         self,
@@ -2943,10 +3466,30 @@ class T1DMAIGui:
         pygame.draw.rect(surface, (22, 22, 30), (cp_x, cp_y, cp_w, cp_h))
         pygame.draw.line(surface, GRID_COLOR, (cp_x, cp_y), (cp_x + cp_w, cp_y))
 
-        from gui_state import TOOL_CURVE_EDITOR, TOOL_PENCIL
+        from gui_state import TOOL_CURVE_EDITOR, TOOL_MASK, TOOL_PENCIL
         tool = self.state.active_tool
 
-        if tool == TOOL_CURVE_EDITOR:
+        if tool == TOOL_MASK:
+            from config import MAX_MASKED_PATCHES
+            n_pred = self._n_pred()
+            n_ctx = self.state.n_ctx()
+            lines = [
+                f"Mask — drag over the context to mask patches. "
+                f"{self.state.masked_patch_count(n_pred)}/{MAX_MASKED_PATCHES} slots, "
+                f"{self.state.mask_budget_left(n_pred)} free.",
+                f"1 = forecast  2 = begin-fill  3 = infill. Click a span to select "
+                f"(its anchor is shown), Ctrl+click or Del to remove.",
+                f"The trailing {n_pred} patches from {n_ctx} on are always masked — "
+                f"the future carries no reading. M = exit tool.",
+            ]
+            line_h = self._font_small.get_height() + ui_px(4)
+            for j, line in enumerate(lines):
+                img = self._font_small.render(line, True, TEXT_COLOR)
+                surface.blit(img, (cp_x + 10, cp_y + 10 + j * line_h))
+            img = self._font_small.render(
+                self._anchor_readout(), True, MASK_EDGE_COLOR)
+            surface.blit(img, (cp_x + 10, cp_y + 10 + len(lines) * line_h))
+        elif tool == TOOL_CURVE_EDITOR:
             ch_name = self.state.channel_names[self.state.selected_edit_channel]
             lines = [
                 f"Curve Editor — channel: {ch_name}  (Tab to cycle)",
@@ -2970,7 +3513,7 @@ class T1DMAIGui:
                 surface.blit(img, (cp_x + 10, cp_y + 10 + j * line_h))
         else:
             lines = [
-                "SPC=Predict 2h  L/Shift+SPC=Long Predict  W=What-If  P=Pencil  F=Roll  G=Sim Fwd  V=Eval  R=Reset",
+                "SPC=Predict 2h  L/Shift+SPC=Long Predict  W=What-If  P=Pencil  M=Mask  F=Roll  G=Sim Fwd  V=Eval  R=Reset",
                 "E=Curve Editor  Tab=Cycle edit channel  C=Clear All curves  N=New Patient  S=Screenshot",
                 "1-4=Toggle channels (BG/Carbs/Insulin/Exercise)  A=Toggle all  Q=Quit",
                 "Scroll=Zoom at cursor  +/-=Zoom  Middle/Right-drag=Pan",
@@ -3076,9 +3619,12 @@ class T1DMAIGui:
         pygame.draw.line(surface, GRID_COLOR, (0, bar_y), (self.width, bar_y))
 
         n_ctx = self.state.context.shape[0] if self.state.context is not None else 0
+        n_pred = self._n_pred()
         status_text = (
             f"Mode: {self.state.mode_label} | "
             f"Context: {n_ctx} patches | "
+            f"Masked: {self.state.masked_patch_count(n_pred)} | "
+            f"Policy: {self.state.masked_channel_policy} | "
             f"Seed: {self.state.patient_seed} | "
             f"{self.state.status_message}"
         )
@@ -3259,6 +3805,9 @@ class T1DMAIGui:
         elif key == pygame.K_p:
             self._do_pencil()
 
+        elif key == pygame.K_m:
+            self._do_mask_tool()
+
         elif key == pygame.K_f:
             self._do_roll_forward()
 
@@ -3278,8 +3827,18 @@ class T1DMAIGui:
             self._do_screenshot()
 
         elif key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
+            from gui_state import (
+                MASK_PRESET_BEGIN_FILL, MASK_PRESET_FORECAST, MASK_PRESET_INFILL,
+                TOOL_MASK,
+            )
             idx = key - pygame.K_1
-            if idx < len(self.state.channel_visible):
+            # While the mask tool is up, 1/2/3 place the presets; the channel
+            # toggles keep the keys otherwise.
+            presets = (MASK_PRESET_FORECAST, MASK_PRESET_BEGIN_FILL,
+                       MASK_PRESET_INFILL)
+            if self.state.active_tool == TOOL_MASK and idx < len(presets):
+                self._do_mask_preset(presets[idx])
+            elif idx < len(self.state.channel_visible):
                 self.state.toggle_channel(idx)
                 self._toggles[idx].state = self.state.channel_visible[idx]
                 self._needs_redraw = True
@@ -3342,7 +3901,14 @@ class T1DMAIGui:
                 self._do_undo()
 
         elif key == pygame.K_DELETE:
-            if (0 <= self.state.selected_event_idx < len(self.state.curve_events)):
+            from gui_state import TOOL_MASK
+            if (self.state.active_tool == TOOL_MASK
+                    and 0 <= self.state.selected_mask_idx < len(self.state.mask_spans)):
+                self.state.remove_mask_span(self.state.selected_mask_idx)
+                self._clear_prediction()
+                self.state.status_message = "Span removed"
+                self._needs_redraw = True
+            elif (0 <= self.state.selected_event_idx < len(self.state.curve_events)):
                 self._snapshot_for_undo()
                 del self.state.curve_events[self.state.selected_event_idx]
                 self.state.selected_event_idx = -1
@@ -3354,7 +3920,10 @@ class T1DMAIGui:
     def run(self) -> None:
         pygame = self.pygame
         pygame.init()
-        pygame.display.set_caption("T1DMAI — Behavior Prediction")
+        pygame.display.set_caption(
+            f"T1DMAI — Behavior Prediction  ·  masked doses: "
+            f"{self.state.masked_channel_policy}"
+        )
 
         self._screen = pygame.display.set_mode(
             (self.width, self.height),
@@ -3413,16 +3982,18 @@ class T1DMAIGui:
                     if self._panning:
                         self._handle_pan_motion(event.pos[0])
                     else:
-                        from gui_state import TOOL_CURVE_EDITOR, TOOL_PENCIL
+                        from gui_state import TOOL_CURVE_EDITOR, TOOL_MASK, TOOL_PENCIL
                         if (self.state.active_tool == TOOL_CURVE_EDITOR
                                 and self.state.dragging_point is not None):
                             self._handle_curve_drag(event.pos[0], event.pos[1])
                         elif (self.state.active_tool == TOOL_PENCIL
                                 and self._pencil_drawing):
                             self._handle_pencil_motion(event.pos[0], event.pos[1])
+                        elif self.state.active_tool == TOOL_MASK:
+                            self._handle_mask_motion(event.pos[0], event.pos[1])
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
-                    from gui_state import TOOL_CURVE_EDITOR, TOOL_PENCIL
+                    from gui_state import TOOL_CURVE_EDITOR, TOOL_MASK, TOOL_PENCIL
                     if (event.button == 1
                             and self._is_in_events_panel(event.pos[0], event.pos[1])):
                         if self._handle_events_panel_click(event.pos[0], event.pos[1]):
@@ -3439,6 +4010,10 @@ class T1DMAIGui:
                             and self.state.active_tool == TOOL_PENCIL
                             and self._is_in_chart(event.pos[0], event.pos[1])):
                         self._handle_pencil_down(event.pos[0], event.pos[1])
+                    elif (event.button == 1
+                            and self.state.active_tool == TOOL_MASK
+                            and self._is_in_chart(event.pos[0], event.pos[1])):
+                        self._handle_mask_down(event.pos[0], event.pos[1])
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button in (2, 3):
@@ -3446,6 +4021,7 @@ class T1DMAIGui:
                     if event.button == 1:
                         self._handle_curve_release(event.pos[0], event.pos[1])
                         self._handle_pencil_release(event.pos[0], event.pos[1])
+                        self._handle_mask_release(event.pos[0], event.pos[1])
 
                 elif event.type == pygame.MOUSEWHEEL:
                     if self._is_in_sidebar(last_mx, last_my):
@@ -3521,7 +4097,18 @@ class T1DMAIGui:
 
 def _load_checkpoint_into_model(
     path: str, device: torch.device, use_ema: bool
-) -> tuple[object, int, dict]:
+) -> tuple[object, int, dict, str]:
+    """Load a checkpoint's weights, horizon, stats and masked-channel policy.
+
+    The policy is part of the return because no parameter shape records it: the
+    strict state-dict load accepts weights trained under either convention, so a
+    blind checkpoint would otherwise be driven as a conditioned one — painted
+    doses landing on channels its weights were trained to read as constant, and
+    a forecast that plausibly does not move.
+
+    Returns:
+        ``(model, prediction_patches, normalization_stats, masked_channel_policy)``.
+    """
     from model import T1DMAI
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model = T1DMAI().to(device)
@@ -3539,9 +4126,13 @@ def _load_checkpoint_into_model(
     model.eval()
     tc = ckpt.get('training_config') or {}
     from config import PREDICTION_PATCHES as _PP
+    from data import stored_masked_channel_policy
     pp = int(tc.get('prediction_patches', _PP))
     norm_stats = ckpt.get('normalization_stats', {}) or {}
-    return model, pp, norm_stats
+    policy = stored_masked_channel_policy(tc)
+    print(f"masked_channel_policy: {policy}"
+          + ('' if 'masked_channel_policy' in tc else ' (absent stamp — announced)'))
+    return model, pp, norm_stats, policy
 
 
 def main() -> None:
@@ -3571,6 +4162,8 @@ def main() -> None:
 
     norm_stats: dict = {}
     model = None
+    from data import masked_channel_policy as _policy_name
+    policy = _policy_name(blind=False)
 
     if args.no_model:
         from model import T1DMAI
@@ -3578,7 +4171,7 @@ def main() -> None:
         model.eval()
     elif args.checkpoint:
         use_ema = not args.live_weights
-        model, ckpt_pred_patches, ns = _load_checkpoint_into_model(
+        model, ckpt_pred_patches, ns, policy = _load_checkpoint_into_model(
             args.checkpoint, device, use_ema=use_ema,
         )
         norm_stats = norm_stats or ns
@@ -3612,6 +4205,7 @@ def main() -> None:
         basal_ramp_up_h=args.basal_ramp_up,
         basal_ramp_down_h=args.basal_ramp_down,
         basal_duration_h=args.basal_duration,
+        masked_channel_policy=policy,
     )
     gui.run()
 
