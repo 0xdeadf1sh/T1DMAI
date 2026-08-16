@@ -327,8 +327,8 @@ def evaluate_from_windows(cal_w: list[Window], test_w: list[Window]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Night-onset nocturnal excursion prediction (real-data mirror of
-# ``train.py::_run_night_onset_validation``).
+# Night-onset nocturnal excursion prediction. Offline evaluation only — the
+# training loop no longer carries a mirror of it, so this is the definition.
 # --------------------------------------------------------------------------- #
 def _night_len_hours() -> float:
     """Length of the nocturnal window (NOCTURNAL_START_HOUR → NOCTURNAL_END_HOUR),
@@ -425,7 +425,7 @@ def _score_night(model, feats: np.ndarray, cgm: np.ndarray, pred_start: int,
         overrides_fn=overrides_fn,
     )
     pred_bg = result['pred_bg'].detach().cpu().numpy()
-    # Band-edge detectors (matching train.py's night-onset): hypo off the τ-lower edge,
+    # Band-edge detectors, as every other clinical hypo/hyper metric: hypo off the τ-lower edge,
     # hyper off the τ-upper edge; truth off the TRUE CGM. bands: (rolls*P, S, K) -> (T, K).
     bands = result['bands'].detach().cpu().numpy().reshape(-1, N_QUANTILES)
     true_bg = cgm[pred_start:pred_start + night_steps].astype(np.float64)

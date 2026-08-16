@@ -501,9 +501,10 @@ def _pick_pred_start_step_at_hour(
     (circular distance), with the SAME context/horizon room requirement as
     ``_pick_pred_start_step``.
 
-    Used for the night-onset validation: the prediction origin is forced to the
-    bedtime hour (``NOCTURNAL_START_HOUR`` ≈ 22:00) so the rolled forecast spans
-    the whole night. Among candidates within ``tol_hours`` of the target (one per
+    Reached through ``force_pred_start_hour``, for an evaluation that needs its
+    origins pinned to one hour-of-day — a bedtime origin
+    (``NOCTURNAL_START_HOUR`` ≈ 22:00), say, so a rolled forecast spans the whole
+    night. Among candidates within ``tol_hours`` of the target (one per
     day on a multi-day trajectory) one is chosen at random for variety; if none
     qualify, the single nearest candidate is used. Returns ``None`` when no legal
     window exists (mirrors ``_pick_pred_start_step``).
@@ -632,8 +633,8 @@ class T1DMDataset(Dataset):
         self.stats = normalization_stats
         self.seed_offset = seed_offset
         # When set, the prediction origin is forced to the patch-aligned step
-        # nearest this hour-of-day (e.g. NOCTURNAL_START_HOUR for the night-onset
-        # validation) instead of a uniform-random origin. Validation-only.
+        # nearest this hour-of-day instead of a uniform-random origin, for an
+        # evaluation that needs its origins pinned. Validation-only.
         self.force_pred_start_hour = force_pred_start_hour
         self.patient_uniform_sample_prob = patient_uniform_sample_prob
         self.simulator_warmup_hours = simulator_warmup_hours
@@ -1387,9 +1388,9 @@ def _build_sample(
     n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
     # The room requirement is the long horizon so the trailing GT slice fits.
     if force_pred_start_hour is not None:
-        # Night-onset validation: force the origin to ~the bedtime hour so the
-        # rolled forecast spans the whole night. Falls back to a uniform-random
-        # origin if no candidate near the target hour leaves enough room.
+        # Pin the origin to ~one hour-of-day — a bedtime origin, say, so a rolled
+        # forecast spans the whole night. Falls back to a uniform-random origin
+        # if no candidate near the target hour leaves enough room.
         pred_start_step = _pick_pred_start_step_at_hour(
             hour_of_day[:N_trimmed], n_ctx, n_long_horizon_steps,
             float(force_pred_start_hour), rng,
@@ -1551,7 +1552,7 @@ def _build_sample(
     slot_hour = hour_of_day[start_step + mask_idx * PATCH_SIZE].astype(np.float32)
 
     # Announced future carbs/insulin/exercise over the long horizon (normalized +
-    # raw), for the conditioned night-onset rolling override.  Exercise is a PLAN
+    # raw), for the conditioned rolled-forecast override.  Exercise is a PLAN
     # channel exactly like the doses: what rides here is what the patient
     # announced, never an inferred session.
     _lh = slice(pred_start_in_window, pred_start_in_window + n_long_horizon_steps)
@@ -1853,9 +1854,9 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     # inference.  ``last_bg`` and ``pred_start_hour`` are per-sample scalars;
     # the trajectories are raw mg/dL ground truth.  The ``extended_carb/
     # insulin/exercise_*`` announced-future arrays are NOT stacked here — they are
-    # consumed only from UN-COLLATED samples by the night-onset validation
-    # override (``train._run_night_onset_validation`` iterates the dataset
-    # directly), so they ride only on each sample's own ``bg_formula_data``.
+    # consumed only from UN-COLLATED samples, by the rolled-forecast override
+    # (``train._make_long_horizon_overrides_fn``, whose callers iterate the
+    # dataset directly), so they ride only on each sample's own ``bg_formula_data``.
     bg_formula_batched: dict[str, Any] = {
         # The masked set, on the PADDED patch axis.  Every one of these is (B, M).
         'mask_idx': mask_idx_batch,

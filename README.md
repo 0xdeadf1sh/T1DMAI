@@ -247,10 +247,10 @@ MARD, band coverage with the width that bought it, median roughness, the
 amplitude and excursion-shape block, the in-training conformal probe, all five
 zones of both error grids (Clarke and DTS) pooled and per horizon, CG-EGA by
 glycemic region, hypo and hyper detection off the band edges both pooled and per
-30-minute bucket, the nocturnal pair and the per-night excursion call,
-time-in-range error, a counterfactual dose-response probe and the clock probe in
-full. The [proper scoring rules](#scoring-rules-and-protocols), the hypo alarm
-operating curve, the infill columns and the nocturnal duplicates of the
+30-minute bucket, the nocturnal pair, time-in-range error, a counterfactual
+dose-response probe and the clock probe in full. The
+[proper scoring rules](#scoring-rules-and-protocols), the hypo alarm operating
+curve, the infill columns and the nocturnal duplicates of the
 all-sample metrics are in the CSV and not on the page.
 
 Each validation batch runs three forwards. The selection loss is read off the

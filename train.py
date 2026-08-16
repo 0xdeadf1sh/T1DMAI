@@ -1497,33 +1497,6 @@ def _render_validation_table(
     _blank()
 
     # ============================================================
-    # 7b. Night-onset excursion call (per NIGHT, not per step)
-    # ============================================================
-    # A different unit from every other row on the page: one binary call per
-    # night, from a forecast rolled across the whole night from the bedtime hour.
-    # The counts travel with the rates because none is derivable from another —
-    # nights scored against nights dropped, and each side's own true/predicted
-    # denominators — and because a rate over three nights is not a rate.
-    _no_n = int(val_metrics.get('night_onset_n_nights', 0) or 0)
-    _no_skip = int(val_metrics.get('night_onset_skipped', 0) or 0)
-    _section(f'Night-Onset Excursion Call ({_no_n} nights'
-             + (f', {_no_skip} skipped)' if _no_skip else ')'))
-    for _side, _rec_sota, _prec_sota in (('hypo', 80.0, 60.0), ('hyper', 80.0, 60.0)):
-        _nt = val_metrics.get(f'night_onset_{_side}_n_true')
-        _np = val_metrics.get(f'night_onset_{_side}_n_pred')
-        higher_row(f'night_onset_{_side}_recall'
-                   + (f'({int(_nt)} true)' if _nt else ''),
-                   _pct(val_metrics.get(f'night_onset_{_side}_recall')),
-                   _rec_sota, fmt='{:.2f}', unit='%', warn_gap=15.0,
-                   prev_key=f'night_onset_{_side}_recall', prev_scale=100.0)
-        higher_row(f'night_onset_{_side}_precision'
-                   + (f'({int(_np)} called)' if _np else ''),
-                   _pct(val_metrics.get(f'night_onset_{_side}_precision')),
-                   _prec_sota, fmt='{:.2f}', unit='%', warn_gap=15.0,
-                   prev_key=f'night_onset_{_side}_precision', prev_scale=100.0)
-    _blank()
-
-    # ============================================================
     # 8. Counterfactual dose-response probe (uncoloured diagnostics)
     # ============================================================
     _cf_n = int(val_metrics.get('cf_n', 0) or 0)
@@ -2216,112 +2189,6 @@ def _accumulate_long_horizon_bg_metrics(
                     night_agg[f'night_bg_rmse_{h_min}_cnt'] = night_agg.get(f'night_bg_rmse_{h_min}_cnt', 0.0) + 1.0
                     night_agg[f'night_bg_mae_{h_min}_abs_sum'] = night_agg.get(f'night_bg_mae_{h_min}_abs_sum', 0.0) + abs(diff)
                     night_agg[f'night_bg_mae_{h_min}_cnt'] = night_agg.get(f'night_bg_mae_{h_min}_cnt', 0.0) + 1.0
-
-
-def _run_night_onset_validation(
-    model: T1DMAI,
-    dataset: T1DMDataset,
-    norm_stats: dict,
-    device: torch.device,
-    hypo_threshold: float = BG_HYPO_THRESHOLD,
-    hyper_threshold: float = BG_HYPER_THRESHOLD,
-) -> dict[str, Any]:
-    """Night-onset excursion prediction. Each sample's origin is forced to the
-    bedtime hour (``NOCTURNAL_START_HOUR``); autoregressively roll the forecast
-    (``predict_rolling``, BG-autoregressive) across the night to
-    ``NOCTURNAL_END_HOUR`` and emit a PER-NIGHT binary excursion call. The
-    predicted call keys off the BAND EDGES (like every other clinical hypo/hyper
-    metric): hypo off the τ=HYPO_ALARM_QUANTILE_TAU lower edge, hyper off the
-    τ=HYPER_ALARM_QUANTILE_TAU upper edge (``predict_rolling`` returns the mg/dL
-    band fan in ``result['bands']``); truth stays off the TRUE bg. Returns
-    ``night_onset_{hypo,hyper}_{recall,precision}`` (+ counts).
-
-    The roll is always conditioned on the night's ANNOUNCED carbs+insulin+exercise
-    via an ``overrides_fn`` (keys are output-channel space {0:carb, 1:insulin,
-    2:exercise}; the inference bridge maps them onto feats 1/2/3 through
-    ``CHANNEL_TO_FEAT``) — the model is always conditioned.
-
-    Three counts travel with the rates, because none of them is derivable from
-    another: ``night_onset_n_nights`` is how many nights were scored and
-    ``night_onset_skipped`` how many were seen and dropped (the two sum to the
-    nights surveyed), while each side's recall is over
-    ``night_onset_{side}_n_true`` and its precision over
-    ``night_onset_{side}_n_pred``.
-    """
-    from inference import predict_rolling
-
-    n_rolls = math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
-    if n_rolls <= 1:
-        return {}
-
-    night_len_h = (NOCTURNAL_END_HOUR - NOCTURNAL_START_HOUR) % 24.0
-    if night_len_h == 0.0:
-        night_len_h = 24.0
-
-    c = {'hypo_true': 0, 'hypo_pred': 0, 'hypo_tp': 0,
-         'hyper_true': 0, 'hyper_pred': 0, 'hyper_tp': 0, 'n': 0, 'skipped': 0}
-    n_val = min(len(dataset), VALIDATION_N_PATIENTS)
-    was_training = model.training
-    model.eval()
-    with torch.no_grad():
-        for i in range(n_val):
-            sample = dataset[i]
-            n_ctx = int(sample['n_context_patches'])
-            bf = sample['bg_formula_data']
-            context = _reconstruct_context_from_patch(
-                _observed_patches(sample, norm_stats), n_ctx,
-                np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool))
-            if context is None:
-                # The observed context is shorter than MIN_CONTEXT_PATCHES — the
-                # night is not scored rather than rolled off two hours of
-                # history. Counted, so that ``n`` + ``skipped`` is the number of
-                # nights surveyed and a shrinking scored set is visible rather
-                # than only its effect. With the BG restored this can now only
-                # fire on a genuinely short window, not on mask placement.
-                c['skipped'] += 1
-                continue
-            dt = int(_dt_minutes(bf))
-            night_steps = int(round(night_len_h * 60.0 / dt))
-            result = predict_rolling(
-                model, context, patient_seed=None, n_rolls=n_rolls,
-                normalization_stats=norm_stats, device=device,
-                overrides_fn=_make_long_horizon_overrides_fn(bf),
-            )
-            pred_bg = result['pred_bg'].detach().cpu()
-            bands = result['bands'].detach().cpu()             # (rolls*P, S, N_QUANTILES) mg/dL
-            bands = bands.reshape(-1, bands.shape[-1])         # -> (T, N_QUANTILES) per-step, aligned with pred_bg
-            true_bg = bf['extended_true_bg_trajectory']
-            true_bg = (true_bg.float().cpu() if isinstance(true_bg, torch.Tensor)
-                       else torch.from_numpy(np.asarray(true_bg)).float())
-            usable = min(pred_bg.shape[0], true_bg.shape[0], night_steps)
-            if usable == 0:
-                c['skipped'] += 1
-                continue
-            tb = true_bg[:usable]
-            # Band-edge detectors: hypo off the τ=HYPO_ALARM_QUANTILE_TAU LOWER edge,
-            # hyper off the τ=HYPER_ALARM_QUANTILE_TAU UPPER edge; truth stays off TRUE bg.
-            pred_lo = bands[:usable, _HYPO_BAND_IDX]
-            pred_hi = bands[:usable, _HYPER_BAND_IDX]
-            c['n'] += 1
-            for side, t_ex, p_ex in (
-                    ('hypo', bool((tb < hypo_threshold).any().item()),
-                             bool((pred_lo < hypo_threshold).any().item())),
-                    ('hyper', bool((tb > hyper_threshold).any().item()),
-                              bool((pred_hi > hyper_threshold).any().item()))):
-                c[f'{side}_true'] += int(t_ex)
-                c[f'{side}_pred'] += int(p_ex)
-                c[f'{side}_tp'] += int(t_ex and p_ex)
-
-    model.train(was_training)
-    out: dict[str, Any] = {'night_onset_n_nights': c['n'],
-                           'night_onset_skipped': c['skipped']}
-    for side in ('hypo', 'hyper'):
-        tr, pr, tp = c[f'{side}_true'], c[f'{side}_pred'], c[f'{side}_tp']
-        out[f'night_onset_{side}_recall'] = (tp / tr) if tr > 0 else None
-        out[f'night_onset_{side}_precision'] = (tp / pr) if pr > 0 else None
-        out[f'night_onset_{side}_n_true'] = tr
-        out[f'night_onset_{side}_n_pred'] = pr
-    return out
 
 
 def _run_counterfactual_probe(
@@ -4139,13 +4006,6 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('night_hyper_recall', 4), ('night_hyper_precision', 4), ('night_hyper_n_steps', 4),
         *[(f'night_clarke_A@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
         *[(f'night_mard@{h}', 4) for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN],
-        # Night-onset. n_nights and skipped sum to the nights surveyed; n_true
-        # and n_pred are the denominators of the recall and the precision.
-        ('night_onset_n_nights', 4), ('night_onset_skipped', 4),
-        ('night_onset_hypo_recall', 4), ('night_onset_hypo_precision', 4),
-        ('night_onset_hypo_n_true', 4), ('night_onset_hypo_n_pred', 4),
-        ('night_onset_hyper_recall', 4), ('night_onset_hyper_precision', 4),
-        ('night_onset_hyper_n_true', 4), ('night_onset_hyper_n_pred', 4),
     ]
 
 
@@ -4300,15 +4160,6 @@ def train(
         patient_uniform_sample_prob=patient_uniform_sample_prob,
         simulator_warmup_hours=simulator_warmup_hours,
         cache_path=cache_path,
-        cache_partition='val',
-    )
-    val_dataset_night_onset = T1DMDataset(
-        master_seed=master_seed + 10_000_000,
-        total_steps=VALIDATION_N_PATIENTS, batch_size=1,
-        normalization_stats=norm_stats,
-        force_pred_start_hour=NOCTURNAL_START_HOUR,
-        patient_uniform_sample_prob=patient_uniform_sample_prob,
-        simulator_warmup_hours=simulator_warmup_hours, cache_path=cache_path,
         cache_partition='val',
     )
 
@@ -4702,9 +4553,6 @@ def train(
                     bg_hypo_threshold=bg_hypo_threshold,
                     bg_hyper_threshold=bg_hyper_threshold,
                 )
-                val_metrics.update(_run_night_onset_validation(
-                    model, val_dataset_night_onset, norm_stats, device,
-                    hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold))
 
             val_total = val_metrics['val_loss_total']
             train_ema = loss_ema if loss_ema is not None else loss_val
@@ -4836,7 +4684,7 @@ def train(
             from metrics import protocols as _protocols
 
             # The families the CSV carried and this record did not: 24 per-horizon
-            # excursion buckets, 12 nocturnal, 7 night-onset and 6 nocturnal RMSE.
+            # excursion buckets, 12 nocturnal and 6 nocturnal RMSE.
             # A run's checkpoint was the only surviving copy of a validation once
             # logs/ was overwritten, and every one of these was absent from it.
             _eh_rec = _excursion_bucket_horizons(PREDICTION_PATCHES)
@@ -4853,12 +4701,6 @@ def train(
             for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
                 val_record[f'night_clarke_A@{h}'] = _r(val_metrics.get(f'night_clarke_A@{h}'))
                 val_record[f'night_mard@{h}'] = _r(val_metrics.get(f'night_mard@{h}'))
-            for _k in ('night_onset_n_nights', 'night_onset_skipped',
-                       'night_onset_hypo_recall', 'night_onset_hypo_precision',
-                       'night_onset_hypo_n_true', 'night_onset_hypo_n_pred',
-                       'night_onset_hyper_recall', 'night_onset_hyper_precision',
-                       'night_onset_hyper_n_true', 'night_onset_hyper_n_pred'):
-                val_record[_k] = _r(val_metrics.get(_k))
 
             # Probabilistic scoring and the two masked-BG protocols, on the d
             # axis. eh is the forecast protocol's d = 1..PREDICTION_PATCHES

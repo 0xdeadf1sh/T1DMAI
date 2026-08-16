@@ -716,7 +716,6 @@ The module defines no pass/fail threshold on any of them, and
 | Clinical accuracy (CG-EGA) | Per-region accurate, benign and erroneous fractions |
 | Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error, and the same detection per 30-minute bucket |
 | Nocturnal | Nocturnal hypo AND hyper recall/precision |
-| Night-onset excursion call | Per-NIGHT binary hypo and hyper recall/precision, with the nights scored, the nights skipped, and each side's true/called counts |
 | Counterfactual dose-response | The two dose directions and insulin monotonicity (`train.py` only — the blind fork removes the probe) |
 | Time-of-day probe | The whole probe: MAE pooled and at high confidence, the three accuracies, bias / std / p90 / gross-error rate, confidence, and the within- and cross-window jump witnesses |
 
@@ -804,12 +803,6 @@ region-binned, and the marginal fit is measured on the same windows in the same
 call so the two fits are never compared across runs. The validation sample is
 small, so the figures are directional; the deployable correction is fit after
 training by `calibrate_conformal.py`.
-
-**Night onset.** Answers the bedtime question — will there be an excursion before
-morning? The forecast origin is forced to `NOCTURNAL_START_HOUR`, the forecast is
-rolled across the whole night conditioned on the announced overnight doses, and a
-per-night binary call is scored off the band edges: of the nights that truly go
-low or high, how many are flagged, and of the flagged nights, how many truly do.
 
 
 ## Conformal calibration

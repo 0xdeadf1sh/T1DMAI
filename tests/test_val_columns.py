@@ -31,9 +31,7 @@ import numpy as np
 import pytest
 import torch
 
-from config import (
-    NOCTURNAL_START_HOUR, PATCH_SIZE, PREDICTION_PATCHES, QUANTILE_LEVELS,
-)
+from config import PATCH_SIZE, PREDICTION_PATCHES, QUANTILE_LEVELS
 from data import T1DMDataset
 from model import T1DMAI
 from normalization import load_normalization_stats
@@ -96,8 +94,6 @@ RESTORED_TO_THE_TABLE = {
     'tod gross-error rate': 'tod_gross_rate',
     'tod jump (cross-window)': 'tod_xwin_jump_h',
     'night_hyper_recall': 'night_hyper_recall',
-    'night_onset_hypo_recall': 'night_onset_hypo_recall',
-    'night_onset_hyper_precision': 'night_onset_hyper_precision',
 }
 
 # The conformal probe is the one CSV_ONLY family the fixture cannot produce:
@@ -124,13 +120,8 @@ def val_metrics(monkeypatch_module):
     weighting = KendallGalWeighting().to(device)
     kw = dict(master_seed=20_000_017, total_steps=N_VAL, batch_size=1,
               normalization_stats=stats, patient_uniform_sample_prob=0.0)
-    metrics = train._run_validation(
+    return train._run_validation(
         model, T1DMDataset(**kw), stats, device, weighting)
-    metrics.update(train._run_night_onset_validation(
-        model,
-        T1DMDataset(force_pred_start_hour=NOCTURNAL_START_HOUR, **kw),
-        stats, device))
-    return metrics
 
 
 @pytest.fixture(scope='module')
