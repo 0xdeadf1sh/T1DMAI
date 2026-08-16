@@ -103,7 +103,8 @@ both keeps the two together.
 **48, 96 and 144 are the arithmetically clean widths.** Hour-of-day coverage is
 exactly uniform when `n_candidates % 48 == 0`, where
 `n_candidates = N/PATCH_SIZE − max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES) − n_ctx + 1`.
-At the pools' 1242 steps that holds at 48, 96 and 144 and nowhere else.
+At the accepted 2394 steps, `n_candidates = 384 − n_ctx`, so it holds at every
+multiple of 48 up to the 336-patch ceiling — 48, 96, 144, 192, 240, 288 and 336.
 
 **Real-cohort evaluation sets shrink with the window.** `realdata/calibrate.py`
 drops any segment shorter than the context plus the horizon, and segments are cut
@@ -118,7 +119,10 @@ memory of 52, and 148 about 8.1×.
 
 ## 3. Pool and statistics
 
-Two pools, both at 1242 steps and 10⁶ rows:
+Two pools, both at 10⁶ rows. Both were built at the retired 1242-step geometry
+and no longer load: `data.py` accepts 2394 steps (see `ON_THE_FLY_SIM_HOURS`) and
+rejects any other length at first row read. Rebuild with
+`--sim-hours 199.5` before use.
 
 | pool | `hypo_oversample` | steps below 70 mg/dL |
 | --- | ---: | ---: |

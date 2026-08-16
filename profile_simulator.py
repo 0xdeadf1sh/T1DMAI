@@ -9,8 +9,8 @@ which simulator hot path dominates per-sample wall time and decide whether
 to (a) reduce the requested simulation hours or (b) raise NUM_WORKERS.
 
 We profile at ``HOURS = 720.0`` to expose cold-path cost; the on-the-fly
-training path uses ``ON_THE_FLY_SIM_HOURS`` (~104 h) per sample, so the
-actual training cost will look like roughly 1/7th of the figures reported
+training path uses ``ON_THE_FLY_SIM_HOURS`` (~200 h) per sample, so the
+actual training cost will look like roughly a third of the figures reported
 here.
 """
 import cProfile

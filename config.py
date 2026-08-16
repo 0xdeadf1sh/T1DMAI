@@ -116,8 +116,8 @@ CHANNEL_TO_FEAT = {0: 1, 1: 2, 2: 3}   # carb -> feat 1; insulin -> feat 2; exer
 # real evening dynamics through all rolls (see inference.predict_rolling sliding
 # logic). Training samples n_ctx uniformly in [MIN, MAX]; the collate function
 # left-pads to the BATCH maximum so every sample's window ends at the right edge.
-MAX_CONTEXT_PATCHES = 96         # Max context patches (ceiling; hours = MAX_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
-MIN_CONTEXT_PATCHES = 48         # Min context patches (floor; hours = MIN_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
+MAX_CONTEXT_PATCHES = 336         # Max context patches (ceiling; hours = MAX_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
+MIN_CONTEXT_PATCHES = 168         # Min context patches (floor; hours = MIN_CONTEXT_PATCHES / _PATCHES_PER_HOUR)
 
 # === Prediction Horizon ===
 # The span of the fixed FORECAST protocol: a dense right-edge window of
@@ -177,7 +177,7 @@ MAX_MASKED_PATCHES = 12          # sampler cap on sum(L), and M, the head's slot
 # so the low end of the plateau is the cheap end. The span-length law is
 # untouched: only where the last span lands changes. Moving this invalidates
 # metrics.protocols.SAMPLER_REFERENCE, which reads it.
-MASK_RIGHT_EDGE_QUOTA = 0.35     # share of windows whose last span is flush right
+MASK_RIGHT_EDGE_QUOTA = 0.50     # share of windows whose last span is flush right
 
 # === Night long-horizon validation ===
 # Validation rolls ``predict_rolling`` out to ``NIGHT_LONG_HORIZON_HOURS`` hours
@@ -227,7 +227,7 @@ BG_QUANTILE_SPREAD_MIN = 1e-3    # additive floor on each softplus spread (anti 
 # K < PATCH_SIZE the highest-frequency (period-2) mode is unrepresentable, so an
 # intra-patch zigzag of the median cannot be emitted by construction.
 # K = PATCH_SIZE recovers a fully-free per-step head exactly.
-BG_HEAD_STEP_BASIS_DIM = 3       # K: coeffs per (patch, channel); K<PATCH_SIZE forbids the period-2 within-patch mode
+BG_HEAD_STEP_BASIS_DIM = 6       # K: coeffs per (patch, channel); K<PATCH_SIZE forbids the period-2 within-patch mode
 BG_HEAD_STEP_BASIS_TYPE = 'dct'  # within-patch basis over PATCH_SIZE points: 'dct' (low-freq DCT-II rows) or 'poly' (orthonormal polynomials)
 
 # Median-assembly mode (R3 selector). assemble_quantiles is the SOLE chokepoint
@@ -262,7 +262,7 @@ BG_HEAD_MEDIAN_MODE = 'global'
 # anti-drift contraction is ABSENT rather than weakened — and every fan assert
 # still passes. What G_L holds roughly constant is the fraction of the span the
 # basis can bend; the cutoff period 2n/G_L varies with L and is what to report.
-BG_HEAD_MEDIAN_GLOBAL_DIM = 6
+BG_HEAD_MEDIAN_GLOBAL_DIM = 12
 
 # === Time-of-day probe (co-trains the trunk; TIME_PROBE_DETACH=False) ===
 # An auxiliary head that classifies each MASKED patch's absolute hour-of-day
@@ -318,7 +318,7 @@ MASTER_SEED = 11011922           # Default master seed for all training data
 DETERMINISTIC = False            # full-determinism toggle; True trades some speed (TF32 off, cuDNN deterministic) for reproducibility; set False for max throughput (GPU: data stream reproducible, SDPA backward not bit-exact)
 TOTAL_STEPS = 100000             # Total training steps
 BATCH_SIZE = 512                 # Training batch size
-NUM_WORKERS = 8                  # DataLoader worker processes
+NUM_WORKERS = 16                 # DataLoader worker processes
 
 # When training off a memory-mapped simulator cache (cache_format=npy-memmap),
 # each random row read faults pages of the multi-TB cache files into the kernel

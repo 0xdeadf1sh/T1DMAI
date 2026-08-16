@@ -18,11 +18,12 @@ One validation is run for real — model, dataset, three forwards, both protocol
 because a static check over the column list is what let the gap open in the first
 place.
 
-Two rules have no subject in a run that size and are driven from inputs built
-here instead: the conformal probe returns nothing under 50 val windows, and the
-hypo alarm raises no detection over 12 patients.  An assertion whose subject the
-run never produces passes on absence, which is the state the columns above were
-already in.
+One rule has no subject in a run that size and is driven from inputs built here
+instead: the conformal probe returns nothing under 50 val windows.  An assertion
+whose subject the run never produces passes on absence, which is the state the
+columns above were already in.  The hypo alarm DOES fire at this N; its synthetic
+fan stays because it exercises the lead-time rule at every tau deterministically,
+rather than at whichever taus the draw happens to reach.
 """
 import math
 import re
@@ -42,7 +43,16 @@ import train
 # Small enough to run in a test, large enough that every fixed-protocol bin is
 # populated: the forecast protocol lays one patch at each d per window and the
 # infill protocol scores every window, so both fill at any N.
-N_VAL = 12
+#
+# The GLYCEMIC-REGION bins do not fill at any N — a CG-EGA hypo row exists only
+# if some drawn window's TRUE BG goes below 70, which is a property of the draw.
+# At 12 it was empty as soon as ON_THE_FLY_SIM_HOURS moved (the longer trajectory
+# draws different windows), at 24 it lands on exactly 0.0, and at 48 it carries a
+# real 0.08. The margin is the point: this file exists so a metric cannot quietly
+# stop being recorded, and a fixture one draw away from an empty bin fails for the
+# wrong reason. Raise this rather than injecting a synthetic value, which would
+# pass even if the metric stopped being computed altogether.
+N_VAL = 48
 
 # The three keys the caller writes onto the record after _run_validation returns
 # (train() computes them from the training-side loss history, not from the
@@ -98,7 +108,8 @@ RESTORED_TO_THE_TABLE = {
 
 # The conformal probe is the one CSV_ONLY family the fixture cannot produce:
 # ``train._conformal_val_probe`` returns nothing under 50 validation windows and
-# N_VAL is 12, so its keys are absent from ``val_metrics`` entirely. An absence
+# N_VAL is 48 — two short, so raising N_VAL past 50 would give this family a live
+# subject — so its keys are absent from ``val_metrics`` entirely. An absence
 # check over a family the run never populates passes on nothing — exactly the
 # state the module docstring says this file exists to prevent — so the render
 # below is fed these values, at the scale a real probe returns, to give the
@@ -458,9 +469,9 @@ def test_a_sample_with_no_slot_pair_cannot_dilute_the_jump_row():
     best attainable value on a lower-is-better row barred at ``<1.000 h``.
     Averaging those in measures how often the sampler drew one span of one patch,
     not whether the clock is stable. The subject is constructed here rather than
-    drawn, because whether a 12-patient fixture happens to contain a no-pair
-    sample is luck, and an assertion whose subject the run never produces passes
-    on absence.
+    drawn, because whether the fixture happens to contain a no-pair sample is luck
+    at any N, and an assertion whose subject the run never produces passes on
+    absence.
     """
     B, M, bins = 4, 3, train.TIME_PROBE_N_BINS
     logits = torch.zeros(B, M, bins)
@@ -498,8 +509,8 @@ def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
     recomputes both candidate means from the same weights and the same batches:
     ``tod_jump_h`` must be the filtered one.
 
-    The subject is asserted before it is used — this seed's 12-sample validation
-    contains exactly one window whose sampler drew a single one-patch span, and
+    The subject is asserted before it is used — this seed's 48-sample validation
+    contains exactly two windows whose sampler drew a single one-patch span, and
     if that ever stops being true the two means coincide and the assertion below
     passes on nothing.
     """

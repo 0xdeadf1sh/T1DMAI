@@ -523,22 +523,24 @@ saturation and prints the `resize_model.py` command each verdict implies.
 The simulator is a Python loop and starves a fast GPU. The shared generator
 pre-builds a pool of post-warmup trajectories once; training then skips the
 simulator entirely. This repository ships no cache; training reads a pool built
-locally by `T1DMSIM/cache_simulator.py`. The two pools T1DMSIM publishes are the
-earlier 666-step geometry, which `data.py` rejects at load against the accepted
-1242-step one.
+locally by `T1DMSIM/cache_simulator.py`. The pools T1DMSIM publishes are earlier
+geometries, which `data.py` rejects at load against the accepted one.
 
 ```bash
-python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000
+python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000 --sim-hours 199.5
 python train.py --cache-path simulator_cache --total-steps 100000
 ```
 
-The geometry the dataset accepts is 1242 steps, 103.5 h at 5-minute resolution
-after a 48 h warmup, which is what `cache_simulator.py` builds by default; a pool
-at any other geometry is rejected at load. `--hypo-oversample` weights the pool
-toward hypoglycemia. At a million trajectories a balanced pool occupies
-16.80 GB and a hypo-weighted one 16.91 GB. Each pool directory carries a
-`DATASET.md` describing what is in it and the `normalization_stats.json` fitted
-on that pool.
+The geometry the dataset accepts is 2394 steps, 199.5 h at 5-minute resolution
+after a 48 h warmup; a pool at any other geometry is rejected at load. The
+`--sim-hours` flag above is required until `cache_simulator.py`'s own default
+moves to match — its built-in default still builds the retired 1242-step pool.
+
+`--hypo-oversample` weights the pool toward hypoglycemia. Pool size scales with
+the row length: at a million trajectories the retired 1242-step balanced pool
+occupied 16.80 GB and its hypo-weighted twin 16.91 GB, so the 2394-step geometry
+runs about 32 GB. Each pool directory carries a `DATASET.md` describing what is
+in it and the `normalization_stats.json` fitted on that pool.
 
 Each channel is a chunked blosc2 array with byte-shuffle and zstd. Byte-shuffle
 groups the high-entropy mantissa bytes of each float apart from the low-entropy
@@ -549,8 +551,12 @@ day index 539× — for roughly 2.4× over the pool as a whole. An uncompressed
 `.npy` memmap layout is also accepted.
 
 Pool reuse is benign, because every draw takes a fresh random window from its
-row: a 1242-step trajectory admits about 5,280 distinct patch-aligned windows, so
-a 1–3 M-row pool is ample for a 100,000-step run at batch 512. The dataset checks
+row: over a 48–96-patch context a 2394-step trajectory admits 15,288 distinct
+patch-aligned windows, and over a 168–336-patch one 22,308, so a 1–3 M-row pool
+is ample for a 100,000-step run at batch 512. Each row is drawn about 64 times at
+10⁶ rows, but the expected number of repeated (row, window) pairs across a whole
+run is under a fifth of a percent of draws — and each of those still draws its
+own mask. The dataset checks
 the cache's `meta.json` — format, channel list, warmup and sim hours, `dt`, the
 uniform-sample probability — and each channel's shape against the runtime config,
 and refuses to train on divergent data. The generation parameters under `params`

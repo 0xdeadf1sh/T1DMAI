@@ -937,7 +937,16 @@ def test_assembled_median_basis_has_rank_g_l_per_span():
         _, median = assemble_quantiles(head_raw, anchor_bg, mask_idx, valid)
         anchor = kovatchev_f(anchor_bg[:, :1]).unsqueeze(-1)          # (B,1,1)
         block = (median[:, :L] - anchor).reshape(B, L * S)            # (B, n)
-        r = int(torch.linalg.matrix_rank(block.double(), tol=1e-6))
+        # RELATIVE cutoff, not absolute.  The projection leaves fp32 rounding in
+        # its null space, and that residue scales with the energy the basis
+        # KEEPS — so an absolute threshold is a threshold on
+        # BG_HEAD_MEDIAN_GLOBAL_DIM and on the head's output scale, not on rank.
+        # At G = 6 the residue sat just under 1e-6 and at G = 12 just over it,
+        # which reported rank G_L + 1 for a projection that is still exactly
+        # rank G_L.  The spectrum has a seven-decade cliff at G_L (sv[G_L-1] ~ 8,
+        # sv[G_L] ~ 1e-6, ratio ~6e-8), so any rtol between fp32 epsilon and the
+        # signal separates them at every G.
+        r = int(torch.linalg.matrix_rank(block.double(), rtol=1e-6))
         ranks[L] = r
         assert r == global_median_dim(L), (
             f"span of L={L} assembled a rank-{r} median, expected G_L="

@@ -248,8 +248,8 @@ def blind_masked_doses(
 # Each training sample needs at most
 #   MAX_CONTEXT_PATCHES + max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
 #   patches × PATCH_SIZE timesteps/patch × DT_MINUTES = 5 min/timestep
-# of raw trajectory.  With MAX_CONTEXT_PATCHES context patches (24 h) plus the
-# NIGHT_LONG_HORIZON_PATCHES (8 h) long-horizon window that is 32 h minimum.
+# of raw trajectory — the context ceiling plus the long-horizon window, both read
+# off config rather than restated here, so a resize carries this with it.
 #
 # The post-warmup trajectory always starts at midnight (warmup discards an
 # integer number of hours, so warmup_hours % 24 == 0 → trajectory step 0 is
@@ -266,21 +266,24 @@ def blind_masked_doses(
 # so a day holds 48 slots and hour-of-day coverage is exactly uniform at a
 # fixed n_ctx iff n_candidates % 48 == 0.
 #
-# At N = 1242 steps, n_candidates = 192 - n_ctx, which is exact at
-# n_ctx ∈ {48, 96, 144} — the 24 h, 48 h and 72 h context widths — and nowhere
-# else.  Training draws n_ctx uniformly (``_build_sample``), so the pooled
-# hour-of-day histogram is a mixture over widths and is never flat.  Exactly
-# enumerated, the most-drawn 30-min slot over the least is 1.3221 over
-# n_ctx 16-48, 1.4158 with the ceiling at 96, and 1.5972 at 144.  The peak is
-# always slot 47 (23:30) and the trough slot 0, so the residual tilt runs away
-# from midnight rather than piling onto it.  This length buys exactness at the
-# deployed context widths and a flatter mixture everywhere else.
+# The condition is N ≡ 90 (mod 288); any other length puts an extra candidate on
+# slot 0.  At N = 2394 steps, n_candidates = 384 - n_ctx, which is exact at every
+# whole-day width up to the ceiling — n_ctx ∈ {48, 96, ..., 336}, 24 h through
+# 7 days — and 2394 is the SMALLEST length satisfying the congruence that leaves
+# a 336-patch (7-day) context any candidate at all: it needs
+# (336 + 16) × 6 = 2112 steps, and 2106 is the previous congruent length.  At the
+# ceiling it leaves exactly 48 candidates, one full day of 30-minute slots.
 #
-# For whole-day context widths one length condition remains, N ≡ 90 (mod 288),
-# and 1242 steps = 103.5 h is the smallest such length that leaves a 72 h
-# context any candidate at all.  Any other length puts an extra candidate on
-# slot 0.
-ON_THE_FLY_SIM_HOURS: float = 103.5
+# Training draws n_ctx uniformly (``_build_sample``), so the pooled hour-of-day
+# histogram is a mixture over widths and is never flat; the residual peak sits at
+# slot 47 (23:30) and the trough at slot 0, so the tilt runs away from midnight
+# rather than piling onto it.
+#
+# PAIRED with T1DMSIM/cache_simulator.py's --sim-hours: a cache is rejected
+# outright unless meta['sim_hours'] equals this (checked in T1DMDataset.__init__,
+# where the cache meta is read).  Raising it
+# also lengthens every on-the-fly (uncached) simulator request in proportion.
+ON_THE_FLY_SIM_HOURS: float = 199.5
 
 # === Conformal-calibration partition (RESERVED) ===
 # A disjoint seed band for the conformal-calibration partition, kept clear of
