@@ -72,7 +72,7 @@ from risk_loss import risk_total_loss, KendallGalWeighting
 from utils import ModelEMA, time_of_day_bin_ce, time_cross_window_consistency_loss
 from data import (
     collate_fn, BG_MASKED_FEAT, _anchor_step_for_span, _mask_slots,
-    masked_channel_policy,
+    masked_channel_policy, stored_masked_channel_policy,
 )
 from realdata import load_dataset
 from realdata.features import build_feature_stack, smoothed_cgm
@@ -367,12 +367,11 @@ LIVE_MASKED_CHANNEL_POLICY = masked_channel_policy(blind=False)
 def _stored_masked_channel_policy(tc: dict[str, Any]) -> str:
     """The masked-channel policy a checkpoint was trained under.
 
-    An ABSENT key reads as ``announced`` unconditionally — not as "unknown", and
-    without the sampler-key precondition ``_stored_quota`` needs. The key was
-    introduced WITH the blind trainer, and a blind run always stamps it, so no
-    checkpoint that lacks it can be a blind one.
+    ``data.stored_masked_channel_policy`` is the single reader of the absent-key
+    convention — it reads as ``announced`` unconditionally, and without the
+    sampler-key precondition ``_stored_quota`` needs.
     """
-    return str(tc.get('masked_channel_policy', masked_channel_policy(blind=False)))
+    return stored_masked_channel_policy(tc)
 
 
 def _policy_guard(ckpt: dict[str, Any]) -> None:

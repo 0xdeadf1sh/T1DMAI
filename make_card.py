@@ -619,6 +619,53 @@ def card_param_breakdown(groups: dict[str, int], total: int) -> None:
     plt.close(fig)
 
 
+# ---------------------------------------------------------------- masked-channel policy
+
+
+def _policy_wording(cfg: dict) -> dict[str, str]:
+    """Per-policy card wording for what a masked patch carries.
+
+    The card is published, so it must not describe a blind checkpoint in the
+    announced convention's terms: under ``blind`` the dose channels are withheld
+    with BG at ``data.zero_dose_fill``, which makes every dose-response claim on
+    the card false and the what-if regime unavailable.  ``cfg`` is the
+    checkpoint's own ``training_config`` and ``data.stored_masked_channel_policy``
+    is the single reader of its absent-key convention.
+
+    Args:
+        cfg: the checkpoint's ``training_config``.
+
+    Returns:
+        ``policy`` (the stamp), ``dose_note`` (the input-table cell for feats
+        1-3), ``regime`` (the short regime name), ``row`` (the regime's row
+        label), ``footer`` (the report-provenance clause) and ``caveat`` (a
+        sentence, empty under ``announced``).
+    """
+    from data import MASKED_CHANNEL_POLICY_BLIND, stored_masked_channel_policy
+    policy = stored_masked_channel_policy(cfg)
+    if policy == MASKED_CHANNEL_POLICY_BLIND:
+        return {
+            "policy": policy,
+            "dose_note": "withheld where masked",
+            "regime": "blind (unconditioned)",
+            "row": "blind",
+            "footer": ("masked-patch carbs/insulin are withheld at the no-dose fill "
+                       "(blind regime)"),
+            "caveat": ("Masked patches carry no dose information: carb, insulin and\n"
+                       "exercise are withheld with BG at the no-dose fill. The model\n"
+                       "cannot respond to an announced dose, so what-if response is\n"
+                       "not available."),
+        }
+    return {
+        "policy": policy,
+        "dose_note": "announced future",
+        "regime": "announced (conditioned)",
+        "row": "announced",
+        "footer": "masked-patch carbs/insulin are announced (what-if regime)",
+        "caveat": "",
+    }
+
+
 # ---------------------------------------------------------------- card 4: io schema
 
 
@@ -645,11 +692,15 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             f"{cfg['patch_size']} timesteps × {config.N_INPUT_FEATURES} features  =  {config.PATCH_DIM} numbers",
             fontsize=9.5, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # Exactly N_INPUT_FEATURES channels — bg, the three announced plan channels,
-    # and the mask bit. The four sin/cos time-of-day / day-of-week features are
+    # Exactly N_INPUT_FEATURES channels — bg, the three dose plan channels, and
+    # the mask bit. The four sin/cos time-of-day / day-of-week features are
     # removed; time-of-day survives only as a detached diagnostic probe head,
     # never a model input. Exercise is a carbohydrate-equivalent glucose-disposal
     # curve on the carb scale, not an intensity.
+    #
+    # What feats 1-3 carry on a MASKED patch is the checkpoint's own
+    # masked-channel policy, not a property of the schema: announced under
+    # train.py, the no-dose fill under train_blind.py.
     #
     # Feat 4 is the one input that is not a normalized signal: one BIT per patch,
     # 1.0 where feat 0 is withheld. It is announced rather than inferred because a
@@ -657,11 +708,12 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
     # (backcast) or sit between visible patches (infill), so masking cannot be
     # read off position, and z = 0 in a masked bg slot is a legal reading rather
     # than a sentinel.
+    wording = _policy_wording(cfg)
     feats = [
         ("BG absolute",           "mg/dL",     "always · 0 where masked"),
-        ("Carbs",                 "g / 5 min", "announced future"),
-        ("Insulin",               "U / 5 min", "announced future"),
-        ("Exercise (carb-equiv)", "g / 5 min", "announced future"),
+        ("Carbs",                 "g / 5 min", wording["dose_note"]),
+        ("Insulin",               "U / 5 min", wording["dose_note"]),
+        ("Exercise (carb-equiv)", "g / 5 min", wording["dose_note"]),
         ("BG masked",             "bit/patch", "1 where BG is withheld"),
     ]
     assert len(feats) == config.N_INPUT_FEATURES
@@ -679,6 +731,18 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
         ax.text(p_x + 0.320, row_y, note, fontsize=9, color=DIMMED,
                 family=FONT_BODY, transform=ax.transAxes, style="italic")
         row_y -= 0.029
+
+    # Masked-channel policy: what feats 1-3 hold on a masked patch, off the
+    # checkpoint's own stamp. Under ``blind`` the caveat is the load-bearing half
+    # — a reader who takes the announced framing would expect a dose response the
+    # weights cannot produce.
+    ax.text(p_x + 0.018, row_y - 0.006,
+            f"Masked-patch dose channels: {wording['regime']}",
+            fontsize=9, color=NAVY, weight="bold", transform=ax.transAxes)
+    if wording["caveat"]:
+        ax.text(p_x + 0.018, row_y - 0.032, wording["caveat"],
+                fontsize=8.5, color=SLATE, va="top", family=FONT_BODY,
+                transform=ax.transAxes)
 
     # Outputs panel (right top)
     o_x, o_y, o_w, o_h = 0.515, 0.58, 0.46, 0.21
@@ -1042,7 +1106,7 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
 # ---------------------------------------------------------------- card 8: metrics
 
 
-def card_metrics_card(val: dict[str, np.ndarray]) -> None:
+def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
     # Tall card: the metric table carries several sections plus the curve-match
     # block (~32 rows + 6 eyebrows at full strength), so the row pitch is tightened
     # and the figure stretched to keep it inside ax [0, 1].
@@ -1125,8 +1189,8 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
     y = _header(ax, "Validation metrics",
                 "Headline results",
                 "Best-over-run (with the step where it was achieved) and mean over the "
-                "last 10 validation rows. Future carb/insulin/exercise are announced "
-                "(conditioned).")
+                "last 10 validation rows. Masked-patch carb/insulin/exercise are "
+                f"{_policy_wording(cfg)['regime']}.")
 
     def _tight_section(yy: float, lab: str, color=NAVY) -> float:
         """Section eyebrow with a tighter gap than the shared _section (this card
@@ -1208,7 +1272,7 @@ def card_metrics_card(val: dict[str, np.ndarray]) -> None:
 # ---------------------------------------------------------------- card 9: real data
 
 
-def card_realdata(realdata: dict[str, dict]) -> None:
+def card_realdata(cfg: dict, realdata: dict[str, dict]) -> None:
     """Real-CGM (and augmented / in-domain-sim) evaluation summary.
 
     Reads the post-training ``metrics/{real,augmented,sim}/stats.json`` reports.
@@ -1222,6 +1286,7 @@ def card_realdata(realdata: dict[str, dict]) -> None:
         return  # No reports yet — omit the section gracefully.
 
     H = REALDATA_HORIZONS
+    wording = _policy_wording(cfg)
     fig, ax = _setup_card((13.6, 13.2))
     step = None
     for s in realdata.values():
@@ -1330,12 +1395,12 @@ def card_realdata(realdata: dict[str, dict]) -> None:
                 cur -= 0.010
 
             # --- Night-onset per-night excursion prediction (bedtime → morning),
-            # announced (the model is always conditioned).
+            # under the checkpoint's own masked-channel policy.
             no = res.get("night_onset")
             if isinstance(no, dict) and no.get("n_nights"):
                 ax.text(0.060, cur, f"Night-onset excursion  ({no['n_nights']} nights, "
                         f"{int(config.NOCTURNAL_START_HOUR):02d}:00→"
-                        f"{int(config.NOCTURNAL_END_HOUR):02d}:00, announced)",
+                        f"{int(config.NOCTURNAL_END_HOUR):02d}:00, {wording['row']})",
                         fontsize=8.5, color=mcolor, weight="bold", style="italic",
                         transform=ax.transAxes)
                 cur -= 0.024
@@ -1346,7 +1411,7 @@ def card_realdata(realdata: dict[str, dict]) -> None:
                 mm = no.get("cond") or {}
                 hy = mm.get("hypo") or {}
                 yp = mm.get("hyper") or {}
-                ax.text(0.075, cur, "announced", fontsize=9, color=INK, family=FONT_BODY, transform=ax.transAxes)
+                ax.text(0.075, cur, wording["row"], fontsize=9, color=INK, family=FONT_BODY, transform=ax.transAxes)
                 ax.text(0.300, cur, f"{_fmt(hy.get('recall'))} / {_fmt(hy.get('precision'))}",
                         fontsize=9, color=NAVY, family=FONT_MONO, transform=ax.transAxes)
                 ax.text(0.600, cur, f"{_fmt(yp.get('recall'))} / {_fmt(yp.get('precision'))}",
@@ -1360,8 +1425,8 @@ def card_realdata(realdata: dict[str, dict]) -> None:
     ax.plot([0.025, 0.975], [0.040, 0.040], color=RULE, lw=0.6, transform=ax.transAxes)
     ax.text(0.025, 0.020,
             "Offsets and recall/precision are read from metrics/{real,augmented,sim}/stats.json "
-            "(written post-training by the report scripts). Future carbs/insulin are announced "
-            "(what-if regime); the offset is fit on a disjoint calibration split.",
+            f"(written post-training by the report scripts). {wording['footer']}; "
+            "the offset is fit on a disjoint calibration split.",
             fontsize=8, color=DIMMED, transform=ax.transAxes)
 
     fig.savefig(OUT_DIR / "card_09_realdata.png")
@@ -1399,6 +1464,10 @@ def card_showcase(cfg: dict, summary: dict,
                       f"architecture and end-of-training performance (step {final_step:,}).")
         chart_subtitle = f"Final values  (step {final_step:,})"
         excursion_subtitle = f"Recall and precision  (final, step {final_step:,})"
+
+    # The headline card must name the regime it was trained under: every clinical
+    # figure below it is read differently when masked-patch doses are withheld.
+    header_sub += f"  Masked-patch doses: {_policy_wording(cfg)['regime']}."
 
     fig, ax = _setup_card((18.7, 13.2))
 
@@ -1809,10 +1878,10 @@ def main() -> None:
     card_training_recipe(cfg)
     card_loss_design(cfg, train)
     card_compute_budget(train, tsum, cfg)
-    card_metrics_card(val)
+    card_metrics_card(cfg, val)
     n_cards = 10
     if realdata:
-        card_realdata(realdata)
+        card_realdata(cfg, realdata)
         n_cards += 1
     print(f"  → wrote {n_cards} card_*.png to {OUT_DIR}")
 

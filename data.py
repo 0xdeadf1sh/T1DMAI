@@ -157,6 +157,38 @@ def masked_channel_policy(blind: bool) -> str:
     return MASKED_CHANNEL_POLICY_BLIND if blind else MASKED_CHANNEL_POLICY_ANNOUNCED
 
 
+def stored_masked_channel_policy(training_config: dict[str, Any] | None) -> str:
+    """The masked-channel policy a checkpoint's ``training_config`` records.
+
+    The ONE reader of the absent-key convention.  An absent key reads as
+    ``announced`` unconditionally — not as "unknown": the key was introduced WITH
+    the blind trainer and a blind run always stamps it, so no checkpoint that
+    lacks it can be a blind one.  Every consumer — ``finetune/finetune.py``'s
+    policy guard, ``gui.py``'s load, ``make_card.py``, ``model_health.py`` — goes
+    through here, so a second convention cannot appear.
+
+    Args:
+        training_config: a checkpoint's ``training_config``, or None.
+
+    Returns:
+        ``MASKED_CHANNEL_POLICY_BLIND`` or ``MASKED_CHANNEL_POLICY_ANNOUNCED``.
+    """
+    tc = training_config or {}
+    return str(tc.get('masked_channel_policy', masked_channel_policy(blind=False)))
+
+
+def checkpoint_masked_channel_policy(ckpt: dict[str, Any] | None) -> str:
+    """``stored_masked_channel_policy`` over a whole checkpoint dict.
+
+    Args:
+        ckpt: a loaded checkpoint, or None.
+
+    Returns:
+        ``MASKED_CHANNEL_POLICY_BLIND`` or ``MASKED_CHANNEL_POLICY_ANNOUNCED``.
+    """
+    return stored_masked_channel_policy((ckpt or {}).get('training_config'))
+
+
 def zero_dose_fill(stats: dict[str, dict[str, float]]) -> dict[int, float]:
     """Per-feat ``normalize(0)`` for every announceable channel, in z-space.
 
