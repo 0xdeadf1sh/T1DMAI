@@ -2201,13 +2201,12 @@ def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) 
     signal, and the val sample is small (~100 windows), so read it as directional.
 
     The fit is REGION-BINNED (``mondrian.fit_mondrian``) on where each window's
-    forecast is heading, and the MARGINAL fit — what ``conformal.py`` alone gives,
-    and the fallback for a bin under ``mondrian.MIN_N_OWN_FIT`` — is measured on the
-    same windows in the same call, so the two arms are never compared across runs.
-    ``conf_cov90_cal`` / ``conf_hypo_esc_cal`` carry the region-binned arm, the
-    correction in force; the marginal arm and the per-bin table go to stdout, since
-    ``_val_log_columns`` carries no column for either and a key with no column is
-    dropped silently.
+    forecast is heading; ``conf_cov90_cal`` / ``conf_hypo_esc_cal`` carry that arm,
+    the correction in force, against the raw fan on the same windows in the same
+    call, so the two are never compared across runs. The MARGINAL fit — what
+    ``conformal.py`` alone gives — is still returned by ``fit_mondrian``, since a
+    bin under ``mondrian.MIN_N_OWN_FIT`` falls back to it, but it is not scored as
+    a third arm: ``_val_log_columns`` carries no column for it.
 
     Each coverage is returned with the mean band width that bought it, over the
     same excursion peaks, because a coverage figure alone is not interpretable:
@@ -2227,7 +2226,6 @@ def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) 
         conf_hypo_esc_raw, conf_hypo_esc_cal, conf_n}`` — widths in mg/dL
         (empty if too few excursion windows to be meaningful).
     """
-    import conformal
     import mondrian
     M = bands.shape[0]
     if M < 50:
@@ -2239,7 +2237,7 @@ def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) 
     # window's bin does not move when the correction is applied.
     cal_bin = mondrian.region_bin(
         mondrian.forecast_destination(bands[ci], _CONF_MEDIAN_IDX))
-    delta, marginal, meta = mondrian.fit_mondrian(
+    delta, _, _ = mondrian.fit_mondrian(
         bands[ci], true[ci], cal_bin, QUANTILE_LEVELS, _CONF_MEDIAN_IDX,
         patients=[int(i) for i in ci])
     bt, tt, lt = bands[ti], true[ti], last[ti]
@@ -2258,29 +2256,9 @@ def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) 
         width = np.mean(B[idx, j[idx], _CONF_HI_IDX] - B[idx, j[idx], _CONF_LO_IDX])
         return float(cov), float(hypo), float(width)
 
-    bt_marg = conformal.apply_quantile_conformal(bt, marginal, _CONF_MEDIAN_IDX)
     bt_cal = mondrian.apply_mondrian(bt, delta, test_bin, _CONF_MEDIAN_IDX)
     cov_raw, hypo_raw, wid_raw = _stats(bt)
-    cov_marg, hypo_marg, wid_marg = _stats(bt_marg)
     cov_cal, hypo_cal, wid_cal = _stats(bt_cal)
-
-    # The raw and binned arms are ROWS on the validation table now, with the width
-    # that bought each. What stays here is what has no column and so cannot be a
-    # row: the MARGINAL arm — the correction `conformal.py` alone would give, and
-    # the fallback for any bin under `mondrian.MIN_N_OWN_FIT` — and the per-bin
-    # table. Coverage is never printed without its n, its distinct-patient count
-    # and its width; the per-bin rows carry the excursion subset only, which is
-    # what the headline conf_* figures are measured on.
-    print(f"[conformal] excursion-peak, n={len(idx)} windows ({len(idx)} patients), "
-          f"region edges {meta['region_edges']} mg/dL on the forecast destination")
-    print(f"[conformal]   MARGINAL arm (no column, table shows raw vs binned): "
-          f"cov90 {100*cov_marg:5.1f}%  width {wid_marg:6.1f} mg/dL  "
-          f"hypo-esc {100*hypo_marg:5.1f}%")
-    for rec in meta['bins']:
-        n_exc = int((test_bin[idx] == rec['bin']).sum())
-        print(f"[conformal]   region {rec['label']:>12}  cal n={rec['n']:<5} "
-              f"test-excursion n={n_exc:<5} "
-              + ('own fit' if rec['own_fit'] else f"MARGINAL: {rec['fallback_reason']}"))
 
     return {'conf_cov90_raw': cov_raw, 'conf_cov90_cal': cov_cal,
             'conf_width_raw': wid_raw, 'conf_width_cal': wid_cal,

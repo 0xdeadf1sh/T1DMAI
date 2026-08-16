@@ -799,8 +799,8 @@ what makes the always-on what-if path trustworthy. Diagnostic only.
 **Conformal coverage.** Fits on a deterministic 60 % of the collected validation
 windows and measures excursion-peak coverage on the disjoint 40 %, reporting raw
 against calibrated with the mean band width that bought each. The fit is
-region-binned, and the marginal fit is measured on the same windows in the same
-call so the two fits are never compared across runs. The validation sample is
+region-binned, and it is measured against the raw fan on the same windows in the
+same call, so the two are never compared across runs. The validation sample is
 small, so the figures are directional; the deployable correction is fit after
 training by `calibrate_conformal.py`.
 

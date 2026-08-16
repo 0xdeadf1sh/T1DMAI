@@ -752,34 +752,13 @@ class T1DMDataset(Dataset):
             self._cache_slab = _cache_slab_geometry(
                 self._cache_pool_size, self.cache_partition)
 
-            # Heads-up: with pool_size < total samples drawn we silently cycle
-            # the pool. The on-the-fly path has effectively-zero collision
-            # over the 64-bit seed space; cache mode trades that for disk
-            # locality. Surfacing this here so it's not invisible.
-            n_samples = total_steps * batch_size
-            if self._cache_pool_size < n_samples:
-                reuse = n_samples / max(self._cache_pool_size, 1)
-                # Distinct patch-aligned windows one row admits, summed over
-                # the context widths ``_build_sample`` draws from. Computed
-                # rather than written down, so it follows MAX_CONTEXT_PATCHES.
-                long_horizon_patches = max(
-                    PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
-                n_win = sum(
-                    max(0, self._cache_n_timesteps // PATCH_SIZE
-                        - long_horizon_patches - c + 1)
-                    for c in range(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1)
-                )
-                print(
-                    f"[T1DMDataset] cache pool_size={self._cache_pool_size} "
-                    f"< total_steps*batch_size={n_samples}; each cache row is "
-                    f"drawn ~{reuse:.1f}x. This is benign: _build_sample takes a "
-                    "fresh random context+horizon window per draw (each "
-                    f"{self._cache_n_timesteps}-step trajectory admits {n_win} "
-                    "distinct patch-aligned windows), so every reuse is a "
-                    "DIFFERENT training window — a pool far smaller than "
-                    "total_steps*batch_size is fine.",
-                    flush=True,
-                )
+            # With pool_size < total_steps * batch_size the pool cycles, and
+            # that is benign rather than a shortfall to warn about:
+            # ``_build_sample`` takes a fresh random context+horizon window per
+            # draw, and one cached trajectory admits many distinct
+            # patch-aligned windows, so every reuse is a DIFFERENT training
+            # window. The on-the-fly path has effectively-zero collision over
+            # the 64-bit seed space; cache mode trades that for disk locality.
 
     def __len__(self) -> int:
         # One dataset index per (step, position) pair — exactly enough work
