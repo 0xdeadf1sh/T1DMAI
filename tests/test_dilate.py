@@ -8,9 +8,16 @@ fp64 (only fp16/bf16 are downcast), so gradcheck is meaningful here. The TDI ter
 no longer has its own custom Function: it is the directional derivative of the
 soft-DTW value, evaluated by a finite difference over ``SoftDTWBatch`` (so its
 gradient rides on the gradcheck'd ``SoftDTWBatch`` backward).
+
+gradcheck runs fp64 on the CPU, which is the eager reference sweep. The Triton
+sweep the CUDA fp32 training path actually runs is a SECOND implementation of the
+same recursion, and nothing above reaches it — ``test_softdtw_triton_matches_
+reference`` is what ties it to the gradchecked one, in value and in gradient.
 """
+import pytest
 import torch
 
+import dilate
 from dilate import SoftDTWBatch, dilate_loss
 
 import risk_loss
@@ -27,6 +34,66 @@ def test_softdtw_gradcheck():
     )
     print("[DUMP] softdtw gradcheck:", ok)
     assert ok
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton sweep is CUDA-only")
+def test_softdtw_triton_matches_reference():
+    """The Triton sweep reproduces the eager one, value and gradient.
+
+    H is swept across the span-length buckets the masked-BG objective dispatches
+    (H = L * PATCH_SIZE for L in MASK_SPAN_LENGTHS) and past both boundary shapes
+    the diagonal walk has: H = 1 (a single cell) and an H whose next power of two
+    overshoots the diagonal (the masked lanes must not reach the store).
+    """
+    from config import DILATE_GAMMA, MASK_SPAN_LENGTHS, PATCH_SIZE
+
+    assert dilate._HAVE_TRITON, "triton missing: the CUDA fp32 path is untested"
+    torch.manual_seed(0)
+    # H = 0 and B = 0 are degenerate shapes dilate_loss rejects, but a direct
+    # apply() reaches them, and the two paths must not disagree about which
+    # returns and which raises.
+    assert not dilate._use_triton(torch.rand(3, 0, 0, device="cuda"))
+    empty = SoftDTWBatch.apply(torch.rand(0, 6, 6, device="cuda"), DILATE_GAMMA)
+    assert empty.shape == (0,)
+
+    horizons = sorted({1, 2, 5} | {L * PATCH_SIZE for L in MASK_SPAN_LENGTHS})
+    worst_val = worst_grad = 0.0
+    for H in horizons:
+        for B in (1, 7, 64):
+            base = torch.rand(B, H, H, device="cuda") * 8.0
+            ref_c = base.clone().requires_grad_(True)
+            tri_c = base.clone().requires_grad_(True)
+            assert not dilate._use_triton(ref_c.double())
+            assert dilate._use_triton(tri_c)
+
+            # The reference is reached by asking for it in fp64 and coming back;
+            # both arms then differ only in which sweep filled R and E.
+            ref_v = SoftDTWBatch.apply(ref_c.double(), DILATE_GAMMA).float()
+            tri_v = SoftDTWBatch.apply(tri_c, DILATE_GAMMA)
+            g = torch.randn(B, device="cuda")
+            ref_v.backward(g)
+            tri_v.backward(g)
+
+            worst_val = max(worst_val, float((ref_v - tri_v).detach().abs().max()))
+            worst_grad = max(worst_grad, float((ref_c.grad - tri_c.grad).abs().max()))
+    print(f"[DUMP] triton vs reference: max |Δvalue|={worst_val:.3e} "
+          f"max |Δgrad|={worst_grad:.3e}")
+    assert worst_val < 1e-4
+    assert worst_grad < 1e-4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton sweep is CUDA-only")
+def test_softdtw_triton_propagates_nan():
+    """A non-finite cost must reach the value, not trip an assert inside the
+    kernel — train.py's isfinite guard is what handles it."""
+    from config import DILATE_GAMMA
+
+    cost = torch.rand(2, 6, 6, device="cuda")
+    cost[0, 3, 3] = float("nan")
+    value = SoftDTWBatch.apply(cost, DILATE_GAMMA)
+    print("[DUMP] triton nan propagation:", value.tolist())
+    assert bool(torch.isnan(value[0]))
+    assert bool(torch.isfinite(value[1]))
 
 
 def test_tdi_finite_difference_matches_exact_directional_derivative():

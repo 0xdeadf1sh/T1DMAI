@@ -43,6 +43,14 @@ must not be dispatched at all (see :func:`dilate_loss`).
 the DP runs once and the gradient is the standard soft-DTW backward recursion
 (no autograd graph over the ``2·H-1`` diagonal steps).
 
+Both sweeps are bound by dispatch, not arithmetic: a diagonal is a handful of
+elementwise ops on a few hundred values, and there are ``2·H-1`` of them, so the
+measured cost tracks ``H`` and ignores the batch size.  On CUDA fp32 the loop
+therefore runs as a Triton kernel — one program per batch row, the diagonals
+swept inside it, the whole sweep one launch.  The eager loop stays as the
+definition of the recursion and runs everywhere else (CPU, fp64, no Triton);
+the two agree to fp32 rounding, which ``tests/test_dilate.py`` asserts.
+
 Everything is fp32; the soft-min is max-subtraction-stabilised.  Cost is the
 squared difference in risk space — a single cell peaks at
 ``(f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))**2 = 99.6416`` (with the default
@@ -66,6 +74,20 @@ try:
     from config import DILATE_TDI_FD_EPS
 except ImportError:
     DILATE_TDI_FD_EPS = 0.05
+
+# Triton carries the DP on CUDA fp32; the eager reference below carries every
+# other case.  Absence is not an error — the reference is complete on its own.
+try:
+    import triton
+    import triton.language as tl
+    _HAVE_TRITON = True
+except ImportError:                                            # pragma: no cover
+    _HAVE_TRITON = False
+
+# One Triton program holds a whole anti-diagonal in a single warp, so H is
+# bounded by the largest block Triton will map to it.  Above this the reference
+# runs; no caller comes close (H = span length x PATCH_SIZE).
+_TRITON_MAX_H = 1024
 
 
 def _pairwise_sq_cost(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -108,6 +130,117 @@ def _softmin(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, gamma: float) ->
     return out
 
 
+def _use_triton(cost: torch.Tensor) -> bool:
+    """Whether the Triton DP may carry this call.
+
+    The reference DP below is the definition of record and the only path the
+    fp64 ``gradcheck`` in ``tests/test_dilate.py`` exercises; Triton is an
+    fp32 CUDA accelerator for it and nothing else.  Both must agree — see
+    ``test_softdtw_triton_matches_reference``.
+
+    ``H > 0`` is part of that agreement, not an optimisation: the reference
+    walks an empty diagonal range and returns ``R[0, 0] = 0``, while a Triton
+    launch at ``H = 0`` asks for a zero-width block and fails to compile.
+    ``dilate_loss`` rejects a zero-length horizon before either sees it, so this
+    only governs a direct ``SoftDTWBatch.apply``.
+    """
+    return (_HAVE_TRITON and cost.is_cuda and cost.dtype == torch.float32
+            and 0 < cost.shape[1] <= _TRITON_MAX_H)
+
+
+if _HAVE_TRITON:
+    @triton.jit
+    def _softdtw_forward_kernel(cost_ptr, r_ptr, gamma, H, BLOCK: tl.constexpr):
+        """One program per batch row; the whole anti-diagonal in one warp.
+
+        The eager DP pays ~16 ATen dispatches per anti-diagonal and 2H-1
+        diagonals per sweep, so it is bound by Python and launch overhead, not
+        arithmetic — the measured cost tracks H and ignores the batch size
+        entirely.  Sinking the diagonal loop INTO the kernel is what removes
+        that: the sweep becomes one launch.
+
+        ``R`` is read and written through L2 (``.cg``) rather than L1 so the
+        previous diagonal a later iteration reads is the one this iteration
+        stored; ``num_warps=1`` at the call site keeps the whole diagonal
+        inside a single warp, and ``tl.debug_barrier`` orders the accesses.
+        """
+        b = tl.program_id(0)
+        HR = H + 1
+        cost_base = b * H * H
+        r_base = b * HR * HR
+        offs = tl.arange(0, BLOCK)
+        neg_gamma = -gamma
+        for k in range(2, 2 * H + 1):
+            i = tl.maximum(1, k - H) + offs
+            live = i <= tl.minimum(H, k - 1)
+            j = k - i
+            here = r_base + i * HR + j
+            up = tl.load(r_ptr + here - HR, mask=live, other=0.0, cache_modifier=".cg")
+            diag = tl.load(r_ptr + here - HR - 1, mask=live, other=0.0, cache_modifier=".cg")
+            left = tl.load(r_ptr + here - 1, mask=live, other=0.0, cache_modifier=".cg")
+            c = tl.load(cost_ptr + cost_base + (i - 1) * H + (j - 1), mask=live, other=0.0)
+            # The +inf boundary divides to -inf, whose exponential is 0; every
+            # reachable cell has a finite predecessor, so z is never -inf.
+            sa = up / neg_gamma
+            sb = diag / neg_gamma
+            sc = left / neg_gamma
+            z = tl.maximum(sa, tl.maximum(sb, sc))
+            s = tl.exp(sa - z) + tl.exp(sb - z) + tl.exp(sc - z)
+            tl.store(r_ptr + here, c + neg_gamma * (z + tl.log(s)),
+                     mask=live, cache_modifier=".cg")
+            tl.debug_barrier()
+
+    @triton.jit
+    def _softdtw_backward_kernel(cost_ptr, r_ptr, e_ptr, gamma, H, BLOCK: tl.constexpr):
+        """Reverse sweep for the alignment soft-assignment ``E``.
+
+        The reference pads ``cost`` into ``D`` and ``R`` into ``Rp`` to make the
+        neighbour reads uniform; here the padding is a masked load instead — an
+        off-grid ``Rp`` reads -inf and an off-grid ``D`` reads 0, which is what
+        those rings held.  So this pass allocates ``E`` alone where the
+        reference allocates three tables of that size.
+        """
+        b = tl.program_id(0)
+        HR = H + 1
+        HE = H + 2
+        cost_base = b * H * H
+        r_base = b * HR * HR
+        e_base = b * HE * HE
+        offs = tl.arange(0, BLOCK)
+        NEG = float("-inf")
+        # Rp[H+1, H+1] — the terminal cell the recursion is seeded from.
+        r_terminal = tl.load(r_ptr + r_base + H * HR + H)
+        for k in range(2 * H, 1, -1):
+            i = tl.maximum(1, k - H) + offs
+            live = i <= tl.minimum(H, k - 1)
+            j = k - i
+            r_here = tl.load(r_ptr + r_base + i * HR + j, mask=live, other=0.0)
+
+            up_live = live & (i + 1 <= H)
+            r_up = tl.load(r_ptr + r_base + (i + 1) * HR + j, mask=up_live, other=NEG)
+            d_up = tl.load(cost_ptr + cost_base + i * H + (j - 1), mask=up_live, other=0.0)
+            a = tl.exp((r_up - r_here - d_up) / gamma)
+
+            dg_live = live & (i + 1 <= H) & (j + 1 <= H)
+            r_dg = tl.load(r_ptr + r_base + (i + 1) * HR + (j + 1), mask=dg_live, other=NEG)
+            d_dg = tl.load(cost_ptr + cost_base + i * H + j, mask=dg_live, other=0.0)
+            r_dg = tl.where(live & (i == H) & (j == H), r_terminal, r_dg)
+            bb = tl.exp((r_dg - r_here - d_dg) / gamma)
+
+            lf_live = live & (j + 1 <= H)
+            r_lf = tl.load(r_ptr + r_base + i * HR + (j + 1), mask=lf_live, other=NEG)
+            d_lf = tl.load(cost_ptr + cost_base + (i - 1) * H + j, mask=lf_live, other=0.0)
+            cc = tl.exp((r_lf - r_here - d_lf) / gamma)
+
+            here = e_base + i * HE + j
+            e_up = tl.load(e_ptr + here + HE, mask=live, other=0.0, cache_modifier=".cg")
+            e_dg = tl.load(e_ptr + here + HE + 1, mask=live, other=0.0, cache_modifier=".cg")
+            e_lf = tl.load(e_ptr + here + 1, mask=live, other=0.0, cache_modifier=".cg")
+            tl.store(e_ptr + here, e_up * a + e_dg * bb + e_lf * cc,
+                     mask=live, cache_modifier=".cg")
+            tl.debug_barrier()
+
+
 class SoftDTWBatch(torch.autograd.Function):
     """
     Batched soft-DTW value + gradient via vectorised anti-diagonal DP.
@@ -126,6 +259,11 @@ class SoftDTWBatch(torch.autograd.Function):
     (``∂loss/∂R``) and pushes it onto the cost matrix: ``∂loss/∂C = grad · E``.
     Both passes are diagonal-vectorised; neither builds an autograd graph over
     the ``2H-1`` steps.
+
+    Each sweep runs one of two ways, over the same recursion and to the same
+    ``R`` and ``E``: a Triton kernel on CUDA fp32 (:func:`_use_triton`), the
+    eager loop everywhere else — CPU, fp64, or no Triton installed.  The eager
+    loop is the definition, and the one the fp64 ``gradcheck`` reads.
     """
 
     @staticmethod
@@ -152,21 +290,27 @@ class SoftDTWBatch(torch.autograd.Function):
         R = torch.full((B, H + 1, H + 1), float("inf"), device=dev, dtype=dt)
         R[:, 0, 0] = 0.0
 
-        # Sweep anti-diagonals k = i + j, i,j in [1, H].  For each k gather the
-        # cells (i, j) with i + j == k, read their three predecessors as flat
-        # vectors, soft-min them, and add the (i-1, j-1) cost cell.
-        for k in range(2, 2 * H + 1):
-            i_lo = max(1, k - H)
-            i_hi = min(H, k - 1)
-            if i_lo > i_hi:
-                continue
-            i = torch.arange(i_lo, i_hi + 1, device=dev)       # (K,)
-            j = k - i                                          # (K,)
-            r_up = R[:, i - 1, j]                              # (B, K)
-            r_diag = R[:, i - 1, j - 1]                        # (B, K)
-            r_left = R[:, i, j - 1]                            # (B, K)
-            c = cost[:, i - 1, j - 1]                          # (B, K)
-            R[:, i, j] = c + _softmin(r_up, r_diag, r_left, gamma)
+        if _use_triton(cost):
+            cost = cost.contiguous()
+            _softdtw_forward_kernel[(B,)](
+                cost, R, float(gamma), H,
+                BLOCK=triton.next_power_of_2(H), num_warps=1)
+        else:
+            # Sweep anti-diagonals k = i + j, i,j in [1, H].  For each k gather
+            # the cells (i, j) with i + j == k, read their three predecessors as
+            # flat vectors, soft-min them, and add the (i-1, j-1) cost cell.
+            for k in range(2, 2 * H + 1):
+                i_lo = max(1, k - H)
+                i_hi = min(H, k - 1)
+                if i_lo > i_hi:
+                    continue
+                i = torch.arange(i_lo, i_hi + 1, device=dev)       # (K,)
+                j = k - i                                          # (K,)
+                r_up = R[:, i - 1, j]                              # (B, K)
+                r_diag = R[:, i - 1, j - 1]                        # (B, K)
+                r_left = R[:, i, j - 1]                            # (B, K)
+                c = cost[:, i - 1, j - 1]                          # (B, K)
+                R[:, i, j] = c + _softmin(r_up, r_diag, r_left, gamma)
 
         # A non-finite value (NaN/Inf cost) is deliberately NOT asserted away:
         # it propagates into the returned loss so train.py's isfinite /
@@ -196,44 +340,51 @@ class SoftDTWBatch(torch.autograd.Function):
         B = cost.shape[0]
         dev, dt = cost.device, cost.dtype
 
-        # Pad the cost so cost-cell indexing inside the E-recursion is uniform;
-        # the dual table E is (H+2) on each axis with the terminal seed E[H+1,
-        # H+1] handled via the boundary below.
-        D = torch.zeros((B, H + 2, H + 2), device=dev, dtype=dt)
-        D[:, 1:H + 1, 1:H + 1] = cost
-
-        # R re-padded to (H+2): outer ring -inf so off-grid neighbours never
-        # win the soft-assignment; terminal cell seeds the recursion.
-        Rp = torch.full((B, H + 2, H + 2), -float("inf"), device=dev, dtype=dt)
-        Rp[:, 0:H + 1, 0:H + 1] = R
-        Rp[:, H + 1, H + 1] = R[:, H, H]
-
         E = torch.zeros((B, H + 2, H + 2), device=dev, dtype=dt)
         E[:, H + 1, H + 1] = 1.0
 
-        # Reverse anti-diagonal sweep k = i + j, i,j in [H, 1].  Each cell's
-        # soft-assignment is the sum of its three successors' assignments times
-        # the local soft-min derivatives a/b/c.
-        for k in range(2 * H, 1, -1):
-            i_lo = max(1, k - H)
-            i_hi = min(H, k - 1)
-            if i_lo > i_hi:
-                continue
-            i = torch.arange(i_lo, i_hi + 1, device=dev)       # (K,)
-            j = k - i                                          # (K,)
+        if _use_triton(cost):
+            # D and Rp below are pure padding — the kernel reads their rings as
+            # masked-load defaults instead, so it allocates E alone.
+            _softdtw_backward_kernel[(B,)](
+                cost, R, E, float(gamma), H,
+                BLOCK=triton.next_power_of_2(H), num_warps=1)
+        else:
+            # Pad the cost so cost-cell indexing inside the E-recursion is
+            # uniform; the dual table E is (H+2) on each axis with the terminal
+            # seed E[H+1, H+1] handled via the boundary below.
+            D = torch.zeros((B, H + 2, H + 2), device=dev, dtype=dt)
+            D[:, 1:H + 1, 1:H + 1] = cost
 
-            # a: (i+1, j) came from (i, j) via the "up" predecessor.
-            a = ((Rp[:, i + 1, j] - Rp[:, i, j] - D[:, i + 1, j]) / gamma).exp()
-            # b: (i+1, j+1) came from (i, j) via the "diag" predecessor.
-            b = ((Rp[:, i + 1, j + 1] - Rp[:, i, j] - D[:, i + 1, j + 1]) / gamma).exp()
-            # c: (i, j+1) came from (i, j) via the "left" predecessor.
-            c = ((Rp[:, i, j + 1] - Rp[:, i, j] - D[:, i, j + 1]) / gamma).exp()
+            # R re-padded to (H+2): outer ring -inf so off-grid neighbours never
+            # win the soft-assignment; terminal cell seeds the recursion.
+            Rp = torch.full((B, H + 2, H + 2), -float("inf"), device=dev, dtype=dt)
+            Rp[:, 0:H + 1, 0:H + 1] = R
+            Rp[:, H + 1, H + 1] = R[:, H, H]
 
-            E[:, i, j] = (
-                E[:, i + 1, j] * a
-                + E[:, i + 1, j + 1] * b
-                + E[:, i, j + 1] * c
-            )
+            # Reverse anti-diagonal sweep k = i + j, i,j in [H, 1].  Each cell's
+            # soft-assignment is the sum of its three successors' assignments
+            # times the local soft-min derivatives a/b/c.
+            for k in range(2 * H, 1, -1):
+                i_lo = max(1, k - H)
+                i_hi = min(H, k - 1)
+                if i_lo > i_hi:
+                    continue
+                i = torch.arange(i_lo, i_hi + 1, device=dev)       # (K,)
+                j = k - i                                          # (K,)
+
+                # a: (i+1, j) came from (i, j) via the "up" predecessor.
+                a = ((Rp[:, i + 1, j] - Rp[:, i, j] - D[:, i + 1, j]) / gamma).exp()
+                # b: (i+1, j+1) came from (i, j) via the "diag" predecessor.
+                b = ((Rp[:, i + 1, j + 1] - Rp[:, i, j] - D[:, i + 1, j + 1]) / gamma).exp()
+                # c: (i, j+1) came from (i, j) via the "left" predecessor.
+                c = ((Rp[:, i, j + 1] - Rp[:, i, j] - D[:, i, j + 1]) / gamma).exp()
+
+                E[:, i, j] = (
+                    E[:, i + 1, j] * a
+                    + E[:, i + 1, j + 1] * b
+                    + E[:, i, j + 1] * c
+                )
 
         e = E[:, 1:H + 1, 1:H + 1]                             # (B, H, H)
         # Non-finite E (from a non-finite forward) is allowed to flow into the
