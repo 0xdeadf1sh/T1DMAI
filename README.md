@@ -652,6 +652,20 @@ draws a new patient, `V` scores the current forecast against the simulator.
 Predictions run on a background thread. `--no-model` starts with random weights
 for UI work.
 
+`M` opens the masking tool, which drags patch-aligned spans over the context and
+draws one quantile fan per span in place. Forecast, begin-fill and infill are
+presets of the same masked-BG objective — a span at the right edge, a span at
+patch 0, a span between visible patches — and a free-form span sits anywhere
+else. The trailing forecast span is always part of the masked set: the future
+zone carries no observed reading, so it is never left visible, and the head's
+`MAX_MASKED_PATCHES` slots are shared between it and the drawn spans. Masked
+spans clear whenever the context changes.
+
+The GUI reads the checkpoint's `masked_channel_policy` and shows it. Under the
+blind policy the masked spans carry the no-dose fill rather than the recorded
+carb / insulin / exercise, matching how that checkpoint was trained, and the
+dose-painting controls are disabled.
+
 
 ## Installation
 
