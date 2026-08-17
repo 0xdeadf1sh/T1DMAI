@@ -85,13 +85,15 @@ _REQUIRED_META_KEYS = (
     'pool_size', 'n_timesteps', 'sim_hours', 'simulator_warmup_hours',
     'patient_uniform_sample_prob', 'dt_minutes', 'channels', 'cache_format',
 )
-# The 3-channel {mean, std} contract in the builder-emitted
-# normalization_stats.json.  DELIBERATE: the external T1DMSIM builder writes
-# exactly these three, and the model's fourth input channel (``exercise_equiv``)
-# is merged onto the real pools' files by hand.  Pinned so a builder change that
-# starts (or stops) emitting the fourth key is visible here rather than in a
-# training run.
-_BUILDER_NORM_STATS_KEYS = frozenset({'bg_absolute', 'carb_intake', 'insulin_combined'})
+# The {mean, std} contract in the builder-emitted normalization_stats.json: all
+# four of ``normalization.CHANNEL_NAMES``.  The T1DMSIM builder emitted only the
+# first three for a long time and the fourth was merged onto each pool's file by
+# hand — which is exactly how a pool reaches training with an unfit channel.
+# Pinned so a builder change that starts (or stops) emitting one is visible here
+# rather than in a training run.
+_BUILDER_NORM_STATS_KEYS = frozenset({
+    'bg_absolute', 'carb_intake', 'insulin_combined', 'exercise_equiv',
+})
 
 
 def _build_tiny_cache(out_dir: str, rows_per_chunk: int = DEFAULT_ROWS_PER_CHUNK) -> None:
@@ -202,19 +204,23 @@ def test_cache_layout(blosc2_cache: str) -> None:
     assert meta['patient_uniform_sample_prob'] == _TINY_UNIFORM_PROB
     assert tuple(meta['channels']) == CHANNEL_NAMES
 
-    # normalization_stats.json: exactly the 3-channel {mean, std} contract the
-    # external builder emits — one key short of the model's input stack.
+    # normalization_stats.json: the {mean, std} contract the external builder
+    # emits, which must COVER the model's input stack with nothing left over.
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
     stats = _cache_stats(out_dir)
     assert set(stats) == _BUILDER_NORM_STATS_KEYS, f"norm stats keys = {set(stats)}"
     for name, mv in stats.items():
         assert set(mv) == {'mean', 'std'}, f"{name} stats = {mv}"
+        # std > 0 is the load-time contract, not a nicety: a channel whose window
+        # held no event fits std = 0, and normalize divides by std + 1e-8.
         assert np.isfinite(mv['mean']) and np.isfinite(mv['std']) and mv['std'] > 0
-    # The gap is exactly the hand-merged exercise channel; if the builder ever
-    # emits it, this is where the hand merge stops being needed.
-    assert set(NORM_CHANNEL_NAMES) - set(stats) == {'exercise_equiv'}, (
+    # No gap either way. A channel the builder omits reaches the input gather as a
+    # KeyError (pinned by test_stats_missing_a_channel_are_refused_by_the_loader);
+    # one it invents is a fit for something the model never reads.
+    assert set(stats) == set(NORM_CHANNEL_NAMES), (
         f"builder-emitted stats {sorted(stats)} vs model channels "
-        f"{sorted(NORM_CHANNEL_NAMES)}: the gap must be exactly exercise_equiv")
+        f"{sorted(NORM_CHANNEL_NAMES)}: the builder must fit every channel and "
+        f"only those")
     print(f"[DUMP] cache_layout | norm stats = {stats} (builder: 3 keys; model "
           f"needs {len(NORM_CHANNEL_NAMES)}, exercise_equiv hand-merged)")
 
@@ -296,19 +302,26 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
           f"n_ctx={s0['n_context_patches']} last_bg={s0['bg_formula_data']['last_bg']:.1f}")
 
 
-def test_builder_three_key_stats_are_refused_by_the_loader(blosc2_cache: str) -> None:
-    """The builder's own three-key stats file must FAIL against the four-CHANNEL
-    normalization rather than quietly leaving a channel untrained.
+def test_stats_missing_a_channel_are_refused_by_the_loader(blosc2_cache: str) -> None:
+    """A stats file missing a channel must FAIL against the four-CHANNEL
+    normalization rather than quietly leaving that channel untrained.
 
-    The builder emits bg / carb / insulin; the input gather walks the model's
-    ``CHANNEL_NAMES`` and indexes ``stats[name]``, so the missing entry has to
-    surface as a ``KeyError``.  A ``.get(name, {'mean': 0, 'std': 1})`` fallback
-    anywhere on this path would turn a missing fit into an untrained channel that
-    trains to completion — this is the pin that stops one being added.
+    The input gather walks the model's ``CHANNEL_NAMES`` and indexes
+    ``stats[name]``, so a missing entry has to surface as a ``KeyError``.  A
+    ``.get(name, {'mean': 0, 'std': 1})`` fallback anywhere on this path would
+    turn a missing fit into an untrained channel that trains to completion — this
+    is the pin that stops one being added.
+
+    The three-key file is CONSTRUCTED here rather than taken from the builder.
+    The builder emitted exactly this shape until it learned to fit exercise, and
+    reading it back from disk would tie this pin to that defect: the day the
+    builder was fixed, the test would stop exercising the missing-channel path
+    instead of reporting it.
     """
     from data import T1DMDataset
 
-    stats = _cache_stats(blosc2_cache)          # builder file, verbatim
+    stats = {k: v for k, v in _cache_stats(blosc2_cache).items()
+             if k != 'exercise_equiv'}
     assert 'exercise_equiv' not in stats
     dataset = T1DMDataset(
         master_seed=0,
