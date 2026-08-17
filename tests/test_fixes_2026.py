@@ -350,8 +350,15 @@ def test_train_inference_anchor_identical():
         pytest.skip("normalization_stats.json required")
     stats = load_normalization_stats()
 
+    # ON_THE_FLY_SIM_HOURS, not a literal: it is the length data.py requests for
+    # ONE training sample, so it follows MAX_CONTEXT_PATCHES by construction. A
+    # hardcoded 33.0 covered a 48-patch context and silently stopped covering the
+    # floor when the window widened — _build_sample then raises "No prediction
+    # window found" rather than reporting an anchor mismatch.
+    from data import ON_THE_FLY_SIM_HOURS
+
     sim = _make_simulator(patient_seed=4242, uniform_skills=False)
-    data = simulate_discard_warmup(sim, 33.0)
+    data = simulate_discard_warmup(sim, ON_THE_FLY_SIM_HOURS)
     icr = float(sim.patient.icr)
 
     n_slots = n_right_edge = 0
