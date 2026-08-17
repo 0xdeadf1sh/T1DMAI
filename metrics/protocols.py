@@ -433,15 +433,15 @@ def baseline_for(masked_set: MaskedSet, cgm: np.ndarray,
 # 4e5 draws of the live sampler at every quota (agreement within 1 sigma at each
 # ``d``); re-run both if any knob here moves.
 SAMPLER_REFERENCE = {
-    'max_context_patches': 96,
-    'min_context_patches': 48,
+    'max_context_patches': 336,
+    'min_context_patches': 168,
     'prediction_patches': 4,
     'mask_max_spans': 3,
     'mask_span_lengths': (1, 2, 3, 4, 5, 6, 7, 8),
     'max_masked_patches': 12,
-    'mask_right_edge_quota': 0.35,
-    'share_pct': {1: 44.532, 2: 28.361, 3: 15.623, 4: 11.484},
-    'patches_per_sample': {1: 3.2966, 2: 2.0996, 3: 1.1566, 4: 0.8501},
+    'mask_right_edge_quota': 0.50,
+    'share_pct': {1: 43.230, 2: 27.775, 3: 15.628, 4: 13.367},
+    'patches_per_sample': {1: 3.2003, 2: 2.0561, 3: 1.1570, 4: 0.9895},
     'mean_masked': 7.4029,
 }
 

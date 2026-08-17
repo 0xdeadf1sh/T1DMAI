@@ -82,11 +82,12 @@ def test_channel_names_are_the_four_input_signals():
 # The balanced pool's fitted exercise_equiv statistics, and the normalized value
 # a zero-RAW (no session) cell takes under them.  Both are exact: the fit is a
 # full pass over the pool, and the baseline is the float32 z the input pipeline
-# actually writes.  The channel is g/step carbohydrate-EQUIVALENT glucose
+# actually writes.  They move with the POOL — refit against
+# ``normalization_stats.json`` whenever the cache geometry changes.  The channel is g/step carbohydrate-EQUIVALENT glucose
 # disposal — rescaling it to an intensity trains a different quantity.
-_BALANCED_EXERCISE_MEAN = 0.02471507759734213
-_BALANCED_EXERCISE_STD = 0.17816225499959235
-_BALANCED_EXERCISE_ZERO_Z = -0.1387222856
+_BALANCED_EXERCISE_MEAN = 0.025454530988451768
+_BALANCED_EXERCISE_STD = 0.18077422733814857
+_BALANCED_EXERCISE_ZERO_Z = -0.1408083886
 # Largest raw exercise cell over the balanced pool, so the round-trip grid below
 # spans the whole trained range rather than a comfortable middle.
 _BALANCED_EXERCISE_MAX_RAW = 22.4029

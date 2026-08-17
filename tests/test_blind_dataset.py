@@ -31,11 +31,14 @@ BLIND_SEED = 20260815
 
 # sha256 over the whole sample — patches, targets, n_context_patches, every
 # bg_formula_data entry and the whole next_window dict — of the ``blind=False``
-# build at seed BLIND_SEED, computed at e644d63, the commit BEFORE the blind flag
-# was added.  See ``test_the_default_path_is_byte_identical_through_the_flag``
-# for what a mismatch means and when it is legitimate to restamp.
+# build at seed BLIND_SEED.  It is a property of that seed, the live context
+# window, the sampler constants, the channel transforms and the normalization
+# pool: this value stands for a 168-336 patch context at
+# MASK_RIGHT_EDGE_QUOTA = 0.50 over the 2394-step pool's stats.  See
+# ``test_the_default_path_is_byte_identical_through_the_flag`` for what a
+# mismatch means and when it is legitimate to restamp.
 DEFAULT_PATH_DIGEST = (
-    '6b6b97543f5bd0760115f4c47c6445716be4b54b1cbcd0855ce37ad3e35e5c89')
+    '04d2cf83341df27cfaa5ff1a8304dae686b5b1179dcde60cf3057705f1e38f49')
 
 
 def _get_stats():
