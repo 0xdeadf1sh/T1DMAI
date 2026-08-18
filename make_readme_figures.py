@@ -6,17 +6,18 @@ matching one through a <picture> element:
     architecture{,-dark}.png   end-to-end pipeline: signals -> encoder -> quantile
                                fan -> mg/dL, and the three things that consume it
     risk-space{,-dark}.png     the Kovatchev warp and the loss asymmetry it creates
-    forecast{,-dark}.png       an actual forecast from a trained checkpoint: the
-                               2 h single-pass fan and the 8 h autoregressive roll
+    forecast{,-dark}.png       three forward passes of a trained checkpoint over one
+                               context window — backcast, infill and forecast — each
+                               cropped to 24 h around its masked span
 
 Usage:
     python make_readme_figures.py --skip-forecast       # diagrams only, no checkpoint
     python make_readme_figures.py --checkpoint PATH     # all three
     python make_readme_figures.py --checkpoint PATH --seed N
 
-The forecast figure has no default checkpoint: the capacity ladder's weights are
-per-run artifacts under the gitignored ``models/*/``. Name one or pass
-``--skip-forecast``.
+The masked-BG figure has no default checkpoint: the capacity ladder's weights are
+per-run artifacts under the gitignored ``new_models/<capacity>/checkpoints/``.
+Name one or pass ``--skip-forecast``.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Rectangle
 
 import config
@@ -161,21 +163,12 @@ def draw_architecture(t: Theme, path: Path) -> None:
     L, R = 0.045, 0.955
     W = R - L
 
-    # --- sources -----------------------------------------------------------
-    _box(ax, t, L, 0.940, 0.435, 0.052, "T1DMSIM behaviour simulator",
+    # --- source ------------------------------------------------------------
+    _box(ax, t, L, 0.940, W, 0.052, "T1DMSIM behaviour simulator",
          "seed → patient → events → 5-min stream", accent=t.SAGE, mono_sub=False)
-    _box(ax, t, R - 0.435, 0.940, 0.435, 0.052, "Real CGM cohorts",
-         "OhioT1DM · AZT1D · ShanghaiT1DM · UVA/Padova",
-         accent=t.PLUM, mono_sub=False)
-    ax.text(R - 0.2175, 0.930, "logged events → absorption / action kernels",
-            ha="center", va="top", fontsize=8.0, color=t.muted, style="italic")
-    ax.text(L + 0.2175, 0.930, "pretraining corpus", ha="center", va="top",
+    ax.text(0.5, 0.930, "training corpus", ha="center", va="top",
             fontsize=8.0, color=t.muted, style="italic")
-
-    _arrow(ax, t, (L + 0.2175, 0.930), (L + 0.2175, 0.900))
-    _arrow(ax, t, (R - 0.2175, 0.930), (R - 0.2175, 0.900))
-    ax.plot([L + 0.2175, R - 0.2175], [0.900, 0.900], color=t.muted, lw=1.2, zorder=1)
-    _down(ax, t, 0.5, 0.900, 0.882)
+    _down(ax, t, 0.5, 0.922, 0.882)
 
     # --- observed signal ---------------------------------------------------
     _box(ax, t, L, 0.828, W, 0.052, "Four input channels, one 5-minute grid",
@@ -285,9 +278,9 @@ def draw_architecture(t: Theme, path: Path) -> None:
     # --- consumers ---------------------------------------------------------
     cw = 0.290
     _box(ax, t, L, 0.036, cw, 0.056, "Validation · metrics",
-         "simulator and real cohorts", accent=t.slate, sub_size=8.2, mono_sub=False)
+         "fresh simulator patients", accent=t.slate, sub_size=8.2, mono_sub=False)
     _box(ax, t, 0.5 - cw / 2, 0.036, cw, 0.056, "Interactive GUI",
-         "what-if plans · rolling forecast", accent=t.slate, sub_size=8.2, mono_sub=False)
+         "what-if plans · free-form masking", accent=t.slate, sub_size=8.2, mono_sub=False)
     _box(ax, t, R - cw, 0.036, cw, 0.056, "Exporters",
          ".pte / .tflite + descriptor", accent=t.slate, sub_size=8.2, mono_sub=False)
     ax.text(R - cw / 2, 0.028, "loaded on device by T1DMDROID", ha="center", va="top",
@@ -424,7 +417,7 @@ def draw_risk_space(t: Theme, path: Path) -> None:
     print(f"wrote {path}")
 
 
-# -------------------------------------------------------------------- forecast
+# ------------------------------------------------------------------- masked BG
 
 def _load_model(checkpoint: str, device):
     import torch
@@ -439,7 +432,7 @@ def _load_model(checkpoint: str, device):
     return m, ck
 
 
-def _sim_window(seed: int, stats):
+def _sim_window(seed: int, stats, hours: float):
     """One simulator patient: normalized features and the raw channels behind them.
 
     ``exercise`` is T1DMSIM's carbohydrate-equivalent glucose-disposal curve in
@@ -450,7 +443,7 @@ def _sim_window(seed: int, stats):
     from data import simulate_discard_warmup
     from normalization import normalize
 
-    raw = simulate_discard_warmup(T1DMSimulator(seed=seed), 60.0)
+    raw = simulate_discard_warmup(T1DMSimulator(seed=seed), hours)
     bg = np.clip(raw["bg_observed"], BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.maximum(raw["total_carb"], 0.0).astype(np.float32)
     ins = np.maximum(raw["total_insulin"], 0.0).astype(np.float32)
@@ -470,10 +463,28 @@ def _sim_window(seed: int, stats):
     return feats, bg, carb, ins, exr, raw["hour_of_day"].astype(np.float32)
 
 
-def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
+CROP_HOURS = 24.0          # the slice each panel shows out of the whole window
+
+
+def _anchor_step(span_start: int, span_len: int, patch_size: int) -> tuple[int, bool]:
+    """The window step index this span's fan is anchored on, and which end it joins.
+
+    The anchor rule is one-sided and LEFT-PREFERRING: every slot of a span takes
+    the last step of its left neighbour, and the first step of its right
+    neighbour only when the span opens the window. So a fan drawn for a span at
+    patch 0 leaves the observed line at its RIGHT edge, and every other fan at
+    its left. The head decodes a delta from that step, so the fan has zero width
+    there and the join is structural, not cosmetic.
+    """
+    if span_start == 0:
+        return (span_start + span_len) * patch_size, False      # join on the right
+    return span_start * patch_size - 1, True                    # join on the left
+
+
+def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     import torch
     import config as cfg
-    from inference import predict, predict_rolling
+    from inference import predict
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, ck = _load_model(checkpoint, device)
@@ -481,139 +492,201 @@ def draw_forecast(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
 
     S, P = cfg.PATCH_SIZE, cfg.PREDICTION_PATCHES
     n_ctx = cfg.MAX_CONTEXT_PATCHES
+    pph = 60 // (5 * S)                       # patches per hour
     ctx_steps, pred_steps = n_ctx * S, P * S
-    n_rolls = cfg.NIGHT_LONG_HORIZON_HOURS // cfg.PREDICTION_HORIZON_HOURS
-    long_steps = n_rolls * pred_steps
+    seq_len = n_ctx + P
+    crop_patches = int(CROP_HOURS * pph)
 
-    feats, bg, carb, ins, exr, hour = _sim_window(seed, stats)
-    start = ((len(bg) - ctx_steps - long_steps - 12) // S) * S
+    # The trailing forecast is masked in every case, so what is left of the
+    # head's slots is what a backcast or an infill span may take.
+    span_len = cfg.MAX_MASKED_PATCHES - P
+
+    # 10 h of slack past the window, so the patch-aligned start below never runs
+    # the window off the end of a short trajectory.
+    feats, bg, carb, ins, exr, _hour = _sim_window(
+        seed, stats, hours=(ctx_steps + pred_steps) * 5.0 / 60.0 + 10.0)
+    start = ((len(bg) - ctx_steps - pred_steps) // S) * S
     ctx_np = feats[start:start + ctx_steps].reshape(n_ctx, S, cfg.N_INPUT_FEATURES)
     context = torch.from_numpy(ctx_np.copy())
     origin = start + ctx_steps
 
-    # The whole announceable set, so the figure conditions on exactly what
+    # The whole announceable set, so every pass conditions on exactly what
     # training conditioned on. Anything left out is silently read as "none".
+    # It is announced in all three passes, not just the forecast: the trailing
+    # zone is masked under every masked set, so leaving it out would condition
+    # the backcast and infill passes differently from the forecast one.
     ANNOUNCE = tuple(cfg.CHANNEL_TO_FEAT)                  # (0, 1, 2)
-    RAW_CH = {0: carb, 1: ins, 2: exr}
-    assert set(RAW_CH) == set(ANNOUNCE)
-
-    def slot(ch, a, b):
-        col = feats[a:b, cfg.CHANNEL_TO_FEAT[ch]].reshape(-1, S)
-        return col
-
-    ov = {ch: torch.from_numpy(slot(ch, origin, origin + pred_steps).copy())
+    ov = {ch: torch.from_numpy(
+              feats[origin:origin + pred_steps, cfg.CHANNEL_TO_FEAT[ch]]
+              .reshape(-1, S).copy())
           for ch in ANNOUNCE}
-    short = predict(model, context, normalization_stats=stats, device=device, overrides=ov)
 
-    def roll_ov(roll_idx, _mu, _abs_n_ctx):
-        a = origin + roll_idx * pred_steps
-        b = a + pred_steps
-        if b > len(feats):
-            return None
-        norm = {ch: slot(ch, a, b).copy() for ch in ANNOUNCE}
-        raw_ = {ch: RAW_CH[ch][a:b].reshape(-1, S).copy() for ch in ANNOUNCE}
-        return norm, raw_
-
-    long = predict_rolling(model, context, n_rolls=int(n_rolls),
-                           normalization_stats=stats, device=device,
-                           overrides_fn=roll_ov)
-
-    _style(t)
-    fig = plt.figure(figsize=(11.5, 8.4), facecolor=t.paper)
-    gs = fig.add_gridspec(5, 1, height_ratios=[3.0, 0.60, 1.30, 3.0, 0.60],
-                          hspace=0.0, left=0.085, right=0.985, top=0.90, bottom=0.13)
-    axes = [fig.add_subplot(gs[i]) for i in (0, 1, 3, 4)]
-    fig.add_subplot(gs[2]).axis("off")
-
-    panels = (
-        (axes[0], axes[1], short["bands"].reshape(-1, cfg.N_QUANTILES).cpu().numpy(),
-         short["median_bg"].cpu().numpy(), 4 * 12,
-         f"{cfg.PREDICTION_HORIZON_HOURS} h forecast — a single forward pass"),
-        (axes[2], axes[3], long["bands"].reshape(-1, cfg.N_QUANTILES).cpu().numpy(),
-         long["pred_bg"].cpu().numpy(), 12 * 12,
-         f"{int(n_rolls * cfg.PREDICTION_HORIZON_HOURS)} h forecast — "
-         f"{int(n_rolls)} autoregressive rolls"),
+    infill_start = ((n_ctx // 2) // pph) * pph              # on an hour boundary
+    CASES = (
+        ("backcast", "the span opens the window",
+         [(0, span_len), (n_ctx, P)], 0, span_len),
+        ("infill", "the span sits between visible patches",
+         [(infill_start, span_len), (n_ctx, P)], infill_start, span_len),
+        ("forecast", "the span ends at the last patch",
+         None, n_ctx, P),
     )
 
-    for ax, dx, bands, med, ctx_show, title in panels:
-        h = len(med)
-        # t=0 is the forecast origin: the LAST VISIBLE step, index origin-1, which is
-        # this masked span's own anchor. The anchor rule is one-sided and
-        # left-preferring — every slot of a span takes the last step of the left
-        # neighbour, the first step of the right neighbour only for a span at patch 0
-        # — so a right-edge span anchors here, and every slot of it shares this value.
-        # Masked step k is index origin+k, at (k+1)*5 min. Each future series is
-        # therefore prepended with the anchor, so it leaves the observed line instead of
-        # starting one step clear of it. For the bands that join is not cosmetic: the
-        # head decodes a delta from the anchor, so the fan has zero width at the origin.
-        tc = np.arange(-ctx_show, 1) * 5.0 / 60.0
-        tf = np.arange(h + 1) * 5.0 / 60.0
-        x0, x1 = tc[0], tf[-1]
-        anchor = bg[origin - 1]
-        ctx_bg = bg[origin - 1 - ctx_show:origin]
-        fut_bg = np.concatenate([[anchor], bg[origin:origin + h]])
-        fut_med = np.concatenate([[anchor], med])
-        fut_bands = np.vstack([np.full((1, bands.shape[1]), anchor), bands])
+    def run(spans):
+        return predict(model, context, normalization_stats=stats, device=device,
+                       overrides=ov, mask_spans=spans)
+
+    def span_fan(res, span_start: int, length: int):
+        """The drawn span's own rows, in patch order: (bands, median) in mg/dL."""
+        idx = res["mask_idx"].cpu().numpy()
+        sel = np.flatnonzero((idx >= span_start) & (idx < span_start + length))
+        sel = sel[np.argsort(idx[sel])]
+        assert len(sel) == length, f"{len(sel)} rows for a {length}-patch span"
+        bands = res["bands"].cpu().numpy()[sel].reshape(-1, cfg.N_QUANTILES)
+        med = res["median_bg"].cpu().numpy().reshape(len(idx), S)[sel].reshape(-1)
+        return bands, med
+
+    _style(t)
+    fig = plt.figure(figsize=(11.5, 13.0), facecolor=t.paper)
+    gs = fig.add_gridspec(8, 1,
+                          height_ratios=[0.95, 0.72, 2.05, 0.72, 2.05, 0.72, 2.05, 0.50],
+                          hspace=0.0, left=0.085, right=0.985, top=0.930, bottom=0.098)
+    loc_ax = fig.add_subplot(gs[0])
+    for r in (1, 3, 5):
+        fig.add_subplot(gs[r]).axis("off")
+    crop_axes = [fig.add_subplot(gs[r]) for r in (2, 4, 6)]
+    plan_ax = fig.add_subplot(gs[7])
+
+    hours = lambda w: w * 5.0 / 60.0            # window step index -> hours
+    window_bg = bg[start:start + ctx_steps + pred_steps]
+
+    # ----------------------------------------------------------- locator strip
+    loc_ax.set_facecolor(t.paper)
+    loc_ax.axhspan(70, 180, color=t.fill(t.SAGE), zorder=0)
+    loc_ax.plot(hours(np.arange(len(window_bg))), window_bg, color=t.ink, lw=0.7,
+                zorder=4)
+    for name, _sub, _spans, s0, length in CASES:
+        loc_ax.axvspan(hours(s0 * S), hours((s0 + length) * S),
+                       color=t.CLAY, alpha=0.55, lw=0, zorder=5)
+        c0 = min(max(s0 + length // 2 - crop_patches // 2, 0), seq_len - crop_patches)
+        loc_ax.axvspan(hours(c0 * S), hours((c0 + crop_patches) * S),
+                       color=t.slate, alpha=0.10, lw=0, zorder=2)
+        loc_ax.text(hours((c0 + crop_patches // 2) * S), 1.06, name,
+                    transform=loc_ax.get_xaxis_transform(), ha="center", va="bottom",
+                    fontsize=9.2, color=t.slate)
+    loc_ax.set_xlim(0, hours(len(window_bg) - 1))
+    loc_ax.set_ylim(40, 400)
+    loc_ax.set_yticks([])
+    loc_ax.set_xticks(np.arange(0, hours(len(window_bg)) + 1, 24.0))
+    loc_ax.set_ylabel("window", fontsize=8.6, color=t.muted, style="italic")
+    loc_ax.tick_params(axis="x", labelsize=8.6)
+    loc_ax.spines["left"].set_visible(False)
+    loc_ax.spines["bottom"].set_color(t.rule)
+
+    # ------------------------------------------------------------------ crops
+    for ax, (name, sub, spans, s0, length) in zip(crop_axes, CASES):
+        bands, med = span_fan(run(spans), s0, length)
+        a_step, join_left = _anchor_step(s0, length, S)
+        anchor = float(window_bg[a_step])
+
+        m0, m1 = s0 * S, (s0 + length) * S              # masked steps, window coords
+        c0 = min(max(s0 + length // 2 - crop_patches // 2, 0), seq_len - crop_patches)
+        v0, v1 = c0 * S, (c0 + crop_patches) * S        # crop steps, window coords
+
+        # The fan and the median leave the observed line at the anchor, so both
+        # are joined to it on the side the anchor rule chose.
+        if join_left:
+            tm = hours(np.arange(a_step, m1))
+            med_j = np.concatenate([[anchor], med])
+            bands_j = np.vstack([np.full((1, bands.shape[1]), anchor), bands])
+        else:
+            tm = hours(np.arange(m0, a_step + 1))
+            med_j = np.concatenate([med, [anchor]])
+            bands_j = np.vstack([bands, np.full((1, bands.shape[1]), anchor)])
 
         ax.set_facecolor(t.paper)
         ax.axhspan(70, 180, color=t.fill(t.SAGE), zorder=0)
         ax.axhline(70, color=t.muted, lw=0.7, ls=(0, (4, 4)), zorder=1)
         ax.axhline(180, color=t.muted, lw=0.7, ls=(0, (4, 4)), zorder=1)
+        ax.axvspan(hours(m0), hours(m1 - 1), color=t.CLAY, alpha=0.07, lw=0, zorder=1)
+
         for lo, hi, alpha in ((0, 6, 0.16), (1, 5, 0.24), (2, 4, 0.34)):
-            ax.fill_between(tf, fut_bands[:, lo], fut_bands[:, hi], color=t.TEAL,
+            ax.fill_between(tm, bands_j[:, lo], bands_j[:, hi], color=t.TEAL,
                             alpha=alpha, lw=0, zorder=2)
-        ax.plot(tc, ctx_bg, color=t.ink, lw=1.6,
-                zorder=5, label="observed CGM")
-        ax.plot(tf, fut_bg, color=t.ink, lw=1.6, ls=(0, (4, 3)),
-                zorder=5, label="true future CGM")
-        ax.plot(tf, fut_med, color=t.CLAY, lw=2.1, zorder=6, label="forecast median")
-        ax.axvline(0.0, color=t.muted, lw=1.0, zorder=3)
+        # Observed either side of the span, withheld inside it: the model is
+        # shown the solid stretches and asked for the dashed one.
+        for a, b in ((v0, m0 + 1), (m1 - 1, v1)):
+            if b - a > 1:
+                w = np.arange(max(a, v0), min(b, v1))
+                ax.plot(hours(w), window_bg[w], color=t.ink, lw=1.6, zorder=5)
+        w = np.arange(m0, m1)
+        ax.plot(hours(w), window_bg[w], color=t.ink, lw=1.6, ls=(0, (4, 3)), zorder=5)
+        ax.plot(tm, med_j, color=t.CLAY, lw=2.1, zorder=6)
+        ax.plot([hours(a_step)], [anchor], marker="o", ms=4.0, color=t.CLAY,
+                mec=t.paper, mew=0.9, zorder=7)
 
-        seen = np.concatenate([ctx_bg, fut_bg, fut_bands[:, 5], fut_med])
-        top = min(400.0, max(220.0, float(np.nanmax(seen)) * 1.07))
-        bot = max(40.0, min(85.0, float(np.nanmin(seen)) * 0.90))
-        ax.set_xlim(x0, x1)
-        ax.set_ylim(bot, top)
+        seen = np.concatenate([window_bg[v0:v1], bands_j[:, 5], bands_j[:, 1], med_j])
+        # A little air either side, so a span flush against the crop edge — the
+        # backcast one always is, and the forecast one ends there — is not read
+        # as a line running off the panel.
+        ax.set_xlim(hours(v0) - 0.4, hours(v1 - 1) + 0.4)
+        ax.set_ylim(max(40.0, min(85.0, float(np.nanmin(seen)) * 0.90)),
+                    min(400.0, max(220.0, float(np.nanmax(seen)) * 1.07)))
         ax.set_ylabel("blood glucose (mg/dL)")
-        ax.set_xticklabels([])
-        ax.tick_params(axis="x", length=0)
-        ax.set_title(title, fontsize=11.5, loc="left", color=t.ink, pad=9)
+        ax.set_title(f"{name} — {sub}", fontsize=11.5, loc="left", color=t.ink, pad=8)
+        ax.set_xticks(np.arange(np.ceil(hours(v0) / 6.0) * 6.0, hours(v1), 6.0))
+        ax.tick_params(axis="x", labelsize=8.6, length=3)
+        ax.set_xlabel("hours into the context window", fontsize=8.8, color=t.muted,
+                      labelpad=2)
         ax.spines["left"].set_color(t.rule)
-        ax.spines["bottom"].set_visible(False)
+        ax.spines["bottom"].set_color(t.rule)
 
-        # announced plan, on its own strip
-        sl = slice(origin - 1 - ctx_show, origin + h)
-        td = np.arange(-ctx_show, h + 1) * 5.0 / 60.0
-        c_max = max(float(carb[sl].max()), 1e-6)
-        i_max = max(float(ins[sl].max()), 1e-6)
-        e_max = max(float(exr[sl].max()), 1e-6)
-        dx.set_facecolor(t.paper)
-        dx.fill_between(td, 0, carb[sl] / c_max, color=t.SAGE, alpha=0.55, lw=0,
-                        zorder=2)
-        dx.plot(td, ins[sl] / i_max, color=t.PLUM, lw=1.3, zorder=3)
-        dx.plot(td, exr[sl] / e_max, color=t.GOLD, lw=1.3, ls=(0, (3, 2)), zorder=3)
-        dx.axvline(0.0, color=t.muted, lw=1.0, zorder=1)
-        dx.set_xlim(x0, x1)
-        dx.set_ylim(0, 1.45)
-        dx.set_yticks([])
-        dx.set_ylabel("plan", fontsize=8.6, color=t.muted, style="italic")
-        dx.set_xlabel("hours from the forecast origin")
-        dx.spines["left"].set_visible(False)
-        dx.spines["bottom"].set_color(t.rule)
+    crop_axes[-1].set_xticklabels([])
+    crop_axes[-1].set_xlabel("")
+    crop_axes[-1].tick_params(axis="x", length=0)
+    crop_axes[-1].spines["bottom"].set_visible(False)
 
-    axes[0].legend(loc="upper left", fontsize=9, ncols=3, labelcolor=t.slate,
-                   bbox_to_anchor=(0.0, 1.30))
-    axes[0].text(1.0, 1.30, "bands: τ .05–.95 · .10–.90 · .25–.75",
-                 transform=axes[0].transAxes, ha="right", va="top",
-                 fontsize=8.8, color=t.muted)
-    fig.text(0.5, 0.062,
-             "The plan strip carries the announced carbohydrate appearance (filled), "
-             "insulin action (solid) and exercise disposal (dashed), each normalised "
-             "to its own peak.\n"
-             f"T1DMSIM patient, seed {seed}; the window's carbohydrate, insulin and "
-             "exercise are announced to the model, as a declared plan would be in "
-             "deployment.",
-             ha="center", va="top", fontsize=9.0, color=t.slate, linespacing=1.6)
+    # The plan strip belongs to the bottom crop's axis, and carries the channels
+    # the model reads at every patch, masked or not.
+    _n, _s, _sp, s0, length = CASES[-1]
+    c0 = min(max(s0 + length // 2 - crop_patches // 2, 0), seq_len - crop_patches)
+    sl = slice(start + c0 * S, start + (c0 + crop_patches) * S)
+    td = hours(np.arange(c0 * S, (c0 + crop_patches) * S))
+    plan_ax.set_facecolor(t.paper)
+    plan_ax.fill_between(td, 0, carb[sl] / max(float(carb[sl].max()), 1e-6),
+                         color=t.SAGE, alpha=0.55, lw=0, zorder=2)
+    plan_ax.plot(td, ins[sl] / max(float(ins[sl].max()), 1e-6),
+                 color=t.PLUM, lw=1.3, zorder=3)
+    plan_ax.plot(td, exr[sl] / max(float(exr[sl].max()), 1e-6),
+                 color=t.GOLD, lw=1.3, ls=(0, (3, 2)), zorder=3)
+    plan_ax.axvspan(hours(s0 * S), hours((s0 + length) * S - 1),
+                    color=t.CLAY, alpha=0.07, lw=0, zorder=1)
+    plan_ax.set_xlim(crop_axes[-1].get_xlim())
+    plan_ax.set_ylim(0, 1.45)
+    plan_ax.set_yticks([])
+    plan_ax.set_ylabel("plan", fontsize=8.6, color=t.muted, style="italic")
+    plan_ax.set_xticks(crop_axes[-1].get_xticks())
+    plan_ax.tick_params(axis="x", labelsize=8.6, length=3)
+    plan_ax.spines["left"].set_visible(False)
+    plan_ax.spines["bottom"].set_color(t.rule)
+
+    handles = [
+        Line2D([], [], color=t.ink, lw=1.6, label="observed CGM"),
+        Line2D([], [], color=t.ink, lw=1.6, ls=(0, (4, 3)), label="withheld CGM"),
+        Line2D([], [], color=t.CLAY, lw=2.1, label="predicted median"),
+    ]
+    loc_ax.legend(handles=handles, loc="lower left", fontsize=9, ncols=3,
+                  labelcolor=t.slate, bbox_to_anchor=(0.0, 1.22))
+    loc_ax.text(1.0, 1.22, "bands: τ .05–.95 · .10–.90 · .25–.75",
+                transform=loc_ax.transAxes, ha="right", va="bottom",
+                fontsize=8.8, color=t.muted)
+    fig.text(0.5, 0.050,
+             "One objective, three placements of the masked span. Each panel is a "
+             f"separate forward pass over the same {n_ctx}-patch window above,\n"
+             f"cropped to the {CROP_HOURS:.0f} h around its span. The plan strip carries "
+             "carbohydrate appearance (filled), insulin action (solid)\n"
+             "and exercise disposal (dashed), each normalised to its own peak; the model "
+             f"reads them at masked patches too.  ·  T1DMSIM patient, seed {seed}.",
+             ha="center", va="top", fontsize=9.0, color=t.slate, linespacing=1.7)
 
     fig.savefig(path, facecolor=t.paper)
     plt.close(fig)
@@ -627,10 +700,10 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
     # No default: the ladder's checkpoints are per-run artifacts under the
-    # gitignored models/*/, so any baked-in path is a promise the tree cannot
-    # keep. The forecast figure names its checkpoint or is skipped.
+    # gitignored new_models/<capacity>/, so any baked-in path is a promise the
+    # tree cannot keep. The figure names its checkpoint or is skipped.
     ap.add_argument("--checkpoint", default=None,
-                    help="checkpoint .pt for the forecast figure; required unless "
+                    help="checkpoint .pt for the masked-BG figure; required unless "
                          "--skip-forecast")
     # The seed the committed screenshots/ figures were drawn from; a rerun that
     # changes it silently replaces the README's patient with a different one.
@@ -642,7 +715,7 @@ def main() -> None:
     if not args.skip_forecast:
         if args.checkpoint is None:
             raise SystemExit(
-                "the forecast figure needs a checkpoint: pass --checkpoint PATH, "
+                "the masked-BG figure needs a checkpoint: pass --checkpoint PATH, "
                 "or --skip-forecast to draw the two diagrams alone.")
         if not Path(args.checkpoint).is_file():
             raise SystemExit(f"no such checkpoint: {args.checkpoint}")
@@ -655,8 +728,8 @@ def main() -> None:
         draw_architecture(theme, out / f"architecture{suffix}.png")
         draw_risk_space(theme, out / f"risk-space{suffix}.png")
         if not args.skip_forecast:
-            draw_forecast(theme, out / f"forecast{suffix}.png",
-                          args.checkpoint, args.seed)
+            draw_masked_bg(theme, out / f"forecast{suffix}.png",
+                           args.checkpoint, args.seed)
 
 
 if __name__ == "__main__":
