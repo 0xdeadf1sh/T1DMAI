@@ -56,9 +56,9 @@ from T1DMSIM.simulator import (
 # other code or comments.  PATCH_SIZE must divide 12 (so an integer number of
 # patches tiles the hour); changing it rescales the wall-clock span of
 # MIN/MAX_CONTEXT_PATCHES, which count patches, not hours.
-D_MODEL = 32                    # Hidden dimension throughout the transformer
-N_LAYERS = 2                     # Number of transformer blocks
-N_HEADS = 2                      # Number of temporal attention heads
+D_MODEL = 128                    # Hidden dimension throughout the transformer
+N_LAYERS = 8                     # Number of transformer blocks
+N_HEADS = 8                      # Number of temporal attention heads
 HEAD_DIM = D_MODEL // N_HEADS    # Per-head dimension for temporal attention
 FFN_DIM = 4 * D_MODEL                   # SwiGLU FFN inner dimension (default 4 × D_MODEL; override via resize_model.py --ffn-mult)
 PATCH_SIZE = 6                   # Timesteps per patch (6 × 5min = 30min)
@@ -103,16 +103,15 @@ MASKABLE_FEATS = (1, 2, 3)       # carb / insulin / exercise carry the announced
 CHANNEL_TO_FEAT = {0: 1, 1: 2, 2: 3}   # carb -> feat 1; insulin -> feat 2; exercise -> feat 3
 
 # === Sequence Lengths ===
-# Variable 24–48 h context. The T1DMSIM diff report (§0.5) measures pooled-CGM
-# Pearson ACF₀.₂ at 5.3 h for the simulator and 2.4–4.8 h across the three
-# real cohorts. The 24 h floor sits well ABOVE every one of those
-# autocorrelation lengths, so the whole autocorrelated span is in scope even at
-# the narrowest context. It also covers one full basal injection cycle — basal
+# Variable 84–168 h context. The T1DMSIM diff report (§0.5) measures pooled-CGM
+# Pearson ACF₀.₂ at 5.3 h for the simulator. The 84 h floor sits far ABOVE that
+# autocorrelation length, so the whole autocorrelated span is in scope even at
+# the narrowest context. It also covers several full basal injection cycles — basal
 # is injected once daily on a fixed interval with no jitter (T1DMSIM/simulator.py
 # BASAL_DOSE_INTERVAL_HOURS — the two analogues differ in ACTION duration,
 # glargine 26 h and degludec 42 h, not in dosing cadence) — which supports
 # patient-identity inference for the patient-agnostic model, and it leaves the
-# 8 h night long-horizon rolling validation ≥ 16 h of GT context to preserve
+# 8 h night long-horizon rolling validation ample GT context to preserve
 # real evening dynamics through all rolls (see inference.predict_rolling sliding
 # logic). Training samples n_ctx uniformly in [MIN, MAX]; the collate function
 # left-pads to the BATCH maximum so every sample's window ends at the right edge.
@@ -314,11 +313,11 @@ TIME_PROBE_CROSS_WINDOW_FRACTION = 1.0  # run the 2nd (next-window) TRAINING for
 ROPE_BASE = 1000                 # Base frequency for rotary position embeddings
 
 # === Training ===
-MASTER_SEED = 11011922           # Default master seed for all training data
+MASTER_SEED = 42                 # Default master seed for all training data
 DETERMINISTIC = False            # full-determinism toggle; True trades some speed (TF32 off, cuDNN deterministic) for reproducibility; set False for max throughput (GPU: data stream reproducible, SDPA backward not bit-exact)
 TOTAL_STEPS = 100000             # Total training steps
-BATCH_SIZE = 512                 # Training batch size
-NUM_WORKERS = 16                 # DataLoader worker processes
+BATCH_SIZE = 64                  # Training batch size
+NUM_WORKERS = 8                  # DataLoader worker processes
 
 # When training off a memory-mapped simulator cache (cache_format=npy-memmap),
 # each random row read faults pages of the multi-TB cache files into the kernel
@@ -428,7 +427,7 @@ KENDALL_LOGVAR_INIT = 0.0        # init for both KendallGalWeighting log-σ para
 # and the export descriptor (exporters/descriptor.py). They record which
 # architecture and loss produced a set of weights and gate nothing: no code
 # compares them at load time, there is no checkpoint-loading path in train.py,
-# and the fine-tune scripts carry a base checkpoint's stamp forward unchanged.
+# and a derived run carries a base checkpoint's stamp forward unchanged.
 ARCH_VERSION = 'risk-v4'              # model-architecture schema (risk-space input + output; [40,400]-anchored Kovatchev, no input/target smoothing)
 LOSS_SCHEMA = 'kendall-pinball-dilate-v3'  # loss schema (Kendall-Gal dynamic pinball/DILATE uncertainty-weighted combine on the risk-v4 arch)
 
@@ -473,7 +472,7 @@ assert HYPO_ALARM_QUANTILE_TAU in QUANTILE_LEVELS and HYPO_ALARM_QUANTILE_TAU < 
 assert HYPER_ALARM_QUANTILE_TAU in QUANTILE_LEVELS and HYPER_ALARM_QUANTILE_TAU > 0.5, \
     "HYPER_ALARM_QUANTILE_TAU must be an upper-half level in QUANTILE_LEVELS"
 
-# Band edges the REAL/SIM comparison suite (realdata/metrics.py) SCORES against — a
+# Band edges the REAL/SIM comparison suite (metrics/core/suite.py) SCORES against — a
 # knob distinct from the alarm taus above, though numerically equal today. The forecast
 # is a quantile fan, so the effective point forecast is the band point nearest the
 # truth: pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI]) — zero

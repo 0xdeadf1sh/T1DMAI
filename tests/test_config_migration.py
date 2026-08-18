@@ -16,7 +16,7 @@ def test_active_config_migrated_values():
     is not the one the value was written for. Its range is checked below.
     """
     import config
-    assert config.BATCH_SIZE == 512
+    assert config.BATCH_SIZE == 64
     assert config.PATIENT_UNIFORM_SAMPLE_PROB == 0.0
     assert config.PREDICTION_HORIZON_HOURS == 2
     assert config.NIGHT_LONG_HORIZON_HOURS == 8

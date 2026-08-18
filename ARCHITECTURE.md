@@ -110,10 +110,10 @@ Derived, not settable:
 | `N_QUANTILES` | `len(QUANTILE_LEVELS)` — `SPEC/invariants.md` §6 fixes the levels and their ascending order for the whole suite |
 | `N_SPREADS` | 3 — spreads per side; the head emits `1 + 2·N_SPREADS` values per step |
 
-At the released defaults a patch is 30 minutes, the context runs 48–96 patches
-(24–48 h), and the forecast protocol's span is 4 patches (2 h). The floor sits
-well above every autocorrelation length `T1DMSIM/diff/README.md` §0.5 measures,
-covers one full basal cycle, and leaves enough real context for the 8-hour
+At the released defaults a patch is 30 minutes, the context runs 168–336 patches
+(84–168 h), and the forecast protocol's span is 4 patches (2 h). The floor sits
+far above every autocorrelation length `T1DMSIM/diff/README.md` §0.5 measures,
+covers several full basal cycles, and leaves ample context for the 8-hour
 nocturnal roll.
 
 
@@ -213,14 +213,12 @@ them forces the model to forecast from signals deployment can supply.
 `carb_intake`, `insulin_combined` and `exercise_equiv` are **rates**, not
 ingestion, injection and session instants: grams entering the blood, units acting,
 and grams of carbohydrate-equivalent disposal in each 5-minute step. Pretraining
-takes them from the simulator directly. Real records rarely store carbohydrate and
-insulin that way, so `realdata/features.py` reconstructs them by convolving logged
-amounts with population-mean kernels, with the fidelity limits the README sets out.
-A record whose events already carry their resolved series instead supplies them on
+takes them from the simulator directly. A record that logs bare amounts instead is
+converted by `metrics/core/features.py`, which convolves them with population-mean
+kernels. A record whose events already carry their resolved series supplies them on
 `Segment.carb_curve` / `Segment.insulin_curve`, which bypass the kernels; the
 transforms in the table above are unchanged either way. `Segment.exercise` is
-already a resolved g/step curve, so nothing on the input path convolves it, and
-every real adapter fills it with zeros.
+already a resolved g/step curve, so nothing on the input path convolves it.
 
 ### The index map
 
@@ -858,12 +856,11 @@ calibration split, and the export path ships none.
 
 ## Report metric basis
 
-The real and simulator report suites score two bases, and they are not
-interchangeable.
+The report suite scores two bases, and they are not interchangeable.
 
 **Median line** — the point forecast `f_inv(median)`. This is what published
-forecasters report, so it is the basis for every peer comparison, for the
-fine-tuning harness's held-out summary, and for checkpoint-selection scalars.
+forecasters report, so it is the basis for every peer comparison and for
+checkpoint-selection scalars.
 
 **Band-scored** — the truth projected onto the inner band,
 `clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])`. A level error becomes

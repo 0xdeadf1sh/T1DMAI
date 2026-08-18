@@ -37,9 +37,9 @@ because every module reads its dimensions from `config` at import.
 
 | rung | command | parameters | buffers |
 | --- | --- | ---: | ---: |
-| nano | `--d-model 32 --heads 2 --layers 2` | 38,241 | 18 |
-| small | `--d-model 64 --heads 4 --layers 4` | 279,457 | 18 |
-| medium | `--d-model 128 --heads 8 --layers 8` | 2,157,345 | 18 |
+| nano | `--d-model 32 --heads 2 --layers 2` | 38,934 | 36 |
+| small | `--d-model 64 --heads 4 --layers 4` | 280,822 | 36 |
+| medium | `--d-model 128 --heads 8 --layers 8` | 2,160,054 | 36 |
 
 ```bash
 venv/bin/python resize_model.py --d-model 32 --heads 2 --layers 2
@@ -73,11 +73,11 @@ venv/bin/python scratch/bitident.py freeze
 
 A patch is 30 minutes, so the window is set in patches.
 
-| window | `--max-context-patches` | `MAX_SEQ_LEN` | `d ≥ 3` share | Ohio segments kept |
-| --- | ---: | ---: | ---: | ---: |
-| 24 h | 48 | 52 | 27.90% | 82 of 156 |
-| 48 h | 96 | 100 | 27.11% | 51 of 156 |
-| 72 h | 144 | 148 | 26.87% | 29 of 156 |
+| window | `--max-context-patches` | `MAX_SEQ_LEN` | `d ≥ 3` share |
+| --- | ---: | ---: | ---: |
+| 24 h | 48 | 52 | 27.90% |
+| 48 h | 96 | 100 | 27.11% |
+| 72 h | 144 | 148 | 26.87% |
 
 The `d ≥ 3` share is `d_balance.d_distribution` at the live sampler constants,
 with `--min-context-patches` at half the ceiling on every row. It barely moves
@@ -95,9 +95,9 @@ Three properties of that table are worth knowing before choosing.
 
 **Pass `--min-context-patches` as well.** Training draws `n_ctx` uniformly from
 `[MIN, MAX]`, and every evaluation entry point scores at `MAX_CONTEXT_PATCHES`.
-Raising only the ceiling, from the live floor of 48 patches, moves the *mean*
-training context to 36 h at 96 patches and 48 h at 144, while the reported number
-stays pinned to the ceiling — a mixture scored only at its widest point. Moving
+Raising only the ceiling leaves the *mean* training context far below it, while
+the reported number stays pinned to the ceiling — a mixture scored only at its
+widest point. The live pair is 168 / 336 patches. Moving
 both keeps the two together.
 
 **48, 96 and 144 are the arithmetically clean widths.** Hour-of-day coverage is
@@ -106,11 +106,10 @@ exactly uniform when `n_candidates % 48 == 0`, where
 At the accepted 2394 steps, `n_candidates = 384 − n_ctx`, so it holds at every
 multiple of 48 up to the 336-patch ceiling — 48, 96, 144, 192, 240, 288 and 336.
 
-**Real-cohort evaluation sets shrink with the window.** `realdata/calibrate.py`
-drops any segment shorter than the context plus the horizon, and segments are cut
-at every CGM gap over 30 minutes. Ohio falls from 82 usable segments to 29 across
-this table; Shanghai keeps all 16 but loses 22% of its windows. Real-cohort
-figures from two different context widths describe two different window sets.
+**Evaluation sets shrink with the window.** `metrics/core/calibrate.py` drops any
+segment shorter than the context plus the horizon, and segments are cut at every
+CGM gap over 30 minutes. Figures from two different context widths therefore
+describe two different window sets.
 
 Attention cost is quadratic in `MAX_SEQ_LEN`: 100 is about 3.7× the attention
 memory of 52, and 148 about 8.1×.
@@ -175,10 +174,9 @@ knobs it names; `sampler_reference_applies()` then refuses the comparison rather
 than reporting against a mixture the sampler does not draw. Re-enumerate and
 update it in the same change.
 
-The three are stamped into every checkpoint, and `finetune/` refuses a checkpoint
-whose recorded sampler is not the live one — no parameter shape depends on the
-sampler, so a strict state-dict load would accept the weights and nothing else
-would notice.
+The three are stamped into every checkpoint. No parameter shape depends on the
+sampler, so a strict state-dict load accepts weights drawn under any of them and
+nothing else would notice — the stamp is the only record.
 
 ---
 

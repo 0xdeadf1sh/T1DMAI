@@ -46,12 +46,8 @@ exported/
 *.tar.gz
 
 # --- Trained-model + report artifact trees (regenerable; keep the .py tools) ---
-models/*/
-models/out/
-models/ablation/
-models_new/
-models_finetuned_on_ohiot1dm/
-finetune/*.csv
+new_models/
+comparison/
 
 # --- Simulator / dataset caches (regenerable) ---
 *.npz
@@ -71,7 +67,6 @@ t1dmai_screenshot_*.png
 
 # --- Generated metrics reports (keep metrics/*.py + rebuild_all.sh) ---
 metrics/**/figures/
-metrics/time_figures/
 metrics/**/README.md
 metrics/**/stats.json
 metrics/*.json
