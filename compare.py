@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-model comparison over the trained checkpoints under ``new_models/``.
+Cross-model comparison over the trained checkpoints under ``models/``.
 
 Compares the three capacities (nano, small, medium) on every horizon and probe the
 per-model metric directories carry, and writes high-resolution figures and
@@ -50,7 +50,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # The trained-checkpoint tree, one directory per capacity. The GUI discovers its
 # checkpoint from the same root — a second root is how the two start disagreeing
 # about which checkpoint "medium" names.
-MODEL_ROOT = os.path.join(ROOT, 'new_models')
+MODEL_ROOT = os.path.join(ROOT, 'models')
 
 sys.path.insert(0, os.path.join(ROOT, 'metrics'))
 import figstyle as fs                                     # type: ignore[import]  # noqa: E402

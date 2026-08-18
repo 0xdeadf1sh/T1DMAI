@@ -16,7 +16,7 @@ Usage:
     python make_readme_figures.py --checkpoint PATH --seed N
 
 The masked-BG figure has no default checkpoint: the capacity ladder's weights are
-per-run artifacts under the gitignored ``new_models/<capacity>/checkpoints/``.
+per-run artifacts under the gitignored ``models/<capacity>/checkpoints/``.
 Name one or pass ``--skip-forecast``.
 """
 
@@ -700,7 +700,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
     # No default: the ladder's checkpoints are per-run artifacts under the
-    # gitignored new_models/<capacity>/, so any baked-in path is a promise the
+    # gitignored models/<capacity>/, so any baked-in path is a promise the
     # tree cannot keep. The figure names its checkpoint or is skipped.
     ap.add_argument("--checkpoint", default=None,
                     help="checkpoint .pt for the masked-BG figure; required unless "

@@ -4189,7 +4189,7 @@ class T1DMAIGui:
 # The trained-checkpoint tree, one capacity per subdirectory. ``compare.py``
 # reads the same root; a second one is how the two start disagreeing about which
 # checkpoint 'medium' names.
-MODEL_DIR = 'new_models'
+MODEL_DIR = 'models'
 
 
 def _discover_checkpoint() -> str | None:
@@ -4262,7 +4262,7 @@ def main() -> None:
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to the trained model checkpoint. With no path '
                              'and no --no-model, the capacity matching the live '
-                             'config.py is looked up under new_models/.')
+                             'config.py is looked up under models/.')
     parser.add_argument('--no-model', action='store_true',
                         help='Use random weights for UI testing')
     parser.add_argument('--seed', type=int, default=42,

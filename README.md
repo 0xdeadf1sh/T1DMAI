@@ -323,7 +323,7 @@ exact count, computed from the architecture rather than targeted.
 Accuracy, wall-clock and peak-memory figures are not listed: none has been
 measured against this architecture, and this repository publishes no checkpoint
 to re-derive them from. `metrics/` scores a locally trained one, and
-`compare.py` tabulates cost and accuracy across a populated `new_models/` tree.
+`compare.py` tabulates cost and accuracy across a populated `models/` tree.
 
 
 ## Scoring rules and protocols
@@ -525,7 +525,7 @@ python3.11 -m venv .venv-export
 
 ```bash
 python gui.py --seed 42
-python gui.py --checkpoint new_models/medium/checkpoints/t1dmai_best.pt --seed 42
+python gui.py --checkpoint models/medium/checkpoints/t1dmai_best.pt --seed 42
 ```
 
 A pygame front end for inspecting a checkpoint one patient at a time: the median
@@ -536,7 +536,7 @@ draws a new patient, `V` scores the current forecast against the simulator.
 Predictions run on a background thread. `--no-model` starts with random weights
 for UI work.
 
-With no `--checkpoint` the GUI takes the one capacity under `new_models/` whose
+With no `--checkpoint` the GUI takes the one capacity under `models/` whose
 architecture matches the live `config.py` — the only one that could load anyway.
 
 The simulated patient runs out to `MAX_CONTEXT_PATCHES`, so the model is fed the

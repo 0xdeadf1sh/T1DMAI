@@ -1,14 +1,14 @@
 # Cross-model comparison
 
 `compare.py` at the repository root reads the trained-model tree under
-`new_models/`, one directory per capacity, and writes a single comparison under
+`models/`, one directory per capacity, and writes a single comparison under
 `comparison/`. Keeping one trained-checkpoint root is what stops the GUI and this
 script from disagreeing about which checkpoint `medium` names.
 
 ## Layout
 
 ```
-new_models/
+models/
 └── nano/  small/  medium/
     ├── checkpoints/            t1dmai_best.pt and the periodic step snapshots
     ├── figures/                per-model training figures and summary.json

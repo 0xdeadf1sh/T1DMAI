@@ -46,7 +46,7 @@ exported/
 *.tar.gz
 
 # --- Trained-model + report artifact trees (regenerable; keep the .py tools) ---
-new_models/
+models/
 comparison/
 
 # --- Simulator / dataset caches (regenerable) ---
