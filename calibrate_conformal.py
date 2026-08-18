@@ -8,7 +8,7 @@ raw-vs-marginal-vs-binned excursion-peak coverage on a disjoint test band so the
 effect is visible.
 
 THIS IS THE BAND THAT SHIPS. ``ckpt['conformal_delta']`` is what
-``realdata/report.py`` attaches to the model and what every ``inference.predict``
+``metrics/core/report.py`` attaches to the model and what every ``inference.predict``
 call applies, so a marginal fit here leaves the deployed correction marginal
 however many evaluation paths are binned.
 
@@ -21,7 +21,7 @@ with ``shipped = False``. Infill residuals are the easier ones (its slots sit at
 two-sided ``d`` = 1..2), and folding them into the shipped band would buy an
 apparently tighter interval the forecast cannot honour.
 
-The corrections live in mg/dL and are SIM-fit — for real cohorts (OhioT1DM, …) re-fit
+The corrections live in mg/dL and are fit on the distribution they will serve; re-fit
 on a held-out slice of that cohort (coverage validity needs cal/test exchangeability).
 
 Usage:
@@ -176,8 +176,8 @@ def _collect(model, seeds, stats, device, infill: bool = True,
     """
     import sim_data as S
     from sim_data import build_sim_feature_stack, _smooth_sim_bg, _future_overrides
-    from realdata.features import context_window
-    from realdata.calibrate import CTX_STEPS, PRED_STEPS
+    from metrics.core.features import context_window
+    from metrics.core.calibrate import CTX_STEPS, PRED_STEPS
     n_ctx = config.MAX_CONTEXT_PATCHES
     spans = [(INFILL_START_PATCH, INFILL_SPAN_LEN), (n_ctx, config.PREDICTION_PATCHES)]
     # Window-relative first step of the infill span; the context block ends at ps.
@@ -343,7 +343,7 @@ def main() -> None:
     if not args.no_write:
         # Store as a TORCH tensor, not a numpy array: torch.load(weights_only=True)
         # (the secure default since PyTorch 2.6, used by load_model and the whole
-        # metrics/realdata pipeline) refuses to unpickle numpy's _reconstruct, so a
+        # metrics pipeline) refuses to unpickle numpy's _reconstruct, so a
         # numpy delta makes the checkpoint unloadable on the safe path. Tensors and
         # plain python types (the meta below) are weights_only-safe.
         #

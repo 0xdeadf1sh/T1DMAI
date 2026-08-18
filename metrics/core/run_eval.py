@@ -1,19 +1,21 @@
 """
-Per-dataset evaluation driver — produces the full comparison metric suite for a
-real CGM dataset, with the comparison-audit reporting protocol baked in:
+Evaluation driver — the full comparison metric suite over a set of collected
+windows, with the reporting protocol baked in:
 
   * headline forecast = the model's quantile BAND projected onto the truth,
     ``clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``; the median line
     ``median_bg`` is kept alongside under ``metrics[h]['median_line']`` as the
-    point basis for peer/literature comparison. Without a band fan (legacy caches,
-    or a split that captured none) every metric falls back to the median line
-  * canonical split: OhioT1DM train/test XML; AZT1D/Shanghai temporal per-patient
+    point basis for peer/literature comparison. Without a band fan every metric
+    falls back to the median line
   * metrics: strict-point + window-mean RMSE/MAE, MARD, Clarke A/A+B, hypo/hyper
     recall+precision (STRICT crossings), persistence skill (persistence carries no
-    band), macro RMSE, realized band coverage/width, split-conformal 90% bands
+    band, so its rows are median-line either way)
+  * split-conformal band recalibration, region-binned, fitted on the calibration
+    windows and reported on the test ones
 
-``evaluate_from_windows`` is model-free (operates on collected Window forecasts),
-so it is reused for the cached OhioT1DM windows in validation.
+``evaluate_from_windows`` is the entry point: it takes the calibration and test
+window lists a collector produced and returns the whole suite. ``metrics/sim/``
+is the collector.
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ from .calibrate import (
     _future_overrides,
 )
 from .features import build_feature_stack, context_window, smoothed_cgm
-from .metrics import compute_suite, conformal_intervals, band_project
+from .suite import compute_suite, conformal_intervals, band_project
 from .horizons import HORIZONS, HORIZON_IDX as _HORIZON_IDX, FIGURE_HORIZONS
 import conformal
 import mondrian
@@ -57,7 +59,7 @@ from utils import kovatchev_f_inv_np
 
 # Medically-useful precision floor for the per-horizon hypo decision-offset
 # selection. The risk-space redesign removed ``config.EXCURSION_DECISION_MIN_PRECISION``
-# (realdata was out of scope for that cycle's config), so the deployment knob lives
+# (this package was out of scope for that cycle's config), so the deployment knob lives
 # here as a module-level default — the highest-recall offset whose CAL precision
 # clears this floor is selected (else the strict δ=0 crossing).
 EXCURSION_DECISION_MIN_PRECISION = 0.7
@@ -144,38 +146,16 @@ def _slice(seg: Segment, a: int, b: int) -> Segment:
         insulin_curve=(None if seg.insulin_curve is None else seg.insulin_curve[a:b]))
 
 
-def split_segments(segs: list[Segment], dataset: str, cal_frac: float = 0.6):
-    """Canonical OhioT1DM train/test split; INTRA-segment temporal split otherwise.
-
-    For AZT1D/Shanghai (no canonical split, many single-segment patients) each
-    segment is cut into an early calibration sub-segment and a late test
-    sub-segment separated by a ``CTX_STEPS`` gap so the test window's context
-    never overlaps the calibration span — every patient thus contributes both.
-    """
-    if dataset in ('ohiot1dm', 'ohio'):
-        return ([s for s in segs if s.split == 'training'],
-                [s for s in segs if s.split == 'testing'])
-    cal, test = [], []
-    need = CTX_STEPS + PRED_STEPS
-    for s in segs:
-        n = len(s)
-        cut = int(cal_frac * n)
-        if cut >= max(need, MIN_SEGMENT_STEPS):
-            cal.append(_slice(s, 0, cut))
-        ts = cut + CTX_STEPS
-        if n - ts >= need:
-            test.append(_slice(s, ts, n))
-    return cal, test
 
 
 def _quantile_cqr(cal_w: list[Window], test_w: list[Window]) -> dict | None:
-    """Per-cohort quantile-CQR band recalibration, REGION-BINNED (Mondrian).
+    """Quantile-CQR band recalibration, REGION-BINNED (Mondrian).
 
     Captures the model's RAW per-window mg/dL quantile fans (``Window.bands``) and
     fits the split-conformal correction on the CALIBRATION split ONCE PER REGION
     BIN (``mondrian.fit_mondrian``), the region being where that window's forecast
-    is HEADING. The fit is automatically PER-COHORT (this runs inside
-    ``evaluate_from_windows`` on one cohort's own cal/test windows). Returns
+    is HEADING. The fit is per run by construction (this runs inside
+    ``evaluate_from_windows`` on that run's own cal/test windows). Returns
     ``None`` when either split lacks bands (old caches / a path that did not
     capture them), so the renderer can skip.
 
@@ -252,7 +232,7 @@ def evaluate_from_windows(cal_w: list[Window], test_w: list[Window]) -> dict:
     """Score the headline metric suite from pre-collected windows (no model).
 
     The headline forecast is the model's quantile BAND projected onto the truth
-    (``realdata.metrics.band_project`` over the τ=``METRIC_BAND_TAU_LO`` /
+    (``metrics.core.suite.band_project`` over the τ=``METRIC_BAND_TAU_LO`` /
     τ=``METRIC_BAND_TAU_HI`` edges of the fan captured at collection); the median line
     ``median_bg`` is scored alongside under ``metrics[h]['median_line']``. The suite,
     the split-conformal intervals and the excursion decision-offset sweep all read the
@@ -449,7 +429,7 @@ def night_onset_from_records(model, stats, records, device,
 
     Each record is ``(feats, cgm, hod)``: the normalized (N, F) feature stack, the
     raw (bg-clamped) comparison-truth CGM (N,) in mg/dL, and the fractional
-    hour-of-day (N,). The real-data path (``evaluate_night_onset``) and the sim path
+    hour-of-day (N,). The window path (``evaluate_night_onset``) and the sim path
     both adapt their data to this shape (each clamping its truth before passing it).
 
     At each night-start origin (``hod`` ≈ ``NOCTURNAL_START_HOUR``) the forecast is
@@ -646,48 +626,6 @@ def rmse_by_horizon_rolling(model, stats, test_segs: list[Segment], device,
         announce=announce, stride_patches=stride_patches, max_windows=max_windows)
 
 
-def evaluate_dataset(name: str, model, stats, device, cal_stride: int = 8,
-                     cal_cap: int = 24, test_stride: int = 6, test_cap: int = 60,
-                     conditional: bool = True, announce: tuple[int, ...] = (0, 1, 2),
-                     augment_fn=None) -> dict:
-    """Full pipeline for one dataset: load -> (augment) -> split -> collect -> evaluate.
-
-    The model is ALWAYS conditioned: each window's true future carbs/insulin/exercise
-    are announced (the deployment what-if regime); there is no unconditioned companion
-    suite. ``conditional`` is retained only for call-compatibility and no longer
-    toggles anything. The exercise column is identically zero on every real cohort,
-    so its announcement declares "no session" rather than adding information.
-
-    Window counts are capped (``cal_cap``/``test_cap`` per patient) so a large
-    cohort like AZT1D stays tractable; a few hundred windows give stable metrics.
-
-    Args:
-        conditional: deprecated no-op (the forecast is always conditioned).
-        announce: output-channel indices announced; see ``collect_windows``.
-        augment_fn: optional ``Segment -> Segment`` map applied right after load
-            (e.g. injecting reconstructed meal/bolus events into the raw record);
-            ``None`` evaluates the unmodified record.
-    """
-    from . import load_dataset
-    segs = load_dataset(name)
-    if augment_fn is not None:
-        segs = [augment_fn(s) for s in segs]
-    cal_segs, test_segs = split_segments(segs, name)
-
-    cal_w = collect_windows(model, stats, cal_segs, device, stride_patches=cal_stride,
-                            max_per_patient=cal_cap, announce=announce)
-    test_w = collect_windows(model, stats, test_segs, device, stride_patches=test_stride,
-                             max_per_patient=test_cap, announce=announce)
-    res = evaluate_from_windows(cal_w, test_w)
-    res['dataset'] = name
-    # Night-onset nocturnal excursion prediction (conditioned roll) on the same test
-    # segments — additive, never alters the suite.
-    res['night_onset'] = evaluate_night_onset(model, stats, test_segs, device, announce=announce)
-    # Hour-by-hour RMSE-vs-horizon (rolled) for the rmse_vs_horizon figure —
-    # figure-only, never alters the suite; matches the report's announce regime.
-    res['rmse_by_hour'] = rmse_by_horizon_rolling(
-        model, stats, test_segs, device, announce=announce)
-    return res
 
 
 def _print(res: dict):
@@ -735,7 +673,7 @@ def _print(res: dict):
     cq = res.get('conformal_cqr')
     if cq:
         fit = cq.get('fit') or {}
-        print("quantile-CQR band coverage (cohort re-fit), region-binned on where the "
+        print("quantile-CQR band coverage (re-fit), region-binned on where the "
               f"forecast is heading; edges {fit.get('region_edges')} mg/dL, "
               f"marginal fallback below n={fit.get('min_n_own_fit')}:")
         print(f"  {'d':>2} {'horizon':>7} | {'cov90 raw':>9} {'marg':>6} {'binned':>7} | "
@@ -762,17 +700,3 @@ def _print(res: dict):
                                       "  test-split coverage per region bin")
 
 
-if __name__ == '__main__':
-    import sys
-    import torch
-    cache = torch.load('scratch/_ohio_windows.pt', weights_only=False)
-    # Risk-space forecast: Windows must carry the headline ``pred_bg`` (median_bg)
-    # field. An old cache predates the redesign (carried dynamics/trend fields) —
-    # skip rather than crash, the cached path is only a convenience.
-    if not all(hasattr(w, 'pred_bg') for w in cache['cal_w'] + cache['test_w']):
-        print("cached windows predate the risk-space redesign (no 'pred_bg' field) — "
-              "re-collect with evaluate_dataset; skipping.", file=sys.stderr)
-        sys.exit(0)
-    res = evaluate_from_windows(cache['cal_w'], cache['test_w'])
-    res['dataset'] = 'ohiot1dm (cached)'
-    _print(res)

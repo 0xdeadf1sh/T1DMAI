@@ -6,8 +6,7 @@ proper scoring rules over a decoded quantile fan, imported rather than run, and
 holding no model, no I/O and no gate.
 
 The submodule is exposed lazily so that importing any sibling (``metrics.figstyle``,
-``metrics.augmented.augment``) still costs nothing beyond what that sibling
-itself needs.
+``metrics.core.suite``) still costs nothing beyond what that sibling itself needs.
 """
 from __future__ import annotations
 

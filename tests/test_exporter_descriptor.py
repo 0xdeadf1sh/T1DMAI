@@ -32,24 +32,6 @@ def _pretrained_ckpt() -> dict:
     }
 
 
-def _finetune_ckpt() -> dict:
-    return {
-        "step": 1100,
-        "finetune_meta": {
-            "dataset": "multi",
-            "datasets": ["ohiot1dm", "azt1d", "shanghai"],
-            "mode": "transfer",
-            "holdout": {"ohiot1dm": "591"},
-            "total_steps": 5000,
-            "lr_scale": 0.2,
-            "best_heldout": {
-                "n_test_windows": 213, "n_patients": 3,
-                "30": {"rmse_point": 16.91047826268084, "mard": 9.5257750, "clarke_AB": 99.06},
-                "60": {"rmse_point": 25.331758314254355, "mard": 14.708157, "clarke_AB": 97.65},
-                "120": {"rmse_point": 34.05994570523643, "mard": 19.412965, "clarke_AB": 99.06},
-            },
-        },
-    }
 
 
 def test_model_card_reads_last_val_history_entry():
@@ -66,48 +48,10 @@ def test_model_card_reads_last_val_history_entry():
     # Absent keys degrade to None rather than aborting the export.
     assert rm["clarke_a_pct"] == [98.5, None, None]
     assert rm["coverage90"] == [None, None, None]
-    assert "finetune" not in card
 
 
-def test_model_card_falls_back_to_finetune_heldout_eval():
-    card = build_model_card(_TinyModel(), _finetune_ckpt())
-    rm = card["reference_metrics"]
-    print(f"[DUMP] finetune card: source={rm['source']} rmse={rm['rmse_mgdl']}")
-
-    assert rm["source"] == "real-heldout"
-    assert rm["rmse_mgdl"] == [16.9105, 25.3318, 34.0599]
-    assert rm["mard_pct"] == [9.5258, 14.7082, 19.413]
-    # The real-cohort eval reports Clarke A+B pooled, never zone A alone: filling
-    # these would misstate what was measured.
-    assert rm["clarke_a_pct"] == [None, None, None]
-    assert rm["clarke_ab_pct"] is None
-    assert rm["coverage90"] == [None, None, None]
-    # The pooled A+B is preserved out of the flat slots the app reads.
-    assert rm["per_horizon_detail"]["30"]["clarke_AB"] == 99.06
-    assert rm["n_test_windows"] == 213
-    assert card["finetune"]["datasets"] == ["ohiot1dm", "azt1d", "shanghai"]
 
 
-def test_model_card_schema_is_identical_across_checkpoint_shapes():
-    """The app reads fixed slots off `reference_metrics`; both checkpoint shapes must
-    fill the same ones with the same arity, only `source` telling them apart."""
-    sim = build_model_card(_TinyModel(), _pretrained_ckpt())["reference_metrics"]
-    real = build_model_card(_TinyModel(), _finetune_ckpt())["reference_metrics"]
-
-    per_horizon = ["rmse_mgdl", "mard_pct", "clarke_a_pct", "coverage90"]
-    scalars = ["clarke_ab_pct", "tod_mae_h", "tod_mae_hiconf_h"]
-    assert set(per_horizon + scalars + ["source", "note", "horizons_min"]) <= set(sim)
-    assert set(per_horizon + scalars + ["source", "note", "horizons_min"]) <= set(real)
-    assert sim["horizons_min"] == real["horizons_min"] == [30, 60, 120]
-    assert sim["source"] != real["source"]
-
-    for k in per_horizon:
-        for card in (sim, real):
-            assert isinstance(card[k], list) and len(card[k]) == 3, f"{k} must be per-horizon"
-            assert all(v is None or isinstance(v, float) for v in card[k])
-    for k in scalars:
-        for card in (sim, real):
-            assert card[k] is None or isinstance(card[k], float), f"{k} must be a scalar"
 
 
 def test_deploy_to_server_pairs_artifact_with_stem_json_sidecar(tmp_path):

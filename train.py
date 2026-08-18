@@ -1544,7 +1544,7 @@ def _render_validation_table(
     #
     # ALREADY PERCENTAGES. ``tod_acc_*`` and ``tod_gross_rate`` are the four tod
     # figures ``_run_validation`` scales by 100 itself, and the CSV column, the
-    # model card and ``models/compare.py`` all read them as percent — so no
+    # model card and ``compare.py`` all read them as percent — so no
     # ``_pct`` here and no ``prev_scale``. Applying either scales them twice: a
     # 16.3% clock rendered 1630.00% and, being above the 60% bar, tiered GREEN.
     higher_row('tod acc ±1h', val_metrics.get('tod_acc_1h'),

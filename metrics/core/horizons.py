@@ -1,10 +1,10 @@
 """
-Single source of truth for the real-data horizon → step-index map.
+Single source of truth for the horizon → step-index map.
 
 The forecast is laid out on the canonical 5-minute CGM grid; a horizon of
 ``h_min`` minutes lands on the 0-based patch-end step ``h_min // 5 - 1`` (e.g.
 the 30-min value is step 5, 60-min is step 11, 120-min is step 23). This was
-duplicated as a literal ``{30: 5, 60: 11, 120: 23}`` across the real-data
+duplicated as a literal ``{30: 5, 60: 11, 120: 23}`` across the evaluation
 modules and hardcoded to the 2 h / 5-min geometry; centralizing it here makes
 the index derive from ``config`` at runtime so a non-default
 ``PREDICTION_HORIZON_HOURS`` no longer reads past the array (short horizon) or
@@ -24,7 +24,7 @@ GRID_MIN = 5
 # Total predicted steps available in a single forward pass.
 PRED_STEPS = config.PREDICTION_PATCHES * config.PATCH_SIZE
 
-# The horizons (minutes) actually reported by the real-data suite. Unchanged.
+# The horizons (minutes) the metric suite reports.
 HORIZONS = (30, 60, 120)
 
 

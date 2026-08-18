@@ -138,7 +138,7 @@ assert N_INPUT_FEATURES == len(CHANNEL_NAMES) + 1, (
 # ride through it; under ``blind`` it withholds those three as well.  The string
 # is the checkpoint's provenance — no parameter shape depends on it, so a strict
 # state-dict load accepts weights trained under either — and
-# ``finetune/finetune.py`` compares it against the policy it implements.  An
+# ``calibrate_conformal.py`` compares it against the policy it implements.  An
 # ABSENT key means ``announced``: the key was introduced with the blind trainer,
 # so every checkpoint written before it was conditioned.
 MASKED_CHANNEL_POLICY_ANNOUNCED = 'announced'
@@ -163,7 +163,7 @@ def stored_masked_channel_policy(training_config: dict[str, Any] | None) -> str:
     The ONE reader of the absent-key convention.  An absent key reads as
     ``announced`` unconditionally — not as "unknown": the key was introduced WITH
     the blind trainer and a blind run always stamps it, so no checkpoint that
-    lacks it can be a blind one.  Every consumer — ``finetune/finetune.py``'s
+    lacks it can be a blind one.  Every consumer — ``calibrate_conformal.py``'s
     policy guard, ``gui.py``'s load, ``make_card.py``, ``model_health.py`` — goes
     through here, so a second convention cannot appear.
 

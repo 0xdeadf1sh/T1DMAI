@@ -31,7 +31,7 @@ from metrics.scoring import (CRPS_PWL, CRPS_TRAPEZOID, POOLED_NOT_COMPARABLE,
                              coverage_sharpness_by_d, crps_by_d, crps_steps,
                              forecast_lead_minutes, joint_coverage_by_d,
                              predictive_cdf, score_fan, winkler_by_d, winkler_steps)
-from realdata.horizons import GRID_MIN, HORIZON_IDX
+from metrics.core.horizons import GRID_MIN, HORIZON_IDX
 from utils import kovatchev_f_np
 
 LV = np.asarray(QUANTILE_LEVELS, dtype=np.float64)

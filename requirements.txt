@@ -12,8 +12,3 @@ pygame>=2.5
 # --- Tests ---
 pytest>=7
 
-# --- Real-data cohorts (realdata/) — optional; only for OhioT1DM / Shanghai / AZT1D / UVA-Padova eval ---
-pandas>=2.0          # realdata/uvapadova.py
-openpyxl>=3.1        # realdata/shanghai.py (.xlsx)
-xlrd>=2.0            # realdata/shanghai.py (legacy .xls)
-simglucose>=0.2.2    # realdata/uvapadova.py (UVA/Padova sim harness; heavy, optional)

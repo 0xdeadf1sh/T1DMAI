@@ -1,12 +1,12 @@
 """
-Actual-vs-predicted BG comparison figures for the real-data report.
+Actual-vs-predicted BG comparison figures for the evaluation report.
 
 Pure plotting (matplotlib); each function takes numpy arrays and writes a PNG.
-The driver (``realdata.report.build_figures``) supplies the model's risk-space
-median BG forecast and the true CGM per test window.
+The driver (``metrics/sim/make_comparison_figures.py``) supplies the model's
+risk-space median BG forecast and the true CGM per test window.
 
-Figures, per dataset:
-  * trajectory_grid  — example windows: real CGM (context+future) vs prediction
+Figures, per source:
+  * trajectory_grid  — example windows: CGM (context+future) vs prediction
   * parity_scatter   — predicted vs true at 30/60/120 min, with the identity line
   * clarke_grid      — Clarke Error Grid (zones drawn) at 30/60/120 min
 

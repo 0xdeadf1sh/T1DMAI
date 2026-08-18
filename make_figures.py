@@ -30,7 +30,7 @@ OUT_DIR = REPO / "figures"
 # make_card.py, which imports it — so the panels are suppressed rather than
 # deleted. Flip it to True once a retrain has regenerated the columns under the
 # fixed argument order and every suppressed panel returns unchanged. It governs
-# ONLY the validation-log columns; metrics/ and realdata/ recompute CG-EGA from
+# ONLY the validation-log columns; metrics/ and metrics/core/ recompute CG-EGA from
 # stored forecasts and are unaffected.
 CGEGA_COLUMNS_TRUSTWORTHY = False
 

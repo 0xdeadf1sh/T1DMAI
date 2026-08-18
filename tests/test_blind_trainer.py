@@ -18,9 +18,9 @@ divergences can fail silently and are pinned here:
   conditioned run may be live in the same checkout, and its logs are overwritten
   on the first step of whatever starts next.
 
-Plus the provenance guard in ``finetune/finetune.py``, which is the only thing
-standing between a blind checkpoint and a conditioned fine-tune: no parameter
-shape records the policy, so the weights load either way.
+Plus the provenance guard in ``calibrate_conformal.py``, which is the only thing
+standing between a blind checkpoint and a conditioned band fit: no parameter shape
+records the policy, so the weights load either way.
 """
 
 import ast
@@ -373,7 +373,7 @@ def test_the_conformal_fit_blinds_the_interior_span(stats):
 def test_the_conformal_fit_refuses_a_policy_it_was_not_asked_for():
     """The flag and the checkpoint's stamp must agree, both ways.
 
-    This delta is the one that ships: ``realdata/report.py`` lifts it onto the
+    This delta is the one that ships: ``metrics/core/report.py`` lifts it onto the
     model and every ``inference.predict`` handed it applies it. Fitted under the
     wrong policy it is not a wrong figure on a page but a wrong interval on the
     phone, and nothing downstream can tell.
@@ -396,22 +396,10 @@ def test_the_conformal_fit_refuses_a_policy_it_was_not_asked_for():
 # The provenance guard
 # ---------------------------------------------------------------------------
 
-def _finetune_module():
-    """``finetune/finetune.py``, imported the way the repo imports it.
-
-    ``finetune/`` carries no ``__init__.py``, so ``from finetune import finetune``
-    would bind the name ``finetune`` to the implicit NAMESPACE PACKAGE — and
-    ``finetune_personal.py`` does a plain ``import finetune`` expecting the
-    module. Whichever ran first would decide what the other got, and
-    ``tests/test_personal_adapter.py`` would fail on an attribute the package has
-    no reason to carry. Same path insert as ``_personal_module`` there.
-    """
-    import os
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), 'finetune'))
-    import finetune
-    return finetune
+def _guard_module():
+    """``calibrate_conformal.py`` — where the policy guard now lives."""
+    import calibrate_conformal
+    return calibrate_conformal
 
 
 def _ckpt(policy) -> dict:
@@ -422,32 +410,29 @@ def _ckpt(policy) -> dict:
     return {'training_config': tc}
 
 
-def test_a_blind_checkpoint_is_refused_by_a_conditioned_finetune():
+def test_a_blind_checkpoint_is_refused_by_a_conditioned_fit():
     """The direction that actually ships: ``train_blind.py`` writes 'blind', and
-    ``finetune.py`` announces doses on the span it predicts."""
-    F = _finetune_module()
+    a fit without ``--blind`` announces doses on the span it predicts."""
+    F = _guard_module()
     with pytest.raises(SystemExit) as exc:
-        F._policy_guard(_ckpt(masked_channel_policy(blind=True)))
+        F._check_policy(_ckpt(masked_channel_policy(blind=True)), blind=False)
     msg = str(exc.value)
     print(f"\n[DUMP] refusal:\n{msg}")
     assert 'blind' in msg and 'announced' in msg, (
         "the refusal names neither policy — the operator cannot act on it")
 
 
-def test_a_conditioned_checkpoint_is_refused_by_a_blind_finetune(monkeypatch):
+def test_a_conditioned_checkpoint_is_refused_by_a_blind_fit():
     """The guard is an equality, not a one-sided blacklist.
 
-    Nothing fine-tunes blind today, so this direction is exercised by moving the
-    live policy rather than by a second script. A guard written as "refuse
-    'blind'" would pass every test above and let the opposite mismatch through
-    the day a blind fine-tune exists.
+    A guard written as "refuse 'blind'" would pass every test above and let the
+    opposite mismatch through — a band fitted blind shipping on a conditioned
+    checkpoint.
     """
-    F = _finetune_module()
-    monkeypatch.setattr(F, 'LIVE_MASKED_CHANNEL_POLICY',
-                        masked_channel_policy(blind=True))
+    F = _guard_module()
     for stored in (masked_channel_policy(blind=False), None):
         with pytest.raises(SystemExit):
-            F._policy_guard(_ckpt(stored))
+            F._check_policy(_ckpt(stored), blind=True)
 
 
 def test_an_unstamped_checkpoint_reads_as_announced():
@@ -458,11 +443,6 @@ def test_an_unstamped_checkpoint_reads_as_announced():
     is what every checkpoint on disk today is. Reading absence as "unknown" would
     skip the check on exactly the population it has to accept.
     """
-    F = _finetune_module()
-    F._policy_guard(_ckpt(None))                      # must not raise
-    F._policy_guard({})                               # no training_config at all
-    assert (F._stored_masked_channel_policy({})
-            == masked_channel_policy(blind=False))
-    assert F.LIVE_MASKED_CHANNEL_POLICY == masked_channel_policy(blind=False), (
-        "finetune.py announces doses on the span it predicts, so its live policy "
-        "is the announced one")
+    F = _guard_module()
+    assert F._check_policy(_ckpt(None), blind=False) == masked_channel_policy(blind=False)
+    assert F._check_policy({}, blind=False) == masked_channel_policy(blind=False)

@@ -63,8 +63,8 @@ import numpy as np
 
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 from config import BG_HYPO_THRESHOLD, HYPO_ALARM_QUANTILE_TAU, PATCH_SIZE, QUANTILE_LEVELS
-from realdata.metrics import _FAN_ORDER_TOL_MGDL as FAN_ORDER_TOL_MGDL
-from realdata.schema import GRID_MIN
+from metrics.core.suite import _FAN_ORDER_TOL_MGDL as FAN_ORDER_TOL_MGDL
+from metrics.core.schema import GRID_MIN
 
 __all__ = [
     'POOLED_NOT_COMPARABLE', 'CRPS_PWL', 'CRPS_TRAPEZOID',
@@ -680,7 +680,7 @@ def forecast_lead_minutes(d: np.ndarray, n_steps: int = PATCH_SIZE) -> np.ndarra
     In that protocol the masked span is the trailing ``PREDICTION_PATCHES``
     patches, so a patch at distance ``d`` is the ``d``-th patch after the origin
     and step ``s`` of it lands at ``((d − 1)·n_steps + s + 1)·GRID_MIN`` minutes
-    — the same 0-based patch-end convention as ``realdata.horizons``.  The
+    — the same 0-based patch-end convention as ``metrics.core.horizons``.  The
     identity ``d = 1..4 ⇔ @30/@60/@90/@120`` min holds only here: for an infill
     span ``d`` is a distance to evidence on either side and says nothing about
     the time to the origin, so that protocol must pass its own ``lead_min``.
@@ -777,7 +777,7 @@ def alarm_operating_curve(q: np.ndarray, true: np.ndarray, d: np.ndarray,
       * SCORE — ``max`` over the scanned steps of ``P(BG <= threshold)`` from
         ``predictive_cdf``.  Sweeping a cut on this score generates the curve.
       * EVENT — the group carries a true hypo if any scanned step has
-        ``true < threshold`` (the strict convention ``realdata.metrics`` and the
+        ``true < threshold`` (the strict convention ``metrics.core.suite`` and the
         validation table already use).  ONSET is the earliest such step.
       * DETECTION RATE — detected events / events.  Groups with no event never
         enter this denominator.

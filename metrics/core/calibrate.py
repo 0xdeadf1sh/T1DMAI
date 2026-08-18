@@ -1,5 +1,5 @@
 """
-Window collection + excursion-decision calibration on the real-data bridge.
+Window collection + excursion-decision calibration on the model-input bridge.
 
 The risk-space redesign makes the HEADLINE BG forecast the model's quantile
 median, ``median_bg = f_inv(median)`` from ``inference.predict`` — there is no
@@ -50,7 +50,7 @@ PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 _OFFSET_GRID = tuple(float(x) for x in np.arange(0.0, 60.0 + 1e-9, 2.5))
 
 # Band the decision sweep reads when a quantile fan is supplied — the same knob the
-# level metrics score against (``realdata.metrics``), distinct from the clinical
+# level metrics score against (``metrics.core.suite``), distinct from the clinical
 # alarm taus.
 _BAND_LO_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)
 _BAND_HI_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)
@@ -218,7 +218,8 @@ def collect_windows(model, stats, segments: list[Segment], device,
         conditional: deprecated no-op (the forecast is always conditioned).
         announce: output-channel indices announced — carbs (0), insulin (1) and
             exercise (2); BG is never conditionable. Exercise is identically zero
-            on every real cohort, so announcing it declares "no session".
+            wherever a source has no activity record, so announcing it declares
+            "no session".
     """
     by_patient: dict[str, list[Window]] = {}
     for seg in segments:

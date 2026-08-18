@@ -345,7 +345,7 @@ def test_percent_metrics_are_not_scaled_twice_on_the_page(val_metrics):
     """A rate reaches the page once, at the scale its producer emits it.
 
     ``_run_validation`` stores ``tod_acc_*`` and ``tod_gross_rate`` as
-    percentages — the CSV column, ``make_card.py`` and ``models/compare.py`` all
+    percentages — the CSV column, ``make_card.py`` and ``compare.py`` all
     read them that way — while every other rate key is a fraction the table
     scales itself. Getting that wrong is silent: the row still renders, still
     tiers, and a 16.3% clock printed 1630.00% sat ABOVE its 60% bar and coloured

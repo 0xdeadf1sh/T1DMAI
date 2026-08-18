@@ -1,5 +1,5 @@
 """
-Comparison metric suite for the real-data harness.
+Comparison metric suite for the evaluation harness.
 
 Replicates train.py's exact definitions (Clarke Error Grid zones, MARD, band-edge
 hypo/hyper recall/precision — hypo off the τ-lower band edge, hyper off the τ-upper,
@@ -245,7 +245,7 @@ def conformal_intervals(cal_pred: np.ndarray, cal_true: np.ndarray,
         scores = np.abs(cal_pred[:, k] - cal_true[:, k])
         nq = len(scores)
         if nq == 0 or len(test_pred) == 0:
-            # A window-starved cohort (e.g. a single short Shanghai segment) yields an
+            # A window-starved source (a single short segment) yields an
             # empty calibration or test split: np.quantile on an empty array (and the
             # nq+1 / nq term) would crash. Degrade gracefully to NaN rather than abort
             # the whole eval.

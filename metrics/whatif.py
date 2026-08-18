@@ -20,15 +20,15 @@ not an accuracy score. The in-domain twin is train.py's ``cf_*`` validation
 probe, which runs the same idea on simulator windows.
 
 A dose is injected as a point event at the forecast origin and convolved with the
-appearance / action kernels the real-data bridge already owns
-(``realdata.features.CARB_KERNEL`` / ``BOLUS_KERNEL`` / ``EXERCISE_KERNEL``), so
+appearance / action kernels the input bridge already owns
+(``metrics.core.features.CARB_KERNEL`` / ``BOLUS_KERNEL`` / ``EXERCISE_KERNEL``), so
 the perturbation enters as a curve rather than an amount dropped into one bucket.
 All three kernels run 240 min, past the 2 h forecast window, so only the leading
 fraction of a dose can act inside the horizon; ``_meta.kernel_mass_in_horizon``
 reports that fraction, without which every magnitude below reads low for a reason
 that has nothing to do with the model.
 
-Five blocks per cohort, from 15 forwards per window (11 where the exercise arm is
+Five blocks per source, from 15 forwards per window (11 where the exercise arm is
 refused, 14 where the empty-future arm is):
 
   ``carb`` / ``insulin`` / ``exercise`` — a dose ladder at (0, ¼, ½, 1, 2)× the
@@ -71,15 +71,7 @@ refused, 14 where the empty-future arm is):
     ``max_abs_dbg`` is a plumbing fault in the override path, not a model result.
     All three dosed channels are reconstructed, so the rail covers all three.
 
-TWO ARMS REFUSE TO RUN, on a property of the source rather than a note in prose:
-
-  the EXERCISE ladder needs a source that announces exercise at all. All five real
-    adapters write an identically-zero exercise column, so on a real cohort the
-    ladder would measure the response to a session no record can carry, against a
-    baseline that is uniformly "no session". ``run`` reads the column, and where it
-    is identically zero the block is ``{'n': 0, 'not_probed': …}`` — there is no
-    exercise sign fraction for a gate to read, rather than a plausible one.
-    ``--dataset sim`` is the source that does announce it.
+ONE ARM REFUSES TO RUN, on a property of the source rather than a note in prose:
 
   the EMPTY-FUTURE arm needs raw carb/bolus EVENTS to strip. A simulator run keeps
     none — its Segments carry pre-resolved channels, every meal and bolus already
@@ -88,24 +80,15 @@ TWO ARMS REFUSE TO RUN, on a property of the source rather than a note in prose:
     event mass the block is ``{'n': 0, 'not_probed': …}`` and ``n_quiet`` is null,
     since a window cannot be shown quiet from a record with no events in it.
 
-Runs on the live best checkpoint (checkpoints/t1dmai_best.pt) over the three
-published cohorts, writing metrics/whatif.json. GPU if available.
+Runs on the live best checkpoint (checkpoints/t1dmai_best.pt) over fresh T1DMSIM
+patients drawn through ``metrics/sim/sim_data.make_sim_segments``, writing
+metrics/whatif.json. GPU if available. The seeds come from the test pool, disjoint
+from the calibration one, so every segment is unseen and all of them are probed.
 
-``--dataset sim`` draws fresh simulator patients instead, through
-``metrics/sim/sim_data.make_sim_segments``. It is the only source with a non-zero
-exercise column and therefore the only one the exercise ladder runs on; its seeds
-come from the test pool, disjoint from the calibration one, and every segment is
-probed (a fresh patient has no in-sample half, and the response is measured
-against the model's own baseline in any case).
-
-``--checkpoint`` / ``--dataset`` / ``--db`` / ``--out`` / ``--no-figures`` override
-each of those, and every default reproduces the no-argument behaviour. They exist
-for the comparison this probe cannot otherwise make: a fine-tune against the base
-checkpoint it came from, on the same windows. Nothing here feeds a loss or a
-checkpoint selection, so dose response is exactly the property a fine-tune can
-quietly destroy while its RMSE improves — the personal fine-tunes are the reason
-the flags were added. ``--dataset personal`` needs ``--db``, and takes the same
-``--exclude-range`` the fine-tune used, or it probes hours the fine-tune refused.
+``--checkpoint`` / ``--out`` / ``--no-figures`` override the defaults, and each
+default reproduces the no-argument behaviour. Nothing here feeds a loss or a
+checkpoint selection, so dose response is exactly the property a training change
+can quietly destroy while its RMSE improves.
 
 The rapid-insulin curves ``--insulin-curve-json`` reads are produced by
 ``metrics/curvegen``, which links ``t1dm-core`` rather than restating its exponential
@@ -124,7 +107,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
-sys.path.insert(0, HERE)                              # curves (local load_model/split_segments)
+sys.path.insert(0, HERE)                              # day_curves (load_model)
 sys.path.insert(0, os.path.join(HERE, 'sim'))         # sim_data (the Segment-shaped simulator source)
 torch.set_num_threads(8)
 
@@ -132,13 +115,12 @@ from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
                     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, CHANNEL_TO_FEAT,
                     CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U, CF_EXERCISE_G)
 from T1DMSIM.simulator import gamma_curve
-from realdata import load_dataset
-from realdata.features import (build_feature_stack, context_window, segment_to_channels,
+from metrics.core.features import (build_feature_stack, context_window, segment_to_channels,
                                CARB_KERNEL, BOLUS_KERNEL, EXERCISE_KERNEL, _convolve)
-from realdata.calibrate import _future_overrides
-from realdata.horizons import HORIZONS, HORIZON_IDX, GRID_MIN
-from realdata import run_eval
-from curves import load_model, split_segments
+from metrics.core.calibrate import _future_overrides
+from metrics.core.horizons import HORIZONS, HORIZON_IDX, GRID_MIN
+from metrics.core import run_eval
+from day_curves import load_model
 from inference import predict
 import sim_data                                       # metrics/sim — the Segment-shaped simulator source
 import figstyle as F
@@ -152,12 +134,12 @@ F.style()
 # span in steps, and it is the extent a dose ladder is announced over. Slot j of
 # the span is d = j + 1 patches from the nearest visible evidence, one-sided, so
 # the per-horizon rows below (30 / 60 / 120 min) ARE d = 1 / 2 / 4; the single
-# derivation is ``realdata.run_eval.horizon_d_patches``. The dose ARM is never a
+# derivation is ``metrics.core.run_eval.horizon_d_patches``. The dose ARM is never a
 # bin — arms are compared at equal d, never pooled across it.
 PRED = PREDICTION_PATCHES * PATCH_SIZE
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
-DATASETS = ('ohiot1dm', 'azt1d', 'shanghai')
-SIM_DATASET = 'sim'                        # the only source with a non-zero exercise column
+SIM_DATASET = 'sim'                        # fresh T1DMSIM patients: the source
+DATASETS = (SIM_DATASET,)
 STRIDE = 8 * PATCH_SIZE
 CAP = 40                                   # windows/segment
 ANNOUNCE = (0, 1, 2)                       # carb, insulin, exercise
@@ -272,8 +254,8 @@ def exercise_is_announced(segs: list) -> bool:
     """True where at least one segment carries a non-zero exercise column.
 
     The exercise ladder's admission test. Read from the data rather than from the
-    cohort's name, so a future adapter that starts filling the column is probed
-    without an edit here, and a cohort that stops is refused without one either.
+    source's name, so a source that stops filling the column is refused without an
+    edit here, and one that starts is probed without one either.
     """
     return any(bool(np.any(np.asarray(s.exercise, dtype=np.float64) > 0.0)) for s in segs)
 
@@ -294,12 +276,12 @@ def run(model, stats: dict, device, segs: list,
         stride: int = STRIDE, cap: int = CAP,
         carb_kernel: np.ndarray | None = None,
         bolus_kernel: np.ndarray | None = None) -> dict:
-    """Probe every strided window of ``segs``; returns the cohort's summary dict.
+    """Probe every strided window of ``segs``; returns the source's summary dict.
 
-    ``stride`` (steps) and ``cap`` (windows per segment) default to the published-cohort
-    settings. A personal record is a fraction of a cohort's size, and every figure below
-    is a FRACTION over windows — a sign rate off nine windows moves in steps of 0.11 and
-    says nothing — so a small record wants both loosened.
+    ``stride`` (steps) and ``cap`` (windows per segment) default to the settings the
+    simulator pool is sized for. Every figure below is a FRACTION over windows — a
+    sign rate off nine windows moves in steps of 0.11 and says nothing — so a
+    smaller draw wants both loosened.
 
     Two arms are admitted or refused from the segments themselves, once, before any
     forward: the exercise ladder needs a source that announces exercise
@@ -465,10 +447,10 @@ def _side(deltas: list[np.ndarray], doses: tuple[float, ...], nulls: list[np.nda
         'doses': [round(d, 3) for d in doses],
         'unit': unit,
         # The sign gate, stated beside what it reads. The THRESHOLD is deliberately
-        # null: §2.11 gates a fine-tune against the correct-sign fraction of the
-        # pretrained model it came from, and no reference pretrain exists yet, so a
-        # number here would be a guess with a checkpoint's shipping decision behind
-        # it. A caller compares two runs of this probe; it does not read a constant.
+        # null: the gate is one training run's correct-sign fraction against
+        # another's, and no reference run is fixed, so a number here would be a
+        # guess with a checkpoint's shipping decision behind it. A caller compares
+        # two runs of this probe; it does not read a constant.
         'sign_gate': {'rule': rule, 'sign': sign, 'metric': 'correct_sign_frac',
                       'threshold': None,
                       'threshold_unset_because':
@@ -735,93 +717,27 @@ def _fig_cohort(ds: str, r: dict, step) -> str:
     return F.save(fig, f'whatif_{ds}.png')
 
 
-def _fig_summary(res: dict, step) -> str | None:
-    """Cross-cohort comparison of the two arms every published cohort runs.
-
-    The exercise arm is absent by construction: it runs on simulator windows only,
-    which is one source and therefore nothing to compare across. ``None`` where no
-    published cohort was probed — an empty grid of axes would read as a measured
-    result of zero.
-    """
-    dss = [d for d in DATASETS if d in res]
-    if not dss:
-        return None
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.2))
-
-    for ax, side, unit in ((axes[0, 0], 'carb', 'g'), (axes[0, 1], 'insulin', 'U')):
-        x = np.arange(len(dss))
-        med = np.array([res[d][side]['slope']['median'] for d in dss])
-        p25 = np.array([res[d][side]['slope']['p25'] for d in dss])
-        p75 = np.array([res[d][side]['slope']['p75'] for d in dss])
-        bars = ax.bar(x, med, width=0.34, color=[F.cohort_color(d) for d in dss],
-                      edgecolor=F.SURFACE, linewidth=1.2)
-        ax.errorbar(x, med, yerr=[np.abs(med - p25), np.abs(p75 - med)], fmt='none',
-                    ecolor=F.INK2, elinewidth=1.2, capsize=4)
-        F.bar_labels(ax, bars, '{:+.2f}', dy=6.0,
-                     tops=np.where(med >= 0, p75, p25))
-        F.zeroline(ax); F.ygrid(ax)
-        ax.set_title(f'{side} sensitivity at {HORIZONS[-1]} min (median, IQR)')
-        ax.set_ylabel(f'mg/dL per {unit}')
-        ax.set_xticks(x); ax.set_xticklabels([F.label(d) for d in dss])
-        ax.margins(y=0.16)
-
-    w = 0.2
-    for ax, vals_of, title, ticks in (
-            (axes[1, 0],
-             lambda d: [res[d][s]['correct_sign_frac'][str(HORIZONS[-1])][REF_IDX]
-                        for s in ('carb', 'insulin')],
-             f'correct-sign fraction at {HORIZONS[-1]} min', ['carbohydrate', 'insulin']),
-            (axes[1, 1],
-             lambda d: [res[d]['empty_future'][t]['monotone_frac'] for t in ('all', 'quiet')],
-             'windows with no reversal when nothing is announced',
-             ['all windows', 'quiet windows'])):
-        for k, d in enumerate(dss):
-            bars = ax.bar(np.arange(2) + (k - 1) * w, vals_of(d), width=w - 0.04,
-                          color=F.cohort_color(d), edgecolor=F.SURFACE, linewidth=1.2)
-            F.bar_labels(ax, bars, '{:.2f}')
-        F.ygrid(ax)
-        ax.set_title(title)
-        ax.set_ylabel('fraction of windows'); ax.set_ylim(0, 1.12)
-        ax.set_xticks(range(2)); ax.set_xticklabels(ticks)
-    F.threshold(axes[1, 0], 0.5, 'coin flip', side='left')
-
-    fig.suptitle(f'What-if dose response — cohort summary (step {step})',
-                 x=0.007, ha='left', fontsize=12, color=F.INK)
-    F.cohort_legend(fig, dss)
-    fig.tight_layout(rect=(0, 0, 1, 0.955))
-    return F.save(fig, 'whatif_summary.png')
 
 
 def _parse_args() -> "argparse.Namespace":
     """CLI. Every default reproduces the original no-argument behaviour exactly.
 
     The flags exist so one probe can be pointed at a checkpoint other than the live
-    best and at a personal record — comparing a fine-tune against the base it came
+    best against a second checkpoint — comparing one training run against another
     from needs both, on the same windows. Nothing about the probe itself changes.
     """
     p = argparse.ArgumentParser(description="What-if dose-response probe.")
     p.add_argument('--checkpoint', default=None,
                    help="checkpoint to probe (default: the live checkpoints/t1dmai_best.pt)")
-    p.add_argument('--dataset', action='append', default=None, metavar='NAME',
-                   help=f"cohort to probe, repeatable (default: {' '.join(DATASETS)}). "
-                        f"'{SIM_DATASET}' draws fresh simulator patients instead — the "
-                        f"only source with a non-zero exercise column, and therefore "
-                        f"the only one the exercise ladder runs on")
     p.add_argument('--sim-seeds', type=int, default=len(sim_data.TEST_SEEDS),
                    metavar='N',
-                   help=f"--dataset {SIM_DATASET}: how many patients to draw, from the head "
+                   help="how many patients to draw, from the head "
                         f"of the test seed pool (default {len(sim_data.TEST_SEEDS)}; the "
                         f"calibration pool is disjoint and never drawn here)")
     p.add_argument('--sim-hours', type=float, default=sim_data.DEFAULT_HOURS,
                    metavar='H',
-                   help=f"--dataset {SIM_DATASET}: post-warmup trajectory hours per patient "
+                   help="post-warmup trajectory hours per patient "
                         f"(default {sim_data.DEFAULT_HOURS:g})")
-    p.add_argument('--db', default=None,
-                   help="record path for --dataset personal, whose location is a file")
-    p.add_argument('--exclude-range', nargs=2, action='append', default=None,
-                   metavar=('START', 'END'),
-                   help="personal only: drop CGM readings in this half-open LOCAL "
-                        "wall-clock range, matching the fine-tune's own filtering")
     p.add_argument('--carb-gamma', nargs=3, type=float, default=None,
                    metavar=('K', 'THETA', 'DURATION_MIN'),
                    help="replace the population carb kernel with a gamma appearance curve "
@@ -836,10 +752,6 @@ def _parse_args() -> "argparse.Namespace":
                         "exponential model is NOT reimplemented here")
     p.add_argument('--arm-label', default=None,
                    help="name recorded in _meta for this arm (e.g. 'Fiasp', 'GI-25')")
-    p.add_argument('--all-windows', action='store_true',
-                   help="probe every segment rather than only the held-out split; the "
-                        "response is measured against the model's OWN baseline, so there "
-                        "is no ground truth for an in-sample window to leak")
     p.add_argument('--stride-patches', type=int, default=STRIDE // PATCH_SIZE,
                    help=f"patches between window origins (default {STRIDE // PATCH_SIZE})")
     p.add_argument('--cap', type=int, default=CAP,
@@ -852,29 +764,20 @@ def _parse_args() -> "argparse.Namespace":
     return p.parse_args()
 
 
-def _load_cohort(ds: str, args: "argparse.Namespace") -> tuple[list, bool]:
-    """Load one cohort's Segments; returns ``(segments, is_pre_split)``.
+def _load_cohort(ds: str, args: "argparse.Namespace") -> list:
+    """Fresh simulator Segments, already held out.
 
-    ``is_pre_split`` marks a source that needs no held-out split of its own: the
-    simulator draws fresh patients from a seed pool disjoint from the calibration
-    one, so every segment it returns is already unseen and splitting it again would
-    halve the windows for nothing.
+    The seeds come from the test pool, which is disjoint from the calibration
+    one, so every segment is unseen and there is no in-sample half to split off.
     """
-    if ds == SIM_DATASET:
-        return sim_data.make_sim_segments(sim_data.TEST_SEEDS[:max(1, int(args.sim_seeds))],
-                                          float(args.sim_hours)), True
-    if ds != 'personal':
-        return load_dataset(ds), False
-    assert args.db, "--dataset personal requires --db <sqlite path>"
-    from realdata.personal import load as load_personal
-    exclude = [(datetime.fromisoformat(a), datetime.fromisoformat(b))
-               for a, b in (args.exclude_range or [])]
-    return load_personal(args.db, exclude=exclude), False
+    assert ds == SIM_DATASET, f"unknown source {ds!r}"
+    return sim_data.make_sim_segments(
+        sim_data.TEST_SEEDS[:max(1, int(args.sim_seeds))], float(args.sim_hours))
 
 
 def main() -> None:
     args = _parse_args()
-    datasets = tuple(args.dataset) if args.dataset else DATASETS
+    datasets = DATASETS
     out_path = args.out or os.path.join(HERE, 'whatif.json')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -892,8 +795,8 @@ def main() -> None:
                      'kernel_mass_in_horizon': KERNEL_MASS,
                      'horizon_min': list(HORIZONS), 'quiet_context_min': QUIET_CTX_MIN,
                      'checkpoint': args.checkpoint, 'datasets': list(datasets),
-                     'stride_patches': int(args.stride_patches), 'cap': int(args.cap),
-                     'all_windows': bool(args.all_windows)}}
+                     'stride_patches': int(args.stride_patches),
+                     'cap': int(args.cap)}}
     stride = max(1, int(args.stride_patches)) * PATCH_SIZE
     carb_kernel = bolus_kernel = None
     if args.carb_gamma:
@@ -927,8 +830,7 @@ def main() -> None:
         res['_meta']['sim_seeds'] = list(sim_data.TEST_SEEDS[:max(1, int(args.sim_seeds))])
         res['_meta']['sim_hours'] = float(args.sim_hours)
     for ds in datasets:
-        segs, pre_split = _load_cohort(ds, args)
-        probed = segs if (args.all_windows or pre_split) else split_segments(segs, ds)[1]
+        probed = _load_cohort(ds, args)
         r = run(model, stats, device, probed, stride=stride, cap=int(args.cap),
                 carb_kernel=carb_kernel, bolus_kernel=bolus_kernel)
         res[ds] = r
@@ -939,9 +841,6 @@ def main() -> None:
         print(f"\n[whatif] wrote {out_path} (figures skipped)")
         return
     paths = [_fig_cohort(ds, res[ds], step) for ds in datasets if ds in res]
-    summary = _fig_summary(res, step)      # None when no published cohort was probed
-    if summary is not None:
-        paths.append(summary)
     print(f"\n[whatif] wrote {out_path} and {len(paths)} figures under "
           f"{os.path.dirname(paths[-1])}/")
 

@@ -22,9 +22,9 @@ import pytest
 
 from config import (PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES, QUANTILE_LEVELS,
                     METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI)
-from realdata.calibrate import Window, forecast_bands, forecast_windows
-from realdata.metrics import band_project, conformal_intervals
-from realdata.run_eval import evaluate_from_windows
+from metrics.core.calibrate import Window, forecast_bands, forecast_windows
+from metrics.core.suite import band_project, conformal_intervals
+from metrics.core.run_eval import evaluate_from_windows
 
 PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 LEVELS = QUANTILE_LEVELS
@@ -179,7 +179,7 @@ def test_sim_collect_rows_band_capture(delta_none):
         sys.path.insert(0, sys_path)
     try:
         from sim_data import collect_sim_rows, make_sim_runs, FIG_ROLLS, FIG_STEPS
-        from realdata.report import load_model
+        from metrics.core.report import load_model
     except Exception as e:
         pytest.skip(f"sim/report imports unavailable: {e}")
     import glob

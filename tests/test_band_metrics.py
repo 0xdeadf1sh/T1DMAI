@@ -1,4 +1,4 @@
-"""Band-scored metric basis (``realdata.metrics``).
+"""Band-scored metric basis (``metrics.core.suite``).
 
 The headline real/sim level metrics score the BAND-PROJECTED forecast
 ``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])`` instead of the
@@ -23,8 +23,8 @@ import numpy as np
 from config import (METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI, QUANTILE_LEVELS,
                     N_QUANTILES, PREDICTION_PATCHES, PATCH_SIZE,
                     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD)
-from realdata.horizons import HORIZONS, HORIZON_IDX
-from realdata.metrics import band_project, compute_suite, conformal_intervals
+from metrics.core.horizons import HORIZONS, HORIZON_IDX
+from metrics.core.suite import band_project, compute_suite, conformal_intervals
 
 PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 LO = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)

@@ -1,5 +1,5 @@
 """
-Model-input bridge — converts a real-data Segment into the model's normalized
+Model-input bridge — converts a Segment into the model's normalized
 ``N_INPUT_FEATURES``-feature input stack
 ``[bg_absolute, carbs, insulin, exercise_equiv, bg_masked]``: four normalized
 signal channels plus the per-patch ``bg_masked`` announcement bit, which is 0.0
@@ -16,16 +16,16 @@ simulator's documented constants (reproducible, no dependence on a captured run)
     insulin  gamma k=3, θ=25    (the rapid bolus-action kernel)
     exercise gamma k=3, θ=15    (the carbohydrate-equivalent disposal curve)
 
-Real insulin is fed as one rapid-delivery series — bolus IU plus CSII basal
-converted from rate (IU/h → IU/step) — convolved with the rapid kernel.  (MDI
-long-acting, which the Shanghai adapter already folded into ``basal_rate`` as a
-24-h-spread rate, is approximated as rapid here; a secondary-cohort caveat.)
+Insulin is fed as one rapid-delivery series — bolus IU plus CSII basal converted
+from rate (IU/h → IU/step) — convolved with the rapid kernel.  A long-acting
+analogue reaching ``basal_rate`` as a 24-h-spread rate is approximated as rapid
+here.
 
 Exercise (feat 3) is the simulator's carbohydrate-*equivalent* glucose-disposal
-curve in g/step, on the same log1p+z transform as carb.  Every real adapter fills
-``Segment.exercise`` with zeros, so the column is structurally present and
-identically zero on all five cohorts; it is written explicitly rather than left at
-the allocation default, because for a ``SPARSE_LOG1P`` channel an unwritten column
+curve in g/step, on the same log1p+z transform as carb.  A source with no activity
+record fills ``Segment.exercise`` with zeros, so the column is structurally present
+and identically zero; it is written explicitly rather than left at the allocation
+default, because for a ``SPARSE_LOG1P`` channel an unwritten column
 sits at z = 0, which is a phantom dose and not "no session" (no session is
 ``normalize(log1p(0))``, z = -0.1387 under the balanced pool).  A source that ever
 does fill the column must convert its own quantity to g/step carbohydrate-equivalent
@@ -38,7 +38,7 @@ holds the resolved per-step curve, so nothing on the input path convolves it.
 
 The risk-space redesign dropped ``bg_delta``, the IS/HGO latent channels, and the
 four temporal sin/cos features from the input stack entirely (they were never
-observable in real data / the model no longer consumes them), so this bridge emits
+observable outside the simulator / the model no longer consumes them), so this bridge emits
 exactly the signal channels ``CHANNEL_NAMES`` retains.  bg (feat 0) is a
 Kovatchev risk-space channel (``kovatchev_f`` applied BEFORE the z-score); carb,
 insulin and exercise keep the log1p+z transform.
@@ -176,7 +176,8 @@ def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.
     latents, and the temporal sin/cos features from the stack, so there is nothing
     to mean-impute and no temporal tail.
 
-    Exercise (feat 3) is zero on every real cohort but is still written explicitly:
+    Exercise (feat 3) is zero on a source with no activity record but is still
+    written explicitly:
     an unwritten column would sit at z = 0, a phantom dose, where the true
     no-session value is ``normalize(log1p(0))``.
 

@@ -1,20 +1,15 @@
 """
-(1) Logging-density / excursion-orphan analysis per real dataset, and
-(2) 48 h curve figures with 2 h AND 8 h prediction windows tiled inside, so we
-    see the model's actual headline BG forecast (``median_bg``) shape/amplitude
-    — curve-tracking vs mean-prediction. The model is always conditioned: each
-    forecast announces the window's true future carbs/insulin/exercise.
+48 h day-figure machinery: the tiled 2 h / 8 h forecast curves and the plotting
+that renders them.
 
-Risk-space redesign note: the model no longer emits the 4 dynamics channels
-(carb/insulin/IS/HGO μ/σ), so the per-channel overlay panels (the old figure rows
-2-7, driven by ``report._build_day`` over ``mu_raw``) were DROPPED. The figure is
-now BG-only — the 2 h and 8 h forecast panels over the headline ``median_bg`` plus
-its empirical per-horizon error envelope. ``shared`` ``split_segments`` /
-``load_model`` are reimplemented locally because the foundation modules that
-formerly hosted them depend on deleted config symbols.
+This module is the shared half — the model loader, the sigma accumulation, the
+per-day forecast assembly and ``plot_day``. ``curves_sim.py`` is the driver that
+feeds it fresh T1DMSIM patients and writes the figures.
+
+Every forecast here runs the FORECAST protocol and takes its masked set from
+``metrics.protocols`` rather than deriving a trailing zone from position.
 
 Runs on the live best checkpoint (checkpoints/t1dmai_best.pt). GPU if available.
-Writes metrics/logging_stats.json and metrics/real/figures/<ds>_day<k>.png.
 """
 from __future__ import annotations
 import os, sys, json
@@ -40,10 +35,9 @@ from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
                     TIME_PROBE_N_BINS)
 from normalization import load_normalization_stats
 from model import T1DMAI
-from realdata import load_dataset
-from realdata.calibrate import _future_overrides, CTX_STEPS
-from realdata.features import build_feature_stack, context_window
-from realdata.schema import GRID_MIN, MIN_SEGMENT_STEPS
+from metrics.core.calibrate import _future_overrides, CTX_STEPS
+from metrics.core.features import build_feature_stack, context_window
+from metrics.core.schema import GRID_MIN, MIN_SEGMENT_STEPS
 from inference import predict, predict_rolling
 from utils import time_of_day_decode_bins
 from clock_face import draw_clock_axis
@@ -70,15 +64,9 @@ def smooth_bg_truth(bg_raw) -> np.ndarray:
 # page restates them.
 PRED = PR.SPAN_STEPS                              # steps in one masked forecast span
 DAY_PATCHES = 48 * _PATCHES_PER_HOUR              # 48 h day window (fixed figure span)
-DAY_WINDOW_STRIDE_PATCHES = DAY_PATCHES // 4      # 12 h candidate step → overlapping
-                                                 # 48 h windows, so data-limited
-                                                 # cohorts still supply DAYS_PER_DS picks
 H8_PATCHES = NIGHT_LONG_HORIZON_PATCHES           # NIGHT_LONG_HORIZON_HOURS long-horizon window
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 ANNOUNCE = (0, 1, 2)                              # carb, insulin, exercise
-DATASETS = ('ohiot1dm', 'azt1d', 'shanghai')
-DAYS_PER_DS = 10
-SPD = 24 * 60 // GRID_MIN                         # GRID_MIN-minute steps per day
 
 # Every announceable channel is announced, and that is checked here rather than
 # left to read correctly: an announced set short of ``CHANNEL_TO_FEAT`` leaves the
@@ -128,31 +116,6 @@ def _slice_seg(seg, a: int, b: int):
         insulin_curve=(None if seg.insulin_curve is None else seg.insulin_curve[a:b]))
 
 
-def split_segments(segs, dataset: str, cal_frac: float = 0.6):
-    """Canonical OhioT1DM train/test split; INTRA-segment temporal split otherwise.
-
-    Reimplemented locally (foundation host depends on deleted config symbols).
-
-    The length a sub-segment must clear is ``protocols.ELIGIBILITY_STEPS``, the
-    PINNED 24 h footprint — not the running ``MAX_CONTEXT_PATCHES``. Segments are
-    already cut at every CGM gap over 30 min, so the survivors are the longest
-    gap-free wears; letting the cut follow the context width would hand each arm
-    a different test set.
-    """
-    if dataset in ('ohiot1dm', 'ohio'):
-        return ([s for s in segs if s.split == 'training'],
-                [s for s in segs if s.split == 'testing'])
-    cal, test = [], []
-    need = PR.ELIGIBILITY_STEPS
-    for s in segs:
-        n = len(s)
-        cut = int(cal_frac * n)
-        if cut >= max(need, MIN_SEGMENT_STEPS):
-            cal.append(_slice_seg(s, 0, cut))
-        ts = cut + CTX_STEPS
-        if n - ts >= need:
-            test.append(_slice_seg(s, ts, n))
-    return cal, test
 
 
 def _pick_day_start(seg) -> int | None:
@@ -205,50 +168,6 @@ def _onsets(x: np.ndarray) -> int:
     return int(x[0]) + int(np.sum(x[1:] & ~x[:-1]))
 
 
-def logging_stats(name: str, segs: list) -> dict:
-    """Event density + how often excursion windows carry a logged carb/bolus.
-
-    Two orphan measures per excursion side: direction-matched (a high with no
-    carb / a low with no bolus — the input that could *cause* it) and any-event
-    (no carb AND no bolus anywhere in the window)."""
-    tot_steps = carb_on = bol_on = 0
-    nw = nw_evt = nhyper = nhyper_carb = nhyper_any = nhypo = nhypo_bolus = nhypo_any = 0
-    for s in segs:
-        tot_steps += len(s)
-        carb_on += _onsets(s.carb_grams)
-        bol_on += _onsets(s.bolus_units)
-        # Excursion ground truth is the raw (bg-clamped) CGM (one space; never the
-        # future) — the same BG truth the model is later scored against.
-        cgm_s = smooth_bg_truth(s.cgm)
-        n = (len(s) // PATCH_SIZE) * PATCH_SIZE
-        for ps in range(CTX, n - PRED + 1, 8 * PATCH_SIZE):
-            fut = cgm_s[ps:ps + PRED]
-            carb_in = float(np.sum(s.carb_grams[ps:ps + PRED])) > 0
-            bol_in = float(np.sum(s.bolus_units[ps:ps + PRED])) > 0
-            any_evt = carb_in or bol_in
-            nw += 1
-            nw_evt += int(any_evt)
-            if np.any(fut > BG_HYPER_THRESHOLD):
-                nhyper += 1; nhyper_carb += int(carb_in); nhyper_any += int(any_evt)
-            if np.any(fut < BG_HYPO_THRESHOLD):
-                nhypo += 1; nhypo_bolus += int(bol_in); nhypo_any += int(any_evt)
-    days = tot_steps / SPD
-    pct = lambda a, b: round(100 * a / max(b, 1), 1)
-    return {
-        'n_segs': len(segs), 'days': round(days, 1),
-        'carb_onsets_per_day': round(carb_on / days, 2),
-        'bolus_onsets_per_day': round(bol_on / days, 2),
-        'pct_windows_with_logged_event': pct(nw_evt, nw),
-        'n_hyper_windows': nhyper,
-        'pct_hyper_windows_with_logged_carb': pct(nhyper_carb, nhyper),
-        'pct_hyper_windows_orphan_nocarb': pct(nhyper - nhyper_carb, nhyper),
-        'pct_hyper_windows_orphan_noevent': pct(nhyper - nhyper_any, nhyper),
-        'n_hypo_windows': nhypo,
-        'pct_hypo_windows_with_logged_bolus': pct(nhypo_bolus, nhypo),
-        'pct_hypo_windows_orphan_nobolus': pct(nhypo - nhypo_bolus, nhypo),
-        'pct_hypo_windows_orphan_noevent': pct(nhypo - nhypo_any, nhypo),
-        'n_windows': nw,
-    }
 
 
 def _bg(out) -> np.ndarray:
@@ -327,23 +246,6 @@ def _sigma_accumulate(model, stats, feats, cgm, horizon_patches, stride_steps, a
         acc['count'] += 1
 
 
-def bg_sigma_real(model, stats, segs, horizon_patches,
-                  stride_steps=8 * PATCH_SIZE, max_windows=200,
-                  report=None) -> np.ndarray:
-    """Per-horizon-step ±1σ envelope (length horizon_patches·PATCH_SIZE) over a real cohort.
-    Forecasts are conditioned (true future announced) and use the genuinely-logged
-    basal (no sim-matching rescale)."""
-    H = horizon_patches * PATCH_SIZE
-    acc = {'se': np.zeros(H), 'n': np.zeros(H), 'count': 0}
-    for s in segs:
-        if acc['count'] >= max_windows:
-            break
-        feats = build_feature_stack(s, stats)
-        # Error envelope is scored against the raw (bg-clamped) CGM (one space).
-        _sigma_accumulate(model, stats, feats, smooth_bg_truth(s.cgm),
-                          horizon_patches, stride_steps, acc, max_windows,
-                          report=report)
-    return np.sqrt(acc['se'] / np.maximum(acc['n'], 1.0))
 
 
 def _tile_band(curve: np.ndarray, sig: np.ndarray, horizon_patches: int):
@@ -365,7 +267,8 @@ def day_curves(model, stats, seg, day_start: int, sig2=None, sig8=None) -> dict:
     conditioned).
     """
     assert day_start >= CTX, (
-        f"origin needs 24 h (MAX) real context behind it; day_start={day_start} < {CTX}")
+        f"origin needs MAX_CONTEXT_PATCHES of context behind it; "
+        f"day_start={day_start} < {CTX}")
     feats = build_feature_stack(seg, stats)
     T = DAY_PATCHES * PATCH_SIZE
     # The plotted "true CGM" the forecast is scored against is the raw (bg-clamped)
@@ -536,7 +439,7 @@ def plot_day(spec, pretty, path):
         ax.set_ylabel('BG (mg/dL)'); ax.set_ylim(40, 360)
         ax.legend(loc='upper right', fontsize=8, ncol=2)
         # per-window basal level (mean IU/h over each prediction window), as small
-        # grey numbers along the bottom of the panel (real data only).
+        # grey numbers along the bottom of the panel (logged-event sources only).
         if basal is not None:
             hsteps = hp * PATCH_SIZE
             for c in range(len(h) // hsteps):
@@ -544,7 +447,7 @@ def plot_day(spec, pretty, path):
                 if seg_b.size:
                     ax.text(h[c * hsteps + hsteps // 2], 43.5, f"{float(np.mean(seg_b)):.1f}",
                             ha='center', va='bottom', fontsize=5.5, color='#777777', zorder=3)
-        # logged-event overlay (real data); skipped when no discrete events are
+        # logged-event overlay; skipped when no discrete events are
         # supplied (e.g. simulator runs, where the full carb/insulin truth is in
         # the channel panels instead). Each event carries its dose UNDER the marker:
         # carb grams under the carb point, bolus IU under the bolus point.
@@ -595,8 +498,9 @@ def plot_day(spec, pretty, path):
             + (f" · {bt:.1f} U basal" if bt is not None else ""))
     if bt is None:                                        # simulator: combined insulin only
         dose = f"48 h totals: {spec['carb_total']:.0f} g carb · {spec['bolus_total']:.1f} U insulin"
+    ctx_h = MAX_CONTEXT_PATCHES * PATCH_SIZE * GRID_MIN / 60.0
     caption = ("Headline median_bg forecast (future carbs/insulin/exercise announced); each origin fed "
-               f"24 h real context (≥8 h floor); BG band = empirical per-horizon error envelope  ·  {dose}")
+               f"{ctx_h:g} h context; BG band = empirical per-horizon error envelope  ·  {dose}")
     fig.tight_layout(rect=[0, 0, 1, 0.955])
     fig.text(0.5, 0.992, f"{pretty} · {spec['patient']} · 48 h", ha='center', va='top',
              fontsize=14, fontweight='bold')
@@ -605,133 +509,11 @@ def plot_day(spec, pretty, path):
     plt.close(fig)
 
 
-PRETTY = {'ohiot1dm': 'OhioT1DM', 'azt1d': 'AZT1D', 'shanghai': 'ShanghaiT1DM'}
 
 
-def _pick_day_windows(cands: list, days_per_ds: int) -> list:
-    """Select up to ``days_per_ds`` 48 h windows from swing-ranked ``cands`` (each
-    ``(swing, segment, day_start, patient)``), maximizing diversity. Patients are
-    visited round-robin (breadth first — every patient before any patient's second
-    window); within a patient the next window chosen is the one farthest (in start
-    offset) from those already taken, with BG swing as the tiebreak. A data-limited
-    cohort — OhioT1DM's test split has only 3 patients with a ≥72 h segment — thus
-    yields ``days_per_ds`` maximally-spread windows rather than a clutch of
-    high-swing near-duplicates. ``cands`` is assumed pre-sorted by descending swing,
-    so each patient's first-seen window is its highest-swing one."""
-    by_pat: dict = {}
-    for swing, s, ds0, pat in cands:
-        by_pat.setdefault(pat, []).append((swing, s, ds0))
-    pats = sorted(by_pat, key=lambda p: -by_pat[p][0][0])   # best-swing patient first
-    picks: list = []
-    chosen: dict = {p: [] for p in pats}
-    while len(picks) < days_per_ds:
-        progressed = False
-        for pat in pats:
-            if len(picks) >= days_per_ds:
-                break
-            avail = [(sw, s, ds0) for sw, s, ds0 in by_pat[pat] if ds0 not in chosen[pat]]
-            if not avail:
-                continue
-            if not chosen[pat]:
-                sw, s, ds0 = max(avail, key=lambda t: t[0])
-            else:
-                sw, s, ds0 = max(avail, key=lambda t: (min(abs(t[2] - c) for c in chosen[pat]), t[0]))
-            picks.append((s, ds0)); chosen[pat].append(ds0)
-            progressed = True
-        if not progressed:
-            break
-    return picks
 
 
-def make_curve_figures(model, stats, figdir: str, days_per_ds: int = DAYS_PER_DS,
-                       augment_fn=None, datasets: tuple = DATASETS,
-                       report=None) -> None:
-    """Write the 48 h day-curve figures (``<ds>_day<k>.png``) for each dataset into
-    ``figdir``. ``augment_fn`` (e.g. ``augment.augment_segment``) is applied to every
-    loaded segment before the split, so the augmented regime's reconstructed
-    meals/boluses appear in the logged-event overlay; ``None`` uses the raw records.
-
-    ``report`` collects each cohort's kept/dropped segment and window counts and
-    the realised d histogram; one is created when the caller passes none."""
-    os.makedirs(figdir, exist_ok=True)
-    if report is None:
-        report = PR.RunReport(label='curves (real cohorts)', n_ctx=MAX_CONTEXT_PATCHES)
-    print("\n=== CURVE FIGURES (48 h, 2 h + 8 h BG tiled, conditioned) ===")
-    print(PR.context_note(MAX_CONTEXT_PATCHES), flush=True)
-    for ds in datasets:
-        segs = load_dataset(ds)
-        if augment_fn is not None:
-            segs = [augment_fn(s) for s in segs]
-        _, test = split_segments(segs, ds)
-        # Kept/dropped segments and windows for this cohort, at the PINNED 24 h
-        # footprint — printed rather than left to a bare ``continue``.
-        print(report.census(ds, [len(s) for s in test],
-                            stride_patches=8).format(), flush=True)
-        # candidate 48 h day windows (overlapping, 12 h step) ranked by true BG swing
-        # (excursion-rich = informative); _pick_day_windows then spreads the picks.
-        cands = []
-        for s in test:
-            n = (len(s) // PATCH_SIZE) * PATCH_SIZE
-            for dp in range(MAX_CONTEXT_PATCHES, n // PATCH_SIZE - DAY_PATCHES + 1,
-                            DAY_WINDOW_STRIDE_PATCHES):
-                ds0 = dp * PATCH_SIZE
-                w = s.cgm[ds0:ds0 + DAY_PATCHES * PATCH_SIZE]
-                cands.append((float(np.nanmax(w) - np.nanmin(w)), s, ds0, s.patient))
-        cands.sort(key=lambda t: -t[0])
-        picks = _pick_day_windows(cands, days_per_ds)
-        # per-horizon conditioned error envelope for this cohort (computed once,
-        # reused across the cohort's day figures); genuinely-logged basal.
-        print(f"  [{ds}] fitting BG error envelope (2 h + 8 h)…", flush=True)
-        sig2 = bg_sigma_real(model, stats, test, PREDICTION_PATCHES,
-                             stride_steps=8 * PATCH_SIZE, max_windows=200,
-                             report=report)
-        sig8 = bg_sigma_real(model, stats, test, H8_PATCHES,
-                             stride_steps=16 * PATCH_SIZE, max_windows=100,
-                             report=report)
-        print(f"  [{ds}] ±1σ @30/60/120m = {sig2[5]:.0f}/{sig2[11]:.0f}/{sig2[23]:.0f} mg/dL; "
-              f"@8h = {sig8[-1]:.0f} mg/dL  ({len(picks)} day windows)", flush=True)
-        for s, ds0 in picks:
-            spec = day_curves(model, stats, s, ds0, sig2=sig2, sig8=sig8)
-            k = len([p for p in os.listdir(figdir) if p.startswith(ds + '_day')])
-            out = os.path.join(figdir, f'{ds}_day{k+1}.png')
-            plot_day(spec, PRETTY[ds], out)
-            print(f"  wrote {out}  ({s.patient})")
 
 
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model, stats, step = load_model(device)
-    model = model.to(device)
-    model.eval()
-    print(f"[curves] model step={step} device={device}")
-    all_log = {'_meta': {'step': step}}
-    report = PR.RunReport(label='curves (real cohorts)', n_ctx=MAX_CONTEXT_PATCHES)
-
-    print("\n=== LOGGING DENSITY / EXCURSION-ORPHAN ANALYSIS (test segments) ===")
-    print(PR.context_note(MAX_CONTEXT_PATCHES))
-    hdr = ("dataset      carb/day  bolus/day  %win w/event  "
-           "hyperWin %w/carb   hypoWin %w/bolus")
-    print(hdr)
-    for ds in DATASETS:
-        segs = load_dataset(ds)
-        _, test = split_segments(segs, ds)
-        print(PR.census_segments(ds, [len(s) for s in test], MAX_CONTEXT_PATCHES,
-                                 stride_patches=8).format())
-        st = logging_stats(ds, test)
-        all_log[ds] = st
-        print(f"{ds:12} {st['carb_onsets_per_day']:8} {st['bolus_onsets_per_day']:10} "
-              f"{st['pct_windows_with_logged_event']:12}  "
-              f"{st['n_hyper_windows']:>5} {st['pct_hyper_windows_with_logged_carb']:6}   "
-              f"{st['n_hypo_windows']:>5} {st['pct_hypo_windows_with_logged_bolus']:6}")
-    with open(os.path.join(HERE, 'logging_stats.json'), 'w') as f:
-        json.dump(all_log, f, indent=2)
-
-    make_curve_figures(model, stats, os.path.join(HERE, 'real', 'figures'),
-                       report=report)
-    print()
-    report.emit()
-    print("\n[curves] DONE")
 
 
-if __name__ == '__main__':
-    main()

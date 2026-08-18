@@ -1,5 +1,5 @@
 """
-Simulator (in-domain) equivalent of curves.py: the same 48 h BG figures
+The 48 h BG day figures (2 h/8 h BG, conditioned) on fresh T1DMSIM patients
 (2 h/8 h BG, conditioned) on FRESH T1DMSIM patients.
 
 No logged-event markers on the BG panels (the simulator's combined insulin has no
@@ -10,7 +10,7 @@ the former carb/insulin/IS/HGO channel panels (which overlaid the simulator's TR
 latents on the predicted dynamics channels) were DROPPED — those are no longer
 model outputs. The figure is BG-only.
 
-Reuses curves.plot_day + constants; the sim data bridge is metrics/sim/sim_data.py.
+Reuses day_curves.plot_day + constants; the sim data bridge is metrics/sim/sim_data.py.
 Runs on the live best checkpoint. Writes metrics/sim/figures/sim_day{k}.png.
 """
 from __future__ import annotations
@@ -21,20 +21,20 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
-sys.path.insert(0, HERE)                                   # curves
+sys.path.insert(0, HERE)                                   # day_curves
 sys.path.insert(0, os.path.join(ROOT, 'metrics', 'sim'))  # sim_data
 
-import curves as CV                       # sets threads + local load_model/split_segments
+import day_curves as CV                  # the shared 48 h figure machinery
 import sim_data as SD
 import protocols as PR
 from config import TIME_PROBE_ENABLED, TIME_PROBE_N_BINS
-from realdata.features import context_window
-from realdata.calibrate import _future_overrides
-from curves import _pick_day_start
+from metrics.core.features import context_window
+from metrics.core.calibrate import _future_overrides
+from day_curves import _pick_day_start
 from inference import predict, predict_rolling
 from utils import time_of_day_decode_bins
 
-# Like curves.py, every forecast here runs the FORECAST protocol and takes its
+# Like day_curves.py, every forecast here runs the FORECAST protocol and takes its
 # masked set from ``metrics.protocols`` rather than deriving a trailing zone from
 # position. ``hp // CV.PREDICTION_PATCHES`` below is how many such spans a tile
 # rolls through; past roll 0 the span's evidence is the previous roll's own
@@ -171,12 +171,12 @@ def main():
                           n_ctx=CV.MAX_CONTEXT_PATCHES)
     print(PR.context_note(CV.MAX_CONTEXT_PATCHES), flush=True)
     # Kept/dropped "segments" (one per sim patient) and windows at the PINNED
-    # 24 h footprint — the same census the real cohorts print, so a sim run and a
+    # 24 h footprint — the same census every run prints, so a sim run and a
     # real run are read on one axis.
     print(report.census('t1dmsim', [len(d['bg_observed']) for _pid, d in runs],
                         stride_patches=8).format(), flush=True)
 
-    need = CV.MAX_CONTEXT_PATCHES + CV.DAY_PATCHES         # MAX_CONTEXT_PATCHES ctx + DAY_PATCHES window (24 h + 48 h)
+    need = CV.MAX_CONTEXT_PATCHES + CV.DAY_PATCHES         # 168 h context + the 48 h day window
     days = []
     for pid, d in runs:
         if len(d['bg_observed']) // CV.PATCH_SIZE < need:

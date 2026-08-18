@@ -7,11 +7,11 @@ owns its own panels; only the look lives here.
 
 Colour jobs, kept deliberately apart — a mark encodes exactly one of them:
 
-``COHORT``     identity. A cohort's hue never changes, is never reassigned by rank,
-               and survives a figure that drops one of the three.
+``COHORT``     identity. A source's hue never changes and is never reassigned by
+               rank, so it survives a figure that drops one.
 ``DOSE_CARB``  ordinal. A dose ladder is an ordered magnitude, so it rides one hue
 ``DOSE_INS``   light→dark rather than three categorical hues.
-``PAIR``       before→after (base→shifted, real→augmented, logged→reconstructed):
+``PAIR``       before→after (base→shifted, logged→reconstructed):
                one hue in two shades. Identity there is carried by the row label,
                so the two jobs never collide on one mark.
 
@@ -47,9 +47,8 @@ AXIS = '#c3c2b7'
 
 # Categorical slots 1-3, in fixed order. Never cycled, never rank-assigned.
 SERIES = ('#2a78d6', '#eb6834', '#1baf7a')
-COHORT = {'ohiot1dm': SERIES[0], 'azt1d': SERIES[1], 'shanghai': SERIES[2]}
-COHORT_LABEL = {'ohiot1dm': 'OhioT1DM', 'azt1d': 'AZT1D', 'shanghai': 'ShanghaiT1DM',
-                'T1DMSIM': 'T1DMSIM'}
+COHORT = {'sim': SERIES[0]}
+COHORT_LABEL = {'sim': 'T1DMSIM', 'T1DMSIM': 'T1DMSIM'}
 
 DOSE_CARB = ('#86b6ef', '#5598e7', '#2a78d6', '#1c5cab', '#104281')
 DOSE_INS = ('#f2905f', '#eb6834', '#cc5321', '#a03f18', '#752d11')

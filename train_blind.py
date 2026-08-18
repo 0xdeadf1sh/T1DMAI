@@ -41,7 +41,7 @@ intended divergence is these seven items and nothing else:
    blind fill.  The conditioned trainer's OOD-runaway concern does not apply —
    an unconditioned roll IS this model's training distribution;
 6. the policy is stamped ``'blind'`` — into ``training_config``, which
-   ``finetune/finetune.py`` refuses to mix with a conditioned fine-tune, and
+   ``calibrate_conformal.py`` refuses to mix with a conditioned band fit, and
    onto the banner, so it is visible before the run rather than after it;
 7. output directories are ``checkpoints_blind/`` and ``logs_blind/``, so a
    conditioned run may be live in the same checkout.
@@ -1576,7 +1576,7 @@ def _render_validation_table(
     #
     # ALREADY PERCENTAGES. ``tod_acc_*`` and ``tod_gross_rate`` are the four tod
     # figures ``_run_validation`` scales by 100 itself, and the CSV column, the
-    # model card and ``models/compare.py`` all read them as percent — so no
+    # model card and ``compare.py`` all read them as percent — so no
     # ``_pct`` here and no ``prev_scale``. Applying either scales them twice: a
     # 16.3% clock rendered 1630.00% and, being above the 60% bar, tiered GREEN.
     higher_row('tod acc ±1h', val_metrics.get('tod_acc_1h'),
@@ -3981,7 +3981,7 @@ def train(
         # blind checkpoint's weights are shaped by a supervision regime no
         # parameter shape records, so a strict state-dict load accepts them
         # anywhere; this stamp is what makes them un-confusable with a
-        # conditioned run's, and finetune/finetune.py refuses to mix the two.
+        # conditioned run's, and calibrate_conformal.py refuses to mix the two.
         'masked_channel_policy': masked_channel_policy(blind=True),
         'master_seed': master_seed, 'total_steps': total_steps, 'batch_size': batch_size,
         'num_workers': num_workers,

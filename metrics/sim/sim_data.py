@@ -7,7 +7,7 @@ training pipeline uses, and turned into the model's ``N_INPUT_FEATURES``-feature
 input stack ``[bg_absolute, carbs, insulin, exercise, bg_masked]`` — four
 normalized signal channels plus the per-patch ``bg_masked`` announcement bit,
 which is 0.0 throughout a stack of observed readings. Unlike
-the real-data bridge, the simulator emits the model's signal channels DIRECTLY —
+a source of logged events, the simulator emits the model's signal channels DIRECTLY —
 ``total_carb`` / ``total_insulin`` / ``total_exercise`` are the post-noise per-step
 carb / insulin / carbohydrate-equivalent exercise disposal the normalization stats
 were fit on (``data._build_sample`` consumes them verbatim) — so no
@@ -17,10 +17,10 @@ This is the model's TRAINING distribution, so the report is an in-domain
 reference, not a peer comparison.
 
 ``run_to_segment`` / ``make_sim_segments`` expose the same runs as ``Segment``s,
-for the consumers built on the real-data schema rather than on this module's
-``Window``. The exercise column is the reason one exists: every real adapter
-writes zeros there, so a simulator run is the only source in the suite that
-announces a session at all, and any probe of the exercise channel has to read one.
+for the consumers built on ``metrics.core.schema`` rather than on this module's
+``Window``. The exercise column is the reason one exists: a source of bare logged
+events carries no session in the channel's units, so the simulator is the only
+source that announces one at all, and any probe of the exercise channel needs it.
 
 Risk-space redesign note: the model now outputs ONLY a BG quantile forecast (no
 carb/insulin/IS/HGO dynamics channels and no trend head), so the former
@@ -45,10 +45,10 @@ from normalization import CHANNEL_NAMES, normalize
 from inference import predict, predict_rolling
 from utils import time_of_day_decode_bins
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
-from realdata.schema import Segment
-from realdata.features import context_window
-from realdata.calibrate import Window, _future_overrides
-from realdata.run_eval import _make_night_overrides_fn
+from metrics.core.schema import Segment
+from metrics.core.features import context_window
+from metrics.core.calibrate import Window, _future_overrides
+from metrics.core.run_eval import _make_night_overrides_fn
 
 
 def _assert_announces_all(announce: tuple[int, ...]) -> None:
@@ -83,7 +83,7 @@ def _smooth_sim_bg(bg_raw: np.ndarray) -> np.ndarray:
 CTX_STEPS = MAX_CONTEXT_PATCHES * PATCH_SIZE
 PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 # Parity/clarke forecasts roll out to the night long horizon for hour-by-hour
-# figure granularity (mirrors realdata.report.FIG_ROLLS); single pass when unset.
+# figure granularity (mirrors metrics.core.report.FIG_ROLLS); single pass when unset.
 FIG_ROLLS = max(1, math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS))
 FIG_STEPS = FIG_ROLLS * PRED_STEPS
 
@@ -110,7 +110,14 @@ assert int(_fc_anchor_step[_fc_valid][0]) == CTX_STEPS - 1, (
 
 # Fixed (arbitrary, reproducible) seed pools — each seed draws a distinct random
 # patient; calibration and test pools are disjoint.
-DEFAULT_HOURS = 120.0
+# Post-warmup trajectory length per patient. It has to clear the context window
+# before a single window exists at all: one forecast window costs
+# MAX_CONTEXT_PATCHES + PREDICTION_PATCHES = 340 patches (170 h), so a shorter
+# run yields ZERO windows and an empty report rather than an error. 288 h is the
+# length at which the collectors' own caps bind exactly — 60 test windows per
+# patient at stride 4, and the 24-window calibration cap at stride 8 — and it
+# also clears curves_sim's MAX_CONTEXT_PATCHES + DAY_PATCHES day figure.
+DEFAULT_HOURS = 288.0
 CAL_SEEDS = tuple(range(7000, 7012))     # 12 calibration patients
 TEST_SEEDS = tuple(range(8000, 8030))    # 30 test patients
 
@@ -203,7 +210,7 @@ def build_sim_feature_stack(d: dict, stats: dict) -> np.ndarray:
     ``CHANNEL_NAMES``) are normalized per ``stats`` via ``normalization.normalize``,
     so bg (feat 0) takes the Kovatchev risk transform BEFORE the z-score and the
     sparse carb/insulin/exercise take log1p — the SOLE input path, mirroring
-    ``realdata.features.build_feature_stack`` / ``data._build_sample`` (the redesign
+    ``metrics.core.features.build_feature_stack`` / ``data._build_sample`` (the redesign
     dropped ``bg_delta``, the IS/HGO latents, and the four sin/cos temporal
     features from the stack).
 
@@ -250,7 +257,7 @@ def collect_sim_windows(model, stats, runs, device, stride_patches: int = 8,
                         conformal_delta=None) -> list[Window]:
     """Slide prediction windows across each simulated patient and capture the
     headline median BG forecast — the simulator analogue of
-    ``realdata.calibrate.collect_windows`` (same trimmed ``Window`` of
+    ``metrics.core.calibrate.collect_windows`` (same trimmed ``Window`` of
     ``pred_bg`` = ``median_bg`` + true CGM, now also the RAW mg/dL band fan). The
     model is always conditioned: each window announces its true future
     carbs/insulin/exercise.

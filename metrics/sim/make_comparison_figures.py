@@ -23,8 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, HERE)
 
 from config import QUANTILE_LEVELS
-from realdata.report import load_model
-from realdata.figures import trajectory_grid, parity_scatter, clarke_grid
+from metrics.core.report import load_model
+from metrics.core.figures import trajectory_grid, parity_scatter, clarke_grid
 from sim_data import make_sim_runs, collect_sim_rows, TEST_SEEDS, DEFAULT_HOURS
 
 _LO_IDX = QUANTILE_LEVELS.index(0.05)

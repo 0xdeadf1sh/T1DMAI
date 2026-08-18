@@ -5,7 +5,7 @@ and insulin announced to the model. Writes metrics/sim/{stats.json, README.md,
 figures/rmse_vs_horizon.png}.
 
 The simulator is the model's training distribution, so this is an in-domain
-reference (an upper anchor for metrics/real/ and metrics/augmented/), not a peer
+reference rather than a measure of generalisation, and not a peer
 comparison — the published real-CGM forecasters are omitted.
 
 Usage:  python metrics/sim/build_report.py
@@ -23,8 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, HERE)
 
 from config import SIMULATOR_WARMUP_HOURS
-from realdata.report import load_model, render_sim_readme, render_sim_figure
-from realdata.run_eval import (evaluate_from_windows, night_onset_from_records,
+from metrics.core.report import load_model, render_sim_readme, render_sim_figure
+from metrics.core.run_eval import (evaluate_from_windows, night_onset_from_records,
                                rmse_by_horizon_from_records)
 from sim_data import (make_sim_runs, collect_sim_windows, build_sim_feature_stack,
                       _smooth_sim_bg, CAL_SEEDS, TEST_SEEDS, DEFAULT_HOURS)

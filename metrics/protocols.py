@@ -19,7 +19,7 @@ That is what makes per-``d`` calibration well populated under this protocol — 
 is the reason §2.10's Mondrian fit calibrates the forecast protocol and gives
 infill its own coarse fit — and it is what keeps the forecast protocol's columns
 element-for-element comparable with the historical tables.  Its column names are
-the EXISTING ones, unchanged: ``realdata.metrics.compute_suite`` computes them
+the EXISTING ones, unchanged: ``metrics.core.suite.compute_suite`` computes them
 and this module does not restate one.
 
 INFILL is scored against LINEAR INTERPOLATION between the bracketing visible BGs,
@@ -54,7 +54,7 @@ What every run reports
 * its ``n_ctx`` (§3.25: every headline number is measured at
   ``MAX_CONTEXT_PATCHES``, a length training barely samples);
 * per cohort, the KEPT and DROPPED segment and window counts (§3.24:
-  ``realdata/calibrate.py`` drops any segment shorter than context + horizon with
+  ``metrics/core/calibrate.py`` drops any segment shorter than context + horizon with
   a bare ``continue``, segments are cut at every CGM gap over 30 min, and the
   survivors are the longest gap-free wears — so each context width would
   otherwise evaluate a different window set).  Eligibility is PINNED to the 24 h
@@ -86,7 +86,7 @@ from config import (                                     # noqa: E402
 )
 # The masked set's slot layout, the ``d`` rule and the anchor rule are ONE
 # definition, in data.py, shared with the training builder and with
-# realdata.run_eval.  A local re-derivation is exactly the second copy that
+# metrics.core.run_eval.  A local re-derivation is exactly the second copy that
 # drifts.
 from data import sample_mask_spans, _mask_slots          # noqa: E402
 
@@ -184,7 +184,7 @@ def column(protocol: Protocol, base: str, d: int | None = None) -> str:
     FORECAST reproduces every EXISTING name, unchanged, so the historical tables
     stay comparable — and it takes no ``d`` suffix, because the reported horizons
     already ARE the d bins (30 / 60 / 90 / 120 min = d = 1..4 one-sided; the
-    single derivation is ``realdata.run_eval.horizon_d_patches``).
+    single derivation is ``metrics.core.run_eval.horizon_d_patches``).
 
     INFILL takes its own ``infill_`` namespace and REQUIRES a ``d``.  An infill
     column without one is a pooled masked-BG scalar, which improves for free
@@ -196,7 +196,7 @@ def column(protocol: Protocol, base: str, d: int | None = None) -> str:
             raise ValueError(
                 f"the forecast protocol carries the existing column names and "
                 f"takes no d suffix: its reported horizons already ARE the d "
-                f"bins (realdata.run_eval.horizon_d_patches). Asked for "
+                f"bins (metrics.core.run_eval.horizon_d_patches). Asked for "
                 f"'{base}' at d={d}."
             )
         assert not base.startswith(INFILL.prefix), (
@@ -369,7 +369,7 @@ def infill_masked_set(n_ctx: int, rng: np.random.Generator) -> MaskedSet:
 def persistence_baseline(anchor_bg: float, n_steps: int) -> np.ndarray:
     """FORECAST's baseline: hold the last observed reading flat.
 
-    This is the same constant-hold rule ``realdata.metrics.compute_suite``
+    This is the same constant-hold rule ``metrics.core.suite.compute_suite``
     already scores the forecast protocol's persistence skill against; it is
     exposed here for callers outside that suite.
     """
@@ -591,7 +591,7 @@ def sampler_d_histogram(n_draws: int = 20000, seed: int = 0) -> DHistogram:
 # Cohort census (§3.24) and the context note (§3.25).
 # --------------------------------------------------------------------------- #
 # Segment eligibility is PINNED to the 24 h footprint and does NOT follow
-# MAX_CONTEXT_PATCHES.  ``realdata/calibrate.py`` drops any segment shorter than
+# MAX_CONTEXT_PATCHES.  ``metrics/core/calibrate.py`` drops any segment shorter than
 # context + horizon with a bare ``continue``, and segments are cut at every CGM
 # gap over 30 min, so the survivors are the longest gap-free wears — a wider
 # context silently re-selects the cohort.  Pinning the footprint is what makes
@@ -882,8 +882,8 @@ def score_infill_trajectory(model, stats, feats: np.ndarray, cgm: np.ndarray,
     Returns the number of windows scored.
     """
     from inference import predict                          # local: keeps torch off import
-    from realdata.features import context_window
-    from realdata.calibrate import _future_overrides
+    from metrics.core.features import context_window
+    from metrics.core.calibrate import _future_overrides
     from config import CHANNEL_TO_FEAT
 
     # Every announceable channel is announced, checked rather than left to read

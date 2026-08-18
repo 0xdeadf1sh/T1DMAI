@@ -1,8 +1,7 @@
 """
-Canonical real-data representation shared by every dataset adapter.
+Canonical record representation every evaluation source parses into.
 
-Each adapter parses its source (OhioT1DM XML, AZT1D CSV, ShanghaiT1DM Excel) into
-a list of :class:`Segment` — a contiguous, gap-free, 5-minute-grid stretch of one
+A :class:`Segment` is a contiguous, gap-free, 5-minute-grid stretch of one
 patient's record carrying the *raw events* the model's input bridge needs:
 
     cgm          mg/dL          the CGM backbone (already gap-interpolated/split)
@@ -11,13 +10,13 @@ patient's record carrying the *raw events* the model's input bridge needs:
     basal_rate   IU/hour        piecewise-constant basal rate (forward-filled)
     exercise     grams/step     carbohydrate-EQUIVALENT glucose disposal from
                                 activity, on the simulator's scale (0 where the
-                                source has none — which is every adapter today)
+                                source has none)
 
 ``exercise`` is the one field carried in the model's own units rather than the
 source's: the input channel is trained on the simulator's g/step carbohydrate-
 equivalent disposal curve, so a source reporting duration, heart rate, or a 0-1
 intensity is converted to that scale before it reaches this field, never after.
-Every adapter currently writes zeros, which is the channel's "no session" value.
+A source with no activity record writes zeros, the channel's "no session" value.
 
 Why raw events and not the model's channels?  The model consumes *absorption /
 action curves* (the simulator's gamma carb-absorption and first-order basal +
@@ -26,14 +25,13 @@ these raw events into those curves is the model-input bridge's job; it
 needs basal and bolus kept *separate* (different kernels), which is why this
 schema preserves them rather than pre-summing an ``insulin_combined`` channel.
 
-A source that already carries per-event curves rather than bare amounts — the
-phone's own record, whose events store the resolved series it fed the model —
-may instead supply them directly as the optional ``carb_curve`` /
-``insulin_curve`` fields, which the bridge then uses in place of its kernels.
-The three published-cohort adapters leave both ``None``.
+A source that already carries per-event curves rather than bare amounts may
+instead supply them directly as the optional ``carb_curve`` / ``insulin_curve``
+fields, which the bridge then uses in place of its kernels. A source of bare
+amounts leaves both ``None``.
 
-All BG is in mg/dL.  Adapters that read a mmol/L source must convert with
-``MGDL_PER_MMOL`` before constructing a Segment.
+All BG is in mg/dL.  A mmol/L source must convert with ``MGDL_PER_MMOL`` before
+constructing a Segment.
 """
 from __future__ import annotations
 

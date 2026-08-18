@@ -17,7 +17,7 @@ edge, in the euglycaemic band, well clear of the hypo threshold. A bin edge at a
 CLINICAL threshold (70) is the one placement to avoid — it puts the boundary
 exactly where the alarm decision is made, so the windows that decide the alarm
 are split across two separately-fit corrections, and it starves the low bin (3 /
-6 / 12 calibration windows on Ohio / AZT1D / Shanghai against the n >= 19 floor
+a handful of calibration windows against the n >= 19 floor
 below).
 
 Because ``conformal`` holds the median FIXED, a window's region is identical

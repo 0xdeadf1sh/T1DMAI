@@ -13,7 +13,7 @@ import numpy as np
 try:
     import matplotlib
     matplotlib.use('Agg')
-    import matplotlib.pyplot as plt  # noqa: F401 (kept for parity with realdata.figures)
+    import matplotlib.pyplot as plt  # noqa: F401 (kept for parity with metrics.core.figures)
     _OK = True
 except Exception:
     _OK = False

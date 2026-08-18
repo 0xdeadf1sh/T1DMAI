@@ -29,13 +29,11 @@ CKPT_PATH = REPO / "checkpoints" / "t1dmai_best.pt"
 OUT_DIR = REPO / "figures"
 METRICS_DIR = REPO / "metrics"
 
-# Real-data report horizons (realdata.calibrate.HORIZONS) and the datasets each
-# report mode may carry. Kept local so the card has no import-time dependency on
-# the realdata package (it only reads the JSON those scripts emit).
-REALDATA_HORIZONS = (30, 60, 120)
-REALDATA_REPORTS = (
-    ("real",      "Real CGM",          ("ohiot1dm", "azt1d", "shanghai")),
-    ("augmented", "Augmented",         ("ohiot1dm", "azt1d", "shanghai")),
+# Report horizons (metrics.core.calibrate.HORIZONS) and the sources each report
+# mode may carry. Kept local so the card has no import-time dependency on the
+# evaluation core (it only reads the JSON those scripts emit).
+REPORT_HORIZONS = (30, 60, 120)
+REPORT_SOURCES = (
     ("sim",       "Simulator (in-domain)", ("sim",)),
 )
 
@@ -185,10 +183,10 @@ def _read_csv(path: Path) -> dict[str, np.ndarray]:
     return {k: np.asarray(v) for k, v in cols.items()}
 
 
-def _load_realdata_stats() -> dict[str, dict]:
+def _load_report_stats() -> dict[str, dict]:
     """Load the real-data report ``stats.json`` files, if present.
 
-    Each report (``metrics/{real,augmented,sim}/stats.json``) is written *after*
+    The report (``metrics/sim/stats.json``) is written *after*
     training by the ``metrics/`` scripts and will simply not exist on a fresh
     run. Every file is guarded independently, so a missing or malformed report is
     skipped rather than aborting the card. The card must build with zero reports
@@ -199,7 +197,7 @@ def _load_realdata_stats() -> dict[str, dict]:
         empty).
     """
     out: dict[str, dict] = {}
-    for mode, _label, _datasets in REALDATA_REPORTS:
+    for mode, _label, _datasets in REPORT_SOURCES:
         path = METRICS_DIR / mode / "stats.json"
         try:
             out[mode] = json.loads(path.read_text())
@@ -1272,32 +1270,33 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
 # ---------------------------------------------------------------- card 9: real data
 
 
-def card_realdata(cfg: dict, realdata: dict[str, dict]) -> None:
-    """Real-CGM (and augmented / in-domain-sim) evaluation summary.
+def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
+    """In-domain simulator evaluation summary.
 
-    Reads the post-training ``metrics/{real,augmented,sim}/stats.json`` reports.
+    Reads the post-training ``metrics/sim/stats.json`` report.
     For each report mode and dataset it surfaces (a) the precision-floored
     per-horizon hypo decision offsets (``selected_offsets``), and (b) the
     per-horizon hypo/hyper event recall/precision (``event_metrics``). If no
     report exists the card is skipped entirely — these files appear only once the
     real-data reports have been generated.
     """
-    if not realdata:
+    if not reports:
         return  # No reports yet — omit the section gracefully.
 
-    H = REALDATA_HORIZONS
+    H = REPORT_HORIZONS
     wording = _policy_wording(cfg)
     fig, ax = _setup_card((13.6, 13.2))
     step = None
-    for s in realdata.values():
+    for s in reports.values():
         step = (s.get("_meta") or {}).get("step")
         if step is not None:
             break
-    sub = ("Post-training evaluation on held-out CGM. Precision-floored hypo "
-           "decision offsets and per-horizon excursion recall / precision.")
+    sub = ("Post-training evaluation on held-out simulator patients. "
+           "Precision-floored hypo decision offsets and per-horizon excursion "
+           "recall / precision.")
     if step is not None:
         sub += f"  (checkpoint step {step:,})"
-    y = _header(ax, "Real-data evaluation", "Out-of-distribution performance", sub)
+    y = _header(ax, "Evaluation", "In-domain simulator performance", sub)
 
     def _fmt(v, fmt: str = "{:.2f}") -> str:
         try:
@@ -1306,10 +1305,10 @@ def card_realdata(cfg: dict, realdata: dict[str, dict]) -> None:
             return "—"
 
     cur = y
-    color_cycle = {"real": CLAY, "augmented": GOLD, "sim": TEAL}
+    color_cycle = {"sim": TEAL}
 
-    for mode, label, datasets in REALDATA_REPORTS:
-        stats = realdata.get(mode)
+    for mode, label, datasets in REPORT_SOURCES:
+        stats = reports.get(mode)
         if not stats:
             continue
         present = [d for d in datasets if isinstance(stats.get(d), dict)]
@@ -1424,12 +1423,12 @@ def card_realdata(cfg: dict, realdata: dict[str, dict]) -> None:
     # Footer note on the regime.
     ax.plot([0.025, 0.975], [0.040, 0.040], color=RULE, lw=0.6, transform=ax.transAxes)
     ax.text(0.025, 0.020,
-            "Offsets and recall/precision are read from metrics/{real,augmented,sim}/stats.json "
+            "Offsets and recall/precision are read from metrics/sim/stats.json "
             f"(written post-training by the report scripts). {wording['footer']}; "
             "the offset is fit on a disjoint calibration split.",
             fontsize=8, color=DIMMED, transform=ax.transAxes)
 
-    fig.savefig(OUT_DIR / "card_09_realdata.png")
+    fig.savefig(OUT_DIR / "card_09_evaluation.png")
     plt.close(fig)
 
 
@@ -1863,7 +1862,7 @@ def main() -> None:
             f"--logs models/logs_<name> --checkpoint models/<name>.pt."
         )
     summary = json.loads((OUT_DIR / "summary.json").read_text())
-    realdata = _load_realdata_stats()  # empty until the metrics/ reports exist
+    reports = _load_report_stats()  # empty until the metrics/ reports exist
 
     groups, total_params = _param_breakdown(sd)
     arch = _derive_arch(sd, cfg)
@@ -1880,8 +1879,8 @@ def main() -> None:
     card_compute_budget(train, tsum, cfg)
     card_metrics_card(cfg, val)
     n_cards = 10
-    if realdata:
-        card_realdata(cfg, realdata)
+    if reports:
+        card_evaluation(cfg, reports)
         n_cards += 1
     print(f"  → wrote {n_cards} card_*.png to {OUT_DIR}")
 
