@@ -495,8 +495,9 @@ HELP_SECTIONS: list[tuple[str, list[str]]] = [
     ("Overview", [
         "T1DMAI predicts blood-glucose trajectories from recent context.",
         "The chart shows the model's input window (highlighted blue) and",
-        "the prediction zone (darker, right of NOW). The model only sees",
-        "the most recent 24 h before NOW — older history is for reference.",
+        "the prediction zone (darker, right of NOW). The model reads the",
+        "whole context window; the chart opens on its last 24 h — scroll to",
+        "zoom, middle/right-drag to pan, R to reset the view.",
     ]),
     ("Prediction", [
         "SPACE / Enter — single-pass 2 h prediction from the current context.",

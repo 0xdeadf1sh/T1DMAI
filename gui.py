@@ -100,7 +100,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from config import BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD
+from config import BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, PATCH_SIZE
 
 from gui_renderer import ui_px  # used by the constants below
 
@@ -275,6 +275,11 @@ DISPLAY_CHANNEL_UNITS: list[str] = [
 
 SCROLL_SPEED = 48
 ZOOM_FACTOR = 1.3
+# Hours of the context window the chart opens on. The window itself is days
+# wide; drawn whole, neither the CGM trace nor the forecast at its right edge is
+# legible, and the curve editor's control points land within a pixel of each
+# other. Zoom and pan reach the rest.
+CHART_VIEW_HOURS = 24.0
 HOVER_TOOLTIP_DELAY_MS = 200
 
 # One colour per display channel — indexed by ``disp_ch`` over
@@ -369,17 +374,39 @@ def _features_from_raw(
     return features, bg_raw, context_raw
 
 
+def default_context_hours() -> float:
+    """Post-warmup simulator hours that fill the model's context window.
+
+    ``MAX_CONTEXT_PATCHES`` is the ceiling the model was trained to, and the
+    forward accepts anything from ``MIN_CONTEXT_PATCHES`` up to it. Bootstrapping
+    short of the floor is the one failure the GUI cannot show you: nothing
+    raises, the fan is simply drawn from a window the weights never saw.
+    """
+    from config import MAX_CONTEXT_PATCHES, PATCH_SIZE
+    return MAX_CONTEXT_PATCHES * PATCH_SIZE * 5.0 / 60.0
+
+
 def _build_context_from_sim(
     seed: int,
     norm_stats: dict,
+    context_hours: float | None = None,
 ) -> tuple[torch.Tensor, dict, np.ndarray, np.ndarray, float, int, Any]:
     from T1DMSIM.simulator import T1DMSimulator
     from data import simulate_discard_warmup
-    from config import PATCH_SIZE, N_INPUT_FEATURES
+    from config import MIN_CONTEXT_PATCHES, PATCH_SIZE, N_INPUT_FEATURES
 
+    hours = default_context_hours() if context_hours is None else float(context_hours)
     sim = T1DMSimulator(seed=seed)
-    raw = simulate_discard_warmup(sim, 24)
+    raw = simulate_discard_warmup(sim, hours)
     features, bg_raw, context_raw = _features_from_raw(raw, norm_stats)
+    n_patches = features.shape[0] // PATCH_SIZE
+    if n_patches < MIN_CONTEXT_PATCHES:
+        raise ValueError(
+            f"{hours:g} h of simulator gives {n_patches} context patches, under the "
+            f"model's MIN_CONTEXT_PATCHES={MIN_CONTEXT_PATCHES} "
+            f"({MIN_CONTEXT_PATCHES * PATCH_SIZE * 5.0 / 60.0:g} h). Raise "
+            f"--context-hours."
+        )
 
     context = torch.from_numpy(features).reshape(-1, PATCH_SIZE, N_INPUT_FEATURES)
     start_hour = float(raw['hour_of_day'][0]) % 24.0
@@ -395,8 +422,13 @@ def _advance_sim_hours(
 ) -> int:
     """Step ``state.sim`` forward by ``hours`` real hours and append the
     new ground-truth steps to the state buffers (context tensor, bg_raw,
-    context_raw). Returns the number of new patches appended (0 if the chunk
-    was shorter than PATCH_SIZE)."""
+    context_raw).
+
+    Returns the NET patch shift: appended minus dropped off the left. Once the
+    buffer is saturated at ``MAX_CONTEXT_PATCHES`` the two cancel and the return
+    is 0 — the window slides rather than grows, and every buffer index, the
+    chart viewport included, stays where it was.
+    """
     from config import PATCH_SIZE, N_INPUT_FEATURES
 
     sim = state.sim
@@ -428,7 +460,21 @@ def _advance_sim_hours(
         np.concatenate([state.context_raw, context_raw_new], axis=0)
         if state.context_raw is not None else context_raw_new
     )
-    return n_new_patches
+
+    # Drop from the left so the buffer never outgrows MAX_CONTEXT_PATCHES. The
+    # forward reads whatever it is handed and RoPE extrapolates, so an overrun
+    # does not raise — it silently forecasts from a window longer than any the
+    # model was trained on, and grows by ``hours`` every press. The bootstrap now
+    # starts AT the ceiling, so the very first step would overrun without this.
+    from config import MAX_CONTEXT_PATCHES
+    n_drop = max(0, int(state.context.shape[0]) - MAX_CONTEXT_PATCHES)
+    if n_drop:
+        state.context = state.context[n_drop:]
+        state.bg_raw = state.bg_raw[n_drop * PATCH_SIZE:]
+        state.context_raw = state.context_raw[n_drop * PATCH_SIZE:]
+        state.sim_start_hour = (
+            float(getattr(state, 'sim_start_hour', 0.0)) + n_drop * 0.5) % 24.0
+    return n_new_patches - n_drop
 
 
 def _hour_at_pred_start(state) -> float:
@@ -1244,8 +1290,10 @@ class T1DMAIGui:
         basal_ramp_down_h: float = 0.5,
         basal_duration_h: float = 4.0,
         masked_channel_policy: str | None = None,
+        context_hours: float | None = None,
     ) -> None:
         self.pygame = _safe_import_pygame()
+        self._context_hours = context_hours
         self.model = model
         self.device = device if device is not None else torch.device('cpu')
         self.width = width
@@ -1404,7 +1452,8 @@ class T1DMAIGui:
                  self.state.bg_raw, self.state.context_raw,
                  self.state.sim_start_hour, self.state.sim_start_day,
                  self.state.sim) = \
-                    _build_context_from_sim(patient_seed, norm_stats)
+                    _build_context_from_sim(patient_seed, norm_stats,
+                                            self._context_hours)
                 self._reset_chart_view()
                 self.state.status_message = "Ready — press SPACE/Enter to predict"
             except Exception as e:
@@ -1510,10 +1559,36 @@ class T1DMAIGui:
         self.state.apply_mask_preset(preset, self._n_pred())
         self._clear_prediction()
         spans = self.state.emitted_mask_spans(self._n_pred())
+        # Frame the span the user asked for, not the whole emitted set: the
+        # trailing forecast span is always in that set and sits a window away
+        # from a backcast one, so framing both frames neither.
+        chosen = [(sp.start, sp.length) for sp in self.state.mask_spans]
+        self._scroll_to_patches(chosen or spans)
         self.state.status_message = (
             f"{MASK_PRESET_LABELS[preset]} preset — masked set {spans}"
         )
         self._needs_redraw = True
+
+    def _scroll_to_patches(self, spans) -> None:
+        """Pan (never zoom) so every span in ``spans`` is on the chart.
+
+        The view opens on the trailing hours of a multi-day window, so the
+        backcast preset's span at patch 0 and an interior infill both land far
+        off the left edge. Their fan would be drawn correctly and seen by nobody.
+        """
+        if not spans:
+            return
+        ct = self.chart_transform
+        lo = min(float(s) for s, _L in spans)
+        hi = max(float(s + L) for s, L in spans)
+        width = ct.cx_max - ct.cx_min
+        if lo >= ct.cx_min and hi <= ct.cx_max:
+            return
+        if hi - lo >= width:                      # too wide to frame: show its head
+            new_min = max(0.0, lo - 1.0)
+        else:
+            new_min = max(0.0, (lo + hi) / 2.0 - width / 2.0)
+        ct.update(chart_x_min=new_min, chart_x_max=new_min + width)
 
     def _clear_prediction(self) -> None:
         """Drop the shown forecast.
@@ -1624,11 +1699,13 @@ class T1DMAIGui:
         # Reset to the forecast preset rather than re-anchor silently.
         self.state.clear_mask_spans()
         self._clear_prediction()
-        # Preserve the user's current zoom/pan — they may be inspecting a
-        # specific window and don't want it snapped back to the full context.
-        # Press R to reset the view explicitly. Predictions only happen on
-        # SPACE/Enter, so the chart now shows context only until the user
-        # asks for a prediction.
+        # Keep the user's zoom, but follow NOW: ``n_added`` is the NET shift, so
+        # it is 0 once the buffer is saturated (the window slides, indices hold)
+        # and positive only while it is still filling. Holding the view fixed
+        # through that phase walks the forecast zone off the right edge.
+        if n_added:
+            ct = self.chart_transform
+            ct.update(chart_x_min=ct.cx_min + n_added, chart_x_max=ct.cx_max + n_added)
         self.state.status_message = (
             f"Sim advanced by {hours:.1f}h ({n_added} patches) — "
             "press SPACE to predict"
@@ -1714,13 +1791,26 @@ class T1DMAIGui:
         self._needs_redraw = True
 
     def _reset_chart_view(self) -> None:
+        """Open on the trailing ``CHART_VIEW_HOURS`` of the window.
+
+        The whole context is several days wide, and drawn end to end nothing in
+        it is legible — least of all the forecast, which is the last 2 h of it.
+        The view is a viewport, not the model's input: every patch is still fed
+        to the forward. Scroll-wheel zooms, drag pans, and ``R`` returns here.
+        """
         if self.state.context is None:
             return
+        from config import GUI_LONG_PREDICTION_HOURS, PREDICTION_HORIZON_HOURS
         n_ctx = self.state.context.shape[0]
-        total_patches = n_ctx + 16
+        # Reserve the LONG fan, not the single-pass one: L rolls the forecast out
+        # to GUI_LONG_PREDICTION_HOURS, and a right edge cut to the 2 h horizon
+        # draws most of that off the chart.
+        rolls = max(1, round(GUI_LONG_PREDICTION_HOURS / PREDICTION_HORIZON_HOURS))
+        end = float(n_ctx + rolls * self._n_pred() + 2)
+        history = CHART_VIEW_HOURS * 60.0 / (PATCH_SIZE * 5.0)
         self.chart_transform.update(
-            chart_x_min=0.0,
-            chart_x_max=float(total_patches + 2),
+            chart_x_min=max(0.0, float(n_ctx) - history),
+            chart_x_max=end,
         )
 
     def _do_reset(self) -> None:
@@ -1764,6 +1854,7 @@ class T1DMAIGui:
                 (ctx, summ, bg_raw, ctx_raw,
                  start_hour, start_day, sim) = _build_context_from_sim(
                     self.state.patient_seed, self.state.norm_stats,
+                    self._context_hours,
                 )
                 self.state.context = ctx
                 self.state.patient_summary = summ
@@ -4095,6 +4186,37 @@ class T1DMAIGui:
         pygame.quit()
 
 
+# The trained-checkpoint tree, one capacity per subdirectory. ``compare.py``
+# reads the same root; a second one is how the two start disagreeing about which
+# checkpoint 'medium' names.
+MODEL_DIR = 'new_models'
+
+
+def _discover_checkpoint() -> str | None:
+    """The best checkpoint of the capacity the live ``config.py`` describes.
+
+    Every builder refuses a checkpoint whose ``training_config`` disagrees with
+    the live config, so there is exactly one capacity under ``MODEL_DIR`` that
+    can be loaded at all — matching on ``D_MODEL`` / ``N_LAYERS`` / ``N_HEADS``
+    picks it without reading a state dict.
+    """
+    from config import D_MODEL, N_LAYERS, N_HEADS
+    for capacity in sorted(os.listdir(MODEL_DIR)) if os.path.isdir(MODEL_DIR) else []:
+        path = os.path.join(MODEL_DIR, capacity, 'checkpoints', 't1dmai_best.pt')
+        if not os.path.isfile(path):
+            continue
+        try:
+            tc = torch.load(path, map_location='cpu',
+                            weights_only=True).get('training_config') or {}
+        except Exception:
+            continue
+        if (tc.get('d_model'), tc.get('n_layers'), tc.get('n_heads')) == \
+                (D_MODEL, N_LAYERS, N_HEADS):
+            print(f"Using {path} (capacity '{capacity}' matches config.py)")
+            return path
+    return None
+
+
 def _load_checkpoint_into_model(
     path: str, device: torch.device, use_ema: bool
 ) -> tuple[object, int, dict, str]:
@@ -4138,7 +4260,9 @@ def _load_checkpoint_into_model(
 def main() -> None:
     parser = argparse.ArgumentParser(description='T1DMAI GUI')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to the trained model checkpoint.')
+                        help='Path to the trained model checkpoint. With no path '
+                             'and no --no-model, the capacity matching the live '
+                             'config.py is looked up under new_models/.')
     parser.add_argument('--no-model', action='store_true',
                         help='Use random weights for UI testing')
     parser.add_argument('--seed', type=int, default=42,
@@ -4156,6 +4280,11 @@ def main() -> None:
                         help='Basal ramp-down duration in hours (default: 0.5)')
     parser.add_argument('--basal-duration', type=float, default=4.0,
                         help='Basal adjustment total duration in hours (default: 4.0)')
+    parser.add_argument('--context-hours', type=float, default=None,
+                        help='Post-warmup simulator hours behind the forecast '
+                             f'origin (default: {default_context_hours():g}, which '
+                             'fills MAX_CONTEXT_PATCHES). Anything under '
+                             'MIN_CONTEXT_PATCHES is refused.')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -4169,10 +4298,16 @@ def main() -> None:
         from model import T1DMAI
         model = T1DMAI().to(device)
         model.eval()
-    elif args.checkpoint:
+    else:
+        checkpoint = args.checkpoint or _discover_checkpoint()
+        if not checkpoint:
+            print("No checkpoint provided and none found under "
+                  f"{MODEL_DIR}/<capacity>/checkpoints/. Pass --checkpoint, or "
+                  "--no-model for a UI-only run.")
+            return
         use_ema = not args.live_weights
         model, ckpt_pred_patches, ns, policy = _load_checkpoint_into_model(
-            args.checkpoint, device, use_ema=use_ema,
+            checkpoint, device, use_ema=use_ema,
         )
         norm_stats = norm_stats or ns
         import model as _model_mod
@@ -4190,11 +4325,6 @@ def main() -> None:
             norm_stats = compute_normalization_stats()
             save_normalization_stats(norm_stats)
 
-    if model is None:
-        print("No checkpoint provided; pass --checkpoint or use --no-model "
-              "for a UI-only run.")
-        return
-
     gui = T1DMAIGui(
         model=model,
         norm_stats=norm_stats,
@@ -4206,6 +4336,7 @@ def main() -> None:
         basal_ramp_down_h=args.basal_ramp_down,
         basal_duration_h=args.basal_duration,
         masked_channel_policy=policy,
+        context_hours=args.context_hours,
     )
     gui.run()
 
