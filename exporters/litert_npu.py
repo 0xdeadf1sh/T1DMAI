@@ -66,12 +66,14 @@ def _import_litert_torch():
     )
 
 
-def _run_tflite(edge_model, patches: torch.Tensor, struct: torch.Tensor) -> list[np.ndarray]:
+def _run_tflite(
+    edge_model, patches: torch.Tensor, struct: torch.Tensor, slot_sel: torch.Tensor,
+) -> list[np.ndarray]:
     """Execute the converted LiteRT model -> ordered list of numpy output arrays.
 
     The converted model is callable with the same positional args as the traced
     module and returns the tflite-interpreter outputs (numpy or torch)."""
-    outs = edge_model(patches, struct)
+    outs = edge_model(patches, struct, slot_sel)
     if isinstance(outs, (list, tuple)):
         seq = list(outs)
     else:
@@ -94,34 +96,36 @@ def main() -> None:
     stats = ck["normalization_stats"]
     wrapper = HeadRawForward(model).eval()
 
-    patches, struct, bool_mask, anchor_bg = build_representative_input(stats)
-    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} anchor={anchor_bg:.2f}")
+    w = build_representative_input(stats)
+    patches, struct, slot_sel = w.patches, w.struct, w.slot_sel
+    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} "
+          f"slot_sel={tuple(slot_sel.shape)} slots={w.n_masked}")
 
     hr_shape = (1, cfg.PREDICTION_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
     tl_shape = (1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS)
 
     # eager references (the modified-forward outputs the .tflite must reproduce)
     with torch.no_grad():
-        hr_eager, tl_eager_mod = wrapper(patches, struct)
-    tl_eager = eager_time_logits(model, patches, bool_mask, anchor_bg)  # stock return_time path
-    d_stock = float((hr_eager - stock_head_raw(model, patches, bool_mask, anchor_bg)).abs().max())
+        hr_eager, tl_eager_mod, _sh = wrapper(patches, struct, slot_sel)
+    tl_eager = eager_time_logits(model, w)   # stock return_time path
+    d_stock = float((hr_eager - stock_head_raw(model, w)).abs().max())
     print(f"[verify] modified(struct) vs stock(bool) head_raw  max|Δ| = {d_stock:.3e}")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     def convert_and_check(tag: str, tol: float, quant_config=None) -> tuple[str, float, float, bool]:
-        print(f"\n[convert] {tag}: {mod_name}.convert(wrapper, (patches, struct)) ...")
+        print(f"\n[convert] {tag}: {mod_name}.convert(wrapper, (patches, struct, slot_sel)) ...")
         if quant_config is not None:
-            edge = aet.convert(wrapper, (patches, struct), quant_config=quant_config)
+            edge = aet.convert(wrapper, (patches, struct, slot_sel), quant_config=quant_config)
         else:
-            edge = aet.convert(wrapper, (patches, struct))
+            edge = aet.convert(wrapper, (patches, struct, slot_sel))
         tfl_name = f"{args.model_id}.tflite" if tag == "fp32" else f"{args.model_id}.{tag}.tflite"
         tfl_path = os.path.join(args.out_dir, tfl_name)
         edge.export(tfl_path)
         sz = os.path.getsize(tfl_path)
         print(f"[export] wrote {tfl_path} ({sz} bytes)")
 
-        outs = _run_tflite(edge, patches, struct)
+        outs = _run_tflite(edge, patches, struct, slot_sel)
         assert len(outs) >= 1, f"{tag}: .tflite returned no outputs"
         # match outputs to (head_raw, time_logits) by shape (converter may reorder)
         hr_t = tl_t = None

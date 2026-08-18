@@ -32,13 +32,18 @@ its masked set as `mask_spans`.
 ## Export
 
 `exporters/modified_forward.py` holds the modified forward every target shares —
-external struct mask, right-edge slice, graph cut at `head_raw`, dual output —
-and `exporters/` lowers it through one partitioner per target:
+external struct mask, external one-hot slot selection, graph cut at `head_raw`,
+three outputs — and `exporters/` lowers it through one partitioner per target:
 `executorch_xnnpack.py`, `executorch_vulkan.py`, `litert_npu.py`.
 `descriptor.py` writes the sidecar all three emit, and it is the only place the
 decode constants leave this repository: the `kovatchev` block it stamps is what
 the app decodes against, so an export is the moment a re-anchoring becomes real
 for every consumer.
 
-An artifact and its descriptor are one unit. Ship them together, from the same
-export run — nothing downstream can detect a mismatched pair.
+`head_weights.py` writes the BG head beside the artifact as a flat fp32 file, and
+`slot_hidden` is the graph output it pairs with: together they let a consumer
+reproduce `head_raw` outside the graph, and adapt it without re-exporting. The
+export checks that reproduction on every run.
+
+An artifact, its descriptor and its head file are one unit. Ship them together,
+from the same export run — nothing downstream can detect a mismatched pair.

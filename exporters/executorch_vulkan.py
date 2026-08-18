@@ -123,7 +123,7 @@ def _target_name_node(n) -> str:
     return getattr(t, "_name", None) or getattr(t, "__name__", None) or str(t)
 
 
-def serialize_vulkan_pte(wrapper, patches, struct, out_path: str, force_fp16: bool = False) -> dict:
+def serialize_vulkan_pte(wrapper, patches, struct, slot_sel, out_path: str, force_fp16: bool = False) -> dict:
     """Full ``to_edge_transform_and_lower(Vulkan) -> to_executorch`` -> write ``out_path``.
 
     Requires ``install_vulkan_preprocess_fake_mode_fix()`` to have run. Returns a census
@@ -143,7 +143,7 @@ def serialize_vulkan_pte(wrapper, patches, struct, out_path: str, force_fp16: bo
     _ensure_flatc()
     compile_options = {"force_fp16": True} if force_fp16 else None
     with torch.no_grad():
-        ep = torch.export.export(wrapper, (patches, struct), strict=False)
+        ep = torch.export.export(wrapper, (patches, struct, slot_sel), strict=False)
     lowered = to_edge_transform_and_lower(ep, partitioner=[VulkanPartitioner(compile_options=compile_options)])
     et_prog = lowered.to_executorch()
     with open(out_path, "wb") as f:
@@ -183,7 +183,7 @@ def serialize_vulkan_pte(wrapper, patches, struct, out_path: str, force_fp16: bo
     }
 
 
-def cpu_faithful_deltas(wrapper, patches, struct) -> dict:
+def cpu_faithful_deltas(wrapper, patches, struct, slot_sel) -> dict:
     """Reference numeric check on host: lower the SAME graph to the PORTABLE CPU runtime
     (no delegation) and compare its head_raw + time_logits to the eager modified forward.
 
@@ -197,11 +197,12 @@ def cpu_faithful_deltas(wrapper, patches, struct) -> dict:
     from exporters.executorch_xnnpack import run_pte_outputs
 
     _ensure_flatc()
-    hr_shape = (1, _cfg.PREDICTION_PATCHES, _cfg.PATCH_SIZE, 1 + 2 * _cfg.N_SPREADS)
-    tl_shape = (1, _cfg.PREDICTION_PATCHES, _cfg.TIME_PROBE_N_BINS)
+    # M rows, not P: the graph emits one per HEAD SLOT, and the masked set is an input.
+    hr_shape = (1, _cfg.MAX_MASKED_PATCHES, _cfg.PATCH_SIZE, 1 + 2 * _cfg.N_SPREADS)
+    tl_shape = (1, _cfg.MAX_MASKED_PATCHES, _cfg.TIME_PROBE_N_BINS)
     with torch.no_grad():
-        hr_e, tl_e = wrapper(patches, struct)
-        ep = torch.export.export(wrapper, (patches, struct), strict=False)
+        hr_e, tl_e, _sh_e = wrapper(patches, struct, slot_sel)
+        ep = torch.export.export(wrapper, (patches, struct, slot_sel), strict=False)
     lowered_cpu = to_edge_transform_and_lower(ep, partitioner=[])
     et_cpu = lowered_cpu.to_executorch()
     import tempfile
@@ -209,7 +210,7 @@ def cpu_faithful_deltas(wrapper, patches, struct) -> dict:
         tf.write(et_cpu.buffer)
         cpu_path = tf.name
     try:
-        outs = run_pte_outputs(cpu_path, patches, struct)
+        outs = run_pte_outputs(cpu_path, patches, struct, slot_sel)
     finally:
         os.remove(cpu_path)
     hr_p = outs[0].reshape(hr_shape)
@@ -280,7 +281,7 @@ class _SkipCapture(logging.Handler):
             self.lines.append(msg)
 
 
-def partition_report(wrapper, patches, struct) -> dict:
+def partition_report(wrapper, patches, struct, slot_sel) -> dict:
     """torch.export -> to_edge -> VulkanPartitioner().partition() and read the tags.
 
     We call the partitioner DIRECTLY (not the full to_edge_transform_and_lower) so we
@@ -297,7 +298,7 @@ def partition_report(wrapper, patches, struct) -> dict:
     logging.getLogger().setLevel(logging.INFO)
 
     with torch.no_grad():
-        ep = torch.export.export(wrapper, (patches, struct), strict=False)
+        ep = torch.export.export(wrapper, (patches, struct, slot_sel), strict=False)
     edge = to_edge(ep)
     edge_ep = edge.exported_program()
 
@@ -373,10 +374,12 @@ def main() -> None:
     stats = ck["normalization_stats"]
     wrapper = HeadRawForward(model).eval()
 
-    patches, struct, _bool_mask, anchor_bg = build_representative_input(stats)
-    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} anchor={anchor_bg:.2f}")
+    w = build_representative_input(stats)
+    patches, struct, slot_sel = w.patches, w.struct, w.slot_sel
+    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} "
+          f"slot_sel={tuple(slot_sel.shape)} slots={w.n_masked}")
 
-    rep = partition_report(wrapper, patches, struct)
+    rep = partition_report(wrapper, patches, struct, slot_sel)
     lowered = rep.pop("_lowered")
 
     print("\n========== VULKAN PARTITION REPORT ==========")
@@ -418,14 +421,14 @@ def main() -> None:
         install_vulkan_preprocess_fake_mode_fix()
         os.makedirs(args.out_dir, exist_ok=True)
         pte_path = os.path.join(args.out_dir, f"{args.model_id}.vulkan.pte")
-        ser = serialize_vulkan_pte(wrapper, patches, struct, pte_path, force_fp16=args.fp16)
+        ser = serialize_vulkan_pte(wrapper, patches, struct, slot_sel, pte_path, force_fp16=args.fp16)
         print(f"\n[export] wrote {pte_path} ({ser['bytes']} bytes)")
         print(f"[export] SERIALIZED delegate subgraphs   : {ser['delegate_subgraphs']}")
         print(f"[export] SERIALIZED ops in delegates     : {ser['ops_absorbed_in_delegates']}")
         print(f"[export] SERIALIZED CPU-fallback ops      : {ser['cpu_fallback_ops']} "
               f"{ser['cpu_fallback_op_census']}")
 
-        deltas = cpu_faithful_deltas(wrapper, patches, struct)
+        deltas = cpu_faithful_deltas(wrapper, patches, struct, slot_sel)
         d_hr = deltas["head_raw_max_abs_delta"]
         d_tl = deltas["time_logits_max_abs_delta"]
         print(f"[verify] portable-CPU pte vs eager head_raw    max|Δ| = {d_hr:.3e}")

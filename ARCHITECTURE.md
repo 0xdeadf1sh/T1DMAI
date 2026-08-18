@@ -1005,14 +1005,17 @@ accumulated band half-width carries into the next roll, so the envelope grows
 monotonically rather than resetting at each seam. `normalization_stats` is
 required; without it the re-normalization cannot be computed.
 
-**Export.** The exported graph is the **right-edge specialisation** of the masked
-objective, and `SPEC/inference.md` §3.1 documents it as such:
-`exporters/modified_forward.py` reads the trailing `PREDICTION_PATCHES` patches as
-a slice instead of gathering by `mask_idx`, takes its mask as an external additive
-float struct at the fixed `T = MAX_SEQ_LEN` with `NEG_FILL = -30000.0`, and cuts
-the graph at `head_raw` so everything downstream of it — the anchor, the assembly,
-the decode — is the consumer's. `NEG_FILL` rather than `-inf` keeps an fp16 NPU
-softmax finite, and underflows to the same zero in fp32.
+**Export.** The exported graph runs the general masked objective, and
+`SPEC/inference.md` §3.1 documents it: `exporters/modified_forward.py` takes the
+masked set as an external `(M, T)` one-hot `slot_sel` matrix instead of gathering
+by `mask_idx`, takes its mask as an external additive float struct at a fixed `T`
+with `NEG_FILL = -30000.0`, and cuts the graph at `head_raw` so everything
+downstream of it — the anchor, the assembly, the decode — is the consumer's.
+`NEG_FILL` rather than `-inf` keeps an fp16 NPU softmax finite, and underflows to
+the same zero in fp32. Beside `head_raw` and the time probe's logits the graph
+emits `slot_hidden`, the final-normed hidden state per slot, and the export writes
+`bg_head`'s weights out with it — together they let a consumer re-run the head
+outside the graph and adapt it without re-exporting.
 
 
 ## Parameter count

@@ -1,14 +1,17 @@
-"""ExecuTorch XNNPACK (CPU fp32) exporter — spike S1.
+"""ExecuTorch XNNPACK (CPU fp32) exporter.
 
-Loads the EMA checkpoint, wraps it in the modified ``head_raw`` forward (external
-struct mask, right-edge slice, graph cut at ``head_raw``), ``torch.export``s it,
-lowers to ExecuTorch XNNPACK -> an fp32 ``<id>.xnnpack.pte``, emits the descriptor,
-and verifies on host that:
+Loads the EMA checkpoint, wraps it in the modified forward (external struct mask,
+external slot selection, graph cut at ``head_raw``), ``torch.export``s it, lowers
+to ExecuTorch XNNPACK -> an fp32 ``<id>.xnnpack.pte``, writes the BG head beside it
+as a flat fp32 side file, emits the descriptor, and verifies on host that:
 
-  (1) the modified (struct-mask) forward matches the STOCK bool-mask forward's
-      internal ``head_raw`` (max|Δ|), and
+  (1) the modified (struct-mask, slot-selection) forward matches the STOCK
+      bool-mask/gather forward's internal ``head_raw``, for a trailing forecast AND
+      for a masked set with an infill span in it,
   (2) the lowered ``.pte`` run through the ExecuTorch python runtime matches the
-      eager modified forward (max|Δ| < TOL).
+      eager modified forward, on both masked sets, and
+  (3) the head side file reproduces ``head_raw`` from the graph's own
+      ``slot_hidden`` — the property the on-device adapter path rests on.
 
 CPU fp32 XNNPACK is the reference/authority; the NPU fp16 path is a separate,
 deferred engine module.
@@ -30,49 +33,105 @@ import model as model_module
 from data import BG_MASKED_FEAT
 from normalization import normalize, CHANNEL_NAMES
 from utils import last_bg_mgdl_from_context, time_of_day_decode_bins
-from inference import _build_patches_tensor
+from inference import _build_patches_tensor, _resolve_mask_spans
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 from exporters.modified_forward import (
-    HeadRawForward, build_struct_mask, load_model, NEG_FILL,
+    HeadRawForward, build_slot_selection, build_struct_mask,
+    build_struct_mask_from_visible, load_model, window_labels, NEG_FILL,
 )
 from exporters.descriptor import (
     build_descriptor, build_model_card, deploy_to_server, write_descriptor,
 )
+from exporters.head_weights import write_head_weights
 
 ENGINE = "executorch_xnnpack_fp32"
 VERIFY_TOL = 1e-3
+# The head side file is the SAME arithmetic in a different order, so it agrees far
+# more tightly than the runtime gate above; a looser bound here would pass a head
+# paired with the wrong graph.
+HEAD_TOL = 1e-4
+
+
+class Window:
+    """One built export input: the padded patches, the additive mask, the slot
+    selection, and the per-slot anchors that name the same masked set to the stock
+    forward. Built by :func:`build_representative_input`; the fields are set there
+    so the two paths cannot describe different masked sets."""
+
+    patches: torch.Tensor      # (1, T, PATCH_DIM)
+    struct: torch.Tensor       # (T, T) additive
+    bool_mask: torch.Tensor    # (T, T) bool
+    slot_sel: torch.Tensor     # (M, T) one-hot rows
+    mask_idx: torch.Tensor     # (1, M) int64; padded slots repeat patch 0
+    anchors: torch.Tensor      # (1, M) mg/dL
+    spans: list
+    n_ctx: int
+    T: int
+    n_masked: int
 
 
 def executorch_version() -> str:
     return importlib.metadata.version("executorch")
 
 
-def build_representative_input(
-    stats: dict[str, dict[str, float]], n_ctx: int = cfg.MAX_CONTEXT_PATCHES,
-) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]":
-    """A plausible normalized ``T=52`` input from a SYNTHETIC 24 h BG series.
+def _slot_anchor_cells(spans, n_ctx):
+    """The ``(patch, step)`` context cell each masked slot anchors on.
 
-    No simulator / sensor needed: a smooth diurnal BG curve with two meal-driven
-    excursions, a light constant basal, two boluses and one exercise bout — passed
+    One-sided and left-preferring: the last step of the span's left neighbour, or
+    the first step of the right neighbour when the span opens the window. Every slot
+    of one span carries the same cell. Only a VISIBLE cell may be named — feat 0 of a
+    masked patch is a legal-looking z that decodes to an ordinary mg/dL, so a wrong
+    index yields a plausible anchor rather than an error.
+    """
+    patch_idx: list[int] = []
+    step_idx: list[int] = []
+    for start, length in spans:
+        if start > 0:
+            p, s = start - 1, cfg.PATCH_SIZE - 1
+        else:
+            p, s = start + length, 0
+        assert 0 <= p < n_ctx, (
+            f"span ({start}, {length}) anchors on patch {p}, outside the {n_ctx} "
+            f"context patches"
+        )
+        patch_idx += [p] * length
+        step_idx += [s] * length
+    return patch_idx, step_idx
+
+
+def build_representative_input(
+    stats: dict[str, dict[str, float]],
+    n_ctx: int | None = None,
+    seq_len: int | None = None,
+    mask_spans=None,
+) -> Window:
+    """A plausible normalized fixed-``T`` input from a SYNTHETIC BG series.
+
+    No simulator / sensor needed: a smooth diurnal BG curve with meal-driven
+    excursions, a light constant basal, boluses and one exercise bout — passed
     through the exact training preprocessing (clamp bg / floor the rest ->
     normalize; no smoothing) and the shipped ``_build_patches_tensor`` so the
-    patches / mask are construction-identical to a real forecast.
+    patches / mask / masked-set bit are construction-identical to a real run.
 
-    The graph is a SINGLE fixed shape ``T = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
-    = 52`` with the real context LEFT-PADDED into the 48 context slots (pred at the
-    right edge) — exactly how training's ``collate_fn`` pads, so the absolute RoPE
-    positions match training. ``_build_patches_tensor`` emits only ``n_ctx + P``
-    tokens, so we prepend ``48 - n_ctx`` zero pad patches here; the struct mask blocks
-    every pad COLUMN, so the pad values never reach a prediction token.
+    The graph is a SINGLE fixed shape ``T``, default
+    ``MAX_CONTEXT_PATCHES + PREDICTION_PATCHES``, with the real context LEFT-PADDED
+    into the context slots (the future patches at the right edge) — exactly how
+    training's ``collate_fn`` pads, so the absolute RoPE positions match training.
+    ``_build_patches_tensor`` emits only ``n_ctx + P`` tokens, so we prepend
+    ``(T - P) - n_ctx`` zero pad patches here; the struct mask blocks every pad
+    COLUMN, so the pad values never reach a masked token.
 
-    Returns:
-        (patches (1,52,PATCH_DIM), struct (52,52), bool_mask (52,52), anchor mg/dL).
+    ``mask_spans`` is the masked set in UNPADDED window coordinates (what
+    ``inference.predict`` takes). None selects the trailing forecast.
     """
+    T = int(seq_len or cfg.MAX_SEQ_LEN)
+    c = T - cfg.PREDICTION_PATCHES
+    n_ctx = int(n_ctx or c)
     n_steps = n_ctx * cfg.PATCH_SIZE
     t = np.arange(n_steps, dtype=np.float64)
-    # Diurnal drift 90..170 mg/dL + two gaussian meal excursions.
-    bg = 120.0 + 30.0 * np.sin(2.0 * np.pi * t / n_steps)
+    # Diurnal drift 90..170 mg/dL + gaussian meal excursions, one per simulated day.
+    bg = 120.0 + 30.0 * np.sin(2.0 * np.pi * t / max(288.0, n_steps / 7.0))
     for center, amp, width in ((0.35 * n_steps, 55.0, 18.0), (0.72 * n_steps, 40.0, 14.0)):
         bg += amp * np.exp(-0.5 * ((t - center) / width) ** 2)
     carb = np.zeros(n_steps, dtype=np.float64)
@@ -109,45 +168,57 @@ def build_representative_input(
     ctx[:, :len(CHANNEL_NAMES)] = feats
     context = torch.from_numpy(ctx).reshape(n_ctx, cfg.PATCH_SIZE, cfg.N_INPUT_FEATURES)
 
-    patches, _mask = _build_patches_tensor(context, normalization_stats=stats)  # (n_ctx+P, PATCH_DIM)
-    # Left-pad the CONTEXT to MAX_CONTEXT_PATCHES so the sequence is the fixed T=52
-    # (pred stays at the right edge); pad patches are zeros (masked out by struct).
-    pad0 = cfg.MAX_CONTEXT_PATCHES - n_ctx
+    spans = _resolve_mask_spans(mask_spans, n_ctx)
+    patches, _bool_unpadded = _build_patches_tensor(
+        context, normalization_stats=stats, mask_spans=mask_spans,
+    )                                                                   # (n_ctx+P, PATCH_DIM)
+    pad0 = c - n_ctx
     if pad0 > 0:
         pad = torch.zeros(pad0, cfg.PATCH_DIM, dtype=patches.dtype)
-        patches = torch.cat([pad, patches], dim=0)                              # (52, PATCH_DIM)
-    struct = build_struct_mask(n_ctx, dtype=torch.float32)                      # (52, 52)
-    bool_mask = (struct == 0.0)                                                 # padded bool mask
-    anchor_bg = float(last_bg_mgdl_from_context(context, stats))
-    return patches.unsqueeze(0).float(), struct, bool_mask, anchor_bg
+        patches = torch.cat([pad, patches], dim=0)                      # (T, PATCH_DIM)
+
+    # Context-side masked patches, shifted into padded coordinates. The future zone
+    # is masked unconditionally by window_labels.
+    extra = [p + pad0 for s, L in spans for p in range(s, s + L) if p < n_ctx]
+    visible, is_pad, idx_abs = window_labels(n_ctx, extra, T)
+    struct = build_struct_mask_from_visible(visible, is_pad, dtype=torch.float32)
+    bool_mask = (struct == 0.0)
+
+    p_cells, s_cells = _slot_anchor_cells(spans, n_ctx)
+    anchor_v = last_bg_mgdl_from_context(context, stats, p_cells, s_cells)   # (n_masked,)
+    m = cfg.MAX_MASKED_PATCHES
+    n_masked = len(idx_abs)
+    assert n_masked == anchor_v.numel(), (
+        f"{n_masked} masked patches but {anchor_v.numel()} anchors"
+    )
+    # Padded slots read patch 0 and carry a legal mg/dL anchor; ``valid`` discards
+    # their outputs downstream.
+    mask_idx = torch.zeros(1, m, dtype=torch.int64)
+    mask_idx[0, :n_masked] = torch.tensor(idx_abs, dtype=torch.int64)
+    anchors = torch.full((1, m), float(anchor_v[0]), dtype=torch.float32)
+    anchors[0, :n_masked] = anchor_v
+
+    w = Window.__new__(Window)
+    w.patches = patches.unsqueeze(0).float()
+    w.struct = struct
+    w.bool_mask = bool_mask
+    w.mask_idx = mask_idx
+    w.anchors = anchors
+    w.slot_sel = build_slot_selection(idx_abs, T)
+    w.spans = spans
+    w.n_ctx = n_ctx
+    w.T = T
+    w.n_masked = n_masked
+    return w
 
 
-def right_edge_slots(
-    B: int, T: int, anchor_bg: float,
-) -> "tuple[torch.Tensor, torch.Tensor]":
-    """The ``(anchor_bg, mask_idx)`` pair naming the trailing forecast span.
-
-    The stock forward reads the masked patches by index, so reproducing the exported
-    graph's RIGHT-EDGE SPECIALISATION against it means naming those indices
-    explicitly: one span of ``PREDICTION_PATCHES`` slots ending at ``T - 1``. Every
-    slot of one span carries the same anchor.
-
-    Returns:
-        (anchor_bg (B, P) mg/dL, mask_idx (B, P) int64).
-    """
-    P = cfg.PREDICTION_PATCHES
-    mask_idx = torch.arange(T - P, T, dtype=torch.int64).expand(B, P).contiguous()
-    return torch.full((B, P), float(anchor_bg), dtype=torch.float32), mask_idx
-
-
-def stock_head_raw(
-    model, patches: torch.Tensor, bool_mask: torch.Tensor, anchor_bg: float,
-) -> torch.Tensor:
-    """Capture the STOCK ``T1DMAI.forward``'s internal ``head_raw`` (bool-mask path).
+def stock_head_raw(model, w: Window) -> torch.Tensor:
+    """Capture the STOCK ``T1DMAI.forward``'s internal ``head_raw`` (bool-mask,
+    gather-by-index path) on the same masked set.
 
     ``head_raw`` is a forward local, so we transiently swap the module-global
     ``assemble_quantiles`` (bound in ``model.py``) for a capturing shim, run the real
-    forward on the right-edge masked set, and read the tapped tensor back.
+    forward, and read the tapped tensor back.
     """
     captured: dict[str, torch.Tensor] = {}
     orig = model_module.assemble_quantiles
@@ -158,15 +229,54 @@ def stock_head_raw(
 
     model_module.assemble_quantiles = _cap
     try:
-        anchor_t, mask_idx = right_edge_slots(patches.shape[0], patches.shape[1], anchor_bg)
         with torch.no_grad():
-            model(patches, bool_mask, anchor_t, mask_idx)
+            model(w.patches, w.bool_mask, w.anchors, w.mask_idx)
     finally:
         model_module.assemble_quantiles = orig
     return captured["head_raw"]
 
 
-def export_pte(wrapper, patches: torch.Tensor, struct: torch.Tensor, out_path: str) -> dict:
+def eager_time_logits(model, w: Window) -> torch.Tensor:
+    """Stock ``T1DMAI.forward(..., return_time=True)`` per-slot time-probe logits —
+    the eager reference the exported ``time_logits`` output is validated against."""
+    with torch.no_grad():
+        _q, _m, time_pred = model(
+            w.patches, w.bool_mask, w.anchors, w.mask_idx, return_time=True,
+        )
+    assert time_pred is not None, "eager forward returned time_pred=None (probe absent)"
+    return time_pred
+
+
+def head_from_hidden(head_path: str, block: dict, slot_hidden: torch.Tensor) -> torch.Tensor:
+    """Reproduce ``head_raw`` from ``slot_hidden`` and the flat head side file.
+
+    This is the on-device adapter path in miniature: read the tensors in file order,
+    run the same two-hidden-layer SiLU MLP, and expand through the within-patch
+    basis. Any disagreement with the graph's own ``head_raw`` means the side file
+    and the ``.pte`` are not the same head.
+    """
+    buf = np.fromfile(head_path, dtype="<f4")
+    off = 0
+    ten: dict[str, torch.Tensor] = {}
+    for spec in block["tensors"]:
+        n = int(np.prod(spec["shape"]))
+        ten[spec["name"]] = torch.from_numpy(
+            buf[off:off + n].astype(np.float32).reshape(spec["shape"]).copy()
+        )
+        off += n
+    assert off == buf.size, f"head file has {buf.size} floats, tensors account for {off}"
+    h = slot_hidden
+    for name in ("l0", "l1"):
+        h = torch.nn.functional.silu(
+            torch.nn.functional.linear(h, ten[f"{name}.weight"], ten[f"{name}.bias"])
+        )
+    out = torch.nn.functional.linear(h, ten["l2.weight"], ten["l2.bias"])
+    b, m = out.shape[0], out.shape[1]
+    coeff = out.view(b, m, cfg.BG_HEAD_STEP_BASIS_DIM, 1 + 2 * cfg.N_SPREADS)
+    return torch.einsum('sk,bmkc->bmsc', ten["step_basis"], coeff)
+
+
+def export_pte(wrapper, w: Window, out_path: str) -> dict:
     """torch.export the wrapper and lower to ExecuTorch XNNPACK; write ``out_path``.
 
     Returns a small dict of {delegated, total, non_delegated_ops} for the op-support
@@ -191,7 +301,9 @@ def export_pte(wrapper, patches: torch.Tensor, struct: torch.Tensor, out_path: s
                 break
 
     with torch.no_grad():
-        ep = torch.export.export(wrapper, (patches, struct), strict=False)
+        ep = torch.export.export(
+            wrapper, (w.patches, w.struct, w.slot_sel), strict=False,
+        )
     lowered = to_edge_transform_and_lower(ep, partitioner=[XnnpackPartitioner()])
     et_prog = lowered.to_executorch()
     with open(out_path, "wb") as f:
@@ -218,60 +330,37 @@ def export_pte(wrapper, patches: torch.Tensor, struct: torch.Tensor, out_path: s
     return info
 
 
-def run_pte_outputs(pte_path: str, patches: torch.Tensor, struct: torch.Tensor) -> list:
-    """Execute the ``.pte`` -> the full ordered list of output tensors.
-
-    A single-output (legacy head_raw-only) ``.pte`` returns ``[head_raw]``; the
-    dual-output graph returns ``[head_raw, time_logits]``.
-    """
+def run_pte_outputs(pte_path: str, patches, struct, slot_sel) -> list:
+    """Execute the ``.pte`` -> the full ordered list of output tensors
+    ``[head_raw, time_logits, slot_hidden]``."""
+    args = [patches.contiguous(), struct.contiguous(), slot_sel.contiguous()]
     try:
         from executorch.runtime import Runtime
         rt = Runtime.get()
         program = rt.load_program(pte_path)
         method = program.load_method("forward")
-        outs = method.execute([patches.contiguous(), struct.contiguous()])
+        outs = method.execute(args)
     except Exception:
         from executorch.extension.pybindings.portable_lib import _load_for_executorch
         module = _load_for_executorch(pte_path)
-        outs = module.forward([patches.contiguous(), struct.contiguous()])
+        outs = module.forward(args)
     return [o if isinstance(o, torch.Tensor) else torch.as_tensor(o) for o in outs]
 
 
-def run_pte(pte_path: str, patches: torch.Tensor, struct: torch.Tensor) -> torch.Tensor:
-    """Execute the ``.pte`` -> head_raw tensor (output 0)."""
-    return run_pte_outputs(pte_path, patches, struct)[0]
-
-
-def eager_time_logits(
-    model, patches: torch.Tensor, bool_mask: torch.Tensor, anchor_bg: float,
-) -> torch.Tensor:
-    """Stock ``T1DMAI.forward(..., return_time=True)`` per-patch time-probe logits.
-
-    The eager reference the exported ``time_logits`` output is validated against —
-    the time analogue of ``stock_head_raw`` for the forecast head, on the same
-    right-edge masked set.
-    """
-    anchor_t, mask_idx = right_edge_slots(patches.shape[0], patches.shape[1], anchor_bg)
-    with torch.no_grad():
-        _q, _m, time_pred = model(patches, bool_mask, anchor_t, mask_idx, return_time=True)
-    assert time_pred is not None, "eager forward returned time_pred=None (probe absent)"
-    return time_pred
-
-
-def write_time_head_golden(model, patches, bool_mask, anchor_bg, out_path: str) -> None:
+def write_time_head_golden(model, w: Window, out_path: str) -> None:
     """Emit the Rust decode golden for ``utils.time_of_day_resultant``.
 
     Rows pair a 12-logit input with T1DMAI's own softmax probs + resultant (hour, R),
     so the Rust port is gated against T1DMAI's geometry core. Mixes the deployed
-    model's real per-patch logits with hand-built synthetic distributions (one-hot,
+    model's real per-slot logits with hand-built synthetic distributions (one-hot,
     uniform, bimodal, sharp, wrap-around) to exercise the circular reduction.
     """
     n = cfg.TIME_PROBE_N_BINS
-    real = eager_time_logits(model, patches, bool_mask, anchor_bg)[0]   # (P, n_bins)
+    real = eager_time_logits(model, w)[0]                              # (M, n_bins)
 
     rows_logits: list[tuple[str, list[float]]] = []
-    for p in range(cfg.PREDICTION_PATCHES):
-        rows_logits.append((f"model_patch{p}", real[p].tolist()))
+    for p in range(min(cfg.PREDICTION_PATCHES, real.shape[0])):
+        rows_logits.append((f"model_slot{p}", real[p].tolist()))
 
     def onehot(k, hi=8.0):
         v = [0.0] * n
@@ -319,7 +408,8 @@ def write_time_head_golden(model, patches, bool_mask, anchor_bg, out_path: str) 
         "n_bins": n,
         "bin_hours": cfg.TIME_PROBE_BIN_HOURS,
         "bin_centers_hours": centers,
-        "reduction": "origin_patch (patch index 0) for the app's current-hour belief",
+        "reduction": "the slot holding the first forecast patch, for the app's "
+                     "current-hour belief",
         "hour_tol": 1e-3,
         "R_tol": 1e-4,
         "R_degenerate_eps": R_DEGEN_EPS,
@@ -339,6 +429,10 @@ def main() -> None:
     ap.add_argument("--model-id", default="t1dmai_best")
     ap.add_argument("--out-dir", default="exported", help="directory to write the artifact and its descriptor into")
     ap.add_argument("--work-dir", default=None, help="where to write the .pte before copy")
+    ap.add_argument("--seq-len", type=int, default=None,
+                    help="fixed graph length T (default MAX_CONTEXT_PATCHES + "
+                         "PREDICTION_PATCHES). A shorter T is a cheaper artifact with "
+                         "a shorter memory; its descriptor reports the context it accepts.")
     ap.add_argument("--deploy-dir", default=None,
                     help="also copy the artifact + a <stem>.json sidecar into a T1DMSERVER "
                          "models directory (e.g. ../T1DMSERVER/data/models)")
@@ -355,90 +449,111 @@ def main() -> None:
     stats = ck["normalization_stats"]
     wrapper = HeadRawForward(model).eval()
 
-    patches, struct, bool_mask, anchor_bg = build_representative_input(stats)
-    print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} "
-          f"anchor={anchor_bg:.2f} mg/dL")
+    T = int(args.seq_len or cfg.MAX_SEQ_LEN)
+    c = T - cfg.PREDICTION_PATCHES
+    m = cfg.MAX_MASKED_PATCHES
 
-    # --- struct builder must equal the stock create_attention_mask (n_ctx=48, no pad) ---
+    # Two masked sets over the same geometry: the trailing forecast the app runs
+    # every cycle, and one with an infill span in the middle of the context — the
+    # case the previous right-edge export could not represent at all.
+    w_fc = build_representative_input(stats, seq_len=T)
+    infill_spans = [(c // 2, 4), (c, cfg.PREDICTION_PATCHES)]
+    w_inf = build_representative_input(stats, seq_len=T, mask_spans=infill_spans)
+    print(f"[input] T={T} patches={tuple(w_fc.patches.shape)} "
+          f"struct={tuple(w_fc.struct.shape)} slot_sel={tuple(w_fc.slot_sel.shape)}")
+    print(f"[input] forecast slots={w_fc.n_masked} infill slots={w_inf.n_masked}")
+
+    # --- struct builder must equal the stock create_attention_mask (no pad) ---
     from utils import create_attention_mask
-    stock_bool_48 = create_attention_mask(cfg.MAX_CONTEXT_PATCHES, cfg.PREDICTION_PATCHES)
-    struct_stock_48 = torch.where(
-        stock_bool_48, torch.zeros_like(struct), torch.full_like(struct, NEG_FILL)
+    stock_bool = create_attention_mask(c, cfg.PREDICTION_PATCHES)
+    struct_stock = torch.where(
+        stock_bool, torch.zeros(T, T), torch.full((T, T), NEG_FILL)
     )
-    assert torch.equal(build_struct_mask(cfg.MAX_CONTEXT_PATCHES), struct_stock_48), (
-        "build_struct_mask(48) disagrees with the stock create_attention_mask(48,4)"
+    assert torch.equal(build_struct_mask(c, T), struct_stock), (
+        "build_struct_mask disagrees with the stock create_attention_mask"
     )
 
-    # --- capture the CURRENTLY-DEPLOYED .pte's head_raw BEFORE we overwrite it, so
-    #     the regression check (I2) can prove the forecast is byte-identical ---
-    hr_shape = (1, cfg.PREDICTION_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
-    tl_shape = (1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS)
-    pte_final = os.path.join(args.out_dir, f"{args.model_id}.xnnpack.pte")
-    hr_deployed = None
-    if os.path.isfile(pte_final):
-        try:
-            hr_deployed = run_pte(pte_final, patches, struct).reshape(hr_shape).clone()
-            print(f"[regress] captured deployed head_raw from {pte_final}")
-        except Exception as exc:
-            print(f"[regress] could not read deployed .pte ({exc!r}); skipping regression")
+    hr_shape = (1, m, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
+    tl_shape = (1, m, cfg.TIME_PROBE_N_BINS)
+    sh_shape = (1, m, cfg.D_MODEL)
 
-    # --- (1) modified (struct) vs stock (bool) head_raw + time_logits ---
-    with torch.no_grad():
-        hr_mod, tl_mod = wrapper(patches, struct)
-    hr_stock = stock_head_raw(model, patches, bool_mask, anchor_bg)
-    d_struct = float((hr_mod - hr_stock).abs().max())
-    print(f"[verify] modified(struct) vs stock(bool) head_raw  max|Δ| = {d_struct:.3e}")
-    assert hr_mod.shape == hr_shape
-    assert tl_mod.shape == tl_shape, f"time_logits shape {tuple(tl_mod.shape)} != {tl_shape}"
+    # --- (1) modified (struct + slot_sel) vs stock (bool + gather) ---
+    deltas: dict[str, float] = {}
+    for name, w in (("forecast", w_fc), ("infill", w_inf)):
+        with torch.no_grad():
+            hr_mod, tl_mod, sh_mod = wrapper(w.patches, w.struct, w.slot_sel)
+        assert hr_mod.shape == hr_shape, f"{name}: head_raw {tuple(hr_mod.shape)} != {hr_shape}"
+        assert tl_mod.shape == tl_shape, f"{name}: time_logits {tuple(tl_mod.shape)} != {tl_shape}"
+        assert sh_mod.shape == sh_shape, f"{name}: slot_hidden {tuple(sh_mod.shape)} != {sh_shape}"
+        hr_stock = stock_head_raw(model, w)
+        # Only the REAL slots are compared: a padded slot repeats patch 0 in both
+        # paths, so it agrees, but nothing downstream reads it.
+        n = w.n_masked
+        d = float((hr_mod[:, :n] - hr_stock[:, :n]).abs().max())
+        deltas[f"struct_{name}"] = d
+        print(f"[verify] modified vs stock head_raw ({name:8s})     max|Δ| = {d:.3e}")
 
-    # --- export + lower (two outputs: head_raw, time_logits) ---
+    # --- export + lower (three inputs, three outputs) ---
     work_dir = args.work_dir or args.out_dir
     os.makedirs(work_dir, exist_ok=True)
     pte_name = f"{args.model_id}.xnnpack.pte"
     pte_work = os.path.join(work_dir, pte_name)
-    op_info = export_pte(wrapper, patches, struct, pte_work)
+    op_info = export_pte(wrapper, w_fc, pte_work)
     print(f"[export] wrote {pte_work} ({os.path.getsize(pte_work)} bytes)")
     print(f"[export] op-support: {op_info}")
 
-    # --- (2) .pte vs eager modified head_raw + time_logits ---
-    outs = run_pte_outputs(pte_work, patches, struct)
-    assert len(outs) == 2, f"expected 2 .pte outputs (head_raw, time_logits), got {len(outs)}"
-    hr_pte = outs[0].reshape(hr_shape)
-    tl_pte = outs[1].reshape(tl_shape)
-    d_pte = float((hr_pte - hr_mod).abs().max())
-    print(f"[verify] pte vs eager-modified head_raw            max|Δ| = {d_pte:.3e}")
+    # --- head side file (the adapter seam) ---
+    os.makedirs(args.out_dir, exist_ok=True)
+    head_name = f"{args.model_id}.head.bin"
+    head_path = os.path.join(args.out_dir, head_name)
+    head_block = write_head_weights(model, head_path)
+    print(f"[head] wrote {head_path} ({head_block['bytes']} bytes, "
+          f"sha256={head_block['sha256'][:12]}…)")
 
-    # --- (2a) .pte time_logits vs eager stock forward(return_time=True) ---
-    tl_eager = eager_time_logits(model, patches, bool_mask, anchor_bg)  # (1,P,n_bins)
-    d_time = float((tl_pte - tl_eager).abs().max())
-    print(f"[verify] pte vs eager time_logits                  max|Δ| = {d_time:.3e}")
+    # --- (2) .pte vs eager modified, on BOTH masked sets ---
+    for name, w in (("forecast", w_fc), ("infill", w_inf)):
+        outs = run_pte_outputs(pte_work, w.patches, w.struct, w.slot_sel)
+        assert len(outs) == 3, (
+            f"expected 3 .pte outputs (head_raw, time_logits, slot_hidden), got {len(outs)}"
+        )
+        hr_pte = outs[0].reshape(hr_shape)
+        tl_pte = outs[1].reshape(tl_shape)
+        sh_pte = outs[2].reshape(sh_shape)
+        with torch.no_grad():
+            hr_mod, _tl_mod, _sh_mod = wrapper(w.patches, w.struct, w.slot_sel)
+        n = w.n_masked
+        deltas[f"pte_{name}"] = float((hr_pte[:, :n] - hr_mod[:, :n]).abs().max())
+        print(f"[verify] pte vs eager head_raw     ({name:8s})     max|Δ| = "
+              f"{deltas[f'pte_{name}']:.3e}")
 
-    # --- (2b) REGRESSION: new head_raw byte-identical to the deployed .pte's ---
-    d_regress = None
-    if hr_deployed is not None:
-        d_regress = float((hr_pte - hr_deployed).abs().max())
-        print(f"[regress] new pte head_raw vs deployed pte head_raw max|Δ| = {d_regress:.3e}")
+        tl_eager = eager_time_logits(model, w)
+        deltas[f"time_{name}"] = float((tl_pte[:, :n] - tl_eager[:, :n]).abs().max())
+        print(f"[verify] pte vs eager time_logits  ({name:8s})     max|Δ| = "
+              f"{deltas[f'time_{name}']:.3e}")
 
-    # --- padded-context sanity: n_ctx=16, ensure finite + shape ---
-    p16, s16, _bm16, _anchor16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES)
-    o16 = run_pte_outputs(pte_work, p16, s16)
-    hr16 = o16[0].reshape(hr_shape)
-    tl16 = o16[1].reshape(tl_shape)
-    finite16 = bool(torch.isfinite(hr16).all() and torch.isfinite(tl16).all())
-    print(f"[verify] padded n_ctx={cfg.MIN_CONTEXT_PATCHES} pte head_raw+time finite = {finite16}")
+        # --- (3) the head side file reproduces head_raw from the graph's own hidden ---
+        hr_head = head_from_hidden(head_path, head_block, sh_pte)
+        deltas[f"head_{name}"] = float((hr_head[:, :n] - hr_pte[:, :n]).abs().max())
+        print(f"[verify] head file vs pte head_raw ({name:8s})     max|Δ| = "
+              f"{deltas[f'head_{name}']:.3e}")
+
+    # --- padded-context sanity: the shortest context the artifact accepts ---
+    w16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES, seq_len=T)
+    o16 = run_pte_outputs(pte_work, w16.patches, w16.struct, w16.slot_sel)
+    finite16 = bool(all(torch.isfinite(o).all() for o in o16))
+    print(f"[verify] padded n_ctx={cfg.MIN_CONTEXT_PATCHES} pte outputs finite = {finite16}")
 
     # --- Rust decode golden for the time probe (opt-in) ---
     golden_path = args.golden
     if golden_path:
-        write_time_head_golden(model, patches, bool_mask, anchor_bg, golden_path)
+        write_time_head_golden(model, w_fc, golden_path)
         print(f"[golden] wrote {golden_path}")
 
     # --- descriptor ---
-    os.makedirs(args.out_dir, exist_ok=True)
     desc = build_descriptor(
         model_id=args.model_id, engine=ENGINE, executorch_version=et_ver,
         artifact_filename=pte_name, normalization_stats=stats, precision="fp32",
-        model_card=build_model_card(model, ck),
+        model_card=build_model_card(model, ck), head=head_block, seq_len=T,
     )
     # Named after the artifact, not a fixed "descriptor.json": several models share
     # one out-dir, and the app's ModelStore discovers `*.descriptor.json` either way.
@@ -447,6 +562,7 @@ def main() -> None:
     print(f"[descriptor] wrote {desc_path}")
 
     # --- copy artifact into out-dir if it was built elsewhere ---
+    pte_final = os.path.join(args.out_dir, pte_name)
     if os.path.abspath(pte_work) != os.path.abspath(pte_final):
         shutil.copy2(pte_work, pte_final)
     print(f"[artifact] {pte_final}")
@@ -455,21 +571,17 @@ def main() -> None:
         art, side = deploy_to_server(pte_final, desc, args.deploy_dir)
         print(f"[deploy] {art}\n[deploy] {side}")
 
-    REGRESS_TOL = 1e-4
-    ok = (
-        (d_struct < VERIFY_TOL) and (d_pte < VERIFY_TOL)
-        and (d_time < VERIFY_TOL) and finite16
-        and (d_regress is None or d_regress < REGRESS_TOL)
+    ok = finite16 and all(
+        v < (HEAD_TOL if k.startswith("head_") else VERIFY_TOL) for k, v in deltas.items()
     )
     print(f"\nRESULT: {'SUCCESS' if ok else 'FAIL'}")
     print(f"  executorch_version = {et_ver}")
     print(f"  pte                = {pte_final}")
+    print(f"  head               = {head_path}")
     print(f"  descriptor         = {desc_path}")
     print(f"  golden             = {golden_path or 'skipped (--golden)'}")
-    print(f"  d_struct           = {d_struct:.3e}")
-    print(f"  d_pte              = {d_pte:.3e}")
-    print(f"  d_time             = {d_time:.3e}")
-    print(f"  d_regress          = {'n/a' if d_regress is None else f'{d_regress:.3e}'}")
+    for k in sorted(deltas):
+        print(f"  {k:18s} = {deltas[k]:.3e}")
     if not ok:
         raise SystemExit(1)
 

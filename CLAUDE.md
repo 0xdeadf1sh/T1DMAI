@@ -255,25 +255,37 @@ region of a training sample.
   - **The rolling band carry is `predict_rolling`'s own, not `assemble_quantiles`'s.** Each roll measures its NATIVE terminal-step half-width `0.5·(q_tau[-1,-1,-1] − q_tau[-1,-1,0])` on the PRE-carry fan; shifts that roll's fan by the running carry (`τ>.5` columns `+ carry`, `τ<.5` columns `− carry`, the median column untouched); derives `bands = f_inv(q_tau)` from the widened fan, with conformal on top of that; and only THEN adds the native half-width to the carry. So roll 0 is unwidened and the carry grows about linearly with the roll count. Measuring the half-width on the POST-carry fan instead compounds it geometrically (`carry → 2·carry + native`) and pins the long-horizon band to the physiological rails.
 - **Long-horizon validation via rolling — conditioned on announced doses.** A single forward covers `PREDICTION_HORIZON_HOURS`, so the table reports `bg_rmse @{30,60,120}` (single-pass) plus rolling `@{180,360,480}` and night-only `night_bg_rmse @{180,360,480}m`, rolled out to `NIGHT_LONG_HORIZON_HOURS`. The roll is conditioned via `_make_long_horizon_overrides_fn` from `bg_formula_data['extended_{carb,insulin,exercise}_{norm,raw}']` — the nocturnal-hypo use case knows the programmed basal ahead of time. BG stays autoregressive; conditioning the doses is what tames the zero-basal-OOD runaway an unconditioned roll would suffer. Set `NIGHT_LONG_HORIZON_HOURS == PREDICTION_HORIZON_HOURS` to skip rolling.
 
-## The export is a right-edge specialisation
+## The export takes the masked set as an input
 
-`exporters/modified_forward.py` deliberately does NOT run the general masked forward. It differs in
-exactly three ways, all required by the on-device contract and all documented in
+`exporters/modified_forward.py` runs the general masked objective. It differs from
+`T1DMAI.forward` in exactly three ways, all required by the on-device contract and all documented in
 `T1DMCOMMON/SPEC/inference.md`:
 
 1. its only mask input is an external **additive float** struct mask, `NEG_FILL = -30000.0` where
    blocked (not `-inf`, so an fp16 NPU softmax stays finite; in fp32 `exp(-30000)` underflows to 0.0,
-   making it bit-identical to `-inf`), built by `build_struct_mask` at a fixed `T = MAX_SEQ_LEN`;
-2. the head reads the trailing `PREDICTION_PATCHES` patches as a **slice**, taking no `mask_idx`;
-3. the graph is **cut at `head_raw`** `(B, P, S, 1 + 2·N_SPREADS)` in risk space — no `anchor_bg`, no
-   `assemble_quantiles`. Everything downstream is Rust.
+   making it bit-identical to `-inf`), built from the training-time
+   `utils.create_attention_mask_from_visible` at a fixed `T`;
+2. the head reads its `M` slots through an external `(M, T)` one-hot **`slot_sel`** matrix rather
+   than gathering by `mask_idx`. Same permutation, but a float matmul — so it delegates with the
+   rest of the graph and no int64 tensor crosses the runtime boundary. Forecast, backcast and infill
+   are one artifact under different inputs;
+3. the graph is **cut at `head_raw`** `(B, M, S, 1 + 2·N_SPREADS)` in risk space — no `anchor_bg`, no
+   `assemble_quantiles`. Everything downstream is the consumer's.
 
-It emits two outputs in a fixed order, `head_raw` then `time_logits`. `exporters/descriptor.py` is
-the SOLE pre/post source for the on-device core: the app reads the artifact plus the descriptor and
-never parses the `.pt`. Three engine modules sit on the same modified forward —
-`executorch_xnnpack.py` (fp32 CPU, the reference/authority), `executorch_vulkan.py` and
-`litert_npu.py` — each self-checking on host that the modified forward matches the stock bool-mask
-forward's `head_raw` and that the lowered artifact matches eager.
+It emits three outputs in a fixed order: `head_raw`, `time_logits`, and `slot_hidden` — the
+final-normed hidden state per slot. `exporters/head_weights.py` writes `bg_head` beside the artifact
+as a flat fp32 file with a sha256, so a consumer can reproduce `head_raw` from `slot_hidden` and put
+an adapter between them; the export checks that reproduction on every run.
+
+`--seq-len` exports a shorter window as a cheaper artifact with a shorter memory, and the descriptor
+reports the context THAT artifact accepts. `exporters/descriptor.py` is the SOLE pre/post source for
+the on-device core: the app reads the artifact plus the descriptor and never parses the `.pt`. Three
+engine modules sit on the same modified forward — `executorch_xnnpack.py` (fp32 CPU, the
+reference/authority), `executorch_vulkan.py` and `litert_npu.py` — each self-checking on host that
+the modified forward matches the stock bool-mask/gather forward's `head_raw`, for a trailing
+forecast AND for a masked set with an infill span in it, and that the lowered artifact matches
+eager. `exporters/rust_golden.py` emits the fixture the consumer's own reimplementation is pinned
+against.
 
 ## Code style
 
@@ -313,7 +325,7 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 - `calibrate_conformal.py` — post-training fit of the shipped forecast `conformal_delta` (and the unshipped infill one) on the reserved partition
 - `metrics/scoring.py` — CRPS, Winkler, coverage-with-sharpness, joint horizon coverage, alarm operating curve with median lead; all binned on `d`, all mg/dL at the boundary
 - `metrics/protocols.py` — the two fixed protocols (forecast vs persistence, infill vs linear interpolation), the `d` axis, column naming, the sampler `d` histogram and the cohort census
-- `exporters/` — `modified_forward.py` (right-edge specialisation + struct mask + checkpoint load), `descriptor.py` (the on-device JSON contract), and the `executorch_xnnpack` / `executorch_vulkan` / `litert_npu` engine modules
+- `exporters/` — `modified_forward.py` (the modified forward + struct mask + slot selection + checkpoint load), `head_weights.py` (the head side file, the adapter seam), `descriptor.py` (the on-device JSON contract), `rust_golden.py` (the consumer's pipeline fixture), and the `executorch_xnnpack` / `executorch_vulkan` / `litert_npu` engine modules
 - `model_health.py` — capacity / staleness audit of a checkpoint, keyed to `resize_model.py`'s knobs; the `--data` pass builds its samples under the CHECKPOINT's `masked_channel_policy`, echoed in the report header and the `--json` payload
 - `resize_model.py` — rewrites `config.py` from manual architecture overrides; reports the resulting parameter count (computed, not targeted)
 - `T1DMSIM/cache_simulator.py` (external, in the T1DMSIM repo) — pre-generates a compressed simulator pool consumed by `T1DMDataset(cache_path=...)`, and emits the four-channel `normalization_stats.json` alongside `meta.json`

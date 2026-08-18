@@ -872,8 +872,8 @@ def global_median_dim(span_patches: int) -> int:
 
         L        1     2     3     4( == PREDICTION_PATCHES)
         n = L*S  6    12    18    24
-        G_L      2     3     5     6
-        2n/G_L  6.0   8.0   7.2   8.0     (shortest representable period, steps)
+        G_L      3     6     9    12
+        2n/G_L  4.0   4.0   4.0   4.0     (shortest representable period, steps)
 
     A FIXED ``G`` is a defect here rather than an approximation: at ``L = 1`` the
     projection would be ``min(G, n) = 6`` columns over ``n = 6`` points — the

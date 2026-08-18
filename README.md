@@ -483,16 +483,18 @@ only, and on Vulkan only takes effect with `--write-pte`. CPU fp32 is the
 reference every other engine is measured against; the Vulkan module also reports
 how much of the graph the backend delegates versus falls back to CPU.
 
-The exported graph is the right-edge case of the objective, specialised: it takes
-the trailing forecast patches as a slice instead of gathering masked patches by
-index, at one fixed sequence length, and its attention mask arrives as an
-additive float built outside the graph. That specialisation is part of the
-on-device contract in
+The exported graph takes the masked set as an input: a one-hot matrix naming the
+patch each head slot reads, at one fixed sequence length, with the attention mask
+arriving as an additive float built outside the graph. Forecast, backcast and
+infill are the same artifact under different inputs. `--seq-len` exports a
+shorter window as a cheaper artifact with a shorter memory. The contract is in
 [T1DMCOMMON/SPEC/inference.md](https://github.com/0xdeadf1sh/T1DMCOMMON/blob/main/SPEC/inference.md).
 
-The graph is cut at the raw head output. The anchor, the softplus and floor, the
-median projection, the inverse transform and the quantile assembly all run
-outside it — and the descriptor is the sole contract for that pre- and
+The graph is cut at the raw head output and also emits the trunk hidden state at
+each masked slot, which — with the head weights written beside the artifact —
+lets a consumer re-run or adapt the head without re-exporting. The anchor, the
+softplus and floor, the median projection, the inverse transform and the quantile
+assembly all run outside it — and the descriptor is the sole contract for that pre- and
 post-processing. **An artifact and its descriptor are one unit**: a graph served
 against a descriptor from a different architecture decodes risk space with the
 wrong constants, and nothing downstream can detect it.

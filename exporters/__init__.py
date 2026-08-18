@@ -7,12 +7,15 @@ descriptor emitter — lives in the shared helpers here; each engine module
 (e.g. ``executorch_xnnpack``) only owns the lowering + serialization specific to
 its runtime.
 
-Graph cut: the exported graph stops at ``head_raw`` (B, P, S, 1+2*N_SPREADS) in
-Kovatchev risk space. The per-slot anchor, softplus+floor, cumsum, the P*S DCT
-median projection, ``carry_spread``, ``f_inv`` and quantile assembly all live
-downstream (Rust ``t1dm-core``), NOT in the graph.
+Graph cut: the exported graph stops at ``head_raw`` (B, M, S, 1+2*N_SPREADS) in
+Kovatchev risk space, and emits ``slot_hidden`` beside it so a consumer can re-run
+the BG head itself from the exported head weights. The per-slot anchor,
+softplus+floor, cumsum, the per-span DCT median projection, ``carry_spread``,
+``f_inv`` and quantile assembly all live downstream (Rust ``t1dm-core``), NOT in
+the graph.
 
-Right edge: the exported graph is the RIGHT-EDGE SPECIALISATION of the general
-masked-BG objective — the masked set is the trailing ``PREDICTION_PATCHES`` patches,
-read by slice, so no ``mask_idx`` crosses the graph boundary.
+Masked set: the graph takes it as an input — a ``(M, T)`` one-hot selection matrix
+naming the patch each of the ``M = MAX_MASKED_PATCHES`` head slots reads. A
+trailing span is a forecast, a leading one a backcast, anything between an infill;
+one artifact serves all three.
 """

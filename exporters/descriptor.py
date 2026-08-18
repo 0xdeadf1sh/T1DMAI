@@ -43,8 +43,19 @@ def build_descriptor(
     normalization_stats: dict[str, dict[str, float]],
     precision: str = "fp32",
     model_card: dict[str, Any] | None = None,
+    head: dict[str, Any] | None = None,
+    seq_len: int | None = None,
 ) -> dict[str, Any]:
     """Assemble the descriptor dict. Pure data; no I/O.
+
+    ``seq_len`` is the exported graph's fixed ``T``; it defaults to
+    ``cfg.MAX_SEQ_LEN`` and bounds the context the artifact can be handed
+    (``MAX_CONTEXT_PATCHES = T - PREDICTION_PATCHES``), so a shorter export is a
+    cheaper model with a shorter memory rather than a different contract.
+
+    ``head`` (optional) is the block :func:`exporters.head_weights.write_head_weights`
+    returns, naming the side file that lets a consumer re-run the BG head from
+    ``slot_hidden``. Absent, the consumer has the frozen graph and no adapter seam.
 
     ``model_card`` (optional) is a display-only provenance block the app surfaces in the
     Models panel: parameter count + held-out validation reference metrics. It is OUTSIDE
@@ -54,7 +65,20 @@ def build_descriptor(
     risk_lo = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     risk_hi = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
 
-    T = cfg.MAX_SEQ_LEN
+    T = int(seq_len or cfg.MAX_SEQ_LEN)
+    P = cfg.PREDICTION_PATCHES
+    M = cfg.MAX_MASKED_PATCHES
+    max_ctx = T - P
+    assert max_ctx >= cfg.MIN_CONTEXT_PATCHES, (
+        f"seq_len {T} leaves {max_ctx} context patches, below MIN_CONTEXT_PATCHES "
+        f"{cfg.MIN_CONTEXT_PATCHES}"
+    )
+    # Bounded above as well: a longer graph would advertise more context than the architecture was
+    # trained to read, and every consumer takes the descriptor at its word.
+    assert T <= cfg.MAX_SEQ_LEN, (
+        f"seq_len {T} exceeds MAX_SEQ_LEN {cfg.MAX_SEQ_LEN}; the model was never trained on a "
+        f"window that long"
+    )
     desc: dict[str, Any] = {
         "schema_version": 1,
         "id": model_id,
@@ -78,21 +102,38 @@ def build_descriptor(
                 "note": "the sole additive term on the attention logits; position "
                         "enters through RoPE alone, so nothing is pre-combined here",
             },
+            "input_slot_sel": {
+                "name": "slot_sel", "shape": [M, T], "dtype": precision,
+                "kind": "one-hot selection",
+                "note": "row j is one-hot at the patch head slot j reads, in "
+                        "ascending patch order; surplus slots repeat patch 0 and "
+                        "their outputs are discarded. A selection matmul, not a "
+                        "gather, so no int64 tensor crosses the runtime boundary.",
+            },
             "output_head_raw": {
                 "name": "head_raw", "output_index": 0,
-                "shape": [1, cfg.PREDICTION_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS],
+                "shape": [1, M, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS],
                 "dtype": precision, "space": "kovatchev-risk",
-                "note": "(B, P, S, 1+2*N_SPREADS): col0 median delta; 1..3 tau>.5 "
-                        "spreads .75/.9/.95; 4..6 tau<.5 spreads .25/.1/.05",
+                "note": "(B, M, S, 1+2*N_SPREADS): col0 median delta; 1..3 tau>.5 "
+                        "spreads .75/.9/.95; 4..6 tau<.5 spreads .25/.1/.05. One row "
+                        "per head slot, in slot_sel order.",
             },
             "output_time_logits": {
                 "name": "time_logits", "output_index": 1,
-                "shape": [1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS],
+                "shape": [1, M, cfg.TIME_PROBE_N_BINS],
                 "dtype": precision, "space": "raw-logits",
-                "note": "(B, P, N_BINS): per-prediction-patch hour-of-day bin logits "
-                        "from the co-trained time probe; softmax over the N_BINS "
-                        "hour-of-day circle downstream (Rust). Present iff the time "
-                        "section below is present.",
+                "note": "(B, M, N_BINS): per-slot hour-of-day bin logits from the "
+                        "co-trained time probe; softmax over the N_BINS hour-of-day "
+                        "circle downstream (Rust). Present iff the time section "
+                        "below is present.",
+            },
+            "output_slot_hidden": {
+                "name": "slot_hidden", "output_index": 2,
+                "shape": [1, M, cfg.D_MODEL],
+                "dtype": precision, "space": "trunk-hidden",
+                "note": "(B, M, D_MODEL) final-normed hidden state per slot — the "
+                        "adapter seam. Feed it to the head block's weights to "
+                        "reproduce head_raw, with or without a low-rank adapter.",
             },
         },
 
@@ -105,10 +146,11 @@ def build_descriptor(
         "time": {
             "output_index": 1,
             "output_name": "time_logits",
-            "shape": [1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS],
+            "shape": [1, M, cfg.TIME_PROBE_N_BINS],
             "n_bins": cfg.TIME_PROBE_N_BINS,
             "bin_hours": cfg.TIME_PROBE_BIN_HOURS,
-            "layout": "per prediction-patch: row p = patch p's hour-of-day bin logits",
+            "layout": "per head slot: row j = the hour-of-day bin logits of the "
+                      "patch slot_sel row j selected",
             "value_kind": "raw logits (softmax over the N_BINS-bin hour-of-day circle)",
             "bin_centers_hours": [
                 (k + 0.5) * (24.0 / cfg.TIME_PROBE_N_BINS)
@@ -122,11 +164,12 @@ def build_descriptor(
             # softmax it, form the mean resultant vector, read hour from its angle and
             # confidence R from its length (utils.time_of_day_resultant /
             # time_of_day_decode_bins).
-            "reduction": "origin_patch",
+            "reduction": "origin_slot",
             "reduction_detail": {
-                "patch_index": 0,
+                "slot_index": "the slot holding the FIRST forecast patch — with an "
+                              "infill span in the masked set that is no longer slot 0",
                 "steps": [
-                    "probs = softmax(time_logits[0, 0, :])",
+                    "probs = softmax(time_logits[0, origin_slot, :])",
                     "res = sum_k probs[k] * (cos th_k, sin th_k)   # th_k = 2*pi*center_hour_k/24",
                     "hour = (atan2(res.sin, res.cos) mod 2*pi) * 24/(2*pi)",
                     "R = hypot(res.cos, res.sin)   # in [0,1], concentration/confidence",
@@ -156,7 +199,15 @@ def build_descriptor(
             "PATCH_DIM": cfg.PATCH_DIM,
             "PREDICTION_PATCHES": cfg.PREDICTION_PATCHES,
             "MIN_CONTEXT_PATCHES": cfg.MIN_CONTEXT_PATCHES,
-            "MAX_CONTEXT_PATCHES": cfg.MAX_CONTEXT_PATCHES,
+            # What THIS artifact accepts, not what the architecture allows: a graph
+            # exported at a shorter T has a shorter memory and says so here.
+            "MAX_CONTEXT_PATCHES": max_ctx,
+            "ARCH_MAX_CONTEXT_PATCHES": cfg.MAX_CONTEXT_PATCHES,
+            # M: the head's slot count and the cap on the masked set the caller may
+            # ask for. It sizes no weight, so no tensor shape recovers it.
+            "MAX_MASKED_PATCHES": M,
+            "MASK_MAX_SPANS": cfg.MASK_MAX_SPANS,
+            "MASK_SPAN_LENGTHS": list(cfg.MASK_SPAN_LENGTHS),
             "D_MODEL": cfg.D_MODEL,
             "N_LAYERS": cfg.N_LAYERS,
             "N_HEADS": cfg.N_HEADS,
@@ -213,6 +264,8 @@ def build_descriptor(
                     "bit-identical (INFERENCE.md §8.4)",
         },
     }
+    if head is not None:
+        desc["head"] = head
     if model_card is not None:
         desc["model_card"] = model_card
     return desc
@@ -291,5 +344,11 @@ def deploy_to_server(pte_path: str, descriptor: dict[str, Any], deploy_dir: str)
     artifact = os.path.join(deploy_dir, os.path.basename(pte_path))
     sidecar = os.path.splitext(artifact)[0] + ".json"
     shutil.copy2(pte_path, artifact)
-    write_descriptor(descriptor, sidecar)
+    # The head side file does NOT travel this way, and the deployed descriptor must not claim it
+    # does. The registry pairs ONE artifact with ONE sidecar and registers every other file in the
+    # directory as a model of its own — a `<id>.head.bin` dropped here would be offered for
+    # download as a model with no descriptor. A phone that syncs from the server therefore gets a
+    # model it can run and cannot adapt, which is what the absent block tells it.
+    deployed = {k: v for k, v in descriptor.items() if k != "head"}
+    write_descriptor(deployed, sidecar)
     return artifact, sidecar
