@@ -226,7 +226,13 @@ BG_QUANTILE_SPREAD_MIN = 1e-3    # additive floor on each softplus spread (anti 
 # K < PATCH_SIZE the highest-frequency (period-2) mode is unrepresentable, so an
 # intra-patch zigzag of the median cannot be emitted by construction.
 # K = PATCH_SIZE recovers a fully-free per-step head exactly.
-BG_HEAD_STEP_BASIS_DIM = 6       # K: coeffs per (patch, channel); K<PATCH_SIZE forbids the period-2 within-patch mode
+# K also fixes the head's median degrees of freedom per span at L*K, and
+# BG_HEAD_MEDIAN_GLOBAL_DIM below is pinned to PREDICTION_PATCHES * K so the
+# projection keeps every one. At K = PATCH_SIZE the head emitted 24 numbers per
+# forecast span for a 12-column basis to keep; the 12 in the projection's null
+# space took no gradient from any loss and grew ~3 orders of magnitude over
+# training, leaving the median a few per cent residue of a much larger vector.
+BG_HEAD_STEP_BASIS_DIM = 2       # K: coeffs per (patch, channel); K<PATCH_SIZE forbids the period-2 within-patch mode
 BG_HEAD_STEP_BASIS_TYPE = 'dct'  # within-patch basis over PATCH_SIZE points: 'dct' (low-freq DCT-II rows) or 'poly' (orthonormal polynomials)
 
 # Median-assembly mode (R3 selector). assemble_quantiles is the SOLE chokepoint
@@ -261,7 +267,10 @@ BG_HEAD_MEDIAN_MODE = 'global'
 # anti-drift contraction is ABSENT rather than weakened — and every fan assert
 # still passes. What G_L holds roughly constant is the fraction of the span the
 # basis can bend; the cutoff period 2n/G_L varies with L and is what to report.
-BG_HEAD_MEDIAN_GLOBAL_DIM = 12
+# Pinned to PREDICTION_PATCHES * K, which makes G_L = K*L exactly at every span
+# length, so the head's L*K median outputs and the basis's G_L columns are the
+# same count and the projection has no null space to discard them into.
+BG_HEAD_MEDIAN_GLOBAL_DIM = PREDICTION_PATCHES * BG_HEAD_STEP_BASIS_DIM
 
 # === Time-of-day probe (co-trains the trunk; TIME_PROBE_DETACH=False) ===
 # An auxiliary head that classifies each MASKED patch's absolute hour-of-day
