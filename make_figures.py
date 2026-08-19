@@ -23,16 +23,18 @@ LOG_DIR = REPO / "logs"
 OUT_DIR = REPO / "figures"
 
 # Every cgega_* column in logs/validation_log.csv (and in each checkpoint's
-# val_history) was written by train.py with the CG-EGA arguments transposed, so
-# each stored value scores (true, pred) instead of (pred, true). They cannot be
-# recomputed: they record a training run that no longer exists to re-score. This
-# flag is the single gate on every consumer of those columns — here and in
+# val_history) is written by train.py from the CG-EGA call site's fixed argument
+# order, so a log a retrain has regenerated scores (pred, true) and is publishable.
+# This flag is the single gate on every consumer of those columns — here and in
 # make_card.py, which imports it — so the panels are suppressed rather than
-# deleted. Flip it to True once a retrain has regenerated the columns under the
-# fixed argument order and every suppressed panel returns unchanged. It governs
-# ONLY the validation-log columns; metrics/ and metrics/core/ recompute CG-EGA from
-# stored forecasts and are unaffected.
-CGEGA_COLUMNS_TRUSTWORTHY = False
+# deleted. It governs ONLY the validation-log columns; metrics/ and metrics/core/
+# recompute CG-EGA from stored forecasts and are unaffected.
+#
+# TRUE means the tree being rendered must carry REGENERATED logs. Columns written
+# before the argument order was fixed hold the transposed statistic, cannot be
+# recomputed, and will now be published as though they were sound — so re-render a
+# capacity only from its own post-retrain logs.
+CGEGA_COLUMNS_TRUSTWORTHY = True
 
 # Architecture label shown in figure suptitles, derived from the resolved
 # config at run time (set by run()).
