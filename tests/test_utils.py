@@ -428,6 +428,46 @@ def test_assemble_quantiles_carry_spread_widens_band():
     print(f"\n[DUMP] assemble_quantiles | carry={carry} widens 5-95 band by 2*carry, median fixed ✓")
 
 
+def test_assemble_quantiles_carry_spread_is_per_level():
+    """``carry_spread`` carries ONE offset PER LEVEL, laid out like the head's own
+    spread columns — ``[.75 .9 .95 | .25 .1 .05]``.  Each edge moves by its own
+    carry and by no other, and a scalar is the same as that scalar in all six
+    slots.  A single carry shared by the levels is the roll-seam defect: it seeds
+    .75 from .95's accumulation."""
+    from utils import assemble_quantiles
+    from config import QUANTILE_LEVELS, N_SPREADS
+
+    B, P, S = 2, 2, 3
+    torch.manual_seed(13)
+    head_raw = torch.randn(B, P, S, 7)
+    last_bg = torch.tensor([95.0, 180.0])
+    median_idx = QUANTILE_LEVELS.index(0.5)
+
+    carry = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])   # up .75/.9/.95 | dn .25/.1/.05
+    q0, m0 = assemble_quantiles(head_raw, last_bg, carry_spread=0.0)
+    qc, mc = assemble_quantiles(head_raw, last_bg, carry_spread=carry)
+
+    assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
+    assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
+
+    # Upper edges take carry[:3] in place; lower edges take carry[3:], flipped to
+    # the fan's ascending-value order ([.05 .1 .25] <- [.25 .1 .05]).
+    up_delta = qc[..., median_idx + 1:] - q0[..., median_idx + 1:]
+    dn_delta = q0[..., :median_idx] - qc[..., :median_idx]
+    assert torch.allclose(up_delta, carry[:N_SPREADS].expand_as(up_delta), atol=1e-6), (
+        f"upper edges must move by their own carry, got {up_delta[0, 0, 0]}")
+    assert torch.allclose(dn_delta, carry[N_SPREADS:].flip(0).expand_as(dn_delta), atol=1e-6), (
+        f"lower edges must move by their own carry, got {dn_delta[0, 0, 0]}")
+
+    # A scalar is the six-slot vector of that scalar (the legacy behaviour).
+    q_scalar, _ = assemble_quantiles(head_raw, last_bg, carry_spread=0.37)
+    q_vector, _ = assemble_quantiles(
+        head_raw, last_bg, carry_spread=torch.full((2 * N_SPREADS,), 0.37))
+    assert torch.allclose(q_scalar, q_vector, atol=1e-6), (
+        "a scalar carry must equal the same value in every level slot")
+    print("\n[DUMP] assemble_quantiles | per-level carry [.75 .9 .95 | .25 .1 .05] ✓")
+
+
 # ---------------------------------------------------------------------------
 # R1 — cumulative cross-patch-continuity median head (BG_HEAD_MEDIAN_MODE='cumulative').
 # ---------------------------------------------------------------------------

@@ -169,19 +169,23 @@ region of a training sample.
     `utils.assemble_quantiles(head_raw, anchor_bg, mask_idx, valid, carry_spread)`: col 0 = median
     delta; cols 1..3 = the `τ>.5` spreads (nearest→far .75/.9/.95); cols 4..6 = the `τ<.5` spreads
     (.25/.1/.05). `anchor = f(anchor_bg).detach()` **per slot**; `spread = softplus(raw) +
-    BG_QUANTILE_SPREAD_MIN` (prevents σ-collapse); `q(τ>.5) = m + carry_spread + cumsum(d+)`,
-    `q(τ<.5) = m − carry_spread − cumsum(d−)`; the fan is ascending by construction.
+    BG_QUANTILE_SPREAD_MIN` (prevents σ-collapse); `q(τ>.5) = m + c_up + cumsum(d+)`,
+    `q(τ<.5) = m − c_dn − cumsum(d−)`; the fan is ascending by construction.
     `BG_HEAD_INIT_SCALE = 1e-2` with zero bias ⇒ small coeffs ⇒ `median ≈ f(anchor_bg)` at init (the
     initial forecast is flat from each slot's own anchor). `QUANTILE_LEVELS = (.05,.1,.25,.5,.75,.9,.95)`,
     `N_QUANTILES = 7`. Output is RISK space; inference owns `f_inv → mg/dL`.
-  - **`carry_spread` is DEAD at runtime** (risk space, default 0.0). It seeds the cumulative-spread
-    base on both sides of the median, and nothing outside `tests/test_utils.py` passes it: the sole
-    non-test call site is `model.forward`, `assemble_quantiles(head_raw, anchor_bg.detach(),
-    mask_idx)`, which takes the default for `valid` and `carry_spread` alike. The rolling widening
-    that needs this algebra lives in `inference.predict_rolling` (see *Rolling prediction BG fill*),
-    which cannot reach the argument at all — the assembly runs inside `model.forward`, so by the
-    time a caller holds a fan the fan is already built. The two pieces of algebra are duplicated of
-    necessity: change the `± carry_spread` here and the rolling shift silently stops matching it.
+  - **`carry_spread` is DEAD at runtime** (risk space, default 0.0) and **PER LEVEL**: six offsets
+    in the spread columns' own layout, `[.75 .9 .95 | .25 .1 .05]`, `c_up`/`c_dn` above; a scalar
+    widens all six alike. It seeds the cumulative-spread base on both sides of the median, and
+    nothing outside `tests/test_utils.py` passes it: the sole non-test call site is `model.forward`,
+    `assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx)`, which takes the default for
+    `valid` and `carry_spread` alike. The rolling widening that needs this algebra lives in
+    `inference.predict_rolling` (see *Rolling prediction BG fill*), which cannot reach the argument
+    at all — the assembly runs inside `model.forward`, so by the time a caller holds a fan the fan
+    is already built. The two pieces of algebra are duplicated of necessity: change the `± carry`
+    here and the rolling shift silently stops matching it. One carry shared across the levels is a
+    defect in either copy — it re-seeds every level from the outermost one's accumulation, and the
+    fan flattens into a slab one seam later (`../T1DMCOMMON/SPEC/inference.md` §8.1, §9).
   - `assemble_quantiles` is the SINGLE chokepoint for the **median and the native fan**: training,
     `inference.predict` and `predict_rolling` all reach it through `model.forward`, so a median-mode
     change propagates to all three identically. It is not the chokepoint for the rolling band carry,

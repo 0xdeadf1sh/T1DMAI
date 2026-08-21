@@ -1029,9 +1029,12 @@ def assemble_quantiles(
     cumsum, plus ``carry_spread``) is untouched.
 
     ``carry_spread`` (risk space, default ``0.0`` → bit-identical to a bare fan)
-    seeds the cumulative spread base on BOTH sides of the median, widening the band
-    symmetrically: ``q(τ>.5) = m + carry_spread + cumsum(d+)`` and
-    ``q(τ<.5) = m − carry_spread − cumsum(d−)``.  NO runtime caller passes it — the
+    seeds the cumulative spread base on BOTH sides of the median:
+    ``q(τ>.5) = m + c_up + cumsum(d+)`` and ``q(τ<.5) = m − c_dn − cumsum(d−)``.
+    It is PER LEVEL — a trailing axis of ``2*N_SPREADS`` in the spread columns' own
+    layout, ``[.75 .9 .95 | .25 .1 .05]`` — and a scalar widens all six alike.  One
+    value across the levels re-seeds every level from the outermost one's carry, so
+    the fan flattens into a slab (`SPEC/inference.md` §8.1).  NO runtime caller passes it — the
     sole non-test call site is ``model.py``'s forward, which takes the default.
     ``inference.predict_rolling`` needs the same widening but cannot reach this
     argument (the assembly runs inside ``model.forward``), so it accumulates its own
@@ -1061,8 +1064,10 @@ def assemble_quantiles(
             gather patch 0 and fall out as their own singleton spans either way;
             passing ``valid`` additionally pins their median to their anchor, so
             no gradient reaches ``head_raw[..., 0]`` there.
-        carry_spread: risk-space scalar or tensor broadcastable to ``(B, M, S, 1)``
-            that seeds the cumulative spread base (default ``0.0``).
+        carry_spread: risk-space scalar, tensor broadcastable to ``(B, M, S, 1)``
+            (every level alike), or one broadcastable to ``(B, M, S, 2*N_SPREADS)``
+            in the spread columns' layout ``[.75 .9 .95 | .25 .1 .05]`` (per level).
+            Seeds the cumulative spread base (default ``0.0``).
 
     Returns:
         q_tau: ``(B, M, S, N_QUANTILES)`` quantiles in risk space, ascending in τ
@@ -1149,8 +1154,18 @@ def assemble_quantiles(
     spread = F.softplus(head_raw[..., 1:]) + BG_QUANTILE_SPREAD_MIN  # (B,M,S,2*N_SPREADS)
     d_up = spread[..., :N_SPREADS]                       # τ>.5: .75/.9/.95
     d_dn = spread[..., N_SPREADS:]                       # τ<.5: .25/.1/.05
-    up = m.unsqueeze(-1) + carry_spread + torch.cumsum(d_up, dim=-1)  # (B,M,S,N_SPREADS) ascending
-    dn = m.unsqueeze(-1) - carry_spread - torch.cumsum(d_dn, dim=-1)  # (B,M,S,N_SPREADS) descending
+    # The carry is PER LEVEL when its last axis is 2*N_SPREADS, in the spread
+    # columns' own layout ([.75 .9 .95 | .25 .1 .05]); a scalar or a trailing 1
+    # widens every level alike, which is what the legacy default 0.0 does.
+    c_up = c_dn = carry_spread
+    if isinstance(carry_spread, torch.Tensor) and carry_spread.ndim and carry_spread.shape[-1] != 1:
+        assert carry_spread.shape[-1] == 2 * N_SPREADS, (
+            f"carry_spread's last axis must be 1 or {2 * N_SPREADS} (per level), "
+            f"got {tuple(carry_spread.shape)}"
+        )
+        c_up, c_dn = carry_spread[..., :N_SPREADS], carry_spread[..., N_SPREADS:]
+    up = m.unsqueeze(-1) + c_up + torch.cumsum(d_up, dim=-1)  # (B,M,S,N_SPREADS) ascending
+    dn = m.unsqueeze(-1) - c_dn - torch.cumsum(d_dn, dim=-1)  # (B,M,S,N_SPREADS) descending
 
     # Assemble ascending τ: [.05 .1 .25 | .5 | .75 .9 .95].
     # dn is [.25 .1 .05] (descending in value) → flip to [.05 .1 .25] (ascending).

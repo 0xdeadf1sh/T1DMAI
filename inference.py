@@ -87,7 +87,7 @@ import numpy as np
 import torch
 
 from config import (
-    PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES, N_QUANTILES,
+    PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES, N_QUANTILES, N_SPREADS,
     MAX_CONTEXT_PATCHES, MAX_MASKED_PATCHES,
     CHANNEL_TO_FEAT, MASKABLE_FEATS, NON_MASKABLE_FEATS, QUANTILE_LEVELS,
     TIME_PROBE_N_BINS,
@@ -785,11 +785,13 @@ def predict_rolling(
     band would otherwise *reset* to the model's near-flat init fan at the new
     context's last step, so the fan would sawtooth at every roll boundary.  To
     keep the fan monotone non-decreasing across boundaries we accumulate a
-    running RISK-space half-width ``carry_spread`` — seeded each roll by the
-    terminal-step half-width the model itself emitted — and widen the next
-    roll's quantiles by it (the exact effect of ``assemble_quantiles``'
-    ``carry_spread`` arg, applied post-forward since the head lives inside
-    ``model.forward``).  The median is untouched; only the band edges fan out.
+    running RISK-space ``carry_spread``, PER LEVEL — seeded each roll by that
+    level's own terminal-step spread — and widen the next roll's quantiles by it
+    (the exact effect of ``assemble_quantiles``' ``carry_spread`` arg, applied
+    post-forward since the head lives inside ``model.forward``).  Per level and
+    not one scalar: a shared carry re-seeds .75 from .95's accumulation, so the
+    inner bands jump outward at every seam and the fan flattens into a slab.  The
+    median is untouched; only the band edges fan out.
 
     Args:
         model: T1DMAI model in eval mode.
@@ -864,10 +866,15 @@ def predict_rolling(
 
     n_ctx_orig = context.shape[0]
 
-    # Running RISK-space band half-width carried across roll boundaries so the
-    # fan does not sawtooth-reset.  ``_MEDIAN_IDX`` is the median column in the
-    # ascending τ fan.
-    carry_spread = 0.0
+    # Running RISK-space band carry, PER LEVEL, so the fan does not sawtooth-reset
+    # at a roll boundary.  Laid out like the head's spread columns,
+    # ``[up .75 .9 .95 | dn .25 .1 .05]`` (``assemble_quantiles``' own argument,
+    # `SPEC/inference.md` §8.1).  One scalar for all six re-seeds every level from
+    # the outermost one's accumulation: the .75 edge of roll r+1 then lands outside
+    # where the .95 edge of roll r was, and after two rolls the fan is a slab.
+    # ``None`` until roll 1, which keeps roll 0 bit-identical to a bare fan.
+    # ``_MEDIAN_IDX`` is the median column in the ascending τ fan.
+    carry_spread: "torch.Tensor | None" = None
 
     # Roll 0 is the only true wall-clock origin — the diagnostic time-of-day probe
     # is read there and nowhere else (later rolls re-feed synthetic BG).
@@ -919,26 +926,29 @@ def predict_rolling(
         q_tau = result['q_tau']            # (PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES) risk
         pred_bg_roll = result['median_bg'].to(device)  # (PREDICTION_PATCHES * PATCH_SIZE,)
 
-        # THIS roll's NATIVE terminal-step half-width — the spread the model itself
+        # THIS roll's NATIVE terminal-step spread, PER LEVEL — what the model itself
         # emitted at the final forecast step (RISK space), measured BEFORE adding
         # any carry.  Measuring it on the POST-carry fan re-counts the carry and
         # makes it compound geometrically (carry → 2·carry + native each roll), the
         # runaway that pinned the long-horizon band to the physiological range.
         native_last = q_tau[-1, -1]        # (N_QUANTILES,) native risk quantiles
-        native_halfwidth = float(
-            (native_last[-1] - native_last[0]).clamp_min(0.0) * 0.5
-        )
+        native_med = native_last[_MEDIAN_IDX]
+        native = torch.cat([
+            (native_last[_MEDIAN_IDX + 1:] - native_med).clamp_min(0.0),          # .75/.9/.95
+            (native_med - native_last[:_MEDIAN_IDX]).clamp_min(0.0).flip(0),      # .25/.1/.05
+        ])                                 # (2*N_SPREADS,) the carry's own layout
 
-        # Widen the RISK-space fan by the accumulated carry so this roll's band
-        # picks up where the previous roll's left off (no boundary reset).  The
-        # carry is purely additive on the cumsum base, exactly mirroring
-        # ``assemble_quantiles(carry_spread=...)``: τ>.5 edges shift up by the
-        # carry, τ<.5 edges shift down by it, the median (idx ``_MEDIAN_IDX``) is
-        # untouched.  ``bands`` is then re-derived from the widened risk fan.
-        if carry_spread > 0.0:
+        # Widen the RISK-space fan by the accumulated carry so EVERY LEVEL picks up
+        # at the width it reached in the previous roll (no boundary reset, and no
+        # level re-seeded from another's carry).  The carry is purely additive on
+        # the cumsum base, exactly mirroring ``assemble_quantiles(carry_spread=...)``:
+        # each τ>.5 edge shifts up by its own carry, each τ<.5 edge down by its own,
+        # the median (idx ``_MEDIAN_IDX``) is untouched.  ``bands`` is then re-derived
+        # from the widened risk fan.
+        if carry_spread is not None:
             q_tau = q_tau.clone()
-            q_tau[..., _MEDIAN_IDX + 1:] = q_tau[..., _MEDIAN_IDX + 1:] + carry_spread
-            q_tau[..., :_MEDIAN_IDX] = q_tau[..., :_MEDIAN_IDX] - carry_spread
+            q_tau[..., _MEDIAN_IDX + 1:] = q_tau[..., _MEDIAN_IDX + 1:] + carry_spread[:N_SPREADS]
+            q_tau[..., :_MEDIAN_IDX] = q_tau[..., :_MEDIAN_IDX] - carry_spread[N_SPREADS:].flip(0)
         bands = kovatchev_f_inv(q_tau)     # (PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES) mg/dL
         if conformal_delta is not None:
             # Split-conformal recalibration of THIS roll's bands (median untouched), on
@@ -948,10 +958,11 @@ def predict_rolling(
             _bf = apply_quantile_conformal(_bf, _conformal_to_np(conformal_delta), _MEDIAN_IDX)
             bands = torch.from_numpy(_bf.astype(np.float32)).to(bands.device).reshape(bands.shape)
 
-        # Accumulate the NATIVE per-roll half-width so the carry grows ~linearly
+        # Accumulate the NATIVE per-roll spread so each level's carry grows ~linearly
         # with the number of rolls (a conservative random-walk band) rather than
-        # doubling — the next roll's fan starts from where this one ended.
-        carry_spread += native_halfwidth
+        # doubling — the next roll's fan starts from where this one ended, level by
+        # level.
+        carry_spread = native if carry_spread is None else carry_spread + native
 
         all_q_tau.append(q_tau)
         all_bands.append(bands)

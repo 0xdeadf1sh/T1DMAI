@@ -464,6 +464,55 @@ def test_predict_rolling_band_halfwidth_monotone():
           "non-decreasing ✓")
 
 
+def test_predict_rolling_carry_is_per_level():
+    """The roll carries ONE offset PER LEVEL, so a level resumes at its own width
+    across a seam.  Two things follow and are asserted: every level's offset is
+    non-decreasing over a seam, and the .25/.75 pair at the first step of a roll
+    still sits INSIDE the .05/.95 pair the previous roll ended on.  A single
+    scalar carry — seeded from the outermost level, added to all six — puts the
+    inner pair OUTSIDE the previous roll's outer pair at every seam, and two seams
+    later the fan is one slab."""
+    from inference import predict_rolling
+    from model import T1DMAI
+    from config import (PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES,
+                        MIN_CONTEXT_PATCHES, QUANTILE_LEVELS, N_SPREADS)
+
+    torch.manual_seed(0)
+    model = T1DMAI()
+    model.eval()
+    stats = _rolling_stats()
+
+    context = torch.randn(MIN_CONTEXT_PATCHES, PATCH_SIZE, N_INPUT_FEATURES)
+    n_rolls = 3
+    result = predict_rolling(model, context, patient_seed=42, n_rolls=n_rolls,
+                             normalization_stats=stats)
+    q_tau = result['q_tau']            # (n_rolls*PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES)
+    med = QUANTILE_LEVELS.index(0.5)
+
+    for r in range(n_rolls - 1):
+        last = q_tau[(r + 1) * PREDICTION_PATCHES - 1, -1]   # terminal step of roll r
+        first = q_tau[(r + 1) * PREDICTION_PATCHES, 0]       # first step of roll r+1
+        for k in range(1, N_SPREADS + 1):
+            up_prev = float(last[med + k] - last[med])
+            up_next = float(first[med + k] - first[med])
+            dn_prev = float(last[med] - last[med - k])
+            dn_next = float(first[med] - first[med - k])
+            assert up_next >= up_prev - 1e-6 and dn_next >= dn_prev - 1e-6, (
+                f"level {k} narrowed across seam {r}: "
+                f"up {up_prev:.4f}->{up_next:.4f}, dn {dn_prev:.4f}->{dn_next:.4f}")
+        outer_prev_up = float(last[-1] - last[med])
+        inner_next_up = float(first[med + 1] - first[med])
+        outer_prev_dn = float(last[med] - last[0])
+        inner_next_dn = float(first[med] - first[med - 1])
+        assert inner_next_up < outer_prev_up, (
+            f"seam {r}: the .75 edge ({inner_next_up:.4f}) left the previous roll's "
+            f".95 edge ({outer_prev_up:.4f}) behind — the carry is shared across levels")
+        assert inner_next_dn < outer_prev_dn, (
+            f"seam {r}: the .25 edge ({inner_next_dn:.4f}) left the previous roll's "
+            f".05 edge ({outer_prev_dn:.4f}) behind — the carry is shared across levels")
+    print(f"\n[DUMP] rolling carry | per level, fan nested across {n_rolls - 1} seams ✓")
+
+
 def test_predict_rolling_phantom_baseline_not_z_zero():
     """C-rolling-phantom: re-fed carb/insulin context slots use the zero-RAW
     normalized baseline (``normalize(0)`` per channel), NOT torch.zeros — z=0
