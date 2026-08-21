@@ -460,8 +460,17 @@ def test_predict_rolling_band_halfwidth_monotone():
     # spread, which it does — softplus floor BG_QUANTILE_SPREAD_MIN > 0).
     assert half_widths[-1] > half_widths[0], (
         f"band must widen over rolls, got {half_widths}")
+    # And it grows in QUADRATURE, not linearly. This model emits a near-identical native
+    # fan on every roll, so the terminal half-width after n rolls is √n × the first
+    # roll's. An additive carry gives n× — twice as wide by the fourth roll, which is
+    # what pinned a long roll's band to the physiological range.
+    for r in range(1, n_rolls):
+        want = half_widths[0] * math.sqrt(r + 1)
+        assert abs(half_widths[r] - want) / want < 0.02, (
+            f"roll {r} terminal half-width {half_widths[r]:.3f} is not √{r + 1}× the "
+            f"first roll's ({want:.3f}) — the carry is not composing in quadrature")
     print(f"\n[DUMP] rolling band | terminal half-widths {['%.3f' % h for h in half_widths]} "
-          "non-decreasing ✓")
+          "non-decreasing, √n growth ✓")
 
 
 def test_predict_rolling_carry_is_per_level():

@@ -419,9 +419,11 @@ under every median mode.
 offsets in the spread columns' own layout, `[.75 .9 .95 | .25 .1 .05]` — but no
 runtime caller passes it, and it defaults to zero everywhere. Because the assembly
 sits inside `model.forward`, `predict_rolling` accumulates its own per-level
-spread and applies the identical shift post-forward on the returned fan. Each
-level therefore resumes across a roll boundary at the width it reached, and the
-envelope grows monotonically rather than resetting at each seam. A single carry
+spread and applies the identical shift post-forward on the returned fan. The
+carry composes with the roll's own offset in quadrature — `hypot(carry, native)`,
+independent increments adding variances — so each level resumes across a roll
+boundary at the width it reached and the envelope grows like `√n` over `n` rolls
+rather than resetting at each seam or growing like `n`. A single carry
 shared by the levels would instead re-seed each of them from the outermost one's
 accumulation, which flattens the fan into one wide band after the first seam.
 

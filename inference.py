@@ -786,7 +786,8 @@ def predict_rolling(
     context's last step, so the fan would sawtooth at every roll boundary.  To
     keep the fan monotone non-decreasing across boundaries we accumulate a
     running RISK-space ``carry_spread``, PER LEVEL — seeded each roll by that
-    level's own terminal-step spread — and widen the next roll's quantiles by it
+    level's own terminal-step spread, in quadrature — and widen the next roll's
+    quantiles by it
     (the exact effect of ``assemble_quantiles``' ``carry_spread`` arg, applied
     post-forward since the head lives inside ``model.forward``).  Per level and
     not one scalar: a shared carry re-seeds .75 from .95's accumulation, so the
@@ -940,15 +941,18 @@ def predict_rolling(
 
         # Widen the RISK-space fan by the accumulated carry so EVERY LEVEL picks up
         # at the width it reached in the previous roll (no boundary reset, and no
-        # level re-seeded from another's carry).  The carry is purely additive on
-        # the cumsum base, exactly mirroring ``assemble_quantiles(carry_spread=...)``:
-        # each τ>.5 edge shifts up by its own carry, each τ<.5 edge down by its own,
-        # the median (idx ``_MEDIAN_IDX``) is untouched.  ``bands`` is then re-derived
-        # from the widened risk fan.
+        # level re-seeded from another's carry).  The carry composes with this roll's
+        # own offset in QUADRATURE, exactly mirroring
+        # ``assemble_quantiles(carry_spread=...)``: each edge's distance from the
+        # median becomes ``hypot(carry, native)``, the median (idx ``_MEDIAN_IDX``) is
+        # untouched.  ``bands`` is then re-derived from the widened risk fan.
         if carry_spread is not None:
             q_tau = q_tau.clone()
-            q_tau[..., _MEDIAN_IDX + 1:] = q_tau[..., _MEDIAN_IDX + 1:] + carry_spread[:N_SPREADS]
-            q_tau[..., :_MEDIAN_IDX] = q_tau[..., :_MEDIAN_IDX] - carry_spread[N_SPREADS:].flip(0)
+            m_col = q_tau[..., _MEDIAN_IDX].unsqueeze(-1)
+            up_off = (q_tau[..., _MEDIAN_IDX + 1:] - m_col).clamp_min(0.0)
+            dn_off = (m_col - q_tau[..., :_MEDIAN_IDX]).clamp_min(0.0)
+            q_tau[..., _MEDIAN_IDX + 1:] = m_col + torch.hypot(carry_spread[:N_SPREADS], up_off)
+            q_tau[..., :_MEDIAN_IDX] = m_col - torch.hypot(carry_spread[N_SPREADS:].flip(0), dn_off)
         bands = kovatchev_f_inv(q_tau)     # (PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES) mg/dL
         if conformal_delta is not None:
             # Split-conformal recalibration of THIS roll's bands (median untouched), on
@@ -958,11 +962,12 @@ def predict_rolling(
             _bf = apply_quantile_conformal(_bf, _conformal_to_np(conformal_delta), _MEDIAN_IDX)
             bands = torch.from_numpy(_bf.astype(np.float32)).to(bands.device).reshape(bands.shape)
 
-        # Accumulate the NATIVE per-roll spread so each level's carry grows ~linearly
-        # with the number of rolls (a conservative random-walk band) rather than
-        # doubling — the next roll's fan starts from where this one ended, level by
-        # level.
-        carry_spread = native if carry_spread is None else carry_spread + native
+        # Accumulate the NATIVE per-roll spread in quadrature, so each level's carry
+        # grows like √n over n rolls (independent increments) rather than n — the next
+        # roll's fan starts from where this one ended, level by level.  ``hypot`` of
+        # the running carry and this roll's native offset IS the terminal offset of
+        # the fan just drawn, which is what `SPEC/inference.md` §9 seeds from.
+        carry_spread = native if carry_spread is None else torch.hypot(carry_spread, native)
 
         all_q_tau.append(q_tau)
         all_bands.append(bands)

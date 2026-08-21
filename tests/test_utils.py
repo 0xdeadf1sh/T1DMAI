@@ -414,18 +414,24 @@ def test_assemble_quantiles_carry_spread_widens_band():
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
 
-    # Upper edges shifted up by exactly +carry, lower edges down by exactly -carry.
-    up_delta = qc[..., median_idx + 1:] - q0[..., median_idx + 1:]
-    dn_delta = qc[..., :median_idx] - q0[..., :median_idx]
-    assert torch.allclose(up_delta, torch.full_like(up_delta, carry), atol=1e-6)
-    assert torch.allclose(dn_delta, torch.full_like(dn_delta, -carry), atol=1e-6)
+    # Each edge's distance from the median becomes hypot(carry, its own native offset) —
+    # QUADRATURE, not a +carry shift (§8.1).
+    m0 = q0[..., median_idx].unsqueeze(-1)
+    up_off0 = q0[..., median_idx + 1:] - m0
+    dn_off0 = m0 - q0[..., :median_idx]
+    want_up = m0 + torch.hypot(torch.full_like(up_off0, carry), up_off0)
+    want_dn = m0 - torch.hypot(torch.full_like(dn_off0, carry), dn_off0)
+    assert torch.allclose(qc[..., median_idx + 1:], want_up, atol=1e-6)
+    assert torch.allclose(qc[..., :median_idx], want_dn, atol=1e-6)
 
-    # Net: the band is strictly wider everywhere off the median.
+    # Net: the band is strictly wider everywhere off the median, and by LESS than the
+    # 2*carry an additive carry would have added.
     width0 = q0[..., -1] - q0[..., 0]
     widthc = qc[..., -1] - qc[..., 0]
     assert (widthc > width0).all(), "carry must strictly widen the 5-95 band"
-    assert torch.allclose(widthc - width0, torch.full_like(width0, 2 * carry), atol=1e-6)
-    print(f"\n[DUMP] assemble_quantiles | carry={carry} widens 5-95 band by 2*carry, median fixed ✓")
+    assert (widthc - width0 < 2 * carry).all(), (
+        "quadrature must widen by less than the perfectly-correlated 2*carry")
+    print(f"\n[DUMP] assemble_quantiles | carry={carry} widens 5-95 band in quadrature, median fixed ✓")
 
 
 def test_assemble_quantiles_carry_spread_is_per_level():
@@ -451,13 +457,17 @@ def test_assemble_quantiles_carry_spread_is_per_level():
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
 
     # Upper edges take carry[:3] in place; lower edges take carry[3:], flipped to
-    # the fan's ascending-value order ([.05 .1 .25] <- [.25 .1 .05]).
-    up_delta = qc[..., median_idx + 1:] - q0[..., median_idx + 1:]
-    dn_delta = q0[..., :median_idx] - qc[..., :median_idx]
-    assert torch.allclose(up_delta, carry[:N_SPREADS].expand_as(up_delta), atol=1e-6), (
-        f"upper edges must move by their own carry, got {up_delta[0, 0, 0]}")
-    assert torch.allclose(dn_delta, carry[N_SPREADS:].flip(0).expand_as(dn_delta), atol=1e-6), (
-        f"lower edges must move by their own carry, got {dn_delta[0, 0, 0]}")
+    # the fan's ascending-value order ([.05 .1 .25] <- [.25 .1 .05]). Composed in
+    # quadrature with each edge's own native offset.
+    m0 = q0[..., median_idx].unsqueeze(-1)
+    up_off0 = q0[..., median_idx + 1:] - m0
+    dn_off0 = m0 - q0[..., :median_idx]
+    want_up = m0 + torch.hypot(carry[:N_SPREADS].expand_as(up_off0), up_off0)
+    want_dn = m0 - torch.hypot(carry[N_SPREADS:].flip(0).expand_as(dn_off0), dn_off0)
+    assert torch.allclose(qc[..., median_idx + 1:], want_up, atol=1e-6), (
+        "upper edges must compose with their OWN carry")
+    assert torch.allclose(qc[..., :median_idx], want_dn, atol=1e-6), (
+        "lower edges must compose with their OWN carry")
 
     # A scalar is the six-slot vector of that scalar (the legacy behaviour).
     q_scalar, _ = assemble_quantiles(head_raw, last_bg, carry_spread=0.37)

@@ -974,6 +974,13 @@ def _median_global_per_span(
     return out
 
 
+def _carry_is_zero(carry_spread: "torch.Tensor | float") -> bool:
+    """True when ``carry_spread`` widens nothing — the default, and the whole training path."""
+    if isinstance(carry_spread, torch.Tensor):
+        return bool((carry_spread == 0).all())
+    return carry_spread == 0
+
+
 def assemble_quantiles(
     head_raw: torch.Tensor, anchor_bg_mgdl: torch.Tensor,
     mask_idx: "torch.Tensor | None" = None,
@@ -1030,7 +1037,10 @@ def assemble_quantiles(
 
     ``carry_spread`` (risk space, default ``0.0`` → bit-identical to a bare fan)
     seeds the cumulative spread base on BOTH sides of the median:
-    ``q(τ>.5) = m + c_up + cumsum(d+)`` and ``q(τ<.5) = m − c_dn − cumsum(d−)``.
+    ``q(τ>.5) = m + hypot(c_up, cumsum(d+))`` and
+    ``q(τ<.5) = m − hypot(c_dn, cumsum(d−))`` — QUADRATURE, because the carry is
+    another roll's increment and independent increments add variances; adding the
+    two is the perfectly-correlated bound.
     It is PER LEVEL — a trailing axis of ``2*N_SPREADS`` in the spread columns' own
     layout, ``[.75 .9 .95 | .25 .1 .05]`` — and a scalar widens all six alike.  One
     value across the levels re-seeds every level from the outermost one's carry, so
@@ -1164,8 +1174,17 @@ def assemble_quantiles(
             f"got {tuple(carry_spread.shape)}"
         )
         c_up, c_dn = carry_spread[..., :N_SPREADS], carry_spread[..., N_SPREADS:]
-    up = m.unsqueeze(-1) + c_up + torch.cumsum(d_up, dim=-1)  # (B,M,S,N_SPREADS) ascending
-    dn = m.unsqueeze(-1) - c_dn - torch.cumsum(d_dn, dim=-1)  # (B,M,S,N_SPREADS) descending
+    o_up, o_dn = torch.cumsum(d_up, dim=-1), torch.cumsum(d_dn, dim=-1)
+    # The carry is a DIFFERENT roll's increment, so it composes with this span's own spread in
+    # QUADRATURE — independent increments add variances, and adding the two is the
+    # perfectly-correlated bound (twice too wide by the fourth roll).  Skipped outright when there
+    # is no carry, which keeps every training and single-window caller bit-identical.
+    if not _carry_is_zero(carry_spread):
+        c_up = torch.as_tensor(c_up, dtype=o_up.dtype, device=o_up.device)
+        c_dn = torch.as_tensor(c_dn, dtype=o_dn.dtype, device=o_dn.device)
+        o_up, o_dn = torch.hypot(c_up, o_up), torch.hypot(c_dn, o_dn)
+    up = m.unsqueeze(-1) + o_up                          # (B,M,S,N_SPREADS) ascending
+    dn = m.unsqueeze(-1) - o_dn                          # (B,M,S,N_SPREADS) descending
 
     # Assemble ascending τ: [.05 .1 .25 | .5 | .75 .9 .95].
     # dn is [.25 .1 .05] (descending in value) → flip to [.05 .1 .25] (ascending).
