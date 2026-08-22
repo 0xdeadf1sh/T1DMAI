@@ -298,8 +298,9 @@ the masked patches' plan channels — "what happens if I eat 40 g at six". A
 baseline forecast with no doses is just another call.
 
 **Rolling.** For horizons past one window, the median forecast is fed back as
-context and the model runs again. Bands widen across roll boundaries by an
-accumulated half-width, so uncertainty grows monotonically instead of resetting
+context and the model runs again. Each quantile level carries its own accumulated
+offset across a roll boundary and composes it with the next roll's spread in
+quadrature, so uncertainty grows monotonically instead of resetting
 at each seam.
 
 

@@ -1005,9 +1005,10 @@ A baseline is simply another call.
 transform to mg/dL, then back through normalization into the new context patches'
 glucose slot, whose `bg_masked` bit is cleared — those patches are visible now.
 The plan slots come from the caller's callback, or the zero-dose baseline. The
-context slides forward and drops its oldest patches at `MAX_CONTEXT_PATCHES`. The
-accumulated band half-width carries into the next roll, so the envelope grows
-monotonically rather than resetting at each seam. `normalization_stats` is
+context slides forward and drops its oldest patches at `MAX_CONTEXT_PATCHES`. Each
+level's accumulated band offset carries into the next roll and composes with that
+roll's own spread in quadrature, so the envelope grows like the square root of the
+roll count rather than resetting at each seam. `normalization_stats` is
 required; without it the re-normalization cannot be computed.
 
 **Export.** The exported graph runs the general masked objective, and

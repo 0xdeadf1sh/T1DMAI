@@ -1048,8 +1048,8 @@ def assemble_quantiles(
     sole non-test call site is ``model.py``'s forward, which takes the default.
     ``inference.predict_rolling`` needs the same widening but cannot reach this
     argument (the assembly runs inside ``model.forward``), so it accumulates its own
-    risk-space half-width and applies the identical shift post-forward on the
-    returned ``q_tau``.  Keep the two in step: a change to the algebra here must be
+    six per-level risk-space offsets and applies the identical quadrature composition
+    post-forward on the returned ``q_tau``.  Keep the two in step: a change to the algebra here must be
     mirrored there, or the rolling band silently stops matching the fan it widens.
 
     Args:
