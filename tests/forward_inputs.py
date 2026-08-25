@@ -1,7 +1,4 @@
-"""Forward-input fixtures for the generalized masked-BG contract.
-
-``model.T1DMAI.forward`` takes four tensors, and three of them are keyed to a
-masked SET rather than to a trailing prediction zone::
+"""Forward-input fixtures for the masked-BG contract::
 
     forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)
       patches   (B, T, PATCH_DIM)   PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES
@@ -9,23 +6,8 @@ masked SET rather than to a trailing prediction zone::
       anchor_bg (B, M) mg/dL        one anchor per masked patch
       mask_idx  (B, M) int64        the patch index each head slot reads
 
-Every test that used to write ``model(patches, mask, last_bg)`` needs the same
-four here, so the construction lives once in this module rather than in ten
-copies that drift apart.  Two shapes of fixture are provided:
-
-* :func:`right_edge_inputs` — one masked span covering the trailing
-  ``PREDICTION_PATCHES`` patches.  That is a FORECAST, the special case the old
-  prediction zone hard-coded, and with ``M == PREDICTION_PATCHES`` it carries no
-  padded slot, so a test written against the old ``(B, PREDICTION_PATCHES, ...)``
-  output shape keeps its assertions.
-* :func:`masked_set_inputs` — an arbitrary set of spans per row, padded out to
-  ``MAX_MASKED_PATCHES`` slots.  Padded slots gather patch 0 and carry a legal
-  mg/dL anchor (the forward's units tripwire reads all ``M``); ``valid`` is the
-  only thing that discards them.
-
-Both write feat 4 (``bg_masked``) from the masked set and withhold feat 0 there,
-exactly as ``data._build_sample`` does: the bit is per PATCH and the row layout
-is step-major, so it goes into ALL ``PATCH_SIZE`` columns of feat 4.
+Both fixtures withhold feat 0 on masked patches and write the feat-4 bit into all
+``PATCH_SIZE`` step-major columns of that patch, as ``data._build_sample`` does.
 """
 
 from typing import Sequence
@@ -60,11 +42,8 @@ def slots(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expand spans into ``M`` head slots: ``(mask_idx, valid, anchor_bg)``.
 
-    The anchor rule is the one ``data._anchor_step_for_span`` implements —
-    ONE-SIDED and LEFT-PREFERRING, one value for the whole span — but the fixture
-    has no BG array to read, so every valid slot takes ``anchor_mgdl``.  Padded
-    slots take it too: they must still be legal mg/dL or the forward's ``(B, M)``
-    units tripwire fires on a slot ``valid`` is about to discard.
+    Padded slots take ``anchor_mgdl`` too — the forward's units tripwire reads all
+    ``M``, so a padded slot must still hold legal mg/dL.
     """
     idx = expand_spans(spans)
     if M is None:
@@ -80,16 +59,8 @@ def slots(
 
 
 def announce(patches: torch.Tensor, masked: torch.Tensor) -> torch.Tensor:
-    """Withhold feat 0 and set the feat-4 bit on ``masked`` patches, in place.
-
-    Args:
-        patches: ``(B, T, PATCH_DIM)`` step-major rows.
-        masked: ``(B, T)`` bool, True where the patch's BG is withheld.
-
-    Returns:
-        ``patches``, edited in place.
-    """
-    # ``patches[..., f::N]`` is a strided VIEW, so these writes land in ``patches``.
+    """Withhold feat 0, set the feat-4 bit on ``masked`` (B, T) patches, in place."""
+    # ``patches[..., f::N]`` is a strided VIEW, so these writes land in ``patches``
     for feat in NON_MASKABLE_FEATS:
         patches[..., feat::N_INPUT_FEATURES][masked] = 0.0
     bit = patches[..., BG_MASKED_FEAT::N_INPUT_FEATURES]
@@ -103,22 +74,10 @@ def right_edge_inputs(
     anchor_mgdl: float = 120.0, seed: int | None = None,
     all_true_mask: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(patches, attn_mask, anchor_bg, mask_idx)`` for a right-edge forecast.
+    """``(patches, attn_mask, anchor_bg, mask_idx)``; one masked span of
+    ``PREDICTION_PATCHES`` ending at ``T - 1``, anchor in mg/dL.
 
-    One masked span of ``PREDICTION_PATCHES`` patches ending at ``T - 1``.  With
-    the default ``M = PREDICTION_PATCHES`` every slot is valid, so the forward
-    emits exactly the ``(B, PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES)`` fan the
-    prediction zone used to.
-
-    Args:
-        B: batch size.
-        n_ctx: visible context patches (default ``MIN_CONTEXT_PATCHES``).
-        M: head slot count (default ``PREDICTION_PATCHES``, i.e. no padding).
-        anchor_mgdl: the per-slot anchor, in mg/dL.
-        seed: seeds a local generator so the patches are reproducible.
-        all_true_mask: return an all-True ``(T, T)`` mask instead of the
-            structured one — what a test that only exercises shape/finiteness
-            wants.
+    Default ``M = PREDICTION_PATCHES`` leaves no padded slot.
     """
     if n_ctx is None:
         n_ctx = MIN_CONTEXT_PATCHES
@@ -150,12 +109,10 @@ def masked_set_inputs(
     spans_per_row: Sequence[Sequence[Span]], n_ctx: int, M: int | None = None,
     anchor_mgdl: float = 120.0, seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(patches, attn_mask, anchor_bg, mask_idx, valid)`` for arbitrary spans.
+    """``(patches, attn_mask, anchor_bg, mask_idx, valid)``; one ``(start_patch,
+    length)`` list per batch row.
 
-    One entry of ``spans_per_row`` per batch row, each a list of
-    ``(start_patch, length)``.  Rows with fewer than ``M`` masked patches pad the
-    surplus slots, which is the ordinary case: the sampler leaves 41.8% of the
-    head's output padded on the average sample.
+    Surplus slots are padded — the sampler leaves 41.8% padded on the average sample.
     """
     B = len(spans_per_row)
     T = n_ctx + PREDICTION_PATCHES

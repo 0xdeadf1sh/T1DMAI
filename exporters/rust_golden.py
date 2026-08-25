@@ -1,21 +1,11 @@
-"""Emit the pipeline golden the on-device Rust core is pinned against.
+"""The pipeline golden `T1DMDROID`'s fp64 Rust pre/post is pinned against; regenerate when the contract moves.
 
-`T1DMDROID` reimplements the pre/post pipeline — the masked-patch fill, the
-attention rule, the per-slot anchors, the per-span median projection and the
-quantile assembly — in fp64 Rust. Nothing in that reimplementation is exercised by
-this repository's own tests, so it is pinned HERE, against the reference the model
-was trained under, and the fixture is regenerated whenever the contract moves.
-
-The fixture holds, per case: the raw four-channel history, the masked set, and
-every intermediate the Rust must reproduce — the padded patch tensor, an exact
-digest of the boolean attention pattern, the per-slot anchors, the head output and
-the decoded fan. Floating-point tensors travel as values with a tolerance; the
-attention pattern is boolean, so it travels as a digest and must match exactly.
-
-Two cases come from the real model (a forecast and an infill), and a third feeds a
-DETERMINISTIC synthetic ``head_raw`` through several span layouts at once — the
-only way to exercise the span-scaled basis dimension at every length a sampler can
-draw, which one real forecast never reaches.
+Nothing in that reimplementation — masked-patch fill, attention rule, per-slot anchors, per-span median
+projection, quantile assembly — is exercised by this repository's tests.
+Per case: raw four-channel history, masked set, padded patch tensor, per-slot anchors, head output, decoded
+fan. Floats travel as values with a tolerance; the boolean attention pattern travels as a digest, exact.
+Two cases run the real model (forecast, infill); the ladders feed a DETERMINISTIC synthetic ``head_raw``
+through several span layouts, the only way to reach every span length the sampler can draw.
 """
 
 from __future__ import annotations
@@ -38,11 +28,9 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 
 def raw_history(n_steps: int) -> dict[str, np.ndarray]:
-    """A deterministic, physiologically-shaped four-channel history in fp64.
+    """A deterministic, physiologically-shaped four-channel history, fp64 throughout.
 
-    fp64 throughout: the Rust normalizes in fp64 and rounds once at the end, so a
-    reference built in fp32 would disagree in the last bit for no reason anyone
-    could act on.
+    The Rust normalizes in fp64 and rounds once at the end; an fp32 reference would disagree in the last bit.
     """
     t = np.arange(n_steps, dtype=np.float64)
     bg = 120.0 + 28.0 * np.sin(2.0 * np.pi * t / 288.0) + 12.0 * np.sin(2.0 * np.pi * t / 47.0)
@@ -78,21 +66,16 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     p = cfg.PREDICTION_PATCHES if with_forecast else 0
     pad0 = T - n_ctx - p
 
-    # The masked set. With a future zone the trailing span is mandatory and
-    # `_resolve_mask_spans` adds and validates it; without one, only the caller's spans
-    # exist and the whole window is observed history.
+    # With a future zone the trailing span is mandatory; without one the whole window is observed history.
     if with_forecast:
-        # The consumer's builder appends the mandatory trailing span itself, so the
-        # fixture's `mask_spans` lists only the EXTRA context spans; name the trailing one
-        # explicitly here, where the reference validator demands the complete set.
+        # The consumer's builder appends the trailing span itself, so the fixture's `mask_spans` lists only
+        # the EXTRA context spans; `_resolve_mask_spans` demands the complete set, so name it here.
         full = sorted([(int(s), int(L)) for s, L in (mask_spans or [])] + [(n_ctx, p)])
         spans = _resolve_mask_spans(full, n_ctx)
     else:
         spans = sorted((int(s), int(L)) for s, L in mask_spans)
 
-    # Patch tensor, built in fp64 and rounded once — the Rust normalizes in fp64 and
-    # rounds at the boundary, so an fp32 intermediate here would disagree in the last bit
-    # for no reason anyone could act on.
+    # fp64, rounded once at the boundary, like the Rust
     pt = np.zeros((T, cfg.PATCH_SIZE, cfg.N_INPUT_FEATURES), dtype=np.float64)
     pt[pad0:pad0 + n_ctx, :, :n_ch] = feats.reshape(n_ctx, cfg.PATCH_SIZE, n_ch)
     if p:
@@ -117,9 +100,8 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     context = torch.from_numpy(
         np.concatenate([feats, np.zeros((n_steps, 1))], axis=-1)
     ).reshape(n_ctx, cfg.PATCH_SIZE, cfg.N_INPUT_FEATURES).float()
-    # The fp64 tensor above is hand-built so the fixture is not quantised through fp32 twice. That
-    # is only safe while it AGREES with the shipped builder — otherwise the golden would pin this
-    # file's idea of the layout rather than the one inference actually uses.
+    # The hand-built fp64 tensor above avoids a second fp32 quantisation, but is only safe while it agrees
+    # with the shipped builder — else the golden pins this file's layout, not the one inference uses.
     if with_forecast:
         shipped, _ = _build_patches_tensor(
             torch.from_numpy(
@@ -149,8 +131,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     attend = create_attention_mask_from_visible(visible[None, :], is_pad[None, :])[0]
 
     if synthetic_head:
-        # A fixed pseudo-random head, so the decode is exercised at every span length
-        # without a model in the loop.
+        # fixed pseudo-random head: the decode runs at every span length with no model in the loop
         g = torch.Generator().manual_seed(20260818)
         head_raw = torch.randn(
             1, m, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS, generator=g, dtype=torch.float32,
@@ -218,9 +199,8 @@ def main() -> None:
         build_case("infill", model, stats, n_ctx, [(60, 3), (100, 5)], True),
         # No future zone: a gap repair reads real evidence on BOTH sides of the span.
         build_case("infill_no_forecast", model, stats, n_ctx, [(80, 4)], False),
-        # Span lengths 1..4 at once, so the span-scaled basis dimension is pinned across the range
-        # a forecast-sized masked set can hold. The sampler draws up to MASK_SPAN_LENGTHS[-1], and
-        # the head has MAX_MASKED_PATCHES slots, so a second ladder covers the long end.
+        # Span lengths 1..4 at once, pinning the span-scaled basis dimension; the sampler draws up to
+        # MASK_SPAN_LENGTHS[-1], so a second ladder covers the long end.
         build_case("span_ladder", model, stats, n_ctx,
                    [(10, 1), (20, 2), (40, 3), (70, 4)], False, synthetic_head=True),
         build_case("span_ladder_long", model, stats, n_ctx,
@@ -238,10 +218,8 @@ def main() -> None:
         "median_global_dim": cfg.BG_HEAD_MEDIAN_GLOBAL_DIM,
         "step_basis_dim": cfg.BG_HEAD_STEP_BASIS_DIM,
         "normalization_stats": stats,
-        # The reference `normalization.normalize` computes in fp32 (the dtype the model and
-        # the DataLoader want); the consumer normalizes in fp64 and rounds once at the
-        # boundary. The two therefore differ by a few fp32 ulps of `ln(g)^power` — about
-        # 1e-6 in z — and the tolerance says so rather than pretending to bit-identity.
+        # `normalization.normalize` is fp32, the consumer fp64-rounded-once: a few fp32 ulps of
+        # `ln(g)^power` apart, about 1e-6 in z. Not bit-identity.
         "tolerances": {"patches": 5e-6, "anchor": 1e-3, "risk": 1e-8},
         "attn_digest_note": "sha256 over the boolean attend pattern, row-major, one byte "
                             "per cell (1 attend / 0 block)",

@@ -1,26 +1,8 @@
-"""LiteRT (.tflite) exporter — the NPU-path feasibility spike (T1DMDROID issue 1).
+"""LiteRT (.tflite) NPU-path exporter, via ``litert-torch`` (formerly ``ai-edge-torch``).
 
-Converts the SAME modified ``head_raw`` + ``time_logits`` forward the ExecuTorch
-XNNPACK exporter uses (external struct mask, right-edge slice, graph cut at
-``head_raw``, dual output) to a ``.tflite`` via ``litert-torch`` (formerly
-``ai-edge-torch``), the Google AI Edge PyTorch->LiteRT converter that builds on
-``torch.export`` — the same entry point the ExecuTorch lowering already uses
-cleanly.
-
-This artifact is what a LiteRT ``CompiledModel.create(..., Options(Accelerator.NPU,
-Accelerator.GPU))`` consumes on the MediaTek APU 990. fp32 CPU XNNPACK remains the
-authority; this is the alternative NPU backend artifact, cross-checked here on host
-against the eager forward before it ever reaches a device.
-
-Validates, on host:
-  (1) the fp32 ``.tflite`` outputs (head_raw, time_logits) vs the eager modified
-      forward (max|Δ|), and
-  (2) — if requested — the fp16 ``.tflite`` vs the same eager forward (a LOOSER
-      tol; fp16 is the NPU-relevant precision).
-
-Emits ``<id>.tflite`` + a ``<id>.litert.descriptor.json`` beside the ExecuTorch
-descriptor (engine = ``litert_npu_fp32`` / ``litert_npu_fp16``), reusing the shared
-descriptor emitter so the on-device Rust pre/post contract is byte-identical.
+Same modified forward as the XNNPACK exporter: external struct mask, ``slot_sel``, cut at ``head_raw``, dual output.
+fp32 CPU XNNPACK stays the authority; both precisions are checked on host against the eager forward first.
+Emits ``<id>.tflite`` + ``<id>.litert.descriptor.json``, engine ``litert_npu_fp32`` / ``litert_npu_fp16``.
 """
 
 from __future__ import annotations
@@ -36,9 +18,8 @@ import torch
 import config as cfg
 from exporters.modified_forward import HeadRawForward, load_model
 from exporters.descriptor import build_descriptor, build_model_card, write_descriptor
-# Reuse the EXACT representative-input + eager references the XNNPACK exporter uses,
-# so the two engines are validated against the same graph on the same input. These
-# imports pull only torch/numpy/config (no executorch at module load).
+# Same representative input and eager references as XNNPACK — one graph, one input.
+# Pulls only torch/numpy/config; no executorch at module load.
 from exporters.executorch_xnnpack import (
     build_representative_input, eager_time_logits, stock_head_raw,
 )
@@ -48,8 +29,7 @@ FP16_TOL = 5e-2        # fp16 head_raw (risk space ~[-3.2,2.8]); informational
 
 
 def _import_litert_torch():
-    """Import the converter under either its new (``litert_torch``) or legacy
-    (``ai_edge_torch``) module name; return the module + its version string."""
+    """Converter under ``litert_torch`` or legacy ``ai_edge_torch`` -> (module, name, version)."""
     for name in ("litert_torch", "ai_edge_torch"):
         try:
             m = importlib.import_module(name)
@@ -69,10 +49,7 @@ def _import_litert_torch():
 def _run_tflite(
     edge_model, patches: torch.Tensor, struct: torch.Tensor, slot_sel: torch.Tensor,
 ) -> list[np.ndarray]:
-    """Execute the converted LiteRT model -> ordered list of numpy output arrays.
-
-    The converted model is callable with the same positional args as the traced
-    module and returns the tflite-interpreter outputs (numpy or torch)."""
+    """Run the converted LiteRT model -> outputs as numpy, in the interpreter's order."""
     outs = edge_model(patches, struct, slot_sel)
     if isinstance(outs, (list, tuple)):
         seq = list(outs)
@@ -104,7 +81,6 @@ def main() -> None:
     hr_shape = (1, cfg.PREDICTION_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
     tl_shape = (1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS)
 
-    # eager references (the modified-forward outputs the .tflite must reproduce)
     with torch.no_grad():
         hr_eager, tl_eager_mod, _sh = wrapper(patches, struct, slot_sel)
     tl_eager = eager_time_logits(model, w)   # stock return_time path
@@ -127,7 +103,7 @@ def main() -> None:
 
         outs = _run_tflite(edge, patches, struct, slot_sel)
         assert len(outs) >= 1, f"{tag}: .tflite returned no outputs"
-        # match outputs to (head_raw, time_logits) by shape (converter may reorder)
+        # by shape: the converter may reorder outputs
         hr_t = tl_t = None
         for o in outs:
             if tuple(o.shape) == hr_shape:
@@ -150,17 +126,16 @@ def main() -> None:
     if args.fp16:
         try:
             from ai_edge_torch.generative.quantize import quant_recipes  # noqa
-            qc = None  # placeholder; fp16 weight quant path varies by version
+            qc = None  # fp16 weight-quant path varies by converter version
         except Exception:
             qc = None
         try:
-            # Prefer the converter's native fp16 flag if exposed; else weight-only.
             import ai_edge_torch  # noqa
             _tfl16, d_hr16, d_tl16, _ok16 = convert_and_check("fp16", FP16_TOL)
         except Exception as exc:
             print(f"[fp16] fp16 conversion path unavailable: {exc!r}")
 
-    # descriptor (engine tag differs; pre/post contract identical to XNNPACK)
+    # pre/post contract identical to XNNPACK; only the engine tag differs
     engine = "litert_npu_fp32"
     desc = build_descriptor(
         model_id=args.model_id, engine=engine, executorch_version=aet_ver,

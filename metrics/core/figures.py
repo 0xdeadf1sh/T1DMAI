@@ -1,18 +1,10 @@
-"""
-Actual-vs-predicted BG comparison figures for the evaluation report.
+"""Actual-vs-predicted BG figures for the evaluation report.
 
-Pure plotting (matplotlib); each function takes numpy arrays and writes a PNG.
-The driver (``metrics/sim/make_comparison_figures.py``) supplies the model's
-risk-space median BG forecast and the true CGM per test window.
+Pure plotting: numpy arrays in, PNG out. The driver supplies median BG forecast and true CGM per window.
 
-Figures, per source:
   * trajectory_grid  — example windows: CGM (context+future) vs prediction
-  * parity_scatter   — predicted vs true at 30/60/120 min, with the identity line
-  * clarke_grid      — Clarke Error Grid (zones drawn) at 30/60/120 min
-
-The former per-channel ``channel_anatomy_grid`` / ``day_channel_trajectory``
-panels were dropped: the risk-space redesign removed the model's carb / insulin /
-IS / HGO dynamics outputs, so there are no per-channel μ ±σ trajectories to plot.
+  * parity_scatter   — predicted vs true per horizon, with the identity line
+  * clarke_grid      — Clarke Error Grid, zones drawn, per horizon
 """
 from __future__ import annotations
 
@@ -28,17 +20,17 @@ except Exception:
 
 from config import BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD
 from .horizons import FIGURE_HORIZONS, FIGURE_HORIZON_IDX
-from .schema import GRID_MIN  # canonical CGM grid resolution (minutes per step)
+from .schema import GRID_MIN  # minutes per step
 from clock_face import draw_clock_axis
 
 
 def _hlabel(h_min: int) -> str:
-    """Compact horizon label: '30 min', '1 h', '2 h', … (whole hours as hours)."""
+    """Horizon label: '30 min', '1 h', '2 h' — whole hours as hours."""
     return f'{h_min} min' if h_min % 60 else f'{h_min // 60} h'
 
 
 def _hhmm(hour: float) -> str:
-    """Format a float hour-of-day in ``[0, 24)`` as a 'HH:MM' wall-clock string."""
+    """Float hour-of-day in ``[0, 24)`` as 'HH:MM'."""
     h = int(hour) % 24
     m = int(round((hour - int(hour)) * 60))
     if m == 60:
@@ -48,13 +40,10 @@ def _hhmm(hour: float) -> str:
 
 
 def _annotate_tod(ax, ex: dict) -> None:
-    """Overlay the time-of-day probe clock readout on a trajectory panel.
+    """Time-of-day probe readout on a trajectory panel: 'pred HH:MM (R…) / true HH:MM'.
 
-    Guarded no-op unless the example carries a finite ``pred_hour`` — the probe
-    being disabled (``TIME_PROBE_ENABLED`` off) leaves the key absent or NaN.
-    Renders 'pred HH:MM (R…) / true HH:MM', tinted grey→blue by the confidence
-    ``tod_R`` (the resultant length R of the per-bin softmax belief) so a low-``R``
-    origin reads as tentative.
+    No-op without a finite ``pred_hour`` — a disabled probe leaves the key absent or NaN.
+    Tinted grey→blue by ``tod_R``, the resultant length of the per-bin softmax belief.
     """
     ph = ex.get('pred_hour')
     if ph is None or not np.isfinite(ph):
@@ -74,16 +63,16 @@ def _annotate_tod(ax, ex: dict) -> None:
 
 
 def _covered_horizons(n_steps: int):
-    """The (horizons, step-indices) from FIGURE_HORIZONS that an ``n_steps``-long
-    forecast array actually reaches; lets the same plotters take a
-    ``PREDICTION_HORIZON_HOURS`` single-pass array or a ``NIGHT_LONG_HORIZON_HOURS``
-    rolled one without reading past the end."""
+    """The ``(horizons, step-indices)`` of FIGURE_HORIZONS an ``n_steps`` array reaches.
+
+    A single-pass array and a rolled one take the same plotters without reading past the end.
+    """
     hs = [h for h in FIGURE_HORIZONS if FIGURE_HORIZON_IDX[h] < n_steps]
     return hs, [FIGURE_HORIZON_IDX[h] for h in hs]
 
 
 def _draw_clarke(ax):
-    """Draw canonical Clarke Error Grid zone boundaries (mg/dL, 0..400)."""
+    """Clarke Error Grid zone boundaries, mg/dL, 0..400."""
     ax.plot([0, 400], [0, 400], 'k:', lw=0.8)
     ax.plot([0, 175 / 3], [70, 70], 'k-', lw=0.6)
     ax.plot([175 / 3, 400 / 1.2], [70, 400], 'k-', lw=0.6)
@@ -118,17 +107,13 @@ def _clarke_AB(pred, true):
 
 
 def trajectory_grid(examples: list, path: str, title: str, ncols: int = 3):
-    """examples: list of dicts {ctx_tail, true_future, pred_future, label}.
+    """``examples``: dicts of {ctx_tail, true_future, pred_future, label}.
 
-    Optional per-example keys are rendered when present: ``band_lo``/``band_hi``
-    (calibrated 90% band edges, each ``(len(pred_future),)`` mg/dL); the
-    time-of-day probe readout ``pred_hour``/``true_hour`` (hour-of-day in
-    ``[0, 24)``) plus ``tod_R`` (probe confidence ``R`` — the resultant length of the per-bin softmax belief); and
-    ``time_probs`` (``(P, TIME_PROBE_N_BINS)`` per-patch softmax belief) rendered as
-    a top-strip row of ``P`` native clock-face histograms (no rotation — one clock
-    per prediction patch). The TOD keys are absent when the probe is disabled
-    (``TIME_PROBE_ENABLED`` off), so every render stays guarded and a probe-off run
-    draws the exact band/forecast panel unchanged."""
+    Optional keys, drawn when present: ``band_lo``/``band_hi``, calibrated 90% edges, each
+    ``(len(pred_future),)`` mg/dL; ``pred_hour``/``true_hour`` in ``[0, 24)`` with confidence ``tod_R``;
+    ``time_probs`` ``(P, TIME_PROBE_N_BINS)``, one native clock per prediction patch.
+    A disabled probe leaves its keys absent and the band/forecast panel unchanged.
+    """
     if not _OK or not examples:
         return
     n = len(examples); nrows = (n + ncols - 1) // ncols
@@ -139,8 +124,7 @@ def trajectory_grid(examples: list, path: str, title: str, ncols: int = 3):
         t_ctx = np.arange(-len(ct), 0) * GRID_MIN
         t_fut = (np.arange(len(tf)) + 1) * GRID_MIN
         ax.plot(t_ctx, ct, color='0.4', lw=1.2)
-        # Optional calibrated 90% band ribbon (sim figure path). Absent ex.band_lo
-        # ⇒ the exact band-less figure. Each edge is (len(pred_future),) mg/dL.
+        # 90% edges, each (len(pred_future),) mg/dL; absent ⇒ no ribbon
         if ex.get('band_lo') is not None and ex.get('band_hi') is not None:
             bl = np.asarray(ex['band_lo']); bh = np.asarray(ex['band_hi'])
             ax.fill_between(np.r_[0, t_fut[:len(bl)]], np.r_[ct[-1], bl], np.r_[ct[-1], bh],
@@ -152,9 +136,7 @@ def trajectory_grid(examples: list, path: str, title: str, ncols: int = 3):
         ax.axhline(BG_HYPER_THRESHOLD, color='0.85', lw=0.6)
         ax.set_title(ex.get('label', ''), fontsize=8)
         _annotate_tod(ax, ex)
-        # Per-patch time-of-day clock strip: one native clock per prediction patch
-        # (no rotation) across the panel's top band. Absent ``time_probs`` (probe
-        # off) => no strip, exact band/forecast panel unchanged.
+        # one native clock per prediction patch, no rotation; absent time_probs ⇒ no strip
         tp = ex.get('time_probs')
         if tp is not None:
             tp = np.asarray(tp)
@@ -174,10 +156,10 @@ def trajectory_grid(examples: list, path: str, title: str, ncols: int = 3):
 
 
 def parity_scatter(pred: np.ndarray, true: np.ndarray, path: str, title: str, ncols: int = 5):
-    """pred/true: (N, S). Scatter pred vs true at each FIGURE horizon the array
-    reaches, one panel per hour-by-hour horizon (wrapped into a grid). True may
-    carry trailing NaN where a rolled window ran past its segment; those points
-    are dropped per horizon."""
+    """``pred``/``true`` ``(N, S)``, one panel per FIGURE horizon the array reaches.
+
+    ``true`` may carry trailing NaN where a rolled window ran past its segment; dropped per horizon.
+    """
     if not _OK or len(pred) == 0:
         return
     hs, idx = _covered_horizons(pred.shape[1])
@@ -210,9 +192,10 @@ def parity_scatter(pred: np.ndarray, true: np.ndarray, path: str, title: str, nc
 
 
 def clarke_grid(pred: np.ndarray, true: np.ndarray, path: str, title: str, ncols: int = 5):
-    """Clarke Error Grid at each FIGURE horizon the array reaches, one panel per
-    hour-by-hour horizon (wrapped into a grid). Trailing-NaN true (rolled past the
-    segment) is dropped per horizon."""
+    """Clarke Error Grid, one panel per FIGURE horizon the array reaches.
+
+    Trailing-NaN ``true`` — rolled past the segment — is dropped per horizon.
+    """
     if not _OK or len(pred) == 0:
         return
     hs, idx = _covered_horizons(pred.shape[1])

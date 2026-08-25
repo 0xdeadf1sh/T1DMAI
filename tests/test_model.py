@@ -1,16 +1,9 @@
-"""Tests for model.py — shape checks, parameter count, forward pass correctness.
+"""model.py — ``forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)``
+in RISK space.
 
-Risk-space redesign: the model emits a single quantile BG head; the forward
-signature is
-``forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)`` in RISK
-space.  There are no per-channel dynamics heads, MDN, trend, event, or alarm
-heads, and the forward takes no extra output-toggle kwargs.
-
-The head gathers ``M`` masked patches BY INDEX and carries one anchor per slot;
-it is not a trailing slice against one broadcast ``last_bg``.  A right-edge span
-of ``PREDICTION_PATCHES`` is the special case these tests mostly use, built by
-``tests.forward_inputs.right_edge_inputs``.  ``T`` is whatever the batch's
-longest sample needs (``T <= MAX_SEQ_LEN``, never asserted equal to it).
+The head GATHERS ``M`` masked patches by index with one anchor per slot, never a
+trailing slice against a broadcast ``last_bg``. ``T`` is the batch's longest sample,
+``<= MAX_SEQ_LEN`` and never asserted equal to it.
 """
 
 import math
@@ -22,14 +15,13 @@ from tests.forward_inputs import masked_set_inputs, right_edge_inputs
 
 
 def test_model_instantiation():
-    """Model creates without error."""
     from model import T1DMAI
     model = T1DMAI()
     assert model is not None
 
 
 def test_parameter_count():
-    """Parameter count lands within a sane range (resize_model can move it)."""
+    """A range, not a value: resize_model.py moves the count."""
     from model import T1DMAI
     model = T1DMAI()
     total = sum(p.numel() for p in model.parameters())
@@ -39,7 +31,6 @@ def test_parameter_count():
 
 
 def test_parameter_breakdown():
-    """Print parameter count per component."""
     from model import T1DMAI
     model = T1DMAI()
     print("\n[DUMP] model | parameter breakdown:")
@@ -48,8 +39,7 @@ def test_parameter_breakdown():
 
 
 def test_old_heads_removed():
-    """The dynamics / MDN / trend / event / alarm heads of the old architecture
-    must be gone — the quantile BG head is the only output head."""
+    """The quantile BG head is the only output head."""
     from model import T1DMAI
     m = T1DMAI()
     for attr in ('channel_heads', 'trend_head', 'event_classifier',
@@ -60,10 +50,8 @@ def test_old_heads_removed():
 
 
 def test_forward_shape():
-    """Forward pass produces the (q_tau, median) 2-tuple with correct shapes,
-    median == q_tau[...,3], and ascending quantiles.  The slot axis is ``M`` —
-    the width of ``mask_idx`` — which a right-edge forecast sets to
-    ``PREDICTION_PATCHES``."""
+    """The slot axis is ``M``, the width of ``mask_idx``; a right-edge forecast sets it
+    to ``PREDICTION_PATCHES``."""
     from model import T1DMAI
     from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES
     model = T1DMAI()
@@ -90,13 +78,11 @@ def test_forward_shape():
 
 
 def test_forward_gathers_an_arbitrary_masked_set():
-    """The slot axis follows ``mask_idx``, not position: a backcast (span at patch
-    0), an infill (span between visible patches) and a forecast run through the
-    same forward, at ``M = MAX_MASKED_PATCHES`` with padded slots.
+    """Backcast, infill and forecast through one forward at ``M = MAX_MASKED_PATCHES``.
 
-    The head slices nothing — a trailing slice would emit the same shapes here and
-    the wrong patches, which is why this asserts the gather instead: slot ``j``'s
-    hidden state must be the one at ``mask_idx[:, j]``."""
+    A trailing slice would emit these same shapes and the wrong patches, so what is
+    asserted is the gather: slot ``j`` is the hidden state at ``mask_idx[:, j]``.
+    """
     from model import T1DMAI
     from config import MAX_MASKED_PATCHES, PATCH_SIZE, N_QUANTILES, PREDICTION_PATCHES
     model = T1DMAI().eval()
@@ -117,10 +103,8 @@ def test_forward_gathers_an_arbitrary_masked_set():
     assert median.shape == (B, MAX_MASKED_PATCHES, PATCH_SIZE)
     assert torch.isfinite(q_tau).all() and torch.isfinite(median).all()
 
-    # Move ONE span to a different start, holding ``patches`` and ``attn_mask``
-    # fixed: only the gather index changes, so a head that sliced positionally
-    # would return exactly the same numbers.  The span keeps its length, so the
-    # per-span median basis is unchanged and the difference is purely the gather.
+    # only the gather index moves: ``patches`` and ``attn_mask`` are held fixed and the
+    # span keeps its length, so a positional slice would return the same numbers
     moved = mask_idx.clone()
     moved[1, :2] = torch.tensor([6, 7])   # still ascending, still separated from 9
     with torch.no_grad():
@@ -135,7 +119,6 @@ def test_forward_gathers_an_arbitrary_masked_set():
 
 
 def test_forward_no_nan():
-    """No NaN or Inf in output for random input."""
     from model import T1DMAI
     model = T1DMAI()
     model.eval()
@@ -154,11 +137,11 @@ def test_forward_no_nan():
 
 
 def test_forward_anchor_required_and_validated():
-    """``anchor_bg`` is a required ``(B, M)`` mg/dL tensor; a z-scored anchor must
-    trip the forward-top units assert, and a ``(B,)`` broadcast anchor — the shape
-    the retired ``last_bg`` had — must be refused outright.  The units guarantee is
-    pool-independent: every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3, the
-    floor the assert reads.  It covers ALL M slots, padded ones included."""
+    """``anchor_bg`` is a required ``(B, M)`` mg/dL tensor.
+
+    The units guarantee is pool-independent: every legal z satisfies
+    z_max < BG_CLAMP_MIN - 1e-3, the floor the assert reads, over ALL M slots.
+    """
     from model import T1DMAI
     model = T1DMAI().eval()
 
@@ -166,23 +149,22 @@ def test_forward_anchor_required_and_validated():
     patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=2)
 
     with torch.no_grad():
-        # A z-space anchor (the bug the assert exists to catch) must raise.
+        # a z-space anchor is the bug the assert exists to catch
         with pytest.raises(AssertionError):
             model(patches, attn_mask, torch.full_like(anchor_bg, -1.5), mask_idx)
-        # One bad slot is enough — the tripwire reads every slot, not slot 0.
+        # one bad slot is enough: the tripwire reads every slot, not slot 0
         one_bad = anchor_bg.clone()
         one_bad[1, -1] = 0.7
         with pytest.raises(AssertionError):
             model(patches, attn_mask, one_bad, mask_idx)
-        # The retired (B,) broadcast anchor no longer type-checks.
+        # a (B,) broadcast anchor is refused outright
         with pytest.raises(AssertionError):
             model(patches, attn_mask, anchor_bg[:, 0], mask_idx)
     print("\n[DUMP] forward | z-space anchor (any slot) and (B,) anchor both trip ✓")
 
 
 def test_forward_variable_context():
-    """Model handles different context lengths — ``T`` is per batch, never
-    ``MAX_SEQ_LEN``."""
+    """``T`` is per batch, never ``MAX_SEQ_LEN``."""
     from model import T1DMAI
     from config import PREDICTION_PATCHES, MIN_CONTEXT_PATCHES
     model = T1DMAI()
@@ -201,9 +183,7 @@ def test_forward_variable_context():
 
 
 def test_attention_mask_pred_bidirectional():
-    """The prediction zone attends to itself BIDIRECTIONALLY (the pred->pred block
-    is all-True), while context->prediction stays BLOCKED (all-False) so no future
-    leaks into the context. Context<->context and prediction->context are full."""
+    """Context->prediction stays blocked so no future leaks into the context."""
     from utils import create_attention_mask
     from config import PREDICTION_PATCHES
 
@@ -221,7 +201,6 @@ def test_attention_mask_pred_bidirectional():
 
 
 def test_rope_positions():
-    """RoPE does not produce NaN for various sequence lengths."""
     from model import T1DMAI
     from config import PATCH_DIM, MAX_SEQ_LEN, MIN_CONTEXT_PATCHES, PREDICTION_PATCHES
     model = T1DMAI()
@@ -241,11 +220,8 @@ def test_rope_positions():
 
 
 def test_rope_orthogonal_and_identity_at_pos0():
-    """RoPE's rotation is orthogonal, so ``apply_rope`` preserves the per-position
-    L2 norm of q exactly, and it is the IDENTITY at position 0 (freqs=0 → cos=1,
-    sin=0).  This pins the half-rotation convention against the cos/sin table:
-    a mismatched split ([even,odd] pairing vs the [first-half,second-half] split
-    the table was built for) would BREAK norm preservation."""
+    """Pins the half-rotation convention against the cos/sin table: an [even,odd]
+    pairing against a [first-half,second-half] table breaks norm preservation."""
     from model import build_rope_cache, apply_rope
     from config import HEAD_DIM, N_HEADS
 
@@ -255,20 +231,18 @@ def test_rope_orthogonal_and_identity_at_pos0():
     cos, sin = build_rope_cache(T, HEAD_DIM)
     assert cos.shape == (T, HEAD_DIM) and sin.shape == (T, HEAD_DIM)
 
-    # Position 0 has zero frequency → cos=1, sin=0, so the table is the identity.
+    # position 0 has zero frequency: cos=1, sin=0, so the table is the identity
     assert torch.allclose(cos[0], torch.ones(HEAD_DIM), atol=1e-6)
     assert torch.allclose(sin[0], torch.zeros(HEAD_DIM), atol=1e-6)
 
     q_rot = apply_rope(q, cos, sin)
     assert q_rot.shape == q.shape
 
-    # (a) orthogonality — per-position L2 norm is invariant under the rotation.
     n_in = torch.linalg.vector_norm(q, dim=-1)
     n_out = torch.linalg.vector_norm(q_rot, dim=-1)
     max_norm_dev = float((n_out - n_in).abs().max())
     assert max_norm_dev < 1e-4, f"RoPE changed the q norm (not orthogonal): {max_norm_dev}"
 
-    # (b) identity at position 0 — the rotation by zero angle is a no-op.
     max_pos0_dev = float((q_rot[:, :, 0, :] - q[:, :, 0, :]).abs().max())
     assert max_pos0_dev < 1e-6, f"RoPE not identity at position 0: {max_pos0_dev}"
     print(f"\n[DUMP] rope | norm-preserving (max dev {max_norm_dev:.2e}), "
@@ -276,10 +250,6 @@ def test_rope_orthogonal_and_identity_at_pos0():
 
 
 def test_bidirectional_pred_forward_finite():
-    """With the now-bidirectional masked block, a fixed small input runs a
-    finite forward — the RoPE tables built inside ``model.forward`` (base
-    ROPE_BASE) compose with the bidirectional masked-row attention without
-    NaN/Inf."""
     from model import T1DMAI
 
     torch.manual_seed(0)
@@ -295,9 +265,8 @@ def test_bidirectional_pred_forward_finite():
 
 
 def test_init_median_is_persistence():
-    """At init (BG_HEAD_INIT_SCALE small, bias 0) the median delta ≈ 0, so the
-    median risk ≈ f(anchor_bg) — i.e. the initial forecast is persistence, and it
-    is the SLOT's own anchor that each slot persists from."""
+    """BG_HEAD_INIT_SCALE small with zero bias ⇒ median delta ≈ 0, so the initial
+    forecast persists from each slot's OWN anchor."""
     from model import T1DMAI
     from utils import kovatchev_f
 
@@ -305,7 +274,7 @@ def test_init_median_is_persistence():
     m = T1DMAI().eval()
     B = 4
     patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=7)
-    # A different anchor per row: the median must follow each row's own value.
+    # a different anchor per row: the median must follow each row's own value
     anchor_bg = torch.tensor([90.0, 120.0, 150.0, 200.0]).unsqueeze(1).expand_as(anchor_bg)
     with torch.no_grad():
         _, median = m(patches, attn_mask, anchor_bg.contiguous(), mask_idx)
@@ -318,10 +287,8 @@ def test_init_median_is_persistence():
 
 
 def test_gradient_flow():
-    """Gradients flow through all forecast-path parameters when the quantile head
-    is exercised. The detached time-of-day probe (``time_head.*``) is deliberately
-    off the forecast path (I1/I3) and is excluded here; its own gradient isolation
-    is covered by ``test_time_probe.test_detach_isolates_trunk``."""
+    """``time_head.*`` sits off the forecast path and is excluded; its isolation is
+    ``test_time_probe.test_detach_isolates_trunk``'s subject."""
     from model import T1DMAI
     model = T1DMAI()
 
@@ -330,14 +297,12 @@ def test_gradient_flow():
         B, seed=8, all_true_mask=True)
 
     q_tau, median = model(patches, attn_mask, anchor_bg, mask_idx)
-    # Sum over every quantile band so each head slot gets a grad.
+    # sum every quantile band so each head slot gets a grad
     loss = q_tau.sum() + median.sum()
     loss.backward()
 
     no_grad_params = []
     for name, param in model.named_parameters():
-        # The time-of-day probe is a DETACHED diagnostic head off the forecast
-        # path by design — a forecast-only loss must not reach it.
         if name.startswith('time_head.'):
             continue
         if param.grad is None:

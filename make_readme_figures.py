@@ -1,23 +1,17 @@
 """Render the figures the README embeds, into screenshots/.
 
-Three figures, each in a light and a dark variant so the README can serve the
-matching one through a <picture> element:
+Three figures, each light and dark so the README can serve the matching one:
 
-    architecture{,-dark}.png   end-to-end pipeline: signals -> encoder -> quantile
-                               fan -> mg/dL, and the three things that consume it
+    architecture{,-dark}.png   signals -> encoder -> quantile fan -> mg/dL, and its consumers
     risk-space{,-dark}.png     the Kovatchev warp and the loss asymmetry it creates
-    forecast{,-dark}.png       three forward passes of a trained checkpoint over one
-                               context window — backcast, infill and forecast — each
-                               cropped to 24 h around its masked span
+    forecast{,-dark}.png       backcast, infill and forecast over one context window,
+                               each cropped to 24 h around its masked span
 
-Usage:
     python make_readme_figures.py --skip-forecast       # diagrams only, no checkpoint
-    python make_readme_figures.py --checkpoint PATH     # all three
-    python make_readme_figures.py --checkpoint PATH --seed N
+    python make_readme_figures.py --checkpoint PATH [--seed N]
 
-The masked-BG figure has no default checkpoint: the capacity ladder's weights are
-per-run artifacts under the gitignored ``models/<capacity>/checkpoints/``.
-Name one or pass ``--skip-forecast``.
+The masked-BG figure has no default checkpoint: the ladder's weights are per-run artifacts
+under the gitignored models/<capacity>/checkpoints/.
 """
 
 from __future__ import annotations
@@ -45,7 +39,6 @@ FONT_BODY = "DejaVu Sans"
 FONT_MONO = "DejaVu Sans Mono"
 
 
-# --------------------------------------------------------------------- palette
 
 class Theme:
     """One coherent set of surface / ink / accent colours."""
@@ -109,7 +102,6 @@ def _style(t: Theme) -> None:
     })
 
 
-# ------------------------------------------------------------------ primitives
 
 def _canvas(figsize: tuple[float, float], t: Theme):
     fig, ax = plt.subplots(figsize=figsize, facecolor=t.paper)
@@ -154,7 +146,6 @@ def _down(ax, t, x, y0, y1, **kw):
     _arrow(ax, t, (x, y0), (x, y1), **kw)
 
 
-# ---------------------------------------------------------------- architecture
 
 def draw_architecture(t: Theme, path: Path) -> None:
     _style(t)
@@ -163,14 +154,12 @@ def draw_architecture(t: Theme, path: Path) -> None:
     L, R = 0.045, 0.955
     W = R - L
 
-    # --- source ------------------------------------------------------------
     _box(ax, t, L, 0.940, W, 0.052, "T1DMSIM behaviour simulator",
          "seed → patient → events → 5-min stream", accent=t.SAGE, mono_sub=False)
     ax.text(0.5, 0.930, "training corpus", ha="center", va="top",
             fontsize=8.0, color=t.muted, style="italic")
     _down(ax, t, 0.5, 0.922, 0.882)
 
-    # --- observed signal ---------------------------------------------------
     _box(ax, t, L, 0.828, W, 0.052, "Four input channels, one 5-minute grid",
          "CGM  mg/dL · carbohydrate  g / step · insulin  U / step"
          " · exercise  g / step (carbohydrate-equivalent)",
@@ -179,7 +168,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
             ha="center", va="top", fontsize=8.0, color=t.muted, style="italic")
     _down(ax, t, 0.5, 0.812, 0.792)
 
-    # --- transforms --------------------------------------------------------
     tw = 0.440
     _box(ax, t, L, 0.736, tw, 0.052, "CGM → Kovatchev f → z-score",
          "the model reads and writes glucose in risk space", accent=t.CLAY,
@@ -191,7 +179,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
     _arrow(ax, t, (R - tw / 2, 0.732), (0.5, 0.712))
     _down(ax, t, 0.5, 0.712, 0.700)
 
-    # --- patching ----------------------------------------------------------
     _box(ax, t, L, 0.644, W, 0.052, "Patch embedding",
          f"{config.PATCH_SIZE} steps × {config.N_INPUT_FEATURES} features "
          f"({config.PATCH_SIZE * 5} min)  →  one token  →  Linear → D_MODEL",
@@ -203,7 +190,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
             ha="center", va="top", fontsize=8.0, color=t.muted, style="italic")
     _down(ax, t, 0.5, 0.626, 0.608)
 
-    # --- encoder stack -----------------------------------------------------
     gy, gh = 0.398, 0.210
     ax.add_patch(FancyBboxPatch(
         (L, gy), W, gh, boxstyle="round,pad=0.006,rounding_size=0.012",
@@ -227,13 +213,11 @@ def draw_architecture(t: Theme, path: Path) -> None:
     _box(ax, t, bx, gy + 0.018, bw, 0.026, "SwiGLU FFN", accent=t.SAGE,
          title_size=9.2, lw=0.9, zorder=3)
 
-    # attention-mask inset
     mx, my, ms = 0.712, gy + 0.062, 0.118
     _mask_inset(ax, t, mx, my, ms)
 
     _down(ax, t, 0.5, gy, 0.372)
 
-    # --- final norm --------------------------------------------------------
     _box(ax, t, 0.290, 0.322, 0.420, 0.042, "Final RMSNorm",
          "gathered by mask_idx — masked patches only, from here on",
          accent=t.NAVY, sub_size=8.0, mono_sub=False)
@@ -242,7 +226,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
     _down(ax, t, 0.235, 0.310, 0.288)
     _down(ax, t, 0.765, 0.310, 0.288)
 
-    # --- heads -------------------------------------------------------------
     _box(ax, t, L, 0.230, 0.435, 0.056, "Blood-glucose quantile head",
          "3-layer MLP → K low-frequency coefficients per masked patch",
          accent=t.TEAL, sub_size=8.2, mono_sub=False)
@@ -252,7 +235,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
          accent=t.PLUM, sub_size=8.2, mono_sub=False)
     _down(ax, t, 0.2325, 0.228, 0.196)
 
-    # --- assembly + decode --------------------------------------------------
     _box(ax, t, L, 0.130, 0.640, 0.064, "Quantile assembly",
          "per-slot anchor f(anchor_bg), one-sided and left-preferring "
          " +  per-span DCT median\n"
@@ -263,7 +245,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
     _box(ax, t, 0.740, 0.130, R - 0.740, 0.064, "f⁻¹  →  mg/dL",
          "median line\n+ six band edges", accent=t.CLAY, sub_size=8.2, mono_sub=False)
 
-    # graph-cut annotation
     ax.plot([L - 0.010, R + 0.010], [0.219, 0.219], color=t.GOLD, lw=1.0,
             ls=(0, (5, 4)), zorder=4)
     ax.text(R + 0.006, 0.213,
@@ -275,7 +256,6 @@ def draw_architecture(t: Theme, path: Path) -> None:
     for cx in (0.165, 0.5, 0.835):
         _down(ax, t, cx, 0.112, 0.094)
 
-    # --- consumers ---------------------------------------------------------
     cw = 0.290
     _box(ax, t, L, 0.036, cw, 0.056, "Validation · metrics",
          "fresh simulator patients", accent=t.slate, sub_size=8.2, mono_sub=False)
@@ -325,11 +305,9 @@ def _mask_inset(ax, t: Theme, x: float, y: float, s: float) -> None:
             zorder=4, linespacing=1.35)
 
 
-# ------------------------------------------------------------------ risk space
 
-# The plotted span is the physical clamp, so the panels cover every BG the
-# simulator and the model can produce. The transform's anchors sit inside it:
-# f is solved so f(40) = -sqrt(10) and f(400) = +sqrt(10).
+# The plotted span is the physical clamp, so the panels cover every BG the model can produce;
+# the transform's anchors sit inside it, f solved so f(40) = -sqrt(10) and f(400) = +sqrt(10).
 BG_LO, BG_HI = BG_CLAMP_MIN, BG_CLAMP_MAX
 BG_ANCHOR_LO = 40.0
 
@@ -347,7 +325,6 @@ def draw_risk_space(t: Theme, path: Path) -> None:
     g = np.linspace(BG_LO, BG_HI, 800)
     r = _f(g)
 
-    # --- panel 1: the warp --------------------------------------------------
     a = axes[0]
     a.set_facecolor(t.paper)
     a.axvspan(70.0, 180.0, color=t.fill(t.SAGE), zorder=0)
@@ -381,7 +358,6 @@ def draw_risk_space(t: Theme, path: Path) -> None:
     a.spines["left"].set_color(t.rule)
     a.spines["bottom"].set_color(t.rule)
 
-    # --- panel 2: what it costs --------------------------------------------
     b = axes[1]
     b.set_facecolor(t.paper)
     err = 20.0
@@ -417,7 +393,6 @@ def draw_risk_space(t: Theme, path: Path) -> None:
     print(f"wrote {path}")
 
 
-# ------------------------------------------------------------------- masked BG
 
 def _load_model(checkpoint: str, device):
     import torch
@@ -450,10 +425,9 @@ def _sim_window(seed: int, stats, hours: float):
     exr = np.maximum(raw["total_exercise"], 0.0).astype(np.float32)
     from data import BG_MASKED_FEAT
 
-    # Four normalized signal columns, then the bg_masked announcement bit above
-    # them. The bit is not a signal — no statistics, never through normalize — and
-    # every step here is an observed reading, so its column stays 0.0; the masked
-    # set is written into the patches downstream, by the builder that knows it.
+    # Four normalized signal columns; the bg_masked bit above them is not a signal — no
+    # statistics, never through normalize. Every step here is observed, so its column stays 0.0
+    # and the masked set is written downstream, by the builder that knows it.
     cols = [bg, carb, ins, exr]
     assert len(cols) == BG_MASKED_FEAT < config.N_INPUT_FEATURES, (
         f"{len(cols)} raw signal columns against BG_MASKED_FEAT={BG_MASKED_FEAT}, "
@@ -467,14 +441,11 @@ CROP_HOURS = 24.0          # the slice each panel shows out of the whole window
 
 
 def _anchor_step(span_start: int, span_len: int, patch_size: int) -> tuple[int, bool]:
-    """The window step index this span's fan is anchored on, and which end it joins.
+    """The window step this span's fan is anchored on, and which end it joins.
 
-    The anchor rule is one-sided and LEFT-PREFERRING: every slot of a span takes
-    the last step of its left neighbour, and the first step of its right
-    neighbour only when the span opens the window. So a fan drawn for a span at
-    patch 0 leaves the observed line at its RIGHT edge, and every other fan at
-    its left. The head decodes a delta from that step, so the fan has zero width
-    there and the join is structural, not cosmetic.
+    One-sided and LEFT-PREFERRING: a span takes its left neighbour's last step, its right
+    neighbour's first only when it opens the window.  The head decodes a delta from that step,
+    so the fan has zero width there — the join is structural, not cosmetic.
     """
     if span_start == 0:
         return (span_start + span_len) * patch_size, False      # join on the right
@@ -497,12 +468,11 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     seq_len = n_ctx + P
     crop_patches = int(CROP_HOURS * pph)
 
-    # The trailing forecast is masked in every case, so what is left of the
-    # head's slots is what a backcast or an infill span may take.
+    # the trailing forecast is masked in every case, so a backcast or infill span gets what is
+    # left of the head's slots
     span_len = cfg.MAX_MASKED_PATCHES - P
 
-    # 10 h of slack past the window, so the patch-aligned start below never runs
-    # the window off the end of a short trajectory.
+    # 10 h of slack, so the patch-aligned start below never runs off a short trajectory
     feats, bg, carb, ins, exr, _hour = _sim_window(
         seed, stats, hours=(ctx_steps + pred_steps) * 5.0 / 60.0 + 10.0)
     start = ((len(bg) - ctx_steps - pred_steps) // S) * S
@@ -510,11 +480,9 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     context = torch.from_numpy(ctx_np.copy())
     origin = start + ctx_steps
 
-    # The whole announceable set, so every pass conditions on exactly what
-    # training conditioned on. Anything left out is silently read as "none".
-    # It is announced in all three passes, not just the forecast: the trailing
-    # zone is masked under every masked set, so leaving it out would condition
-    # the backcast and infill passes differently from the forecast one.
+    # The whole announceable set, so every pass conditions on what training conditioned on;
+    # anything left out reads as "none". Announced in all three passes, not just the forecast:
+    # the trailing zone is masked under every set, so omitting it would condition them apart.
     ANNOUNCE = tuple(cfg.CHANNEL_TO_FEAT)                  # (0, 1, 2)
     ov = {ch: torch.from_numpy(
               feats[origin:origin + pred_steps, cfg.CHANNEL_TO_FEAT[ch]]
@@ -559,7 +527,6 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     hours = lambda w: w * 5.0 / 60.0            # window step index -> hours
     window_bg = bg[start:start + ctx_steps + pred_steps]
 
-    # ----------------------------------------------------------- locator strip
     loc_ax.set_facecolor(t.paper)
     loc_ax.axhspan(70, 180, color=t.fill(t.SAGE), zorder=0)
     loc_ax.plot(hours(np.arange(len(window_bg))), window_bg, color=t.ink, lw=0.7,
@@ -582,7 +549,6 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     loc_ax.spines["left"].set_visible(False)
     loc_ax.spines["bottom"].set_color(t.rule)
 
-    # ------------------------------------------------------------------ crops
     for ax, (name, sub, spans, s0, length) in zip(crop_axes, CASES):
         bands, med = span_fan(run(spans), s0, length)
         a_step, join_left = _anchor_step(s0, length, S)
@@ -592,8 +558,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
         c0 = min(max(s0 + length // 2 - crop_patches // 2, 0), seq_len - crop_patches)
         v0, v1 = c0 * S, (c0 + crop_patches) * S        # crop steps, window coords
 
-        # The fan and the median leave the observed line at the anchor, so both
-        # are joined to it on the side the anchor rule chose.
+        # both leave the observed line at the anchor, on the side the anchor rule chose
         if join_left:
             tm = hours(np.arange(a_step, m1))
             med_j = np.concatenate([[anchor], med])
@@ -612,8 +577,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
         for lo, hi, alpha in ((0, 6, 0.16), (1, 5, 0.24), (2, 4, 0.34)):
             ax.fill_between(tm, bands_j[:, lo], bands_j[:, hi], color=t.TEAL,
                             alpha=alpha, lw=0, zorder=2)
-        # Observed either side of the span, withheld inside it: the model is
-        # shown the solid stretches and asked for the dashed one.
+        # solid where the model was shown the reading, dashed where it was withheld
         for a, b in ((v0, m0 + 1), (m1 - 1, v1)):
             if b - a > 1:
                 w = np.arange(max(a, v0), min(b, v1))
@@ -625,9 +589,8 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
                 mec=t.paper, mew=0.9, zorder=7)
 
         seen = np.concatenate([window_bg[v0:v1], bands_j[:, 5], bands_j[:, 1], med_j])
-        # A little air either side, so a span flush against the crop edge — the
-        # backcast one always is, and the forecast one ends there — is not read
-        # as a line running off the panel.
+        # air either side, so a span flush against the crop edge does not read as a line
+        # running off the panel
         ax.set_xlim(hours(v0) - 0.4, hours(v1 - 1) + 0.4)
         ax.set_ylim(max(40.0, min(85.0, float(np.nanmin(seen)) * 0.90)),
                     min(400.0, max(220.0, float(np.nanmax(seen)) * 1.07)))
@@ -645,8 +608,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     crop_axes[-1].tick_params(axis="x", length=0)
     crop_axes[-1].spines["bottom"].set_visible(False)
 
-    # The plan strip belongs to the bottom crop's axis, and carries the channels
-    # the model reads at every patch, masked or not.
+    # bottom crop's axis: the channels the model reads at every patch, masked or not
     _n, _s, _sp, s0, length = CASES[-1]
     c0 = min(max(s0 + length // 2 - crop_patches // 2, 0), seq_len - crop_patches)
     sl = slice(start + c0 * S, start + (c0 + crop_patches) * S)
@@ -693,20 +655,17 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     print(f"wrote {path}")
 
 
-# ------------------------------------------------------------------------ main
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
-    # No default: the ladder's checkpoints are per-run artifacts under the
-    # gitignored models/<capacity>/, so any baked-in path is a promise the
-    # tree cannot keep. The figure names its checkpoint or is skipped.
+    # No default: the ladder's checkpoints are per-run artifacts under the gitignored
+    # models/<capacity>/, so a baked-in path is a promise the tree cannot keep.
     ap.add_argument("--checkpoint", default=None,
                     help="checkpoint .pt for the masked-BG figure; required unless "
                          "--skip-forecast")
-    # The seed the committed screenshots/ figures were drawn from; a rerun that
-    # changes it silently replaces the README's patient with a different one.
+    # the seed the committed screenshots/ were drawn from; changing it swaps the README patient
     ap.add_argument("--seed", type=int, default=14)
     ap.add_argument("--skip-forecast", action="store_true",
                     help="draw only the two diagrams (no checkpoint)")

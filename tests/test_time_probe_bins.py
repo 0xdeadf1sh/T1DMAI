@@ -1,33 +1,7 @@
-"""Tests for the categorical per-patch time-of-day bin probe.
+"""The categorical per-patch time-of-day bin probe.
 
-The redesigned probe classifies every prediction patch's hour-of-day into
-``TIME_PROBE_N_BINS`` circular bins (softmax logits, no mean-pool). These tests
-cover the ``utils`` bin machinery and the model's per-patch logit output:
-
-* ``time_of_day_bin_target`` — soft circular labels: rows sum to 1, a one-hot
-  when ``smooth_bins <= 0``, a peak on the containing bin, and mass that WRAPS
-  across the 24 h seam;
-* ``time_of_day_decode_bins`` — resultant-vector decode: a one-hot logit at bin
-  ``k`` roundtrips to ``center_k`` with confidence ``R ≈ 1``; a uniform logit
-  yields ``R ≈ 0``;
-* ``time_inter_patch_jump_hours`` — the WITHIN-window "no jumping" witness (now an
-  UNPENALIZED diagnostic; the old within-window advance penalty was removed as
-  redundant): ``≈ 0`` on a patch-by-patch ramp advancing one bin, large on a jump;
-* ``time_cross_window_consistency_loss`` — the CROSS-window (paired-window) penalty
-  coupling two INDEPENDENT forwards: ``≈ 0`` when window ``k+1``'s ORIGIN patch reads
-  exactly one horizon (== ``advance_hours``) ahead of window ``k``'s, strictly larger
-  on a non-advancing pair, valid-masked (a finite ``0`` when no rows are valid);
-* ``time_cross_window_jump_hours`` — the decode-based cross-window witness:
-  per-sample ``|clock_{k+1,origin} − clock_{k,origin} − advance_hours|`` in hours,
-  ``≈ 0`` on an exactly-advanced pair, large on a mis-advanced one;
-* the model forward — ``return_time=True`` yields per-patch logits of shape
-  ``(B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)``; with the probe disabled the
-  logits are ``None`` and ``(q_tau, median)`` are bit-identical (invariant I2).
-
-Small tensors, CPU, ``num_workers=0`` (no data loading); ``[DUMP]`` lines make
-silent numerical drift visible.  The jump/cross-window unit tests pick their own
-``n_bins``/``advance_hours`` so one bin equals one horizon of advance — with
-``n_bins = 12`` and ``advance = 2 h`` one 2 h bin is exactly one horizon.
+The jump and cross-window tests pick ``n_bins = 12`` with ``advance = 2 h`` so one
+bin is exactly one horizon of advance.
 """
 
 import math
@@ -37,42 +11,19 @@ import torch
 
 
 def _onehot_logits(bins: torch.Tensor, n_bins: int, hot: float = 20.0) -> torch.Tensor:
-    """One-hot bin logits.
-
-    Args:
-        bins: ``(...,)`` long tensor of bin indices in ``[0, n_bins)``.
-        n_bins: number of bins.
-        hot: logit magnitude on the chosen bin (0 elsewhere); ``exp(hot)`` must
-            dominate so the softmax is ≈ one-hot.
-
-    Returns:
-        ``(..., n_bins)`` fp32 logits.
-    """
+    """``(..., n_bins)`` fp32 logits; ``exp(hot)`` must dominate so softmax ≈ one-hot."""
     return torch.nn.functional.one_hot(bins, n_bins).to(torch.float32) * hot
 
 
 def _forward_inputs(B: int = 2):
-    """CPU ``(patches, attn_mask, anchor_bg, mask_idx)`` mirroring tests/test_model.py.
-
-    Args:
-        B: batch size.
-
-    Returns:
-        The four-tensor forward contract for a right-edge forecast span:
-        ``T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES`` and
-        ``M = PREDICTION_PATCHES``, so the probe emits one row per horizon patch.
-    """
+    """``(patches, attn_mask, anchor_bg, mask_idx)`` right-edge, ``M = PREDICTION_PATCHES``
+    so the probe emits one row per horizon patch."""
     from tests.forward_inputs import right_edge_inputs
 
     return right_edge_inputs(B, all_true_mask=True)
 
 
-# ============================================================================
-# time_of_day_bin_target — soft circular labels
-# ============================================================================
-
 def test_bin_target_rows_sum_to_one():
-    """Every soft-label row is a probability distribution (sums to 1)."""
     from utils import time_of_day_bin_target
 
     n_bins = 12
@@ -86,7 +37,6 @@ def test_bin_target_rows_sum_to_one():
 
 
 def test_bin_target_onehot_when_no_smooth():
-    """``smooth_bins <= 0`` collapses to a one-hot at the containing bin."""
     from utils import time_of_day_bin_target, time_of_day_bin_centers
 
     n_bins = 12
@@ -103,7 +53,6 @@ def test_bin_target_onehot_when_no_smooth():
 
 
 def test_bin_target_peak_at_correct_bin():
-    """The soft label peaks on the bin that contains the hour."""
     from utils import time_of_day_bin_target, time_of_day_bin_centers
 
     n_bins = 12
@@ -117,7 +66,6 @@ def test_bin_target_peak_at_correct_bin():
 
 
 def test_bin_target_circular_wrap():
-    """A late-evening hour spreads mass across the seam onto the FIRST bin too."""
     from utils import time_of_day_bin_target
 
     n_bins = 12                                    # 2 h bins
@@ -125,20 +73,13 @@ def test_bin_target_circular_wrap():
     top2 = set(int(i) for i in torch.topk(row, 2).indices.tolist())
     print(f"\n[DUMP] bin_target | hour=23.9 top-2 bins={sorted(top2)} "
           f"p[0]={float(row[0]):.4f} p[11]={float(row[11]):.4f} p[6]={float(row[6]):.4f}")
-    # The two heaviest bins straddle the midnight seam (last bin 11 and first bin 0).
     assert top2 == {0, 11}, f"mass must wrap the seam onto bins {{0, 11}}, got {sorted(top2)}"
-    # And it wraps the SHORT way: the first bin outweighs a bin an equal step ahead.
+    # wraps the SHORT way: bin 0 outweighs a bin an equal step the other way
     assert float(row[0]) > float(row[2]), "wrap must put more mass on bin 0 than bin 2"
     assert float(row[0]) > float(row[6]), "antipodal bin must stay near-empty"
 
 
-# ============================================================================
-# time_of_day_decode_bins — resultant-vector decode
-# ============================================================================
-
 def test_decode_bins_roundtrip_and_confidence():
-    """One-hot logits at bin ``k`` decode to ``center_k`` with ``R ≈ 1``;
-    a uniform logit decodes to ``R ≈ 0`` (no preferred hour)."""
     from utils import (time_of_day_decode_bins, time_of_day_bin_centers,
                        circular_hour_error)
 
@@ -159,16 +100,8 @@ def test_decode_bins_roundtrip_and_confidence():
     assert float(uni_R) < 1e-4, f"uniform bins have no preferred hour, R={float(uni_R)}"
 
 
-# ============================================================================
-# within-window jump witness + cross-window (paired-window) consistency
-# ============================================================================
-
 def _ramp_and_jump(n_bins: int, P: int) -> "tuple[torch.Tensor, torch.Tensor]":
-    """Consistent one-bin-per-patch ramp vs a scrambled jumping set, as logits.
-
-    Returns:
-        ``(ramp_logits, jump_logits)`` each ``(B, P, n_bins)``.
-    """
+    """``(ramp_logits, jump_logits)``, each ``(B, P, n_bins)``."""
     base = torch.tensor([0, 4])                                    # (B,)
     steps = torch.arange(P)
     ramp_bins = (base[:, None] + steps[None, :]) % n_bins          # +1 bin/patch
@@ -178,7 +111,6 @@ def _ramp_and_jump(n_bins: int, P: int) -> "tuple[torch.Tensor, torch.Tensor]":
 
 
 def test_inter_patch_jump_ramp_vs_jump():
-    """The diagnostic ``|advance deviation|`` is ≈0 on the ramp, large on the jump."""
     from utils import time_inter_patch_jump_hours
 
     n_bins, P = 12, 6
@@ -206,9 +138,7 @@ def _origin_onehot(bins, n_bins, P=2):
 
 
 def test_cross_window_consistency_loss():
-    """≈0 when window k+1's origin is exactly one horizon (== one 2 h bin) ahead of
-    window k's, strictly larger on a non-advancing pair; the valid mask drops rows and
-    yields a finite zero when none are valid."""
+    """An all-False valid mask must give a finite 0, not NaN."""
     from utils import time_cross_window_consistency_loss
     n_bins, H = 12, 2.0                       # one 2 h bin == one horizon
     k = _origin_onehot([3, 7], n_bins)
@@ -228,8 +158,6 @@ def test_cross_window_consistency_loss():
 
 
 def test_cross_window_jump_hours():
-    """Decode-based |cross-window advance − H|: ≈0 on an exactly-advanced pair, large
-    on a mis-advanced pair, shaped (B,)."""
     from utils import time_cross_window_jump_hours
     n_bins, H = 12, 2.0
     k = _origin_onehot([3, 7], n_bins)
@@ -240,14 +168,9 @@ def test_cross_window_jump_hours():
     assert float(jg.mean()) < 1e-3 and float(jb.mean()) > 1.0
 
 
-# ============================================================================
-# model forward — per-patch bin logits + disable path (invariant I2)
-# ============================================================================
-
 def test_model_forward_bin_logits_shape_and_disable(monkeypatch):
-    """``return_time=True`` emits ``(B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)``
-    logits; disabling the probe yields ``None`` and leaves ``(q_tau, median)``
-    bit-identical (forecast init RNG is probe-neutral, I2)."""
+    """Probe presence leaves ``(q_tau, median)`` bit-identical: its init draws under a
+    saved RNG state, so the forecast weights are probe-neutral."""
     import config
     import model as model_mod
     from config import PREDICTION_PATCHES, TIME_PROBE_N_BINS
@@ -282,17 +205,9 @@ def test_model_forward_bin_logits_shape_and_disable(monkeypatch):
     assert torch.equal(med0, med1), "probe presence perturbed median (I2 violated)"
 
 
-# ============================================================================
-# retirement of the within-window penalty; cross-window config/API surface
-# ============================================================================
-
 def test_within_window_penalty_retired():
-    """The redundant within-window advance penalty is gone: no
-    ``TIME_PROBE_CONSISTENCY_WEIGHT`` config knob and no
-    ``utils.time_advance_consistency_loss`` symbol; the cross-window knobs and the
-    two cross-window helpers replace them, while the unpenalized within-window
-    witness ``time_inter_patch_jump_hours`` is kept.
-    """
+    """The cross-window knobs carry the penalty; the within-window witness stays
+    unpenalized."""
     import config
     import utils
 

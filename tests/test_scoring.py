@@ -1,21 +1,13 @@
-"""Proper scoring rules for the masked-BG fan (``metrics.scoring``).
+"""Proper scoring rules for the masked-BG fan (``metrics.scoring``). Three fans recur:
 
-Deterministic synthetic checks against hand-computable cases — no model, no
-simulator, no checkpoint.  Three fans recur:
+  * DEGENERATE, every τ on one value: CRPS is the absolute error, Winkler the pure
+    escape penalty, coverage 0/1;
+  * CALIBRATED, the exact quantiles of the law the truth is drawn from;
+  * MISCALIBRATED, that one shrunk: worse on every rule while reading SHARPER, which
+    is why sharpness never travels without coverage.
 
-  * a DEGENERATE fan (every τ on one value), where CRPS collapses to the absolute
-    error, the Winkler score to the pure escape penalty and coverage to 0/1;
-  * a PERFECTLY CALIBRATED fan (the exact quantiles of the law the truth is drawn
-    from), where marginal coverage must land on nominal;
-  * a KNOWN-MISCALIBRATED fan (the calibrated one shrunk by a fixed factor),
-    which must score worse on every rule while reading SHARPER — the pair of
-    numbers is the reason sharpness never travels without coverage.
-
-CRPS additionally gets an independent reference: dense trapezoidal quadrature of
-the pinball loss over τ on the same piecewise-linear-quantile law, which the
-closed form must reproduce.
-
-Every array here is mg/dL physical space; the space guard is tested directly.
+CRPS also gets an independent reference: dense quadrature of the pinball loss over τ.
+Every array is mg/dL; the space guard is tested directly.
 """
 from __future__ import annotations
 
@@ -39,9 +31,6 @@ MED = QUANTILE_LEVELS.index(0.5)
 HYPO_EDGE = QUANTILE_LEVELS.index(HYPO_ALARM_QUANTILE_TAU)
 
 
-# --------------------------------------------------------------------------- #
-# Builders
-# --------------------------------------------------------------------------- #
 def _fan(center: np.ndarray, width: float) -> np.ndarray:
     """``(N, S, K)`` ascending fan: level τ at ``center + 2·width·(τ − 0.5)``.
 
@@ -74,9 +63,6 @@ def _crps_dense(qrow: np.ndarray, y: float, n: int = 400001) -> float:
     return float(2.0 * np.trapezoid(pin, tau))
 
 
-# --------------------------------------------------------------------------- #
-# The input contract: space, and the padded-slot tripwire
-# --------------------------------------------------------------------------- #
 def test_risk_space_fan_is_rejected():
     """A fan left in Kovatchev risk space must not score as if it were mg/dL."""
     true_mgdl = np.full((4, 2), 120.0)
@@ -112,16 +98,12 @@ def test_central_levels_are_the_fans_own_pairs():
     assert central_levels() == ((0.9, 0, 6), (0.8, 1, 5), (0.5, 2, 4))
 
 
-# --------------------------------------------------------------------------- #
-# 1. CRPS
-# --------------------------------------------------------------------------- #
 @pytest.mark.parametrize('rule', [CRPS_PWL, CRPS_TRAPEZOID])
 @pytest.mark.parametrize('y', [80.0, 120.0, 200.0])
 def test_crps_degenerate_fan_is_the_absolute_error(rule, y):
-    """A fan collapsed onto one value is a point mass: CRPS == |y − m|, exactly.
+    """A collapsed fan is a point mass: CRPS == |y − m| exactly.
 
-    Both quadrature rules must agree here — every τ gap has zero spread, so the
-    interior integrand is linear in τ and the trapezoid excess vanishes.
+    Both rules agree: every τ gap has zero spread, so the trapezoid excess vanishes.
     """
     q = _degenerate(np.full((1, 1), 120.0))
     got = float(crps_steps(q, np.array([[y]]), LV, rule)[0, 0])
@@ -145,12 +127,11 @@ def test_crps_pwl_matches_dense_quadrature():
 
 
 def test_crps_trapezoid_excess_matches_its_closed_form():
-    """The documented quadrature error, verified on the widest τ gap.
+    """Only ``q(0.5)..q(0.75)`` is non-degenerate, so the whole rule difference comes
+    from that subinterval (h = 0.25, spread D).
 
-    Only ``q(0.5)..q(0.75)`` is non-degenerate here, so the whole difference
-    between the rules comes from that one subinterval (h = 0.25, spread D) and
-    must equal ``2·[D·h·u(1−u)(1−h)/2 − D·h²·(u³+(1−u)³)/6]``, peaking at
-    ``D/24`` when the truth sits mid-gap.
+    It must equal ``2·[D·h·u(1−u)(1−h)/2 − D·h²·(u³+(1−u)³)/6]``, peaking at ``D/24``
+    with the truth mid-gap.
     """
     base, D, h, ta = 150.0, 20.0, 0.25, 0.5
     qrow = np.array([base] * 4 + [base + D] * 3, dtype=np.float64)
@@ -171,11 +152,7 @@ def test_crps_trapezoid_excess_matches_its_closed_form():
 
 
 def test_crps_prefers_the_calibrated_fan():
-    """CRPS is proper: the fan of the law that generated the truth wins.
-
-    Both a too-narrow and a too-wide fan must score worse than the calibrated one
-    over the same draws.
-    """
+    """CRPS is proper: too narrow and too wide both score worse than calibrated."""
     rng = np.random.default_rng(11)
     n = 4000
     y = rng.uniform(80.0, 220.0, size=(n, 1))
@@ -209,12 +186,11 @@ def test_crps_by_d_bins_and_marks_the_pooled_figure():
 
 
 def test_pooled_moves_with_the_d_mixture_alone():
-    """The pooling hazard, pinned: identical per-``d`` skill, different pooled score.
+    """Identical per-``d`` skill, different pooled score, because the supervision shares
+    differ.
 
-    Two protocols with the same error at every ``d`` but different shares of
-    supervision at each ``d`` produce different pooled CRPS.  That is why the
-    pooled figure carries ``POOLED_NOT_COMPARABLE`` and cannot select a
-    checkpoint: it improves when the mask mixture softens.
+    Hence ``POOLED_NOT_COMPARABLE``: the pooled figure improves when the mask mixture
+    softens, so it cannot select a checkpoint.
     """
     def pooled_for(n_easy: int, n_hard: int) -> float:
         true = np.full((n_easy + n_hard, 1), 100.0)
@@ -231,9 +207,6 @@ def test_pooled_moves_with_the_d_mixture_alone():
     assert balanced == pytest.approx(25.0)
 
 
-# --------------------------------------------------------------------------- #
-# 2. Interval / Winkler score
-# --------------------------------------------------------------------------- #
 def test_winkler_hand_computed():
     """W = width + (2/α)·escape, on one interval with the truth in each position."""
     lo_idx, hi_idx = 0, N_QUANTILES - 1                # the central-90% pair, α = 0.1
@@ -276,9 +249,6 @@ def test_winkler_prefers_the_calibrated_fan():
     assert s_cal < s_nar and s_cal < s_wid
 
 
-# --------------------------------------------------------------------------- #
-# 3. Coverage, always with the width that bought it
-# --------------------------------------------------------------------------- #
 def test_coverage_cannot_be_built_without_its_width():
     """The container makes a widthless coverage figure unconstructible."""
     with pytest.raises(TypeError):
@@ -320,9 +290,6 @@ def test_calibrated_fan_covers_at_nominal_and_the_narrow_one_does_not():
             0.5 * c[nominal].pooled.mean_width, rel=1e-9)
 
 
-# --------------------------------------------------------------------------- #
-# 4. Joint (simultaneous) coverage vs per-step marginal
-# --------------------------------------------------------------------------- #
 def _two_group_case():
     """Two groups × four patches (``d`` = 1..4) × two steps; one step escapes."""
     n, s = 8, 2
@@ -375,9 +342,6 @@ def test_joint_equals_marginal_when_the_scope_is_one_step():
     assert out.joint_pooled.coverage == pytest.approx(0.75)
 
 
-# --------------------------------------------------------------------------- #
-# 5. Alarm operating curve
-# --------------------------------------------------------------------------- #
 def test_forecast_lead_minutes_reproduces_the_horizon_grid():
     """``d`` = 1..4 one-sided IS @30/@60/@90/@120 min on the right-edge protocol."""
     lead = forecast_lead_minutes(np.array([1, 2, 3, 4], dtype=np.int64))
@@ -402,9 +366,8 @@ def test_predictive_cdf_is_the_fan_interpolated():
 def _alarm_case():
     """Four groups × four patches (``d`` = 1..4) × ``PATCH_SIZE`` steps.
 
-    A patch centred on 80 mg/dL dips its τ=0.25 edge to 60 and alarms; one
-    centred on 150 never does.  Truth is flat 150 apart from the two planted
-    hypos.
+    A patch centred on 80 mg/dL dips its τ=0.25 edge to 60 and alarms; one centred on
+    150 never does. Truth is flat 150 apart from the two planted hypos.
 
       g0: alarms at d = 3, true hypo at d = 3 step 0  → detected, lead 65 min
       g1: alarms at d = 1, true hypo at d = 1 step 5  → detected, lead 30 min
@@ -491,9 +454,6 @@ def test_alarm_without_an_observation_span_reports_counts_only():
     assert dep.n_false_alarms == 1
 
 
-# --------------------------------------------------------------------------- #
-# The aggregate
-# --------------------------------------------------------------------------- #
 def test_score_fan_runs_all_five_and_marks_every_pooled_figure():
     q, true, d, group, lead = _alarm_case()
     out = score_fan(q, true, d, group, lead, observed_days=2.0)

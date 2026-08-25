@@ -1,10 +1,6 @@
-"""Render model-card-style figures for the T1DMAI run (logs/ + checkpoints/).
+"""Model-card figures for one T1DMAI run, from logs/ + checkpoints/.
 
-Writes to figures/ with a card_ prefix so the existing fig01..fig09 training
-figures stay sorted separately.
-
-Usage:
-    python make_card.py
+Writes figures/card_*.png; the prefix keeps them sorted apart from fig01..fig09.
 """
 
 from __future__ import annotations
@@ -29,19 +25,17 @@ CKPT_PATH = REPO / "checkpoints" / "t1dmai_best.pt"
 OUT_DIR = REPO / "figures"
 METRICS_DIR = REPO / "metrics"
 
-# Report horizons (metrics.core.calibrate.HORIZONS) and the sources each report
-# mode may carry. Kept local so the card has no import-time dependency on the
-# evaluation core (it only reads the JSON those scripts emit).
+# metrics.core.calibrate.HORIZONS, restated locally so the card has no import-time dependency
+# on the evaluation core — it only reads the JSON those scripts emit.
 REPORT_HORIZONS = (30, 60, 120)
 REPORT_SOURCES = (
     ("sim",       "Simulator (in-domain)", ("sim",)),
 )
 
 
-# ---------------------------------------------------------------- design system
 
 
-# Palette: muted, publication-style. One warm + cool pair, neutrals dominant.
+# muted publication palette: one warm + cool pair, neutrals dominant
 INK       = "#1a1f2e"   # primary text (very dark navy, easier than pure black)
 SLATE     = "#3d4659"   # secondary text
 DIMMED    = "#6b7280"   # tertiary text
@@ -58,7 +52,7 @@ GOLD  = "#a8843a"       # warning / calibration
 SAGE  = "#5a7d4a"       # secondary positive
 PLUM  = "#74416e"       # rare accent (events / sparse)
 
-# Soft tints (5% mixes of the accents with white) for backgrounds.
+# background tints: 5% mixes of the accents with white
 NAVY_T = "#ecf1f7"
 CLAY_T = "#f8efe9"
 TEAL_T = "#eef4f6"
@@ -83,8 +77,7 @@ def _set_style() -> None:
             "axes.facecolor": PAPER,
             "font.size": 10.5,
             "font.family": FONT_BODY,
-            # Font fallback chain — Ubuntu lacks some math glyphs (→, ², ⁻),
-            # DejaVu Sans is the safety net.
+            # Ubuntu lacks some math glyphs (→, ², ⁻); DejaVu Sans is the fallback
             "font.sans-serif": ["Ubuntu", "DejaVu Sans", "Liberation Sans"],
             "text.color": INK,
             "axes.edgecolor": RULE,
@@ -108,7 +101,6 @@ def _set_style() -> None:
     )
 
 
-# ---------------------------------------------------------------- card primitives
 
 
 def _setup_card(figsize: tuple[float, float]) -> tuple[mpl.figure.Figure, mpl.axes.Axes]:
@@ -123,12 +115,12 @@ def _setup_card(figsize: tuple[float, float]) -> tuple[mpl.figure.Figure, mpl.ax
 
 def _header(ax, eyebrow: str, title: str, subtitle: str | None = None,
             y_top: float = 0.965) -> float:
-    """Render the shared card header. Returns the y at which content can start."""
+    """Shared card header; returns the y content can start at."""
     ax.text(0.025, y_top, eyebrow.upper(), fontsize=8.5, color=CLAY,
             family=FONT_BODY, weight="bold", transform=ax.transAxes)
     ax.text(0.025, y_top - 0.050, title, fontsize=20, color=INK,
             family=FONT_TITLE, va="top", transform=ax.transAxes)
-    # Reserve enough space for the serif title cap-height.
+    # room for the serif title's cap-height
     title_block = 0.115
     if subtitle:
         ax.text(0.025, y_top - 0.050 - title_block, subtitle, fontsize=10, color=SLATE,
@@ -141,7 +133,7 @@ def _header(ax, eyebrow: str, title: str, subtitle: str | None = None,
 
 
 def _section(ax, y, label, color=NAVY) -> float:
-    """Small uppercase section eyebrow. Returns y for first content row."""
+    """Section eyebrow; returns the y of its first content row."""
     ax.text(0.025, y, label.upper(), fontsize=8.5, color=color,
             family=FONT_BODY, weight="bold", transform=ax.transAxes)
     return y - 0.040
@@ -149,15 +141,12 @@ def _section(ax, y, label, color=NAVY) -> float:
 
 def _stat_tile(ax, x, y, w, h, label, big, sub, accent):
     """A clean stat tile with a thin colored top bar."""
-    # Card body
     ax.add_patch(FancyBboxPatch((x, y), w, h,
                                  boxstyle="round,pad=0.005,rounding_size=0.012",
                                  fc=CARD, ec=RULE, lw=0.9, transform=ax.transAxes))
-    # Top accent bar (thin rectangle)
     bar_h = 0.010
     ax.add_patch(Rectangle((x, y + h - bar_h), w, bar_h, fc=accent,
                             ec="none", transform=ax.transAxes))
-    # Text
     ax.text(x + w / 2, y + h - 0.045, label,
             fontsize=8.5, color=DIMMED, family=FONT_BODY, weight="bold", ha="center", transform=ax.transAxes)
     ax.text(x + w / 2, y + h * 0.42, big,
@@ -168,7 +157,6 @@ def _stat_tile(ax, x, y, w, h, label, big, sub, accent):
             transform=ax.transAxes)
 
 
-# ---------------------------------------------------------------- data loaders
 
 
 def _read_csv(path: Path) -> dict[str, np.ndarray]:
@@ -184,17 +172,10 @@ def _read_csv(path: Path) -> dict[str, np.ndarray]:
 
 
 def _load_report_stats() -> dict[str, dict]:
-    """Load the real-data report ``stats.json`` files, if present.
+    """``{mode: parsed_stats}`` for every report that loaded; empty on a fresh run.
 
-    The report (``metrics/sim/stats.json``) is written *after*
-    training by the ``metrics/`` scripts and will simply not exist on a fresh
-    run. Every file is guarded independently, so a missing or malformed report is
-    skipped rather than aborting the card. The card must build with zero reports
-    present.
-
-    Returns:
-        ``{mode: parsed_stats}`` for every report that loaded cleanly (possibly
-        empty).
+    ``metrics/sim/stats.json`` is written after training, so each file is guarded on its own —
+    the card must build with zero reports present.
     """
     out: dict[str, dict] = {}
     for mode, _label, _datasets in REPORT_SOURCES:
@@ -207,10 +188,8 @@ def _load_report_stats() -> dict[str, dict]:
 
 
 def _human_count(n) -> str:
-    """Human-readable magnitude that adapts the unit to the value, so small (nano)
-    models read sensibly instead of collapsing to ``0M``:
-    ``37195 -> '37K'``, ``2_140_885 -> '2.14M'``, ``3.7e9 -> '3.69B'``, ``950 -> '950'``.
-    """
+    """Magnitude with the unit picked per value, so a nano model does not collapse to ``0M``:
+    ``37195 -> '37K'``, ``2_140_885 -> '2.14M'``, ``3.7e9 -> '3.69B'``, ``950 -> '950'``."""
     n = float(n)
     if n >= 1e9:
         b = n / 1e9
@@ -248,9 +227,8 @@ def _param_breakdown(sd: dict) -> tuple[dict[str, int], int]:
                 break
         else:
             ungrouped += n
-    # Every tensor must land in exactly one group, else the chart's wedges/bars
-    # would sum to less than the headline total. Fail loudly if a newly-added
-    # top-level module escapes the regex table above.
+    # Every tensor lands in exactly one group, else the wedges sum to less than the headline
+    # total; fail loudly when a new top-level module escapes the regex table above.
     assert ungrouped == 0, (
         f"_param_breakdown: {ungrouped} params matched no group — add a pattern "
         f"(group sums {sum(out.values())} vs total {total})"
@@ -259,32 +237,17 @@ def _param_breakdown(sd: dict) -> tuple[dict[str, int], int]:
 
 
 def _derive_arch(sd: dict, cfg: dict) -> dict:
-    """Recover the architecture flags from the checkpoint weights themselves.
+    """Architecture flags recovered from the checkpoint weight SHAPES, never from ``config.py``.
 
-    The risk-space redesign collapsed the output side to a single BG quantile
-    head (``bg_head.*``): there are no per-channel dynamics heads, no channel
-    cross-attention, no MDN, no event/trend/alarm heads. The only structural
-    knob left to recover is the BG head's hidden width and the quantile-fan
-    width — both encoded in the head's weight shapes, which travel with the
-    checkpoint even when the live ``config.py`` has since been edited
-    (``resize_model.py`` rewrites ``BG_HEAD_HIDDEN`` and leaves no param-count
-    tripwire elsewhere).
-
-    Args:
-        sd:  ``model_state_dict`` from the checkpoint.
-        cfg: resolved training config (only ``patch_size`` is consulted — itself
-             part of the serialized set, hence authoritative).
-
-    Returns:
-        dict with keys ``bg_head_hidden``, ``n_spreads``, ``n_quantiles``, and —
-        for the time-of-day probe — ``time_probe`` (bool), ``time_probe_hidden``,
-        ``time_probe_bins`` (0 when the probe was disabled at train time).
+    The shapes travel with the checkpoint; ``resize_model.py`` rewrites ``BG_HEAD_HIDDEN`` in
+    the live config and leaves no tripwire behind it.  Returns ``bg_head_hidden``,
+    ``n_spreads``, ``n_quantiles``, ``time_probe``, ``time_probe_hidden`` and
+    ``time_probe_bins`` (0 when the probe was off at train time).
     """
-    # First Linear of the BG head: (BG_HEAD_HIDDEN, D_MODEL).
+    # bg_head.0: (BG_HEAD_HIDDEN, D_MODEL)
     bg_head_hidden = sd['bg_head.0.weight'].shape[0]
-    # Final Linear of the smooth-basis head emits BG_HEAD_STEP_BASIS_DIM (=K)
-    # coefficients per output channel: out_last = K × (1 + 2·N_SPREADS) — NOT
-    # PATCH_SIZE × (...).  Recover N_SPREADS (and the quantile-fan width) from K.
+    # the smooth-basis head's last Linear is K = BG_HEAD_STEP_BASIS_DIM coefficients per
+    # channel: out_last = K × (1 + 2·N_SPREADS), NOT PATCH_SIZE × (...)
     import config as _cfg
     k_basis = _cfg.BG_HEAD_STEP_BASIS_DIM
     out_last = sd['bg_head.4.weight'].shape[0]
@@ -292,10 +255,8 @@ def _derive_arch(sd: dict, cfg: dict) -> dict:
         f"head out width {out_last} not divisible by BG_HEAD_STEP_BASIS_DIM {k_basis}")
     per_channel = out_last // k_basis              # == 1 + 2·N_SPREADS
     n_spreads = (per_channel - 1) // 2
-    # Time-of-day probe head — a 2-layer SiLU MLP off every prediction-patch
-    # hidden state (time_head.0 → (HIDDEN, D_MODEL); time_head.2 → (N_BINS,
-    # HIDDEN)). Present in the weights iff TIME_PROBE_ENABLED at train time, so
-    # its presence + dims are read from the state dict, never the mutable config.
+    # time_head.0 → (HIDDEN, D_MODEL), time_head.2 → (N_BINS, HIDDEN); present iff
+    # TIME_PROBE_ENABLED at train time, so read presence and dims off the state dict
     time_probe = 'time_head.0.weight' in sd
     return {
         'bg_head_hidden': bg_head_hidden,
@@ -307,7 +268,6 @@ def _derive_arch(sd: dict, cfg: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------- card 1: overview
 
 
 def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> None:
@@ -315,16 +275,13 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
     y = _header(ax, "Model card", f"T1DMAI  ·  {_human_count(total_params)} parameter model",
                 "Encoder-only transformer for Type 1 diabetes behavioral-dynamics forecasting")
 
-    # summary['best'][...] values can be None when a metric column is absent or
-    # all-NaN (make_figures._best writes None); format tolerantly so a tile shows
-    # '—' instead of raising on f"{None:.2f}".
+    # summary['best'][...] is None on an absent or all-NaN column, so format tolerantly
     def _b(key: str, fmt: str, suffix: str = "") -> str:
         v = summary.get('best', {}).get(key)
         if v is None or (isinstance(v, float) and not np.isfinite(v)):
             return "—"
         return fmt.format(v) + suffix
 
-    # Stat tiles
     tiles = [
         ("Parameters",      f"{_human_count(total_params)}",
                             f"{total_params:,} exact",  NAVY),
@@ -342,10 +299,8 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
         _stat_tile(ax, x0 + i * (tile_w + pad), tile_y, tile_w, tile_h,
                    label, big, sub, color)
 
-    # Time-of-day probe tiles — the auxiliary detached diagnostic head reached via
-    # forward(..., return_time=True). Values are best-over-run from summary.json;
-    # _b renders '—' when the probe is off or the column is absent, so a
-    # TIME_PROBE_ENABLED=False run still lays out cleanly.
+    # Diagnostic probe, best-over-run from summary.json; '—' when it was off, so a
+    # TIME_PROBE_ENABLED=False run still lays out.
     tod_tiles = [
         ("TOD MAE",      _b('tod_mae_h', '{:.2f}', ' h'), "hour-of-day error (lower better)",  TEAL),
         ("Clock ±2h",    _b('tod_acc_2h', '{:.0f}', '%'), "origin decoded within 2 h",         SAGE),
@@ -357,7 +312,6 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
         _stat_tile(ax, x0 + i * (tod_w + pad), tod_y, tod_w, tod_h,
                    label, big, sub, color)
 
-    # Facts list
     y2 = tod_y - 0.045
     facts = [
         ("Architecture",
@@ -386,7 +340,6 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
                 transform=ax.transAxes)
         y2 -= 0.044
 
-    # Footer
     ax.plot([0.025, 0.975], [0.055, 0.055], color=RULE, lw=0.6, transform=ax.transAxes)
     ax.text(0.025, 0.025,
             f"Training: {cfg['total_steps']:,} steps · batch {cfg['batch_size']} · "
@@ -398,12 +351,11 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 2: architecture
 
 
 def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
     fig, ax = _setup_card((11.8, 13.0))
-    # Compact, inline header — the diagram is tall and needs the room.
+    # inline header: the diagram is tall and needs the room
     ax.text(0.025, 0.975, "ARCHITECTURE", fontsize=8.5, color=CLAY,
             family=FONT_BODY, weight="bold", transform=ax.transAxes)
     ax.text(0.025, 0.945, f"Forward pass · {_human_count(total_params)} arch", fontsize=18, color=INK,
@@ -415,7 +367,7 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
             transform=ax.transAxes)
     ax.plot([0.025, 0.975], [0.855, 0.855], color=RULE, lw=0.9, transform=ax.transAxes)
 
-    # Helper to draw a stylized block. All in axes fraction coordinates.
+    # axes-fraction coordinates throughout
     def block(x, y, w, h, title, sub="", fc=CARD, ec=NAVY, title_color=INK,
               title_size=10, sub_size=8.5, bar_color=None):
         if bar_color:
@@ -437,7 +389,6 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
         ax.add_patch(FancyArrowPatch(p0, p1, arrowstyle="-|>", mutation_scale=11,
                                       color=color, lw=lw, transform=ax.transAxes))
 
-    # Input
     _pd = config.PATCH_DIM
     _ps_feat = cfg['patch_size']
     block(0.20, 0.795, 0.60, 0.040, f"Input patches  (B, T, {_pd})",
@@ -445,13 +396,11 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
           ec=GOLD, bar_color=GOLD, fc=GOLD_T, title_size=10)
     arrow((0.50, 0.795), (0.50, 0.780))
 
-    # Patch embed
     block(0.30, 0.725, 0.40, 0.045, "Patch embedding",
           f"Linear (bias)   {_pd} → {cfg['d_model']}",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
     arrow((0.50, 0.725), (0.50, 0.705))
 
-    # Transformer block container
     bx, by, bw, bh = 0.07, 0.345, 0.86, 0.355
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
                                  boxstyle="round,pad=0.008,rounding_size=0.018",
@@ -462,7 +411,6 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
             "pre-norm  ·  residual connection on every sub-layer",
             fontsize=8.5, color=DIMMED, family=FONT_BODY, transform=ax.transAxes)
 
-    # Sub-layer 1: temporal attention
     block(0.12, 0.588, 0.30, 0.032, "RMSNorm", "", ec=RULE, fc=CARD, title_size=9)
     arrow((0.27, 0.588), (0.27, 0.572))
     block(0.12, 0.520, 0.30, 0.050, "Temporal self-attention",
@@ -472,7 +420,6 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
             fontsize=9, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
     arrow((0.27, 0.520), (0.27, 0.482))
 
-    # Sub-layer 2: SwiGLU FFN
     block(0.12, 0.448, 0.30, 0.032, "RMSNorm", "", ec=RULE, fc=CARD, title_size=9)
     arrow((0.27, 0.448), (0.27, 0.430))
     block(0.12, 0.378, 0.30, 0.050, f"SwiGLU FFN  ({cfg['ffn_dim']})",
@@ -481,18 +428,14 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
     ax.text(0.45, 0.403, "gate, up, down linears   ·   no bias",
             fontsize=9, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # Out of block stack
     arrow((0.50, 0.340), (0.50, 0.302))
 
-    # Final norm
     block(0.32, 0.260, 0.36, 0.040, "Final RMSNorm", "",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T, title_size=10)
 
-    # Rail from final_norm to the output heads. Both read the SAME prediction-
-    # patch hidden state: the risk-space BG quantile head (the sole forecast
-    # output) and, when the checkpoint carries it, the time-of-day probe (a
-    # co-training diagnostic, not a forecast). All widths are derived from the
-    # checkpoint weights (_derive_arch), never from the mutable config.py.
+    # Both heads read the SAME masked-slot hidden state: the risk-space BG quantile fan, and
+    # the time-of-day probe when the checkpoint carries it — a diagnostic, not a forecast.
+    # Widths come from _derive_arch, off the weights, never from config.py.
     _hh = arch['bg_head_hidden']
     _d = cfg['d_model']
     _ps = cfg['patch_size']
@@ -545,7 +488,6 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
                 fontsize=line_fs, color=DIMMED, ha="center", style="italic",
                 family=FONT_BODY, transform=ax.transAxes)
 
-    # Footer
     ax.plot([0.025, 0.975], [0.055, 0.055], color=RULE, lw=0.6, transform=ax.transAxes)
     ax.text(0.025, 0.025,
             f"Total parameters: {total_params:,}    ·    "
@@ -558,7 +500,6 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 3: param breakdown
 
 
 def card_param_breakdown(groups: dict[str, int], total: int) -> None:
@@ -567,7 +508,7 @@ def card_param_breakdown(groups: dict[str, int], total: int) -> None:
     vals = np.array([v for _, v in items])
     pct = 100 * vals / total
 
-    # Color assignment per group, ordered by size (largest = primary accent).
+    # ordered by size, largest on the primary accent
     palette = [SAGE, TEAL, NAVY, CLAY, GOLD, PLUM, MUTED, DIMMED, SLATE]
     colors = [palette[i % len(palette)] for i in range(len(names))]
 
@@ -576,14 +517,12 @@ def card_param_breakdown(groups: dict[str, int], total: int) -> None:
     gs = fig.add_gridspec(1, 2, width_ratios=[1.55, 1.0], wspace=0.20,
                           left=0.04, right=0.97, top=0.66, bottom=0.07)
 
-    # Card-wide header (full-width invisible axes covering top region)
     head_ax = fig.add_axes([0.0, 0.64, 1.0, 0.36]); head_ax.axis("off")
     _header(head_ax, "Parameters",
             "Where the parameters live",
             f"Total: {total:,}  ·  largest contributor: {names[0]} ({pct[0]:.1f}%)",
             y_top=0.92)
 
-    # Horizontal bar chart
     ax = fig.add_subplot(gs[0, 0]); ax.set_facecolor(PAPER)
     y_pos = np.arange(len(names))
     bars = ax.barh(y_pos, vals, color=colors, edgecolor="none", height=0.60)
@@ -601,7 +540,6 @@ def card_param_breakdown(groups: dict[str, int], total: int) -> None:
                 f"{v:,}    {p:.1f}%", va="center", fontsize=9, color=INK,
                 family=FONT_MONO)
 
-    # Donut chart with center label
     ax = fig.add_subplot(gs[0, 1]); ax.set_facecolor(PAPER)
     wedges, _ = ax.pie(
         vals, colors=colors, startangle=90, counterclock=False,
@@ -617,27 +555,16 @@ def card_param_breakdown(groups: dict[str, int], total: int) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- masked-channel policy
 
 
 def _policy_wording(cfg: dict) -> dict[str, str]:
-    """Per-policy card wording for what a masked patch carries.
+    """Card wording for what a masked patch carries, off the checkpoint's own stamp.
 
-    The card is published, so it must not describe a blind checkpoint in the
-    announced convention's terms: under ``blind`` the dose channels are withheld
-    with BG at ``data.zero_dose_fill``, which makes every dose-response claim on
-    the card false and the what-if regime unavailable.  ``cfg`` is the
-    checkpoint's own ``training_config`` and ``data.stored_masked_channel_policy``
-    is the single reader of its absent-key convention.
-
-    Args:
-        cfg: the checkpoint's ``training_config``.
-
-    Returns:
-        ``policy`` (the stamp), ``dose_note`` (the input-table cell for feats
-        1-3), ``regime`` (the short regime name), ``row`` (the regime's row
-        label), ``footer`` (the report-provenance clause) and ``caveat`` (a
-        sentence, empty under ``announced``).
+    The card is published, so a ``blind`` checkpoint must not be described in the announced
+    convention's terms: its dose channels are withheld at ``data.zero_dose_fill``, which makes
+    every dose-response claim on the card false and the what-if regime unavailable.
+    Returns ``policy``, ``dose_note``, ``regime``, ``row``, ``footer`` and ``caveat`` (empty
+    under ``announced``).
     """
     from data import MASKED_CHANNEL_POLICY_BLIND, stored_masked_channel_policy
     policy = stored_masked_channel_policy(cfg)
@@ -664,20 +591,17 @@ def _policy_wording(cfg: dict) -> dict[str, str]:
     }
 
 
-# ---------------------------------------------------------------- card 4: io schema
 
 
 def card_io_schema(cfg: dict, arch: dict) -> None:
     fig, ax = _setup_card((13.8, 9.8))
-    # This card pins its panels at absolute fractions (it does not flow from the
-    # returned y), so lift the header via y_top to keep the looser _header rule
-    # clear of the panel tops at 0.79.
+    # panels are pinned at absolute fractions, not flowed from the returned y, so lift the
+    # header to keep its rule clear of the panel tops at 0.79
     y = _header(ax, "Inputs & Outputs",
                 "Tensor shapes and channel schema",
                 "What the model consumes (per patch) and what it returns (per timestep).",
                 y_top=0.985)
 
-    # Inputs panel (left)
     p_x, p_y, p_w, p_h = 0.025, 0.43, 0.45, 0.36
     ax.add_patch(FancyBboxPatch((p_x, p_y), p_w, p_h,
                                  boxstyle="round,pad=0.008,rounding_size=0.014",
@@ -690,22 +614,13 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             f"{cfg['patch_size']} timesteps × {config.N_INPUT_FEATURES} features  =  {config.PATCH_DIM} numbers",
             fontsize=9.5, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # Exactly N_INPUT_FEATURES channels — bg, the three dose plan channels, and
-    # the mask bit. The four sin/cos time-of-day / day-of-week features are
-    # removed; time-of-day survives only as a detached diagnostic probe head,
-    # never a model input. Exercise is a carbohydrate-equivalent glucose-disposal
-    # curve on the carb scale, not an intensity.
-    #
-    # What feats 1-3 carry on a MASKED patch is the checkpoint's own
-    # masked-channel policy, not a property of the schema: announced under
-    # train.py, the no-dose fill under train_blind.py.
-    #
-    # Feat 4 is the one input that is not a normalized signal: one BIT per patch,
-    # 1.0 where feat 0 is withheld. It is announced rather than inferred because a
-    # masked span may end at the last patch (forecast), start at patch 0
-    # (backcast) or sit between visible patches (infill), so masking cannot be
-    # read off position, and z = 0 in a masked bg slot is a legal reading rather
-    # than a sentinel.
+    # Exactly N_INPUT_FEATURES: bg, three dose plan channels, the mask bit. Exercise is a
+    # carb-equivalent glucose-disposal curve on the carb scale, not an intensity.
+    # What feats 1-3 carry on a MASKED patch is the checkpoint's policy, not the schema.
+    # Feat 4 is the one input that is not a normalized signal: one BIT per patch, 1.0 where
+    # feat 0 is withheld. Announced rather than inferred — a span may end at the last patch,
+    # start at patch 0 or sit between visible ones, and z = 0 in a masked bg slot is a legal
+    # reading, not a sentinel.
     wording = _policy_wording(cfg)
     feats = [
         ("BG absolute",           "mg/dL",     "always · 0 where masked"),
@@ -730,10 +645,8 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
                 family=FONT_BODY, transform=ax.transAxes, style="italic")
         row_y -= 0.029
 
-    # Masked-channel policy: what feats 1-3 hold on a masked patch, off the
-    # checkpoint's own stamp. Under ``blind`` the caveat is the load-bearing half
-    # — a reader who takes the announced framing would expect a dose response the
-    # weights cannot produce.
+    # Under ``blind`` the caveat is the load-bearing half: a reader taking the announced
+    # framing would expect a dose response the weights cannot produce.
     ax.text(p_x + 0.018, row_y - 0.006,
             f"Masked-patch dose channels: {wording['regime']}",
             fontsize=9, color=NAVY, weight="bold", transform=ax.transAxes)
@@ -742,7 +655,6 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
                 fontsize=8.5, color=SLATE, va="top", family=FONT_BODY,
                 transform=ax.transAxes)
 
-    # Outputs panel (right top)
     o_x, o_y, o_w, o_h = 0.515, 0.58, 0.46, 0.21
     ax.add_patch(FancyBboxPatch((o_x, o_y), o_w, o_h,
                                  boxstyle="round,pad=0.008,rounding_size=0.014",
@@ -756,9 +668,8 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             f"{cfg['prediction_patches']*cfg['patch_size']} timesteps",
             fontsize=9.5, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # The single head emits an ascending fan of N_QUANTILES Kovatchev-risk
-    # quantiles per timestep; inference inverts each via kovatchev_f_inv to
-    # mg/dL band edges, the τ=0.5 median being the headline forecast.
+    # ascending fan of N_QUANTILES risk-space quantiles per timestep; inference inverts each
+    # through kovatchev_f_inv to mg/dL, τ=0.5 being the headline forecast
     levels = config.QUANTILE_LEVELS
     mid = len(levels) // 2
     chans = []
@@ -769,7 +680,6 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
     row_y = o_y + o_h - 0.095
     dy = 0.105 / max(len(chans), 1)
     for idx, name, unit, note, color in chans:
-        # circular numeric badge
         circ_r = 0.012
         ax.add_patch(plt.Circle((o_x + 0.030, row_y + 0.004), circ_r, fc=color,
                                  ec="none", transform=ax.transAxes))
@@ -781,7 +691,6 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
                 family=FONT_BODY, transform=ax.transAxes)
         row_y -= dy
 
-    # Note panel (right middle)
     n_x, n_y, n_w, n_h = 0.515, 0.43, 0.46, 0.135
     ax.add_patch(FancyBboxPatch((n_x, n_y), n_w, n_h,
                                  boxstyle="round,pad=0.008,rounding_size=0.014",
@@ -802,7 +711,6 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             fontsize=9, color=SLATE, va="top", family=FONT_BODY,
             transform=ax.transAxes)
 
-    # Tensor shape panels (bottom row, monospace).
     _nq = arch['n_quantiles']
     _time_line = (
         f"\ntime_pred(diag) : (B, {cfg['prediction_patches']}, {arch['time_probe_bins']})"
@@ -844,7 +752,6 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 5: training recipe
 
 
 def card_training_recipe(cfg: dict) -> None:
@@ -910,7 +817,6 @@ def card_training_recipe(cfg: dict) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 6: loss design
 
 
 def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
@@ -949,7 +855,6 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
             "combined under learned Kendall-Gal uncertainty weights.",
             y_top=0.92)
 
-    # Left: stacked term cards
     ax = fig.add_subplot(gs[0, 0]); ax.set_facecolor(PAPER)
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values(): s.set_visible(False)
@@ -970,9 +875,8 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
         ax.text(0.030, y0 + 0.025, weight, fontsize=8.5, color=DIMMED,
                 family=FONT_MONO)
 
-    # Right: the learned Kendall-Gal log-variances σ_Q (pinball) / σ_D (DILATE),
-    # traced per training step — the dynamic uncertainty weighting that adapts the
-    # L_Q / L_D balance as training proceeds (a per-step trace, not a static split).
+    # the learned Kendall-Gal log-variances per training step — a trace of the L_Q / L_D
+    # balance as it moves, not a static split
     ax = fig.add_subplot(gs[0, 1]); ax.set_facecolor(PAPER)
     sig_series = [("log_sigma_Q", "σ_Q  (pinball)", NAVY),
                   ("log_sigma_D", "σ_D  (DILATE)", TEAL)]
@@ -1005,17 +909,15 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 7: compute budget
 
 
 def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> None:
     elapsed_h = tsum["progress"]["elapsed_hours"]
     sps = tsum["progress"]["steps_per_second"]
     samples = cfg["total_steps"] * cfg["batch_size"]
-    # Each training window is a fresh simulator patient (a unique compute_patient_seed),
-    # so "patients seen" == window draws; "hours seen" is the CGM-time those windows
-    # span (avg context + prediction patches × 30 min/patch); "patches seen" is the
-    # padded sequence length the model actually forward-passes (context padded to MAX).
+    # Every window is a fresh simulator patient, so patients seen == window draws; hours seen
+    # is their CGM-time (avg context + prediction patches × 30 min/patch); patches seen is the
+    # PADDED sequence the model forward-passes (context padded to MAX).
     patients = samples
     _avg_patches = (cfg["min_context_patches"] + cfg["max_context_patches"]) / 2 + cfg["prediction_patches"]
     hours_seen = samples * _avg_patches * cfg["patch_size"] * 5 / 60.0
@@ -1035,7 +937,6 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
             f"{elapsed_h:.2f} h wallclock  ·  {sps:.2f} steps/sec  ·  "
             f"{_human_count(samples)} samples  ·  {_human_count(hours_seen)} CGM-h seen", y_top=0.92)
 
-    # Stat tiles for budget
     tile_axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
     tile_data = [
         ("Wallclock", f"{elapsed_h:.2f} h", "of training", NAVY),
@@ -1057,7 +958,6 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
         ax.text(0.5, 0.46, big, fontsize=26, color=INK, family=FONT_TITLE, ha="center")
         ax.text(0.5, 0.18, sub, fontsize=9, color=DIMMED, ha="center")
 
-    # Step-time chart spans bottom row
     ax = fig.add_subplot(gs[1, :]); ax.set_facecolor(PAPER)
     s = train["step"]
     ema = np.empty_like(s, dtype=float)
@@ -1081,7 +981,6 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
     ax.tick_params(bottom=True, left=True, colors=SLATE)
     ax.legend(loc="upper right", frameon=False, fontsize=9)
 
-    # Inset stat strip between the tile row and the chart row
     strip_ax = fig.add_axes([0.04, 0.39, 0.93, 0.05]); strip_ax.axis("off")
     strip_ax.set_xlim(0, 1); strip_ax.set_ylim(0, 1)
     extras = [
@@ -1101,13 +1000,11 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 8: metrics
 
 
 def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
-    # Tall card: the metric table carries several sections plus the curve-match
-    # block (~32 rows + 6 eyebrows at full strength), so the row pitch is tightened
-    # and the figure stretched to keep it inside ax [0, 1].
+    # ~32 rows + 6 eyebrows at full strength, so the pitch is tightened and the figure
+    # stretched to keep the table inside ax [0, 1]
     ROW = 0.0145      # per-row vertical pitch (axes fraction)
     BAND = 0.014      # alternating row-shade height (axes fraction)
     SEC_PAD = 0.003   # trailing gap after each section
@@ -1135,16 +1032,11 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
           ("hypo_precision",  True, "hypo precision",                 "{:.3f}", "{:.3f}"),
           ("hyper_recall",    True, f"hyper recall  (BG > {config.BG_HYPER_THRESHOLD:.0f} mg/dL)", "{:.3f}", "{:.3f}"),
           ("hyper_precision", True, "hyper precision",                "{:.3f}", "{:.3f}")]),
-        # Marginal coverage of the 90% quantile band (τ 0.05–0.95), per horizon;
-        # target = 0.90.  Higher-is-better is ambiguous (over- and under-coverage
-        # both miss), so these track toward 0.90 — flagged as lower-distance, the
-        # closest the simple best/last-10 table supports.
-        #
-        # Each coverage row is followed by the mean band WIDTH that produced it.
-        # Coverage on its own is not a calibration claim: a wide enough band
-        # covers everything, and the pair is the only honest reading. A run whose
-        # validation pass emitted no sharpness renders those rows as "—" rather
-        # than dropping them, so the omission is visible on the card.
+        # Coverage of the 90% band (τ 0.05–0.95), target 0.90. Over- and under-coverage both
+        # miss, so these track toward 0.90 as a distance, the closest a best/last-10 table gets.
+        # Every coverage row is followed by the mean band WIDTH that bought it — coverage alone
+        # is not a calibration claim. A run with no sharpness column renders "—" rather than
+        # dropping the row, so the omission stays visible.
         ("Calibration  (90% band coverage, target 0.90)", GOLD,
          [("coverage90@30",  True,  "coverage @30m",              "{:.3f}", "{:.3f}"),
           ("sharp90@30",     False, "  band width @30m  (mg/dL)", "{:.1f}", "{:.1f}"),
@@ -1153,16 +1045,13 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
           ("coverage90@120", True,  "coverage @120m",             "{:.3f}", "{:.3f}"),
           ("sharp90@120",    False, "  band width @120m (mg/dL)", "{:.1f}", "{:.1f}")]),
     ]
-    # Rows added since CARD_H was sized. The canvas grows by exactly their space
-    # so the physical pitch and every font size stay where they were.
+    # rows added since CARD_H was sized; the canvas grows by exactly their space, so the
+    # physical pitch and every font size stay put
     _EXTRA_ROWS = 3
 
-    # CG-EGA (Kovatchev 2004): %AP higher better, %EP lower better, per region.
-    # Read straight out of validation_log.csv, so the section stands or falls with
-    # CGEGA_COLUMNS_TRUSTWORTHY. When it is False the six rows are withheld and
-    # the canvas is shortened by exactly the space they would have occupied, so
-    # the physical row pitch and every font size are unchanged and the table just
-    # ends one section earlier.
+    # CG-EGA (Kovatchev 2004): %AP higher better, %EP lower better, per region. Read straight
+    # out of validation_log.csv, so the section stands or falls with CGEGA_COLUMNS_TRUSTWORTHY;
+    # withheld, the canvas shortens by exactly their space and the table ends a section early.
     cgega_section = (
         "CG-EGA clinical accuracy", PLUM,
         [("cgega_ap_hypo",  True,  "%AP hypo  (accurate, higher better)",    "{:.3f}", "{:.3f}"),
@@ -1191,9 +1080,8 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
                 f"{_policy_wording(cfg)['regime']}.")
 
     def _tight_section(yy: float, lab: str, color=NAVY) -> float:
-        """Section eyebrow with a tighter gap than the shared _section (this card
-        packs every metric section plus the curve-match block, so it can't afford
-        0.040 per heading)."""
+        """Section eyebrow at a tighter gap than ``_section``'s 0.040 — this card cannot
+        afford it across every metric section plus the curve-match block."""
         ax.text(0.025, yy, lab.upper(), fontsize=8.5, color=color,
                 family=FONT_BODY, weight="bold", transform=ax.transAxes)
         return yy - SEC_HEAD
@@ -1210,16 +1098,14 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
         if yy.size == 0:
             return float("nan"), 0, float("nan")
         idx = int(np.argmax(yy) if higher_is_better else np.argmin(yy))
-        # Mean over the last 10 *actual* validation rows (nan-tolerant), not the
-        # last 10 finite cells of this column — a sparsely-populated column would
-        # otherwise reach back arbitrarily far and mislabel the window.
+        # last 10 ACTUAL validation rows, not the last 10 finite cells: a sparse column would
+        # otherwise reach back arbitrarily far and mislabel the window
         last10 = float(np.nanmean(yv[-10:])) if np.isfinite(yv[-10:]).any() else float("nan")
         return yy[idx], int(ss[idx]), last10
 
     def _fmt(v: float, fmt: str) -> str:
         return fmt.format(v) if np.isfinite(v) else "—"
 
-    # Column headers
     ax.text(0.045, y - 0.005, "METRIC", fontsize=8.5, color=DIMMED, weight="bold", transform=ax.transAxes)
     ax.text(0.585, y - 0.005, "BEST  (STEP)", fontsize=8.5, color=DIMMED, weight="bold", transform=ax.transAxes)
     ax.text(0.835, y - 0.005, "LAST-10 MEAN", fontsize=8.5, color=DIMMED, weight="bold", transform=ax.transAxes)
@@ -1244,8 +1130,7 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
             cur -= ROW
         cur -= SEC_PAD
 
-    # ---- Forecast curve / trend quality (per-patch 30-min ΔBG).  All computed
-    # from the headline median_bg forecast; higher correlation is better.
+    # per-patch 30-min ΔBG, all off the headline median_bg forecast
     cur = _tight_section(cur, "Forecast curve / trend quality", color=CLAY)
     match_rows = [
         ("bg_curve_corr",   "BG curve corr  (anchor-relative)", "{:.3f}"),
@@ -1267,18 +1152,14 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 9: real data
 
 
 def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
-    """In-domain simulator evaluation summary.
+    """In-domain simulator evaluation, from the post-training ``metrics/sim/stats.json``.
 
-    Reads the post-training ``metrics/sim/stats.json`` report.
-    For each report mode and dataset it surfaces (a) the precision-floored
-    per-horizon hypo decision offsets (``selected_offsets``), and (b) the
-    per-horizon hypo/hyper event recall/precision (``event_metrics``). If no
-    report exists the card is skipped entirely — these files appear only once the
-    real-data reports have been generated.
+    Surfaces the precision-floored per-horizon hypo decision offsets (``selected_offsets``) and
+    the per-horizon hypo/hyper event recall/precision (``event_metrics``).  Skipped entirely
+    when no report exists.
     """
     if not reports:
         return  # No reports yet — omit the section gracefully.
@@ -1331,7 +1212,6 @@ def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
                         color=DIMMED, family=FONT_MONO, transform=ax.transAxes)
             cur -= 0.028
 
-            # --- Selected hypo decision offsets (precision-floored). ---------
             so = res.get("selected_offsets")
             if isinstance(so, dict) and so.get("hypo"):
                 floor = so.get("min_precision")
@@ -1362,7 +1242,6 @@ def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
                     cur -= 0.025
                 cur -= 0.006
 
-            # --- Per-horizon event recall / precision (hypo & hyper). --------
             em = res.get("event_metrics")
             if isinstance(em, dict):
                 ax.text(0.060, cur, "Event recall / precision  (gain = 1.0)",
@@ -1393,8 +1272,7 @@ def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
                     cur -= 0.025
                 cur -= 0.010
 
-            # --- Night-onset per-night excursion prediction (bedtime → morning),
-            # under the checkpoint's own masked-channel policy.
+            # bedtime → morning, under the checkpoint's own masked-channel policy
             no = res.get("night_onset")
             if isinstance(no, dict) and no.get("n_nights"):
                 ax.text(0.060, cur, f"Night-onset excursion  ({no['n_nights']} nights, "
@@ -1420,7 +1298,6 @@ def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
 
         cur -= 0.008
 
-    # Footer note on the regime.
     ax.plot([0.025, 0.975], [0.040, 0.040], color=RULE, lw=0.6, transform=ax.transAxes)
     ax.text(0.025, 0.020,
             "Offsets and recall/precision are read from metrics/sim/stats.json "
@@ -1432,7 +1309,6 @@ def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- card 0: showcase
 
 
 def card_showcase(cfg: dict, summary: dict,
@@ -1440,9 +1316,8 @@ def card_showcase(cfg: dict, summary: dict,
                   train: dict[str, np.ndarray],
                   tsum: dict, total_params: int, arch: dict,
                   mode: str = "best") -> None:
-    """One large landscape card that ties architecture and clinical results
-    together. ``mode='best'`` shows best-over-run numbers; ``mode='final'``
-    shows the values at the last validation checkpoint."""
+    """Architecture beside clinical results; ``mode`` 'best' is best-over-run, 'final' the
+    last validation checkpoint."""
 
     assert mode in ("best", "final")
     final_step = int(val["step"][-1])
@@ -1464,13 +1339,12 @@ def card_showcase(cfg: dict, summary: dict,
         chart_subtitle = f"Final values  (step {final_step:,})"
         excursion_subtitle = f"Recall and precision  (final, step {final_step:,})"
 
-    # The headline card must name the regime it was trained under: every clinical
-    # figure below it is read differently when masked-patch doses are withheld.
+    # the headline card names its regime: every clinical figure below reads differently when
+    # masked-patch doses are withheld
     header_sub += f"  Masked-patch doses: {_policy_wording(cfg)['regime']}."
 
     fig, ax = _setup_card((18.7, 13.2))
 
-    # =================== HEADER ===================
     ax.text(0.025, 0.975, header_eyebrow, fontsize=10, color=CLAY,
             family=FONT_BODY, weight="bold", va="top", transform=ax.transAxes)
     ax.text(0.025, 0.955, f"T1DMAI  ·  {_human_count(total_params)} parameter model",
@@ -1482,14 +1356,12 @@ def card_showcase(cfg: dict, summary: dict,
     ax.plot([0.025, 0.975], [0.860, 0.860], color=RULE, lw=1.0,
             transform=ax.transAxes)
 
-    # =================== HERO STAT TILES ===================
     def _col_sc(col: str) -> np.ndarray:
         """Column accessor tolerant of an absent column (older CSV schema)."""
         return val[col] if col in val else np.full_like(val["step"], np.nan, dtype=float)
 
     def _stat_str(v: float, fmt: str, suffix: str = "") -> str:
-        """Format a hero stat, degrading a non-finite value to an em dash so an
-        all-NaN / absent metric column renders '—' rather than crashing or 'nan'."""
+        """Hero stat; a non-finite value renders '—' rather than 'nan'."""
         return "—" if not np.isfinite(v) else fmt.format(v) + suffix
 
     def stat_best(col: str, higher_is_better: bool):
@@ -1548,28 +1420,22 @@ def card_showcase(cfg: dict, summary: dict,
                                      fc=CARD, ec=RULE, lw=0.9, transform=ax.transAxes))
         ax.add_patch(Rectangle((tx, tile_y + tile_h - 0.010), tile_w, 0.010,
                                 fc=color, ec="none", transform=ax.transAxes))
-        # Label (top of tile, below the colored bar)
         ax.text(tx + tile_w / 2, tile_y + tile_h - 0.028, label.upper(),
                 fontsize=10, color=DIMMED, weight="bold", ha="center", va="top",
                 transform=ax.transAxes)
-        # Big headline number
         ax.text(tx + tile_w / 2, tile_y + tile_h * 0.42, big,
                 fontsize=32, color=INK, family=FONT_TITLE, ha="center",
                 va="center", transform=ax.transAxes)
-        # Subtitle
         ax.text(tx + tile_w / 2, tile_y + 0.030, sub,
                 fontsize=9.5, color=SLATE, ha="center", va="center",
                 transform=ax.transAxes)
-        # Footer caption
         ax.text(tx + tile_w / 2, tile_y + 0.012, foot,
                 fontsize=8.5, color=DIMMED, ha="center", va="center",
                 family=FONT_MONO, transform=ax.transAxes)
 
-    # Soft divider between hero tiles and the two-column body
     ax.plot([0.025, 0.975], [0.655, 0.655], color=RULE, lw=0.6,
             transform=ax.transAxes)
 
-    # =================== LEFT COLUMN: ARCHITECTURE ===================
     ax.text(0.030, 0.630, "ARCHITECTURE", fontsize=10, color=CLAY,
             weight="bold", va="top", transform=ax.transAxes)
     ax.text(0.030, 0.610, "Forward pass",
@@ -1602,18 +1468,15 @@ def card_showcase(cfg: dict, summary: dict,
     # Architecture diagram laid out in x ∈ [0.045, 0.425], y ∈ [0.07, 0.575]
     cx = 0.235  # center x of the column
 
-    # Input
     block(0.135, 0.555, 0.20, 0.022, f"Input  (B, T, {config.PATCH_DIM})", "",
           ec=GOLD, bar_color=GOLD, fc=GOLD_T, title_size=8.5)
     arrow((cx, 0.555), (cx, 0.547))
 
-    # Patch embed
     block(0.150, 0.510, 0.17, 0.030, "Patch embedding",
           f"Linear  {config.PATCH_DIM} → {cfg['d_model']}",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
     arrow((cx, 0.510), (cx, 0.500))
 
-    # Transformer block container
     bx, by, bw, bh = 0.055, 0.215, 0.360, 0.280
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
                                  boxstyle="round,pad=0.006,rounding_size=0.012",
@@ -1625,7 +1488,6 @@ def card_showcase(cfg: dict, summary: dict,
             "pre-norm  ·  residual on every sub-layer",
             fontsize=7.5, color=DIMMED, transform=ax.transAxes)
 
-    # Sub-layer 1: temporal attention
     block(0.090, 0.418, 0.290, 0.018, "RMSNorm", "", ec=RULE, fc=CARD, title_size=8)
     arrow((cx, 0.418), (cx, 0.412))
     block(0.090, 0.378, 0.290, 0.028, "Temporal self-attention",
@@ -1633,22 +1495,19 @@ def card_showcase(cfg: dict, summary: dict,
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
     arrow((cx, 0.378), (cx, 0.300))
 
-    # Sub-layer 2: SwiGLU FFN
     block(0.090, 0.282, 0.290, 0.018, "RMSNorm", "", ec=RULE, fc=CARD, title_size=8)
     arrow((cx, 0.282), (cx, 0.276))
     block(0.090, 0.246, 0.290, 0.024, f"SwiGLU FFN  ({cfg['ffn_dim']})",
           "x · SiLU(gate(x)) → down",
           ec=SAGE, bar_color=SAGE, fc=SAGE_T)
 
-    # Out of container
     arrow((cx, 0.244), (cx, 0.200))
 
-    # Final norm
     block(0.155, 0.170, 0.160, 0.024, "Final RMSNorm", "",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
 
-    # Rail to the output heads: the risk-space BG quantile head (sole forecast)
-    # plus, when the checkpoint carries it, the diagnostic time-of-day probe.
+    # to the output heads: the risk-space BG quantile fan, plus the diagnostic time-of-day
+    # probe when the checkpoint carries it
     _hh = arch['bg_head_hidden']
     _d = cfg['d_model']
     _ps = cfg['patch_size']
@@ -1698,13 +1557,10 @@ def card_showcase(cfg: dict, summary: dict,
                 fontsize=oh_line_fs, color=DIMMED, ha="center", style="italic",
                 transform=ax.transAxes)
 
-    # Light vertical divider between columns
     ax.plot([0.443, 0.443], [0.060, 0.635], color=RULE, lw=0.6,
             transform=ax.transAxes)
 
-    # =================== RIGHT COLUMN: CLINICAL DETAIL ===================
 
-    # Multi-horizon BG RMSE
     ax.text(0.465, 0.630, "MULTI-HORIZON BG RMSE", fontsize=10, color=CLAY,
             weight="bold", va="top", transform=ax.transAxes)
     ax.text(0.465, 0.610, chart_subtitle,
@@ -1737,7 +1593,6 @@ def card_showcase(cfg: dict, summary: dict,
     chart_ax.spines["top"].set_visible(False);   chart_ax.spines["right"].set_visible(False)
     chart_ax.yaxis.grid(True, linestyle=":", alpha=0.6, color=RULE)
     chart_ax.set_axisbelow(True)
-    # Value label above bar, horizon label inside bar near the bottom
     for bar, v, lab in zip(bars, values, labels):
         chart_ax.text(bar.get_x() + bar.get_width() / 2,
                        v + max(values) * 0.025,
@@ -1750,7 +1605,6 @@ def card_showcase(cfg: dict, summary: dict,
                        ha="center", va="bottom", fontsize=9, color="white",
                        weight="bold")
 
-    # Excursion detection grid
     ax.text(0.465, 0.298, "EXCURSION DETECTION", fontsize=10, color=CLAY,
             weight="bold", va="top", transform=ax.transAxes)
     ax.text(0.465, 0.278, excursion_subtitle,
@@ -1784,7 +1638,6 @@ def card_showcase(cfg: dict, summary: dict,
         ax.add_patch(FancyBboxPatch((cx_cell, cy_cell), cell_w, cell_h,
                                      boxstyle="round,pad=0.004,rounding_size=0.010",
                                      fc=CARD, ec=RULE, lw=0.8, transform=ax.transAxes))
-        # Left color bar
         ax.add_patch(Rectangle((cx_cell, cy_cell), 0.006, cell_h,
                                 fc=color, ec="none", transform=ax.transAxes))
         ax.text(cx_cell + 0.022, cy_cell + cell_h - 0.018, label.upper(),
@@ -1801,7 +1654,6 @@ def card_showcase(cfg: dict, summary: dict,
                 fontsize=30, color=INK, family=FONT_TITLE, ha="right",
                 va="center", transform=ax.transAxes)
 
-    # =================== FOOTER ===================
     ax.plot([0.025, 0.975], [0.038, 0.038], color=RULE, lw=0.6,
             transform=ax.transAxes)
     elapsed_h = tsum["progress"]["elapsed_hours"]
@@ -1821,7 +1673,6 @@ def card_showcase(cfg: dict, summary: dict,
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- driver
 
 
 def main() -> None:
@@ -1841,12 +1692,10 @@ def main() -> None:
     _set_style()
     OUT_DIR.mkdir(exist_ok=True)
 
-    # Load the checkpoint once. Its embedded ``training_config`` is the resolved
-    # CLI > config.py snapshot that actually produced
-    # these weights — authoritative and travelling with the checkpoint, unlike
-    # the live config.py (mutable) or logs/resolved_config.json (could belong to
-    # a newer run). The structural architecture flags it does NOT carry are
-    # recovered from the weight shapes by _derive_arch.
+    # The checkpoint's embedded ``training_config`` is the resolved CLI > config.py snapshot
+    # that produced these weights — authoritative, unlike the mutable config.py or a
+    # logs/resolved_config.json that may belong to a newer run. Flags it does not carry come
+    # from the weight shapes, via _derive_arch.
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["model_state_dict"]
     cfg = ckpt["training_config"]

@@ -1,21 +1,13 @@
 """The exact ``d`` histogram of the masked-BG sampler.
 
-``d`` -- a masked patch's distance in patches to the nearest visible evidence on
-either side -- is the only axis a masked-BG metric bins on, and the mixture the
-sampler draws is what those bins are read against.  This module enumerates that
-mixture exactly from the sampler's own knobs; ``metrics.protocols.SAMPLER_REFERENCE``
-is produced from it and checked against it.  ``python d_balance.py`` prints the
-live figures.
-
-The enumeration covers BOTH of ``data.sample_mask_spans``' placement branches.
-Uniform placement alone leaves the deployed one-sided forecast case at ~3% of
-masked slots, which is what ``config.MASK_RIGHT_EDGE_QUOTA`` corrects; a change
-to the sampler that is not mirrored here silently moves every ``d``-binned
-figure's reference.
-
-The tail is POOLED, not binned: ``d = 1, 2, 3`` and ``d >= 4``.  ``d >
-N_D_GROUPS`` needs an edge-touching span longer than ``N_D_GROUPS`` patches, and
-it lies beyond the deployed horizon.
+``d``: a masked patch's distance in patches to the nearest visible evidence on
+either side; the only axis a masked-BG metric bins on.
+Both of ``data.sample_mask_spans``' placement branches are enumerated. Uniform
+placement alone leaves the deployed one-sided forecast case at ~3% of masked
+slots — what ``config.MASK_RIGHT_EDGE_QUOTA`` corrects. A sampler change not
+mirrored here moves every ``d``-binned figure's reference.
+``metrics.protocols.SAMPLER_REFERENCE`` is produced from this and checked
+against it. Tail POOLED: ``d = 1, 2, 3`` and ``d >= 4``.
 """
 
 from __future__ import annotations
@@ -34,21 +26,20 @@ from config import (
     PREDICTION_PATCHES,
 )
 
-# Groups the histogram reports.  The last is a pooled tail: every d at or above
-# it shares one bin.
+# The last group is a pooled tail: every d at or above it shares one bin.
 N_D_GROUPS = 4
 
 
 def _group(d: int) -> int:
-    """1-based group index; everything at or above N_D_GROUPS pools into it."""
+    """1-based group index."""
     return min(d, N_D_GROUPS)
 
 
 def _accumulate_span(mass: list[float], weight: float, S: int, Li: int, T: int) -> float:
-    """Add one span's ``Li`` masked patches to ``mass`` at their own ``d``.
+    """``Li`` masked patches into ``mass`` at their own ``d``; returns the mass added.
 
-    ``d`` is the distance to the nearest visible evidence on EITHER side, so a
-    span touching an edge is one-sided there and counts outward from the other.
+    An edge-touching span is one-sided there, so ``d`` counts outward from the
+    other side.
     """
     left_edge, right_edge = S == 0, S + Li == T
     for o in range(Li):
@@ -72,20 +63,12 @@ def d_distribution(
     pred: int,
     right_edge_quota: float = 0.0,
 ) -> tuple[float, ...]:
-    """Exact share of masked patches in each ``d`` group, by enumeration.
+    """Exact share of masked patches in each ``d`` group — ``N_D_GROUPS`` shares summing to 1.
 
-    Enumerated rather than sampled: at 1e5 draws the per-position 1-sigma is
-    about 0.99 % of the mean, several times the effect being measured, so a
-    correct sampler still reports the wrong answer in every replicate.
-
-    Both of ``data.sample_mask_spans``' placement branches are enumerated. Under
-    the right-edge branch the LAST span is pinned at ``T - L_last`` and the rest
-    are composed over the prefix that clears it and its separator, which holds
-    the same ``slack`` the uniform branch spreads over one more gap. Both branches
-    draw ``n_spans`` and the lengths identically, so the quota moves this
-    histogram and nothing else.
-
-    Returns a tuple of ``N_D_GROUPS`` shares summing to 1.
+    Enumerated, not sampled: at 1e5 draws the per-position 1-sigma is ~0.99 % of
+    the mean, several times the effect measured.
+    Both branches draw ``n_spans`` and the lengths identically, so the right-edge
+    quota moves this histogram and nothing else.
     """
     vecs: list[tuple[float, tuple[int, ...]]] = []
     for n in range(1, max_spans + 1):
@@ -131,7 +114,6 @@ def d_distribution(
 
             if w_right > 0.0:
                 wr = pT * w_right
-                # The pinned span first, then the prefix composition (if any).
                 total += _accumulate_span(mass, wr, T - last, last, T)
                 if n > 1:
                     total += compose(n - 1, slack, wr, L[:-1], T)

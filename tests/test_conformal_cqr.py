@@ -1,22 +1,3 @@
-"""Quantile-CQR re-fit wiring tests (additive band path):
-
-* ``Window`` carries an optional RAW band fan; ``forecast_bands`` stacks it and
-  returns None whenever a window lacks bands (old-cache compat).
-* ``run_eval.evaluate_from_windows`` grows a ``conformal_cqr`` block when bands are
-  present, calibrating the test bands toward nominal coverage — and leaves it None on
-  the band-less path (additivity / None ⇒ identity).
-* the METRICS are no longer basis-invariant: with bands the suite is BAND-SCORED
-  (``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``), so the
-  headline block is strictly better than the band-less run, and the median-line basis
-  survives bit-identically under ``metrics[h]['median_line']``.
-* the point ``conformal`` block carries whatever basis ``evaluate_from_windows`` hands
-  ``conformal_intervals`` — the band-projected arrays when both splits have bands, the
-  median line otherwise. Both are legitimate; the invariant asserted here is the one
-  that holds either way (the projected residual is ≤ the median residual element-wise,
-  so the band half-width can only shrink).
-* the sim ``collect_sim_rows`` band capture is single-pass-only and leaves
-  median/pred bit-identical to the no-delta run.
-"""
 import numpy as np
 import pytest
 
@@ -32,9 +13,7 @@ MED = LEVELS.index(0.5)
 LO, HI = LEVELS.index(0.05), LEVELS.index(0.95)
 BAND_LO, BAND_HI = LEVELS.index(METRIC_BAND_TAU_LO), LEVELS.index(METRIC_BAND_TAU_HI)
 
-# The block ``_point_block`` emits per basis — the keys the band-scored row and its
-# ``median_line`` twin share, and on which the median line must reproduce the
-# band-less run exactly.
+# ``_point_block``'s keys: shared by the band-scored row and its ``median_line`` twin
 POINT_KEYS = ('rmse_point', 'mae_point', 'rmse_winmean', 'mae_winmean', 'rmse_macro',
               'mard', 'clarke_A', 'clarke_AB', 'clarke_D', 'clarke_E', 'skill_point')
 ERROR_KEYS = ('rmse_point', 'mae_point', 'rmse_winmean', 'mae_winmean', 'rmse_macro', 'mard')
@@ -67,30 +46,23 @@ def test_forecast_bands_shape_and_none():
 
 
 def test_evaluate_from_windows_cqr_and_additivity():
-    """CQR additivity + the BAND-SCORED suite contract.
+    """``conformal_cqr`` is additive: present with bands, None without.
 
-    ``conformal_cqr`` is still purely additive (present with bands, None without). The
-    metric suite is NOT basis-invariant any more: with bands it scores the
-    band-projected forecast, so its level metrics are strictly better than the
-    band-less run, and the old median-line numbers move to
-    ``metrics[h]['median_line']``, reproduced bit-identically. The point ``conformal``
-    block moves to the same band-projected basis on both splits (cal and test must
-    share one basis for the residuals to stay exchangeable), which can only shrink its
-    half-width.
+    With bands the suite scores the band-projected forecast, so it is not
+    basis-invariant; the median-line numbers move to ``metrics[h]['median_line']``.
+    Cal and test must share one basis or the residuals stop being exchangeable.
     """
     rng = np.random.default_rng(7)
-    # Two synthetic cohorts' worth of windows; bands are DELIBERATELY too narrow
-    # (half=6) so raw 90% coverage is well below 0.90 and CQR must widen it.
+    # half=6 is deliberately too narrow: raw cov90 well under 0.90, so CQR must widen
     cal_b = [_make_window(rng, f"c{i%3}", with_bands=True, half=6.0) for i in range(120)]
     test_b = [_make_window(rng, f"t{i%3}", with_bands=True, half=6.0) for i in range(120)]
-    # Identical windows but with bands stripped (old-cache path).
+    # same windows, bands stripped (old-cache path)
     cal_n = [Window(w.patient, w.pred_bg, w.last_bg, w.cgm, None) for w in cal_b]
     test_n = [Window(w.patient, w.pred_bg, w.last_bg, w.cgm, None) for w in test_b]
 
     res_b = evaluate_from_windows(cal_b, test_b)
     res_n = evaluate_from_windows(cal_n, test_n)
 
-    # --- CQR present + calibrated coverage closer to 0.90 than raw -----------
     cq = res_b['conformal_cqr']
     assert cq is not None
     for h in ('30', '60', '120'):
@@ -102,10 +74,8 @@ def test_evaluate_from_windows_cqr_and_additivity():
     print(f"\n[DUMP] CQR cov90 @120 raw={cq['120']['raw_cov90']:.3f} "
           f"-> cal={cq['120']['cal_cov90']:.3f} (target 0.90) ✓")
 
-    # --- no-bands path: conformal_cqr is None --------------------------------
     assert res_n['conformal_cqr'] is None
 
-    # --- the suite is BAND-SCORED with bands, median-line without ------------
     for h in ('30', '60', '120'):
         rb, rn = res_b['metrics'][h], res_n['metrics'][h]
         assert 'median_line' not in rn and 'band_cov50' not in rn and 'band_width' not in rn
@@ -113,7 +83,6 @@ def test_evaluate_from_windows_cqr_and_additivity():
             assert rb[k] <= rn[k] + 1e-9, (h, k, rb[k], rn[k])
         assert rb['rmse_point'] < rn['rmse_point'], \
             f"a non-degenerate band must strictly reduce the scored RMSE @{h}"
-        # the median-line basis survives verbatim
         for k in POINT_KEYS:
             assert rb['median_line'][k] == rn[k], (h, k, rb['median_line'][k], rn[k])
         assert rb['rmse_persist_point'] == rn['rmse_persist_point']
@@ -126,7 +95,6 @@ def test_evaluate_from_windows_cqr_and_additivity():
           f"{res_b['metrics']['120']['band_cov50']:.3f}, width "
           f"{res_b['metrics']['120']['band_width']:.1f} mg/dL ✓")
 
-    # --- point conformal: same projected basis on BOTH splits ----------------
     cal_bands, test_bands = forecast_bands(cal_b), forecast_bands(test_b)
     _, cal_true, _, _ = forecast_windows(cal_b)
     test_pred, test_true, _, _ = forecast_windows(test_b)
@@ -141,7 +109,7 @@ def test_evaluate_from_windows_cqr_and_additivity():
           f"{res_b['conformal']['120']['half_width']:.2f} vs median-line "
           f"{res_n['conformal']['120']['half_width']:.2f}; median-line run unchanged ✓")
 
-    # --- decision-offset sweep: the band edge is the more sensitive detector --
+    # decision-offset sweep: the band edge is the more sensitive detector
     for side in ('hypo', 'hyper'):
         for h in ('30', '60', '120'):
             cb, cn = res_b['threshold_curves'][side][h], res_n['threshold_curves'][side][h]
@@ -168,9 +136,7 @@ def test_evaluate_from_windows_cqr_and_additivity():
 
 @pytest.mark.parametrize("delta_none", [True, False])
 def test_sim_collect_rows_band_capture(delta_none):
-    """Single-pass branch captures a (PRED_STEPS, K) band fan; median/pred are
-    bit-identical to the no-delta run. Requires the simulator + a checkpoint, so
-    skip cleanly when neither is available."""
+    """Single-pass captures a (PRED_STEPS, K) fan; skips without simulator or checkpoint."""
     import os
     import torch
     sys_path = os.path.join(os.path.dirname(__file__), '..', 'metrics', 'sim')
@@ -188,11 +154,8 @@ def test_sim_collect_rows_band_capture(delta_none):
     if not ckpts:
         pytest.skip("no checkpoint available")
     device = torch.device('cpu')
-    # A checkpoint from an earlier input layout cannot be loaded at all: PATCH_DIM
-    # is ``patch_embed``'s fan-in and it moves whenever an input feature is added
-    # (24 -> 30 with the bg_masked bit).  The weights would have to be re-strided
-    # column by column to lift, so an incompatible checkpoint is SKIPPED rather
-    # than reported as a wiring failure of the code under test.
+    # PATCH_DIM is ``patch_embed``'s fan-in, so a checkpoint trained at another
+    # input layout cannot be lifted: skip it rather than fail the code under test
     from config import PATCH_DIM
     sd = torch.load(ckpts[-1], map_location='cpu',
                     weights_only=True)['model_state_dict']
@@ -212,7 +175,6 @@ def test_sim_collect_rows_band_capture(delta_none):
         else:
             assert r['bands'] is None     # rolling: sim delta cannot span FIG_STEPS
 
-    # median/pred identical regardless of conformal_delta
     rows0 = collect_sim_rows(model, stats, runs, device, cap=2, conformal_delta=None)
     for ra, rb in zip(rows, rows0):
         assert np.array_equal(ra['pred'], rb['pred']), "median/pred must be delta-invariant"

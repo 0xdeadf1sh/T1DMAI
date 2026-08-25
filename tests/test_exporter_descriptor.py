@@ -1,6 +1,3 @@
-"""Exporter descriptor assembly: the model card's two checkpoint shapes and the
-T1DMSERVER sidecar naming contract."""
-
 import json
 import os
 
@@ -45,7 +42,7 @@ def test_model_card_reads_last_val_history_entry():
     assert rm["rmse_mgdl"] == [12.1919, 22.5888, 32.0049]
     assert rm["mard_pct"] == [6.0748, 11.5741, 16.4332]
     assert rm["clarke_ab_pct"] == 99.9
-    # Absent keys degrade to None rather than aborting the export.
+    # absent keys degrade to None rather than aborting the export
     assert rm["clarke_a_pct"] == [98.5, None, None]
     assert rm["coverage90"] == [None, None, None]
 
@@ -55,8 +52,7 @@ def test_model_card_reads_last_val_history_entry():
 
 
 def test_deploy_to_server_pairs_artifact_with_stem_json_sidecar(tmp_path):
-    """t1dm-store::refresh_models pairs an artifact with a SIBLING <stem>.json, so
-    `large-sim.xnnpack.pte` must deploy alongside `large-sim.xnnpack.json`."""
+    """t1dm-store::refresh_models pairs an artifact with a sibling <stem>.json."""
     src = tmp_path / "build"
     src.mkdir()
     pte = src / "large-sim.xnnpack.pte"
@@ -86,8 +82,7 @@ def test_deploy_to_server_pairs_artifact_with_stem_json_sidecar(tmp_path):
 
 
 def test_descriptor_kovatchev_block_tracks_the_live_transform():
-    """The descriptor is the Rust runtime's SOLE source for f/f_inv; a stale block
-    would decode risk space against the wrong parameterization."""
+    """Descriptor is the Rust runtime's only source for f/f_inv; stale = wrong decode."""
     from utils import _KOVATCHEV_SCALE, _KOVATCHEV_OFFSET, _KOVATCHEV_POWER, kovatchev_f
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 

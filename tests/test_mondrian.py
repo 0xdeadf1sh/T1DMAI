@@ -1,21 +1,3 @@
-"""Region-binned (Mondrian) conformal: the fit, the grouped apply, and the floor rule.
-
-What these pin, in the order the module is used:
-
-* the region axis — one edge near 110 mg/dL, never at a clinical threshold, read
-  off where the forecast is HEADING, and invariant under the correction itself
-  (``conformal`` holds the median fixed, so a window's bin cannot move);
-* the ARITHMETIC FLOOR as a stated rule — a bin with fewer than
-  ``MIN_N_OWN_FIT = 39`` calibration windows takes the marginal delta and records
-  that it did, because below 39 its own τ=0.05 offset IS the sample minimum;
-* per-bin conditional coverage: with two regions whose residual scales differ, the
-  marginal fit under-covers one and over-covers the other and the binned fit does
-  neither;
-* the grouped apply — one ``conformal.apply_quantile_conformal`` call per bin with
-  that bin's ``(S, K)`` slice, never a gathered ``(N, S, K)`` delta, which the
-  function's 2-D assert still refuses;
-* the infill fit is coarse, loud about its fallbacks, and stamped ``shipped=False``.
-"""
 import numpy as np
 import pytest
 
@@ -28,8 +10,7 @@ K = len(QUANTILE_LEVELS)
 MED = QUANTILE_LEVELS.index(0.5)
 LO, HI = QUANTILE_LEVELS.index(0.05), QUANTILE_LEVELS.index(0.95)
 
-# Gaussian z at each τ, so a fan built with a given half-scale has a KNOWN
-# coverage against Gaussian truth of that same scale.
+# Gaussian z per τ: a fan at scale s has known coverage against N(·, s) truth
 _Z = {0.05: -1.6449, 0.1: -1.2816, 0.25: -0.6745, 0.5: 0.0,
       0.75: 0.6745, 0.9: 1.2816, 0.95: 1.6449}
 
@@ -41,8 +22,7 @@ def _fan(center: np.ndarray, scale: np.ndarray) -> np.ndarray:
 
 
 def _cohort(rng, n: int, dest: float, model_scale: float, true_scale: float):
-    """n windows whose median line sits flat at ``dest`` with a fan of
-    ``model_scale`` and truth actually drawn at ``true_scale``."""
+    """n windows, median flat at ``dest``, fan at ``model_scale``, truth at ``true_scale``."""
     center = np.full((n, S), float(dest)) + rng.standard_normal((n, 1)) * 0.5
     q = _fan(center, np.full(n, float(model_scale)))
     true = center + rng.standard_normal((n, S)) * true_scale
@@ -57,8 +37,7 @@ def test_region_edge_is_not_a_clinical_threshold():
     b = mondrian.region_bin(np.array([40.0, 109.999, 110.0, 400.0]))
     assert b.tolist() == [0, 0, 1, 1], b
     assert mondrian.MIN_N_OFFSET_EXISTS == 19 and mondrian.MIN_N_OWN_FIT == 39
-    # The floors are arithmetic, not tuned: they are where the order statistic
-    # floor((n+1)*0.05) first reaches 1 and 2.
+    # the floors are arithmetic, not tuned: where floor((n+1)*0.05) first hits 1 and 2
     assert int(np.floor((19 + 1) * 0.05)) == 1 and int(np.floor((18 + 1) * 0.05)) == 0
     assert int(np.floor((39 + 1) * 0.05)) == 2 and int(np.floor((38 + 1) * 0.05)) == 1
     print(f"\n[DUMP] region edges {mondrian.REGION_EDGES} mg/dL; bins "
@@ -82,7 +61,7 @@ def test_destination_is_invariant_under_the_correction():
 
 
 def test_thin_bin_takes_the_marginal_delta_and_says_so():
-    """Ohio's low bin (32 calibration windows at edge 110) is the case this rule is for."""
+    """32 windows in the low bin — Ohio's count at edge 110 — is the case for this rule."""
     rng = np.random.default_rng(1)
     q_lo, t_lo = _cohort(rng, 32, 95.0, 8.0, 30.0)     # < 110, under the floor
     q_hi, t_hi = _cohort(rng, 112, 150.0, 8.0, 12.0)   # >= 110, over it
@@ -105,9 +84,6 @@ def test_thin_bin_takes_the_marginal_delta_and_says_so():
 def test_binned_fit_restores_conditional_coverage_the_marginal_one_loses():
     """Two regions, two residual scales: marginal is right on average and wrong in both."""
     rng = np.random.default_rng(2)
-    # The model's fan is the SAME width everywhere; the truth is far noisier in the
-    # low region. A single pooled delta therefore over-widens one and under-widens
-    # the other.
     cal = [_cohort(rng, 200, 90.0, 10.0, 35.0), _cohort(rng, 200, 160.0, 10.0, 8.0)]
     test = [_cohort(rng, 400, 90.0, 10.0, 35.0), _cohort(rng, 400, 160.0, 10.0, 8.0)]
     cq = np.concatenate([c[0] for c in cal]); ct = np.concatenate([c[1] for c in cal])
@@ -130,14 +106,12 @@ def test_binned_fit_restores_conditional_coverage_the_marginal_one_loses():
               f"{rec['arms']['marginal']['width']:.1f}) -> binned "
               f"{rec['arms']['binned']['cov']:.3f} (width "
               f"{rec['arms']['binned']['width']:.1f})")
-    # The pooled figure is the one that hides it: marginal looks fine overall.
     pooled_m = float(np.mean(conformal.band_coverage(t_marg, tt, LO, HI)))
     pooled_b = float(np.mean(conformal.band_coverage(t_mond, tt, LO, HI)))
     print(f"[DUMP] pooled cov marginal {pooled_m:.3f} vs binned {pooled_b:.3f} — "
           f"the pooled number is what conceals the per-region gap ✓")
 
-    # Every bin also reports per d, the only axis a masked-BG metric may be binned
-    # on; the right-edge forecast span puts patch p at one-sided d = p+1.
+    # d is the only axis a masked-BG metric bins on; right-edge patch p is d = p+1
     groups = mondrian.forecast_d_step_groups(PREDICTION_PATCHES, PATCH_SIZE)
     assert list(groups) == [f'd{i}' for i in range(1, PREDICTION_PATCHES + 1)]
     assert sum(len(v) for v in groups.values()) == S
@@ -166,14 +140,12 @@ def test_grouped_apply_matches_per_group_and_the_2d_assert_is_intact():
         want[rows] = conformal.apply_quantile_conformal(q[rows], delta[bi], MED)
     assert np.array_equal(got, want)
 
-    # A gathered per-window delta is exactly what apply must keep refusing, and the
-    # refusal is the guard against a 1-D (K,) delta broadcasting across every step.
+    # the 2-D assert refuses an (N,S,K) gather and a (K,) delta broadcast over steps
     with pytest.raises(AssertionError):
         conformal.apply_quantile_conformal(q, delta[b], MED)
     with pytest.raises(AssertionError):
         conformal.apply_quantile_conformal(q, delta[0, 0, :], MED)
 
-    # Zero delta is still the identity through the binned path.
     z = np.zeros((mondrian.N_REGION_BINS, S, K))
     assert np.array_equal(mondrian.apply_mondrian(q, z, b, MED), q)
     print(f"[DUMP] grouped apply == per-group apply; (N,S,K) and (K,) deltas both "
@@ -195,7 +167,6 @@ def test_infill_fit_is_coarse_loud_and_never_shipped(capsys):
     assert meta['shipped'] is False and meta['protocol'] == 'infill'
     assert meta['bins'][0]['own_fit'] is False
     assert np.array_equal(delta[0], marginal)
-    # Every bin reports its distinct-patient count beside its n.
     assert all(r['n_patients'] is not None for r in meta['bins'])
     assert delta.shape == (mondrian.N_REGION_BINS, S, K)
     print(f"\n[DUMP] infill fit shipped={meta['shipped']}, bins "

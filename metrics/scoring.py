@@ -1,40 +1,28 @@
-"""
-Proper scoring rules for the masked-BG quantile fan, binned on ``d``.
+"""Proper scoring rules for the masked-BG quantile fan, binned on ``d``. Measured nowhere else in this tree.
 
-Five rules live here, none of which is measured anywhere else in this tree:
-
-  1. ``crps_by_d``                — continuous ranked probability score
+  1. ``crps_by_d``               — continuous ranked probability score
   2. ``winkler_by_d``            — interval / Winkler score per nominal central level
   3. ``coverage_sharpness_by_d`` — coverage AND the width that bought it, never apart
   4. ``joint_coverage_by_d``     — simultaneous horizon coverage, distinct from marginal
   5. ``alarm_operating_curve``   — hypo detection rate vs false alarms/day + median lead
 
-SPACE — every array crossing this module's boundary is (b) mg/dL PHYSICAL.
-Not (c) Kovatchev risk space, not (a) normalized z-space.  The model emits its
-fan in risk space; the caller crosses once with ``utils.kovatchev_f_inv`` and
-passes the decoded result here.  Nothing in this module transforms a space, and
-every public entry point runs the same units tripwire (``_assert_mgdl``): a
-risk-space fan lies in ``[f(10), f(400)] = [-6.82, +3.16]`` and a z-space one is
-smaller still, so both trip the ``>= BG_CLAMP_MIN`` floor loudly rather than
-producing a plausible score.  See ``CLAUDE.md`` "Three spaces and the only two
-bridges" — the single copy of that contract.
+SPACE — every array crossing this boundary is (b) mg/dL PHYSICAL, never risk space, never z-space. The
+caller crosses once with ``utils.kovatchev_f_inv``; nothing here transforms a space. Every public entry runs
+``_assert_mgdl``: a risk-space fan lies in ``[f(10), f(400)] = [-6.82, +3.16]`` and a z-space one is smaller
+still, so both trip the ``>= BG_CLAMP_MIN`` floor instead of producing a plausible score. The contract has one
+copy, in ``CLAUDE.md`` "Three spaces and the only two bridges".
 
-THE ``d`` AXIS — ``d`` is the distance in patches to the nearest visible
-evidence on EITHER side (``data.py`` ``_mask_slots``).  Every rule here bins on
-it, and on nothing else: not on span length, which confounds one-sided and
-two-sided cases at equal difficulty, and not on arm.  The fixed forecast
-protocol's @30/@60/@90/@120 min columns ARE ``d = 1..4`` one-sided.
+THE ``d`` AXIS — the distance in patches to the nearest visible evidence on EITHER side
+(``data._mask_slots``). Every rule bins on it and nothing else: not span length, which confounds one-sided and
+two-sided cases at equal difficulty, and not arm. The forecast protocol's @30/@60/@90/@120 min columns ARE
+``d = 1..4``, one-sided.
 
-POOLED FIGURES ARE NOT A SELECTION METRIC.  Every rule also reports a figure
-pooled over ``d``, and every one of those carries ``POOLED_NOT_COMPARABLE``.
-The training sampler concentrates its supervision at small ``d`` and on the
-two-sided case (``metrics.protocols.SAMPLER_REFERENCE`` carries the enumerated
-shares), so a pooled masked-BG scalar is an average over a mask distribution
-rather than over a difficulty: it improves when the mixture softens and moves
-between protocols that share no mixture.  Compare pooled
-against pooled only within one fixed protocol, and select on nothing pooled.
+POOLED FIGURES ARE NOT A SELECTION METRIC. Every pooled figure carries ``POOLED_NOT_COMPARABLE``: the sampler
+concentrates supervision at small ``d`` and on the two-sided case (``metrics.protocols.SAMPLER_REFERENCE``
+enumerates the shares), so a pooled scalar averages a mask distribution, not a difficulty — it improves when
+the mixture softens. Compare pooled against pooled within one fixed protocol; select on nothing pooled.
 
-SCORING UNIT — a masked patch.  Arrays arrive as
+SCORING UNIT — a masked patch:
 
     q         (N, S, K)  quantile fan, mg/dL, ascending in K
     true      (N, S)     realized BG, mg/dL
@@ -42,16 +30,13 @@ SCORING UNIT — a masked patch.  Arrays arrive as
     group     (N,)       int, the window (forecast origin) each unit belongs to
     lead_min  (N, S)     minutes from that window's alarm-decision time to the step
 
-with ``S = PATCH_SIZE`` steps per patch and ``K = len(QUANTILE_LEVELS)``.  A
-forward emits ``q_tau (B, M, S, K)`` over ``M = MAX_MASKED_PATCHES`` head slots
-of which only ``valid`` ones carry supervision; the caller flattens the valid
-slots into ``N``.  Padded slots carry ``d = 0``, so the ``d >= 1`` assert here
-is also the tripwire for an unfiltered ``(B, M)`` flatten.
+``S = PATCH_SIZE``, ``K = len(QUANTILE_LEVELS)``. A forward emits ``q_tau (B, M, S, K)`` over
+``M = MAX_MASKED_PATCHES`` slots, of which only ``valid`` ones carry supervision; the caller flattens those
+into ``N``. Padded slots carry ``d = 0``, so the ``d >= 1`` assert is also the tripwire for an unfiltered
+``(B, M)`` flatten.
 
-NO GATES.  This module reports numbers and defines no pass/fail threshold on any
-of them: no reference pretrain exists to read one off, and a guessed gate is
-worse than an absent one.  Selection and admission thresholds belong wherever
-they are eventually measured, not here.
+NO GATES. Numbers only, no pass/fail on any of them: no reference pretrain exists to read one off, and a
+guessed gate is worse than none.
 """
 from __future__ import annotations
 
@@ -89,15 +74,11 @@ CRPS_TRAPEZOID = 'trapezoid'
 _HYPO_EDGE_IDX = QUANTILE_LEVELS.index(HYPO_ALARM_QUANTILE_TAU)
 
 
-# --------------------------------------------------------------------------- #
-# Input contract
-# --------------------------------------------------------------------------- #
 def _assert_mgdl(a: np.ndarray, name: str) -> None:
-    """Units tripwire: ``a`` must be (b) mg/dL physical, not risk and not z-space.
+    """Units tripwire: ``a`` must be mg/dL physical, not risk space and not z-space.
 
-    Risk space spans ``[f(10), f(400)] = [-6.82, +3.16]`` and z-space is narrower
-    still, so both fail the ``BG_CLAMP_MIN`` floor by a wide margin.  Non-finite
-    entries are ignored here and dropped by each rule's own masking.
+    Risk space spans ``[f(10), f(400)] = [-6.82, +3.16]`` and z-space is narrower, so both miss the
+    ``BG_CLAMP_MIN`` floor by a wide margin. Non-finite entries pass here and are dropped by each rule.
     """
     v = np.asarray(a, dtype=np.float64)
     finite = np.isfinite(v)
@@ -114,11 +95,10 @@ def _assert_mgdl(a: np.ndarray, name: str) -> None:
 
 def _check_fan(q: np.ndarray, true: np.ndarray, d: np.ndarray,
                levels: Sequence[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Validate and normalize ``(q, true, d, levels)``; return them as arrays.
+    """Validate ``(q, true, d, levels)`` -> arrays; ``q`` and ``true`` mg/dL physical.
 
-    All of ``q`` / ``true`` are mg/dL physical.  ``d`` must be >= 1: a padded head
-    slot carries ``d = 0``, so a zero here means an unfiltered ``(B, M)`` flatten
-    reached the scorer and the padded slots would be scored against patch 0.
+    ``d`` must be >= 1: a padded head slot carries ``d = 0``, so a zero means an unfiltered ``(B, M)``
+    flatten reached the scorer and padded slots would be scored against patch 0.
     """
     q = np.asarray(q, dtype=np.float64)
     true = np.asarray(true, dtype=np.float64)
@@ -150,12 +130,10 @@ def _check_group(group, n: int) -> np.ndarray:
 
 
 def central_levels(levels: Sequence[float] = QUANTILE_LEVELS) -> tuple[tuple[float, int, int], ...]:
-    """The nominal central levels the fan's τ pairs imply, widest first.
+    """The nominal central levels the fan's τ pairs imply, widest first -> ``(nominal, lo_idx, hi_idx)``.
 
-    A pair ``(τ, 1 − τ)`` present in ``levels`` brackets a central interval of
-    nominal level ``1 − 2τ``.  With ``QUANTILE_LEVELS`` this is 0.90 (0.05/0.95),
-    0.80 (0.1/0.9) and 0.50 (0.25/0.75).  Returns ``(nominal, lo_idx, hi_idx)``
-    triples; a level with no partner is skipped rather than approximated.
+    A pair ``(τ, 1 − τ)`` brackets nominal ``1 − 2τ``: under ``QUANTILE_LEVELS``, 0.90 (0.05/0.95),
+    0.80 (0.1/0.9), 0.50 (0.25/0.75). A level with no partner is skipped, never approximated.
     """
     lv = [float(x) for x in levels]
     out: list[tuple[float, int, int]] = []
@@ -169,9 +147,6 @@ def central_levels(levels: Sequence[float] = QUANTILE_LEVELS) -> tuple[tuple[flo
     return tuple(out)
 
 
-# --------------------------------------------------------------------------- #
-# Result containers
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ByD:
     """One scalar reported per ``d``, plus the pooled figure and its warning."""
@@ -195,17 +170,12 @@ class ByD:
 
 @dataclass(frozen=True)
 class CoverageSharpness:
-    """A coverage figure and the interval width that bought it — always together.
+    """A coverage figure and the mg/dL width that bought it — always together.
 
-    Both fields are required at construction, so no caller can build a coverage
-    number that has lost its sharpness.  ``render`` emits the pair on one line;
-    a coverage reported without its width is not interpretable, since coverage
-    alone is bought by widening the band.
-
-    Widths are mg/dL.  ``kind`` names WHICH coverage this is — marginal per step,
-    or one of the simultaneous variants — so the two can never be confused in a
-    table.  ``n`` counts that kind's own scoring units: (unit, step) pairs for a
-    marginal figure, groups for a joint one.
+    Both fields are required at construction, so no caller can build a coverage number that lost its
+    sharpness: coverage alone is bought by widening the band.
+    ``kind`` names WHICH coverage this is, marginal per step or a simultaneous variant. ``n`` counts that
+    kind's own units: (unit, step) pairs for marginal, groups for joint.
     """
     kind: str
     nominal: float
@@ -251,18 +221,15 @@ class CoverageByD:
 class JointCoverage:
     """Simultaneous coverage, kept apart from the marginal figure by construction.
 
-    ``marginal_*`` is per (unit, step): the fraction of individual steps inside
-    the band.  The three ``joint_*`` fields are per GROUP (one forecast origin)
-    and require EVERY step in their scope to be inside at once:
+    ``marginal_*`` is per (unit, step). The ``joint_*`` fields are per GROUP — one forecast origin — and need
+    EVERY step in scope inside at once:
 
       * ``joint_within_d``  — every step of the group's patches at that ``d``
-      * ``joint_path_to_d`` — every step at ``d' <= d``: the simultaneous
-        coverage of the whole forecast path out to that distance
+      * ``joint_path_to_d`` — every step at ``d' <= d``, the whole forecast path out to that distance
       * ``joint_pooled``    — every scored step of the group
 
-    Joint coverage is at most the smallest marginal in its scope and falls fast
-    with scope; reporting one as the other overstates calibration.  Every field
-    carries its own width, so no coverage travels without its sharpness.
+    Joint coverage is at most the smallest marginal in its scope and falls fast with scope, so reporting one
+    as the other overstates calibration. Every field carries its own width.
     """
     nominal: float
     marginal_by_d: Mapping[int, CoverageSharpness]
@@ -298,11 +265,9 @@ class JointCoverage:
 class AlarmPoint:
     """One operating point of the hypo alarm.
 
-    ``median_lead_min`` is the median, over the detected events, of the minutes
-    between the alarm's decision time and the first true sub-threshold step it
-    caught.  It is what makes the rest of the point actionable: a detection rate
-    bought at a two-minute lead is not a usable alarm, and the rate alone cannot
-    show that.
+    ``median_lead_min``: median over detected events of the minutes between the decision time and the first
+    true sub-threshold step caught. A detection rate bought at a two-minute lead is not a usable alarm, and
+    the rate alone cannot show it.
     """
     rule: str
     score_threshold: float | None
@@ -336,67 +301,37 @@ class AlarmCurves:
     pooled_note: str = POOLED_NOT_COMPARABLE
 
 
-# --------------------------------------------------------------------------- #
-# 1. CRPS
-# --------------------------------------------------------------------------- #
 def crps_steps(q: np.ndarray, true: np.ndarray,
                levels: Sequence[float] = QUANTILE_LEVELS,
                rule: str = CRPS_PWL) -> np.ndarray:
-    """Per-(unit, step) CRPS in mg/dL from the discrete quantile fan.
+    """Per-(unit, step) CRPS from the discrete fan -> ``(N, S)`` mg/dL; non-finite ``true`` propagates as NaN.
 
-    SPACE: ``q`` ``(N, S, K)`` and ``true`` ``(N, S)`` are (b) mg/dL physical,
-    and the returned score is in mg/dL (CRPS carries the unit of the variable).
-
-    The quantile decomposition is used throughout:
+    Quantile decomposition throughout:
 
         CRPS(F, y) = 2 ∫₀¹ ρ_τ(y − F⁻¹(τ)) dτ,   ρ_τ(u) = u·(τ − 1{u < 0})
 
-    i.e. twice the integral of the pinball loss over τ.  The fan supplies F⁻¹ at
-    ``K = 7`` nodes only, so the integral needs a quadrature rule and the choice
-    is not neutral at that spacing.  Both rules here share the SAME closed-form
-    tails, so they differ only in the interior and the difference is attributable.
+    The fan supplies F⁻¹ at ``K = 7`` nodes, so the integral needs quadrature and the choice is not neutral at
+    that spacing. Both rules share the SAME closed-form tails, so they differ only in the interior.
 
-    TAILS (τ < τ₁ and τ > τ_K), identical under both rules.  F⁻¹ is extended
-    flat, which is the quantile function of a law holding mass τ₁ as an atom at
-    q₁ and 1 − τ_K as an atom at q_K.  The contribution is then exact for that
-    law: ``τ₁²·(y − q₁)`` when ``y >= q₁`` and ``(2τ₁ − τ₁²)·(q₁ − y)`` when it
-    is below, and symmetrically at the top.  The weight on an escape below the
-    fan is therefore ``2τ₁ − τ₁² = 0.0975`` mg/dL per mg/dL at ``τ₁ = 0.05``.
-    Against a true law with a genuine tail the sign of this error is not fixed:
-    concentrating the tail mass at the edge overstates the score for x between y
-    and the edge and understates it beyond, so it is a discretization error of
-    the fan and not a bias with a known direction.
+    TAILS (τ < τ₁, τ > τ_K), identical under both. F⁻¹ extends flat, the quantile function of a law holding
+    mass τ₁ as an atom at q₁ and 1 − τ_K at q_K, and the contribution is exact for that law:
+    ``τ₁²·(y − q₁)`` when ``y >= q₁``, ``(2τ₁ − τ₁²)·(q₁ − y)`` below, symmetric at the top. An escape below
+    the fan therefore weighs ``2τ₁ − τ₁² = 0.0975`` mg/dL per mg/dL at ``τ₁ = 0.05``. The sign of the error
+    against a law with a genuine tail is not fixed — a discretization error of the fan, not a known bias.
 
-    INTERIOR, ``rule = CRPS_PWL`` (default).  F⁻¹ is the linear interpolation of
-    the fan between adjacent nodes, and the integral is evaluated in closed form
-    on every subinterval, splitting analytically at the crossing τ* where
-    F⁻¹(τ*) = y.  Quadrature error is ZERO for that piecewise-linear-quantile
-    law; the residual against the model's own predictive law is the fan's
-    discretization, which no rule can recover from 7 nodes.
+    INTERIOR, ``CRPS_PWL`` (default). F⁻¹ is linear between nodes and the integral is closed-form on every
+    subinterval, split analytically at the crossing τ* where F⁻¹(τ*) = y. Quadrature error is ZERO for that
+    piecewise-linear-quantile law; what remains is the fan's own discretization at 7 nodes.
 
-    INTERIOR, ``rule = CRPS_TRAPEZOID``.  Trapezoidal quadrature on the τ nodes.
-    ρ_τ is V-shaped around τ*, so a chord across the subinterval containing the
-    crossing lies above the true integrand and the rule OVERSTATES.  On one
-    subinterval of width h whose quantile gap is D, with the crossing at
-    fraction u of the gap, the excess is exactly
+    INTERIOR, ``CRPS_TRAPEZOID``. ρ_τ is V-shaped around τ*, so the chord across the crossing subinterval
+    lies above the integrand and the rule OVERSTATES. On a subinterval of width h with quantile gap D and the
+    crossing at fraction u, the excess is exactly
 
         2·[ D·h·u(1−u)(1−h)/2 − D·h²·(u³ + (1−u)³)/6 ]
 
-    maximised at u = 1/2.  ``QUANTILE_LEVELS`` has τ gaps
-    (0.05, 0.15, 0.25, 0.25, 0.15, 0.05), so the worst case is h = 0.25 and the
-    excess is at most exactly ``D/24 ≈ 0.0417·D`` mg/dL, D being that gap's
-    spread — the fan's ``q(0.5)..q(0.75)`` (or ``q(0.25)..q(0.5)``) width.  A
-    20 mg/dL half-IQR therefore inflates CRPS by up to 0.83 mg/dL.  The two rules
-    agree exactly on a degenerate fan, where every gap has D = 0.
-
-    Args:
-        q:      ``(N, S, K)`` ascending fan, mg/dL.
-        true:   ``(N, S)`` realized BG, mg/dL.
-        levels: the ``K`` τ of the fan, ascending, strictly inside (0, 1).
-        rule:   ``CRPS_PWL`` or ``CRPS_TRAPEZOID``.
-
-    Returns:
-        ``(N, S)`` CRPS in mg/dL.  Non-finite ``true`` propagates as NaN.
+    maximised at u = 1/2. ``QUANTILE_LEVELS`` has τ gaps (0.05, 0.15, 0.25, 0.25, 0.15, 0.05), so the worst
+    case h = 0.25 costs at most ``D/24 ≈ 0.0417·D`` mg/dL, D being that gap's spread: a 20 mg/dL half-IQR
+    inflates CRPS by up to 0.83 mg/dL. The two rules agree exactly on a degenerate fan, every gap D = 0.
     """
     assert rule in (CRPS_PWL, CRPS_TRAPEZOID), f"unknown CRPS rule {rule!r}"
     q = np.asarray(q, dtype=np.float64)
@@ -448,15 +383,10 @@ def crps_steps(q: np.ndarray, true: np.ndarray,
 def crps_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
               levels: Sequence[float] = QUANTILE_LEVELS,
               rule: str = CRPS_PWL) -> ByD:
-    """CRPS averaged per ``d``, and pooled.
+    """CRPS averaged per ``d``, and pooled; mg/dL in and out. ``crps_steps`` carries the quadrature error.
 
-    SPACE: (b) mg/dL physical on both inputs and the score.  See ``crps_steps``
-    for the quadrature rule and its error.
-
-    Every step of one masked patch shares that patch's ``d``, so the per-``d``
-    figure is the mean over all (unit at that ``d``, step) pairs.  The pooled
-    figure averages over the protocol's own mask distribution and carries
-    ``POOLED_NOT_COMPARABLE``.
+    Every step of a masked patch shares that patch's ``d``, so a per-``d`` figure is the mean over its
+    (unit, step) pairs. The pooled figure averages the protocol's mask distribution: ``POOLED_NOT_COMPARABLE``.
     """
     q, true, d, lv = _check_fan(q, true, d, levels)
     s = crps_steps(q, true, lv, rule)
@@ -471,21 +401,14 @@ def crps_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
                n_pooled=int(ok.sum()))
 
 
-# --------------------------------------------------------------------------- #
-# 2. Interval / Winkler score
-# --------------------------------------------------------------------------- #
 def winkler_steps(q: np.ndarray, true: np.ndarray, lo_idx: int, hi_idx: int,
                   alpha: float) -> np.ndarray:
-    """Per-(unit, step) Winkler interval score for one central interval, mg/dL.
-
-    SPACE: (b) mg/dL physical throughout.
+    """Per-(unit, step) Winkler interval score for one central interval, mg/dL, smaller better.
 
         W = (u − l) + (2/α)·(l − y)·1{y < l} + (2/α)·(y − u)·1{y > u}
 
-    for a central interval ``[l, u]`` of nominal level ``1 − α``.  The score is
-    proper: the width term alone is minimized by a collapsed interval and the
-    escape terms alone by an infinite one, so it prices coverage and sharpness
-    against each other on one axis.  Smaller is better; the unit is mg/dL.
+    for ``[l, u]`` at nominal ``1 − α``. Proper: the width term alone is minimized by a collapsed interval and
+    the escape terms alone by an infinite one, so coverage and sharpness are priced on one axis.
     """
     lo, hi = q[..., lo_idx], q[..., hi_idx]
     w = hi - lo
@@ -496,12 +419,9 @@ def winkler_steps(q: np.ndarray, true: np.ndarray, lo_idx: int, hi_idx: int,
 
 def winkler_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
                  levels: Sequence[float] = QUANTILE_LEVELS) -> dict[float, ByD]:
-    """Winkler score per ``d`` and pooled, at every nominal level the fan implies.
+    """Winkler score per ``d`` and pooled, mg/dL, one ``ByD`` per nominal central level.
 
-    SPACE: (b) mg/dL physical on inputs and score.
-
-    Returns one ``ByD`` per nominal central level from ``central_levels`` — 0.90,
-    0.80 and 0.50 under ``QUANTILE_LEVELS`` — keyed by that nominal level.
+    Levels come from ``central_levels``: 0.90, 0.80 and 0.50 under ``QUANTILE_LEVELS``, and key the result.
     """
     q, true, d, lv = _check_fan(q, true, d, levels)
     out: dict[float, ByD] = {}
@@ -521,9 +441,6 @@ def winkler_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 3. Coverage AND sharpness
-# --------------------------------------------------------------------------- #
 def _cov_sharp(kind: str, nominal: float, inside: np.ndarray, width: np.ndarray,
                sel: np.ndarray) -> CoverageSharpness:
     """Build a coverage/width pair over the selected mask; empty ⇒ NaN with n = 0."""
@@ -540,19 +457,12 @@ def _cov_sharp(kind: str, nominal: float, inside: np.ndarray, width: np.ndarray,
 def coverage_sharpness_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
                             levels: Sequence[float] = QUANTILE_LEVELS
                             ) -> dict[float, CoverageByD]:
-    """Marginal per-step coverage, reported with the width that bought it.
+    """Marginal per-step coverage with the mg/dL width that bought it, in one ``CoverageSharpness`` each.
 
-    SPACE: (b) mg/dL physical; widths are mg/dL.
-
-    Coverage and sharpness are returned in one ``CoverageSharpness`` object with
-    both fields required, so a coverage figure cannot be rendered, tabulated or
-    logged without the width beside it.  A band widens to any coverage, so the
-    number alone says nothing about the forecast.
-
-    This is the MARGINAL figure — the fraction of individual (unit, step) pairs
-    inside the band, one step at a time.  ``joint_coverage_by_d`` carries the
-    simultaneous variant; the two are labelled by ``CoverageSharpness.kind`` and
-    are not interchangeable.
+    Both fields are required, so no coverage figure can be rendered without its width: a band widens to any
+    coverage.
+    MARGINAL — the fraction of individual (unit, step) pairs inside the band. ``joint_coverage_by_d`` carries
+    the simultaneous variant, labelled by ``kind``, and the two are not interchangeable.
     """
     q, true, d, lv = _check_fan(q, true, d, levels)
     out: dict[float, CoverageByD] = {}
@@ -570,16 +480,13 @@ def coverage_sharpness_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 4. Joint (simultaneous) horizon coverage
-# --------------------------------------------------------------------------- #
 def _joint(kind: str, nominal: float, inside: np.ndarray, width: np.ndarray,
            ok: np.ndarray, gidx: np.ndarray, n_groups: int,
            unit_sel: np.ndarray) -> CoverageSharpness:
     """Fraction of groups with EVERY selected step inside, plus that scope's width.
 
-    A group counts only when it carries at least one selected finite step.  A
-    step that is not finite is excluded rather than treated as an escape.
+    A group counts only if it carries one selected finite step; a non-finite step is excluded, never read as
+    an escape.
     """
     step_sel = ok & unit_sel[:, None]
     if not step_sel.any():
@@ -601,22 +508,13 @@ def joint_coverage_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
                         group: np.ndarray,
                         levels: Sequence[float] = QUANTILE_LEVELS
                         ) -> dict[float, JointCoverage]:
-    """Simultaneous horizon coverage, reported beside — and labelled apart from —
-    the per-step marginal figure.
+    """Simultaneous horizon coverage, labelled apart from the per-step marginal figure; widths mg/dL.
 
-    SPACE: (b) mg/dL physical; widths mg/dL.
-
-    ``group`` labels the window (one forecast origin) each masked patch belongs
-    to.  Marginal coverage asks whether a single step landed inside its band;
-    joint coverage asks whether an entire path did at once, which is the question
-    a rolled-out trajectory or an alarm actually poses.  Joint coverage is
-    bounded above by the smallest marginal in its scope and decays with the
-    number of steps in it, so the two figures cannot be read as the same
-    quantity: each ``CoverageSharpness`` here names its own ``kind``.
-
-    Three joint scopes are reported (see ``JointCoverage``): within one ``d``,
-    cumulatively out to a ``d`` (the forecast path), and over every scored step
-    of the group.
+    ``group`` labels the forecast origin each masked patch belongs to. Marginal asks whether one step landed
+    inside its band; joint asks whether a whole path did at once, the question a rolled trajectory or an alarm
+    poses. Joint is bounded by the smallest marginal in its scope and decays with scope, so each
+    ``CoverageSharpness`` names its own ``kind``.
+    Three scopes: within one ``d``, cumulatively out to a ``d``, and over every scored step of the group.
     """
     q, true, d, lv = _check_fan(q, true, d, levels)
     group = _check_group(group, d.size)
@@ -645,20 +543,13 @@ def joint_coverage_by_d(q: np.ndarray, true: np.ndarray, d: np.ndarray,
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 5. Alarm operating curve
-# --------------------------------------------------------------------------- #
 def predictive_cdf(q: np.ndarray, x: float,
                    levels: Sequence[float] = QUANTILE_LEVELS) -> np.ndarray:
-    """``P(Y <= x)`` under the same piecewise-linear-quantile law ``CRPS_PWL`` scores.
+    """``P(Y <= x)`` under the piecewise-linear-quantile law ``CRPS_PWL`` scores; ``q`` and ``x`` mg/dL.
 
-    SPACE: ``q`` and ``x`` are (b) mg/dL physical; the result is a probability.
-
-    F⁻¹ is linear between fan nodes and flat outside them, so the mass below the
-    lowest node sits as an atom at that node: the probability is exactly 0 below
-    ``q₁`` and exactly 1 at or above ``q_K``.  Using the whole fan rather than a
-    single band edge is what gives the alarm a continuous score to sweep — the
-    fan carries only three τ below the median, far too coarse an axis on its own.
+    F⁻¹ is linear between nodes and flat outside, so the mass below the lowest node sits as an atom there:
+    exactly 0 below ``q₁``, exactly 1 at or above ``q_K``. The whole fan is what gives the alarm a continuous
+    score to sweep — three τ below the median is far too coarse an axis.
     """
     q = np.asarray(q, dtype=np.float64)
     lv = np.asarray(levels, dtype=np.float64)
@@ -674,16 +565,12 @@ def predictive_cdf(q: np.ndarray, x: float,
 
 
 def forecast_lead_minutes(d: np.ndarray, n_steps: int = PATCH_SIZE) -> np.ndarray:
-    """``(N, S)`` minutes from the forecast origin to each step, for the RIGHT-EDGE
-    forecast protocol only.
+    """``(N, S)`` minutes from the forecast origin to each step — RIGHT-EDGE forecast protocol ONLY.
 
-    In that protocol the masked span is the trailing ``PREDICTION_PATCHES``
-    patches, so a patch at distance ``d`` is the ``d``-th patch after the origin
-    and step ``s`` of it lands at ``((d − 1)·n_steps + s + 1)·GRID_MIN`` minutes
-    — the same 0-based patch-end convention as ``metrics.core.horizons``.  The
-    identity ``d = 1..4 ⇔ @30/@60/@90/@120`` min holds only here: for an infill
-    span ``d`` is a distance to evidence on either side and says nothing about
-    the time to the origin, so that protocol must pass its own ``lead_min``.
+    There a patch at distance ``d`` is the ``d``-th after the origin, so step ``s`` lands at
+    ``((d − 1)·n_steps + s + 1)·GRID_MIN`` minutes, the patch-end convention of ``metrics.core.horizons``.
+    ``d = 1..4 ⇔ @30/@60/@90/@120`` min holds only here: for an infill span ``d`` is a distance to evidence on
+    either side and says nothing about time to the origin, so that protocol passes its own ``lead_min``.
     """
     d = np.asarray(d)
     assert np.issubdtype(d.dtype, np.integer) and (d >= 1).all()
@@ -716,11 +603,10 @@ def _alarm_curve_for(d_label: int | None, sel_units: np.ndarray, score_unit: np.
                      edge_unit: np.ndarray, true: np.ndarray, lead_min: np.ndarray,
                      gidx: np.ndarray, n_groups: int, threshold: float,
                      observed_days: float | None, max_points: int) -> AlarmCurve:
-    """One operating curve over the groups touched by ``sel_units``.
+    """One operating curve over the groups ``sel_units`` touches; untouched groups are dropped.
 
-    Per group: the alarm score is the maximum over the scanned steps, the
-    deployed band edge the minimum, and the event onset the earliest scanned step
-    with ``true < threshold``.  Groups no selected unit touches are dropped.
+    Per group: score = max over the scanned steps, deployed band edge = min, event onset = earliest scanned
+    step with ``true < threshold``.
     """
     big = np.finfo(np.float64).max
     rows = np.nonzero(sel_units)[0]
@@ -741,8 +627,7 @@ def _alarm_curve_for(d_label: int | None, sel_units: np.ndarray, score_unit: np.
     score_g, onset_g, edge_g = score_g[present], onset_g[present], edge_g[present]
     has_event = np.isfinite(onset_g)
 
-    # The swept cuts are the realized scores themselves (an exact ROC sweep), plus
-    # the always-fire endpoint at 0.
+    # the realized scores themselves — an exact ROC sweep — plus the always-fire endpoint at 0
     cuts = np.unique(score_g[score_g > 0.0])
     if cuts.size > max_points - 1:
         cuts = np.unique(np.quantile(cuts, np.linspace(0.0, 1.0, max_points - 1)))
@@ -766,42 +651,27 @@ def alarm_operating_curve(q: np.ndarray, true: np.ndarray, d: np.ndarray,
                           max_points: int = 101) -> AlarmCurves:
     """Hypo detection rate against false alarms per day, with the median lead time.
 
-    SPACE: (b) mg/dL physical — ``q``, ``true`` and ``threshold`` are mg/dL; the
-    swept score is a probability and the lead time is minutes.
+    ``q``, ``true`` and ``threshold`` mg/dL; the swept score is a probability, the lead time minutes.
+    ``lead_min`` ``(N, S)`` is minutes from the group's decision time to each step — ``forecast_lead_minutes``
+    builds it for the right-edge protocol, and an infill protocol supplies its own.
+    One decision per ``group``. The scanned steps are the selected masked patches: every patch pooled, the
+    patches at one ``d`` per-``d``.
 
-    One alarm decision is made per ``group`` (one forecast origin).  Within a
-    group, the scanned steps are those of the selected masked patches — every
-    patch for the pooled curve, the patches at one ``d`` for a per-``d`` curve.
-    Then:
+      * SCORE — ``max`` over scanned steps of ``P(BG <= threshold)`` from ``predictive_cdf``; the cut on it
+        sweeps the curve.
+      * EVENT — any scanned step with ``true < threshold``, the strict convention used elsewhere. ONSET is
+        the earliest such step.
+      * DETECTION RATE — detected events / events; a group with no event never enters the denominator.
+      * FALSE ALARMS PER DAY — firing groups with no event, over ``observed_days``. An ISSUANCE rate: one
+        alarm per group, so overlapping windows raise it and the caller's cadence sets it.
+        ``observed_days=None`` leaves the rate ``None`` and reports the count — the denominator belongs to
+        the evaluation set, never to a default.
+      * MEDIAN LEAD TIME — median over detected events of the onset's ``lead_min``. Per issuance: a group
+        firing 30 min before another for the same physiological event is a separate detection with its own
+        lead, so this is what ONE forecast delivers, not the earliest a stream could warn.
 
-      * SCORE — ``max`` over the scanned steps of ``P(BG <= threshold)`` from
-        ``predictive_cdf``.  Sweeping a cut on this score generates the curve.
-      * EVENT — the group carries a true hypo if any scanned step has
-        ``true < threshold`` (the strict convention ``metrics.core.suite`` and the
-        validation table already use).  ONSET is the earliest such step.
-      * DETECTION RATE — detected events / events.  Groups with no event never
-        enter this denominator.
-      * FALSE ALARMS PER DAY — firing groups with no event, over
-        ``observed_days``.  This is an ISSUANCE rate: one alarm per group, so
-        overlapping windows raise it and the caller's window cadence sets it.
-        ``observed_days=None`` leaves the rate ``None`` and reports the count —
-        the denominator is a property of the evaluation set, never a default.
-      * MEDIAN LEAD TIME — median over detected events of the onset's
-        ``lead_min``, i.e. the minutes between the alarm and the first true
-        sub-threshold reading it caught.  Measured per issuance: a group that
-        fires 30 min before another for the same physiological event is a
-        separate detection with its own lead, so this is the lead a single
-        forecast delivers rather than the earliest warning a stream could give.
-
-    The deployed rule is scored alongside the swept curve at every ``d``: the
-    band-edge detector the app ships (``HYPO_ALARM_QUANTILE_TAU``'s lower edge
-    dipping below ``BG_HYPO_THRESHOLD``), so the curve carries the operating
-    point actually in use rather than only the envelope around it.
-
-    Args:
-        lead_min: ``(N, S)`` minutes from the group's decision time to each step.
-            ``forecast_lead_minutes`` builds it for the right-edge forecast
-            protocol; an infill protocol must supply its own.
+    The deployed rule is scored beside the swept curve at every ``d``: the band-edge detector the app ships,
+    ``HYPO_ALARM_QUANTILE_TAU``'s lower edge below ``BG_HYPO_THRESHOLD``.
     """
     q, true, d, lv = _check_fan(q, true, d, levels)
     group = _check_group(group, d.size)
@@ -823,9 +693,6 @@ def alarm_operating_curve(q: np.ndarray, true: np.ndarray, d: np.ndarray,
     return AlarmCurves(by_d=by_d, pooled=pooled)
 
 
-# --------------------------------------------------------------------------- #
-# Convenience aggregate
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class FanScores:
     """The five rules over one protocol's scored masked patches."""
@@ -842,14 +709,10 @@ def score_fan(q: np.ndarray, true: np.ndarray, d: np.ndarray, group: np.ndarray,
               observed_days: float | None = None,
               levels: Sequence[float] = QUANTILE_LEVELS,
               crps_rule: str = CRPS_PWL) -> FanScores:
-    """Run all five rules over one protocol's scored masked patches.
+    """All five rules over one protocol's scored masked patches; mg/dL throughout.
 
-    SPACE: (b) mg/dL physical throughout — the caller has already crossed out of
-    risk space with ``kovatchev_f_inv``.
-
-    ``lead_min=None`` skips the alarm curve (no lead time can be defined without
-    it, and a detection rate without a lead time is not an operating point).
-    Nothing here is a gate: no threshold is applied to any figure it returns.
+    ``lead_min=None`` skips the alarm curve: a detection rate without a lead time is not an operating point.
+    No figure returned here is gated.
     """
     return FanScores(
         crps=crps_by_d(q, true, d, levels, crps_rule),

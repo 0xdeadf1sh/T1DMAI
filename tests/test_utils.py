@@ -9,7 +9,6 @@ import torch
 
 
 def test_seed_hash_deterministic():
-    """Same (master_seed, step, position) always produces the same patient seed."""
     from utils import compute_patient_seed
     seed1 = compute_patient_seed(42, 100, 5)
     seed2 = compute_patient_seed(42, 100, 5)
@@ -17,7 +16,6 @@ def test_seed_hash_deterministic():
 
 
 def test_seed_hash_unique():
-    """Different (step, position) pairs produce different seeds (no collisions in 32K pairs)."""
     from utils import compute_patient_seed
     seeds = set()
     for i in range(1000):
@@ -27,7 +25,6 @@ def test_seed_hash_unique():
 
 
 def test_seed_hash_range():
-    """Patient seeds are in valid range [0, 2^63 - 1]."""
     from utils import compute_patient_seed
     for i in range(100):
         seed = compute_patient_seed(42, i, 0)
@@ -35,29 +32,23 @@ def test_seed_hash_range():
 
 
 def test_attention_mask_shape():
-    """Attention mask has correct shape and four-region pattern."""
     from utils import create_attention_mask
     n_ctx, n_pred = 4, 3
     mask = create_attention_mask(n_ctx, n_pred)
     T = n_ctx + n_pred
     assert mask.shape == (T, T)
 
-    # Context-to-context: all True (bidirectional)
     assert mask[:n_ctx, :n_ctx].all(), "Context-to-context should be all True"
 
-    # Context-to-prediction: all False (context doesn't see future)
     assert not mask[:n_ctx, n_ctx:].any(), "Context-to-prediction should be all False"
 
-    # Prediction-to-context: all True
     assert mask[n_ctx:, :n_ctx].all(), "Prediction-to-context should be all True"
 
-    # Prediction-to-prediction: all True (BIDIRECTIONAL within the horizon).
-    # The prediction zone attends to itself in both directions — no future leak
-    # arises because context-to-prediction is already blocked above.
+    # the prediction zone attends to itself in BOTH directions; no future leaks,
+    # since context-to-prediction is already blocked above
     pred_block = mask[n_ctx:, n_ctx:]
     assert pred_block.all(), "Prediction-to-prediction should be all True (bidirectional)"
 
-    # DUMP: print the mask as a visual grid
     print("\n[DUMP] attention_mask | visual (4 ctx + 3 pred):")
     for i in range(T):
         row = ""
@@ -68,15 +59,13 @@ def test_attention_mask_shape():
 
 
 def test_attention_mask_is_not_memoized():
-    """THE MEMO IS GONE.  The old cache keyed on ``(n_context, n_prediction)`` and
-    handed the identical tensor to every caller at that key — so a mask built for
-    one masked set was returned for another, with no shape error and nothing to
-    notice.  The masked set is now arbitrary and no cheap key identifies it.
+    """No cheap key identifies an arbitrary masked set, so a memo on
+    ``(n_context, n_prediction)`` hands one sample's mask to another with no shape error.
 
-    Two witnesses, and the first is the one that matters: two DIFFERENT masked
-    sets at the SAME ``n_ctx`` must produce DIFFERENT masks.  The bit-identity
-    gate cannot catch a returning memo — it runs the one key the memo was built
-    for."""
+    The witness that matters: two DIFFERENT masked sets at the SAME ``n_ctx`` must
+    produce different masks. The bit-identity gate cannot catch a returning memo — it
+    runs the one key the memo was built for.
+    """
     import utils
     from utils import create_attention_mask, create_attention_mask_from_visible
 
@@ -87,7 +76,7 @@ def test_attention_mask_is_not_memoized():
         v[0, list(masked_patches)] = False
         return v
 
-    # Same n_ctx (8 visible patches), two different masked sets of the same size.
+    # same n_ctx, two different masked sets of the same size
     a = create_attention_mask_from_visible(visible([2, 3, 8, 9]))
     b = create_attention_mask_from_visible(visible([4, 5, 10, 11]))
     assert a.shape == b.shape == (1, T, T)
@@ -95,8 +84,8 @@ def test_attention_mask_is_not_memoized():
         "two different masked sets at the same n_ctx produced the SAME mask — "
         "a memo keyed on (n_context, n_prediction) is back")
 
-    # No module-level cache, and repeated identical calls hand back independent
-    # tensors: a caller that edits one must not poison the next.
+    # repeated identical calls hand back INDEPENDENT tensors: a caller that edits one
+    # must not poison the next
     assert not hasattr(utils, '_ATTENTION_MASK_CACHE'), \
         "utils._ATTENTION_MASK_CACHE must be deleted — no memo can be correct here"
     m1 = create_attention_mask(n_ctx, T - n_ctx)
@@ -111,11 +100,9 @@ def test_attention_mask_is_not_memoized():
           f"{n_diff} of {T * T} entries; no cache attribute; fresh tensor per call ✓")
 
 
-# ---------------------------------------------------------------------------
-# Kovatchev risk transform — the ONLY (b)mg/dL <-> (c)risk-space bridge.
-# kovatchev_f imports BG_CLAMP_MIN/MAX from the simulator (the units tripwire);
-# kovatchev_f_inv clamps the risk input, exp's, then clamps the mg/dL output.
-# ---------------------------------------------------------------------------
+# the Kovatchev transform is the ONLY mg/dL <-> risk-space bridge. kovatchev_f imports
+# BG_CLAMP_MIN/MAX from the simulator, the units tripwire; kovatchev_f_inv clamps the
+# risk input, exps, then clamps the mg/dL output.
 
 def _sim_clamps() -> tuple[float, float]:
     import T1DMSIM.simulator as sim
@@ -123,11 +110,12 @@ def _sim_clamps() -> tuple[float, float]:
 
 
 def test_kovatchev_constants_against_reference():
-    """The [40,400]-anchored Kovatchev constants (SCALE 2.2211457449985317 /
-    POWER 1.084 / OFFSET 5.540076976170212) must back the implemented f —
-    verified by (a) an independent reference evaluation at three BG levels and
-    (b) the DEFINING endpoint property f(40) = -sqrt(10), f(400) = +sqrt(10), so
-    the risk 10*f^2 saturates at 100 exactly at both CGM device rails."""
+    """SCALE 2.2211457449985317 / POWER 1.084 / OFFSET 5.540076976170212, against an
+    independent reference and against the defining endpoints.
+
+    f(40) = -sqrt(10) and f(400) = +sqrt(10), so the risk 10*f^2 saturates at 100 at
+    both CGM device rails.
+    """
     from utils import kovatchev_f
 
     SCALE, POWER, OFFSET = 2.2211457449985317, 1.084, 5.540076976170212
@@ -139,33 +127,32 @@ def test_kovatchev_constants_against_reference():
         got = float(kovatchev_f(torch.tensor(g)))
         assert abs(got - f_ref(g)) < 1e-4, (
             f"kovatchev_f({g})={got} != reference {f_ref(g)} — constants drifted")
-    # Defining endpoints: re-anchored so f = -/+ sqrt(10) at the [40, 400] rails.
+    # the defining endpoints: f = -/+ sqrt(10) at the [40, 400] rails
     s10 = math.sqrt(10.0)
     assert abs(float(kovatchev_f(torch.tensor(40.0))) + s10) < 1e-4, "f(40) != -sqrt(10)"
     assert abs(float(kovatchev_f(torch.tensor(400.0))) - s10) < 1e-4, "f(400) != +sqrt(10)"
-    # The zero-risk euglycemic center sits at ~128 mg/dL (the log^POWER center of
-    # [40, 400]); f is near zero there.
+    # the zero-risk euglycemic centre is ~128 mg/dL, the log^POWER centre of [40, 400]
     assert abs(float(kovatchev_f(torch.tensor(127.97)))) < 0.02
     print(f"\n[DUMP] kovatchev[40,400] | f(40)={f_ref(40.0):.4f} f(400)={f_ref(400.0):.4f} "
           f"f(128)={f_ref(127.97):.4f} (endpoints = -/+ sqrt10)")
 
 
 def test_kovatchev_f_units_tripwire():
-    """kovatchev_f is the CONTROLLED-caller guard: a z-scored value trips the hard
-    ``g >= BG_CLAMP_MIN`` assert loudly (the units tripwire).  The guarantee is
-    pool-independent — every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3.
-    Re-f of an f'd value (output in [f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)], which sits
-    wholly below that floor) must likewise trip."""
+    """``kovatchev_f`` guards controlled callers: a z-scored value trips the hard
+    ``g >= BG_CLAMP_MIN`` assert.
+
+    Pool-independent, since every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3. Re-f
+    of an f'd value lands wholly below that floor and trips too.
+    """
     from utils import kovatchev_f
 
     bg_min, _ = _sim_clamps()
-    # A legitimate mg/dL anchor passes.
+    # a legitimate mg/dL anchor passes
     _ = kovatchev_f(torch.tensor([bg_min, 100.0, 250.0]))
-    # A z-space vector (what the tripwire exists to catch) must raise.
+    # a z-space vector is what the tripwire exists to catch
     with pytest.raises(AssertionError):
         kovatchev_f(torch.tensor([-2.5, 0.3, 1.7]))
-    # Re-f of an already-risk value (in [f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]) must
-    # also raise.
+    # re-f of an already-risk value must raise too
     risk_vals = kovatchev_f(torch.tensor([100.0, 250.0]))
     with pytest.raises(AssertionError):
         kovatchev_f(risk_vals)
@@ -185,8 +172,8 @@ def test_kovatchev_f_inv_range_and_inverse():
     assert torch.allclose(back, grid, atol=1e-2, rtol=1e-3), (
         f"f_inv(f(g)) must recover g: {back.tolist()} vs {grid.tolist()}")
 
-    # Worst-case risk extremes that would otherwise overflow exp or take the log
-    # of a negative base — must clamp into [BG_CLAMP_MIN, BG_CLAMP_MAX], finite.
+    # risk extremes that would otherwise overflow exp or log a negative base: they
+    # must clamp into [BG_CLAMP_MIN, BG_CLAMP_MAX], finite
     extreme = torch.tensor([-1e3, -8.2, -3.5, 3.0, 40.0, 1e3])
     out = kovatchev_f_inv(extreme)
     assert torch.isfinite(out).all(), "f_inv must stay finite on extreme risk inputs"
@@ -198,10 +185,12 @@ def test_kovatchev_f_inv_range_and_inverse():
 
 
 def test_kovatchev_f_inv_nan_guard():
-    """f_inv scrubs a non-finite risk input (NaN / ±inf) to the band edges
-    BEFORE clamp, so it can never silently emit a NaN mg/dL.  ``clamp`` alone
-    would let NaN flow straight through (NaN compares false against both bounds),
-    so the explicit ``nan_to_num`` is the load-bearing guard."""
+    """A non-finite risk input is scrubbed to the band edges BEFORE the clamp, so
+    ``f_inv`` can never emit a NaN mg/dL.
+
+    ``clamp`` alone lets NaN through — it compares false against both bounds — so the
+    explicit ``nan_to_num`` is the load-bearing guard.
+    """
     from utils import kovatchev_f_inv
 
     bg_min, bg_max = _sim_clamps()
@@ -210,7 +199,7 @@ def test_kovatchev_f_inv_nan_guard():
     assert torch.isfinite(out).all(), (
         f"f_inv must scrub non-finite risk inputs, got {out.tolist()}")
     assert (out >= bg_min - 1e-3).all() and (out <= bg_max + 1e-3).all()
-    # +inf risk -> ceiling, -inf / NaN -> floor (the scrub maps them to r_hi/r_lo).
+    # the scrub maps +inf to r_hi and -inf / NaN to r_lo
     assert float(out[1]) == pytest.approx(bg_max, abs=1e-2), "posinf -> BG ceiling"
     assert float(out[2]) == pytest.approx(bg_min, abs=1e-2), "neginf -> BG floor"
     assert float(out[0]) == pytest.approx(bg_min, abs=1e-2), "NaN -> BG floor"
@@ -219,38 +208,33 @@ def test_kovatchev_f_inv_nan_guard():
 
 
 def test_kovatchev_f_target_clamps_not_tripwire():
-    """The target-path f (kovatchev_f_target) PHYSICALLY clamps mg/dL into the
-    band before f rather than asserting — it must NOT raise on a sub-floor or
-    super-ceiling physical value (a rare smoother backstop), only clamp it."""
+    """``kovatchev_f_target`` clamps mg/dL into the band before f rather than asserting,
+    so an out-of-band physical value is clamped, never raised on."""
     from utils import kovatchev_f, kovatchev_f_target
 
     bg_min, bg_max = _sim_clamps()
-    # Slightly out-of-band physical values: clamped, not raised.
+    # slightly out-of-band physical values: clamped, not raised
     g = torch.tensor([bg_min - 5.0, 100.0, bg_max + 50.0])
     out = kovatchev_f_target(g)
     assert torch.isfinite(out).all()
-    # In-band values match the plain f exactly.
     g_in = torch.tensor([70.0, 120.0, 180.0])
     assert torch.allclose(kovatchev_f_target(g_in), kovatchev_f(g_in), atol=1e-5)
-    # The clamped extremes equal f at the respective bounds.
+    # the clamped extremes equal f at the respective bounds
     assert abs(float(out[0]) - float(kovatchev_f(torch.tensor(bg_min)))) < 1e-4
     assert abs(float(out[2]) - float(kovatchev_f(torch.tensor(bg_max)))) < 1e-4
     print("\n[DUMP] kovatchev_f_target | clamps out-of-band, matches f in-band ✓")
 
 
 def test_f_once_per_target_batch_is_mgdl():
-    """A realistic batch BG target tensor lives in mg/dL (>= BG_CLAMP_MIN), i.e.
-    it is NOT yet f-transformed — f is applied exactly once at the top of the
-    loss, never baked into the batch. (If a target had been double-f'd it would
-    sit near zero and trip this floor.)"""
+    """A batch BG target is mg/dL, not yet f-transformed: f is applied exactly once at
+    the top of the loss, and a double-f'd target sits near zero and trips this floor."""
     bg_min, bg_max = _sim_clamps()
-    # Stand-in for data.py's smoothed pred-zone target (mg/dL physical band).
+    # stands in for data.py's target, in the mg/dL physical band
     true_bg = torch.tensor([[55.0, 70.0, 120.0, 180.0, 250.0],
                             [40.0, 90.0, 140.0, 200.0, 300.0]])
     assert (true_bg >= bg_min - 1e-3).all(), "target must be mg/dL, not f-transformed"
     assert (true_bg <= bg_max + 1e-3).all()
-    # A doubly-f'd target lands in [f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)], wholly below
-    # the mg/dL floor, and fails it — assert the trap.
+    # a doubly-f'd target lands wholly below the mg/dL floor
     from utils import kovatchev_f
     risk = kovatchev_f(true_bg)
     assert (risk < bg_min).all(), "f-transformed values are NOT in the mg/dL band"
@@ -271,10 +255,10 @@ def test_three_hop_round_trip():
 
     bg_min, bg_max = _sim_clamps()
     mgdl = np.linspace(bg_min + 5.0, bg_max - 5.0, 40).astype(np.float32)
-    # Hop into z-space first (the representation predict_rolling carries in slot 0).
+    # z-space first: the representation predict_rolling carries in slot 0
     z = normalize(mgdl[:, None], stats, channel_names=[bg_name])[:, 0]
 
-    # z -> mg/dL -> risk -> mg/dL -> z.
+    # z -> mg/dL -> risk -> mg/dL -> z
     back_mgdl = denormalize(z[:, None], stats, channel_names=[bg_name])[:, 0]
     risk = kovatchev_f(torch.tensor(back_mgdl))
     inv_mgdl = kovatchev_f_inv(risk).numpy()
@@ -294,10 +278,8 @@ def _get_stats():
     return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
 
 
-# ---------------------------------------------------------------------------
-# assemble_quantiles — turns the BG head's raw (B,P,S, 1 + 2*N_SPREADS) output
-# into ascending risk-space quantiles anchored at f(last_bg).
-# ---------------------------------------------------------------------------
+# assemble_quantiles turns the head's raw (B, P, S, 1 + 2*N_SPREADS) output into
+# ascending risk-space quantiles anchored at f(last_bg)
 
 def test_assemble_quantiles_index_for_index_and_gap():
     """assemble_quantiles emits (B,P,S,7) ascending quantiles whose index-for-
@@ -317,21 +299,19 @@ def test_assemble_quantiles_index_for_index_and_gap():
     assert q_tau.shape == (B, P, S, N_QUANTILES), f"bad q_tau shape {q_tau.shape}"
     assert median.shape == (B, P, S), f"bad median shape {median.shape}"
 
-    # Median is the index-3 quantile.
     assert torch.allclose(median, q_tau[..., 3], atol=1e-6), "median must == q[...,3]"
 
-    # Index-for-index ascending (NOT merely monotone in value — the level ORDER
-    # must line up with QUANTILE_LEVELS).
+    # index for index, not merely monotone in value: the level ORDER must line up
+    # with QUANTILE_LEVELS
     assert list(QUANTILE_LEVELS) == sorted(QUANTILE_LEVELS)
     diffs = q_tau[..., 1:] - q_tau[..., :-1]
     assert (diffs >= BG_QUANTILE_SPREAD_MIN - 1e-6).all(), (
         f"strict gap violated: min adjacent gap {float(diffs.min()):.3e} "
         f"< {BG_QUANTILE_SPREAD_MIN}")
 
-    # Median assembly depends on the BG_HEAD_MEDIAN_MODE gate.  Under 'global' the
-    # subspace dimension is per-SPAN — ``global_median_dim(L)``, not the configured
-    # G, which is only the value at L == PREDICTION_PATCHES.  The legacy (B,)
-    # anchor form makes all P slots one span, so L == P here.
+    # under 'global' the subspace dimension is per-SPAN, ``global_median_dim(L)``, and
+    # the configured G is only its value at L == PREDICTION_PATCHES. The (B,) anchor
+    # form makes all P slots one span, so L == P here.
     from config import (BG_HEAD_MEDIAN_MODE, BG_HEAD_STEP_BASIS_TYPE)
     from utils import get_global_median_basis, global_median_dim
     anchor = kovatchev_f(last_bg).view(B, 1, 1)
@@ -393,10 +373,8 @@ def test_assemble_quantiles_carry_spread_default_is_identity():
 
 
 def test_assemble_quantiles_carry_spread_widens_band():
-    """A positive ``carry_spread`` inflates the risk-space band SYMMETRICALLY about
-    the median (τ>.5 edges shift up by carry, τ<.5 down by carry) while leaving the
-    median untouched — the exact effect predict_rolling relies on to keep the fan
-    monotone across roll boundaries."""
+    """A positive ``carry_spread`` inflates the band symmetrically about the median and
+    leaves the median untouched, which is what keeps a roll's fan monotone."""
     from utils import assemble_quantiles
     from config import QUANTILE_LEVELS
 
@@ -410,12 +388,11 @@ def test_assemble_quantiles_carry_spread_widens_band():
     q0, m0 = assemble_quantiles(head_raw, last_bg, carry_spread=0.0)
     qc, mc = assemble_quantiles(head_raw, last_bg, carry_spread=carry)
 
-    # Median is untouched.
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
 
-    # Each edge's distance from the median becomes hypot(carry, its own native offset) —
-    # QUADRATURE, not a +carry shift (§8.1).
+    # each edge's distance from the median becomes hypot(carry, its own native offset):
+    # QUADRATURE, not a +carry shift (SPEC/inference.md §8.1)
     m0 = q0[..., median_idx].unsqueeze(-1)
     up_off0 = q0[..., median_idx + 1:] - m0
     dn_off0 = m0 - q0[..., :median_idx]
@@ -424,8 +401,8 @@ def test_assemble_quantiles_carry_spread_widens_band():
     assert torch.allclose(qc[..., median_idx + 1:], want_up, atol=1e-6)
     assert torch.allclose(qc[..., :median_idx], want_dn, atol=1e-6)
 
-    # Net: the band is strictly wider everywhere off the median, and by LESS than the
-    # 2*carry an additive carry would have added.
+    # strictly wider everywhere off the median, and by LESS than the 2*carry an
+    # additive carry would have added
     width0 = q0[..., -1] - q0[..., 0]
     widthc = qc[..., -1] - qc[..., 0]
     assert (widthc > width0).all(), "carry must strictly widen the 5-95 band"
@@ -435,11 +412,12 @@ def test_assemble_quantiles_carry_spread_widens_band():
 
 
 def test_assemble_quantiles_carry_spread_is_per_level():
-    """``carry_spread`` carries ONE offset PER LEVEL, laid out like the head's own
-    spread columns — ``[.75 .9 .95 | .25 .1 .05]``.  Each edge moves by its own
-    carry and by no other, and a scalar is the same as that scalar in all six
-    slots.  A single carry shared by the levels is the roll-seam defect: it seeds
-    .75 from .95's accumulation."""
+    """ONE offset PER LEVEL, laid out like the head's spread columns,
+    ``[.75 .9 .95 | .25 .1 .05]``; a scalar is that scalar in all six slots.
+
+    One carry shared by the levels is the roll-seam defect: it seeds .75 from .95's
+    accumulation.
+    """
     from utils import assemble_quantiles
     from config import QUANTILE_LEVELS, N_SPREADS
 
@@ -456,9 +434,9 @@ def test_assemble_quantiles_carry_spread_is_per_level():
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
 
-    # Upper edges take carry[:3] in place; lower edges take carry[3:], flipped to
-    # the fan's ascending-value order ([.05 .1 .25] <- [.25 .1 .05]). Composed in
-    # quadrature with each edge's own native offset.
+    # upper edges take carry[:3] in place, lower edges carry[3:] flipped into the fan's
+    # ascending order ([.05 .1 .25] <- [.25 .1 .05]), each in quadrature with its own
+    # native offset
     m0 = q0[..., median_idx].unsqueeze(-1)
     up_off0 = q0[..., median_idx + 1:] - m0
     dn_off0 = m0 - q0[..., :median_idx]
@@ -469,7 +447,7 @@ def test_assemble_quantiles_carry_spread_is_per_level():
     assert torch.allclose(qc[..., :median_idx], want_dn, atol=1e-6), (
         "lower edges must compose with their OWN carry")
 
-    # A scalar is the six-slot vector of that scalar (the legacy behaviour).
+    # a scalar is the six-slot vector of that scalar
     q_scalar, _ = assemble_quantiles(head_raw, last_bg, carry_spread=0.37)
     q_vector, _ = assemble_quantiles(
         head_raw, last_bg, carry_spread=torch.full((2 * N_SPREADS,), 0.37))
@@ -478,26 +456,21 @@ def test_assemble_quantiles_carry_spread_is_per_level():
     print("\n[DUMP] assemble_quantiles | per-level carry [.75 .9 .95 | .25 .1 .05] ✓")
 
 
-# ---------------------------------------------------------------------------
-# R1 — cumulative cross-patch-continuity median head (BG_HEAD_MEDIAN_MODE='cumulative').
-# ---------------------------------------------------------------------------
-
 def _force_mode(monkeypatch, mode: str):
-    """Set BG_HEAD_MEDIAN_MODE in config (assemble_quantiles re-imports it from config
-    at call time, so patching config alone suffices)."""
+    """``assemble_quantiles`` re-imports the mode at call time, so patching config alone
+    suffices."""
     import config
     monkeypatch.setattr(config, "BG_HEAD_MEDIAN_MODE", mode, raising=False)
 
 
 def _force_cumulative(monkeypatch, value: bool):
-    """Back-compat shim for the R1 tests: True → 'cumulative', False → 'independent'
-    (the two legacy bit-identical paths the old boolean selected)."""
+    """True -> 'cumulative', False -> 'independent'."""
     _force_mode(monkeypatch, 'cumulative' if value else 'independent')
 
 
 def test_assemble_quantiles_cumulative_c0_continuity(monkeypatch):
-    """R1 ON: for every interior patch seam, the median end of patch p equals the
-    median start of patch p+1 exactly (C0 continuity), for random nonzero head_raw."""
+    """Under 'cumulative', the median end of patch p equals the start of patch p+1
+    exactly, at every interior seam."""
     from utils import assemble_quantiles
     _force_cumulative(monkeypatch, True)
 
@@ -578,7 +551,7 @@ def test_assemble_quantiles_cumulative_p1_edge(monkeypatch):
 
 
 def test_assemble_quantiles_cumulative_median_equals_q_tau3_and_ascending(monkeypatch):
-    """R1 ON: median == q_tau[...,3] and q_tau strictly ascending along the τ axis."""
+    """Under 'cumulative': median == q_tau[...,3], and q_tau ascends in τ."""
     from utils import assemble_quantiles
     _force_cumulative(monkeypatch, True)
 
@@ -595,8 +568,7 @@ def test_assemble_quantiles_cumulative_median_equals_q_tau3_and_ascending(monkey
 
 
 def test_assemble_quantiles_cumulative_init_is_persistence(monkeypatch):
-    """R1 ON at init (zero head): median == anchor everywhere (persistence). Also
-    holds OFF (the property is flag-agnostic for the zero head)."""
+    """At init the zero head gives median == anchor everywhere, in either mode."""
     from utils import assemble_quantiles, kovatchev_f, kovatchev_f_inv
 
     B, P, S = 2, 4, 6
@@ -614,36 +586,34 @@ def test_assemble_quantiles_cumulative_init_is_persistence(monkeypatch):
     print("\n[DUMP] R1 init persistence | zero head -> median==anchor (both flags) ✓")
 
 
-# ---------------------------------------------------------------------------
-# R3 — GLOBAL smooth-basis median (BG_HEAD_MEDIAN_MODE='global', the default).
-# Projects the per-patch median delta onto a fixed low-frequency DCT-II subspace
-# over the FULL P*S horizon, killing R1's unconstrained-integrator drift.
-# ---------------------------------------------------------------------------
+# BG_HEAD_MEDIAN_MODE='global', the default: it projects the per-patch median delta
+# onto a fixed low-frequency DCT-II subspace over the FULL P*S horizon, which is what
+# kills the cumulative mode's unconstrained-integrator drift
 
 def _force_global(monkeypatch):
     _force_mode(monkeypatch, 'global')
 
 
 def _r1_cumulative_op(delta, anchor):
-    """The R1 cumulative per-patch offset o[p] = m[:,p,0]-anchor, in risk space —
-    the documented [0, 0.24, 0.43, 0.63]-style LINEAR ramp the projection must NOT
-    reproduce.  o[p] = exclusive cumsum over patches of the within-patch rise."""
+    """The cumulative per-patch offset ``o[p] = m[:,p,0] - anchor``, in risk space: an
+    exclusive cumsum over patches of the within-patch rise.
+
+    It is the linear ramp the projection must NOT reproduce.
+    """
     rise = delta[..., -1] - delta[..., 0]               # (B,P)
     o = torch.cumsum(rise, dim=1) - rise                # (B,P) exclusive
     return o                                             # m[:,p,0]-anchor == o[:,p] (d_rel[...,0]==0)
 
 
 def test_assemble_quantiles_global_non_accumulation(monkeypatch):
-    """R3 KEY REGRESSION (reproduces scratch/overshoot_diag.py's o[p] measurement):
-    under 'global', the per-patch offset o[p]=median[:,p,0]-anchor does NOT drift like
-    R1's amplifying [0,0.24,0.43,0.63] ramp. Two witnesses on RANDOM coeffs:
+    """Under 'global' the per-patch offset ``o[p]`` does not drift the way the
+    cumulative integrator's ramp does. Two witnesses, on random coefficients:
 
-    (A) for zero-mean random deltas, mean |o[p]| over the batch is NON-MONOTONE in p
-        (a projection of unbiased noise has no preferred direction — it cannot ramp);
-    (B) on the SAME random deltas, R1's cumulative integrator AMPLIFIES the offset in
-        the far patches: its mean |o[p]| at the last patch strictly exceeds global's
-        (the cumsum accumulates while the projection contracts). This is the structural
-        contrast scratch/overshoot_diag.py measured on the trained R1 checkpoint."""
+    (A) for zero-mean deltas, mean |o[p]| is NON-MONOTONE in p — a projection of
+        unbiased noise has no preferred direction, so it cannot ramp;
+    (B) on the same deltas, the cumulative integrator's mean |o[p]| at the last patch
+        strictly exceeds global's: the cumsum accumulates while the projection contracts.
+    """
     from utils import assemble_quantiles, kovatchev_f
     _force_global(monkeypatch)
 
@@ -702,9 +672,8 @@ def test_assemble_quantiles_global_is_projection_contraction(monkeypatch):
 
 
 def test_assemble_quantiles_global_smoothness(monkeypatch):
-    """R3 SMOOTHNESS: the low-pass leaves no high-frequency seam sawtooth — the
-    risk-space |Δ²m| at the patch seams {S,2S,3S} is NOT larger than the interior
-    |Δ²m| (the seam/interior ratio ~1), unlike 'independent' where seams spike."""
+    """The low-pass leaves no seam sawtooth: risk-space |Δ²m| at the seams {S, 2S, 3S}
+    is no larger than in the interior, unlike 'independent' where seams spike."""
     from utils import assemble_quantiles, kovatchev_f
     _force_global(monkeypatch)
 
@@ -735,8 +704,7 @@ def test_assemble_quantiles_global_smoothness(monkeypatch):
 
 
 def test_assemble_quantiles_global_init_persistence(monkeypatch):
-    """R3 persistence-at-init: head_raw≈0 (BG_HEAD_INIT_SCALE scale) ⇒ z≈0 ⇒
-    delta_global≈0 ⇒ median≈anchor everywhere."""
+    """At init ``head_raw ≈ 0`` gives ``delta_global ≈ 0``, so the median is the anchor."""
     from utils import assemble_quantiles, kovatchev_f
     _force_global(monkeypatch)
 
@@ -754,7 +722,6 @@ def test_assemble_quantiles_global_init_persistence(monkeypatch):
 
 
 def test_assemble_quantiles_global_median_eq_qtau3(monkeypatch):
-    """R3: median == q_tau[...,3] exactly under 'global'."""
     from utils import assemble_quantiles
     _force_global(monkeypatch)
 
@@ -768,8 +735,8 @@ def test_assemble_quantiles_global_median_eq_qtau3(monkeypatch):
 
 
 def test_assemble_quantiles_global_fan_ascending(monkeypatch):
-    """R3: the quantile fan is strictly ascending in τ under 'global' (the spread
-    structure is unchanged by the median projection)."""
+    """The median projection leaves the spread structure untouched, so the fan still
+    ascends in τ."""
     from utils import assemble_quantiles
     _force_global(monkeypatch)
 
@@ -784,12 +751,12 @@ def test_assemble_quantiles_global_fan_ascending(monkeypatch):
 
 
 def test_assemble_quantiles_global_spreads_unchanged(monkeypatch):
-    """R3: with two head_raw differing ONLY in col0 (the median delta), the band is
-    a pure function of head_raw[...,1:] and the median shift — the global projection
-    touches only `m`, never the spread fan. Witness: the per-quantile offset from the
-    median, q[...,k]-m, is IDENTICAL across the two assemblies (every q carries ±m,
-    so the comparison is done against each assembly's own median; the residual is the
-    softplus+cumsum band, bit-identical since cols 1: are shared)."""
+    """With two head_raw differing ONLY in col0, the projection touches ``m`` and never
+    the spread fan.
+
+    Witness: ``q[...,k] - m`` is identical across the two assemblies — compared against
+    each one's OWN median, since every q carries ±m.
+    """
     from utils import assemble_quantiles
     _force_global(monkeypatch)
 
@@ -816,8 +783,7 @@ def test_assemble_quantiles_global_spreads_unchanged(monkeypatch):
 
 
 def test_assemble_quantiles_global_p1_edge(monkeypatch):
-    """R3 P==1 edge: n=S=6, G clamps to <=6; no seams; within-patch low-pass; no
-    crash; median==q_tau[...,3]."""
+    """The P == 1 edge: n = S = 6, G clamps to <= 6, no seams, within-patch low-pass."""
     from utils import assemble_quantiles
     _force_global(monkeypatch)
 
@@ -833,8 +799,7 @@ def test_assemble_quantiles_global_p1_edge(monkeypatch):
 
 
 def test_assemble_quantiles_mode_cumulative_bit_identical(monkeypatch):
-    """Legacy preserved: 'cumulative' reproduces the EXACT R1 cumulative median
-    (torch.equal vs the R1 reference formula)."""
+    """'cumulative' reproduces the reference formula under ``torch.equal``."""
     from utils import assemble_quantiles, kovatchev_f
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     _force_mode(monkeypatch, 'cumulative')
@@ -860,7 +825,7 @@ def test_assemble_quantiles_mode_cumulative_bit_identical(monkeypatch):
 
 
 def test_assemble_quantiles_mode_independent_bit_identical(monkeypatch):
-    """Legacy preserved: 'independent' reproduces m=anchor+delta bit-identically."""
+    """'independent' reproduces ``m = anchor + delta`` bit-identically."""
     from utils import assemble_quantiles, kovatchev_f
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     _force_mode(monkeypatch, 'independent')
@@ -879,8 +844,8 @@ def test_assemble_quantiles_mode_independent_bit_identical(monkeypatch):
 
 
 def test_global_median_basis_orthonormal_and_cached():
-    """get_global_median_basis: orthonormal columns (BgᵀBg≈I), col0 is the constant
-    DC mode, and a second call with the same key returns the cached basis."""
+    """Orthonormal columns, col0 the constant DC mode, and a second call at the same key
+    returns the cached basis."""
     from utils import get_global_median_basis
     from config import PREDICTION_PATCHES, PATCH_SIZE, BG_HEAD_MEDIAN_GLOBAL_DIM
 
@@ -890,10 +855,10 @@ def test_global_median_basis_orthonormal_and_cached():
     gram = Bg.T @ Bg
     assert torch.allclose(gram, torch.eye(G), atol=1e-5), (
         f"columns not orthonormal: max off-diag {float((gram - torch.eye(G)).abs().max()):.3e}")
-    # col0 is the constant DC mode (all equal).
+    # col0 is the constant DC mode
     col0 = Bg[:, 0]
     assert torch.allclose(col0, col0[0].expand_as(col0), atol=1e-6), "col0 must be the DC mode"
-    # Cached: same underlying canonical tensor (same values; same object pre-move on CPU).
+    # cached: the same canonical tensor, same object pre-move on CPU
     Bg2 = get_global_median_basis(n, G, 'dct')
     assert torch.equal(Bg, Bg2)
     print(f"\n[DUMP] R3 basis | ({n},{G}) orthonormal, col0 DC (val {float(col0[0]):.3f}), cached ✓")
@@ -1015,10 +980,9 @@ def test_assembled_median_basis_has_rank_g_l_per_span():
 
 
 def test_reshape_consistency_with_to_patch_major():
-    """RESHAPE INVARIANT (highest-severity latent bug guard): the delta.reshape(B,P*S)
-    used inside assemble_quantiles's global path equals risk_loss._to_patch_major(delta)
-    — both C-contiguous patch-major (flat=p*S+s) — so the global basis and the
-    DILATE median term index the time axis identically."""
+    """``assemble_quantiles``'s ``delta.reshape(B, P*S)`` equals
+    ``risk_loss._to_patch_major(delta)`` — both C-contiguous patch-major, flat = p*S+s —
+    so the global basis and the DILATE median term index the time axis identically."""
     from risk_loss import _to_patch_major
     from config import PREDICTION_PATCHES, PATCH_SIZE
 
@@ -1030,10 +994,8 @@ def test_reshape_consistency_with_to_patch_major():
     print("\n[DUMP] R3 reshape | delta.reshape(B,P*S) == _to_patch_major(delta) ✓")
 
 
-# ---------------------------------------------------------------------------
-# ModelEMA — the finiteness guard: one NaN in the live weights must not
-# permanently poison the shadow (decay*NaN + ... == NaN forever otherwise).
-# ---------------------------------------------------------------------------
+# ModelEMA's finiteness guard: one NaN in the live weights must not permanently poison
+# the shadow, since decay*NaN + ... stays NaN forever
 
 class _TinyModel(torch.nn.Module):
     def __init__(self) -> None:

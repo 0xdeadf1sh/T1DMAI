@@ -1,14 +1,7 @@
-"""
-In-domain T1DMSIM report (announced-event regime): evaluate T1DMAI on fresh
-simulator patients drawn at fixed seeds, with each window's future carbohydrate
-and insulin announced to the model. Writes metrics/sim/{stats.json, README.md,
-figures/rmse_vs_horizon.png}.
+"""In-domain T1DMSIM report: fresh simulator patients at fixed seeds, future carb and insulin announced.
 
-The simulator is the model's training distribution, so this is an in-domain
-reference rather than a measure of generalisation, and not a peer
-comparison — the published real-CGM forecasters are omitted.
-
-Usage:  python metrics/sim/build_report.py
+Writes metrics/sim/{stats.json, README.md, figures/rmse_vs_horizon.png}.
+The simulator is the training distribution — in-domain reference, not generalisation, not a peer comparison.
 """
 from __future__ import annotations
 
@@ -42,15 +35,12 @@ def main():
     res = evaluate_from_windows(cal_w, test_w)
     res['dataset'] = 'T1DMSIM'
     res['conditional'] = True
-    # Night-onset nocturnal excursion prediction on the test patients (scored
-    # internally), adapting each sim run to a (feats, cgm, hod) record. The scored
-    # ground-truth BG is the raw (bg-clamped) CGM (one space; never the future).
+    # record = (feats, cgm, hod); truth is the raw bg-clamped CGM, never the future
     night_records = ((build_sim_feature_stack(d, stats),
                       _smooth_sim_bg(d['bg_observed']),
                       d['hour_of_day'].astype(float)) for _, d in test_runs)
     res['night_onset'] = night_onset_from_records(model, stats, night_records, device)
-    # Hour-by-hour RMSE-vs-horizon (rolled, announced) for the rmse_vs_horizon
-    # figure — figure-only, never alters the suite. Scored against smoothed CGM.
+    # rolled, announced; figure only, never alters the suite
     rbh_records = ((build_sim_feature_stack(d, stats), _smooth_sim_bg(d['bg_observed']))
                    for _, d in test_runs)
     res['rmse_by_hour'] = rmse_by_horizon_from_records(

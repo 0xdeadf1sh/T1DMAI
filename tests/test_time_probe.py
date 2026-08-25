@@ -1,37 +1,12 @@
-"""Tests for the time-of-day diagnostic probe.
+"""The time-of-day probe: per-slot hour-of-day logits over ``TIME_PROBE_N_BINS``
+circular bins, no mean-pool.
 
-The probe is a small auxiliary head that classifies the hour-of-day of EVERY
-prediction patch into ``TIME_PROBE_N_BINS`` circular bins (per-patch softmax
-logits, no mean-pool). With ``TIME_PROBE_DETACH=False`` (the crucial setting)
-its gradient co-trains the shared trunk; the forward VALUE of the forecast is
-unaffected either way.  These tests exercise:
+At ``TIME_PROBE_DETACH=False`` its gradient co-trains the shared trunk; the forward
+VALUE of the forecast is unaffected either way. Logits are ``(B, M, N_BINS)`` and
+slot ``j`` is patch ``mask_idx[:, j]``, so only a right-edge span makes slot ``j``
+the patch at ``pred_start + j``.
 
-* the retained ``utils`` circular-hour helpers (``circular_hour_error`` /
-  ``circular_hour_residual`` / ``circular_bias_hours`` / ``circular_std_hours``) —
-  circular-distance values, signed residuals, and clock bias/precision;
-* the ``model.forward(..., return_time=False)`` arity contract — a
-  BIT-IDENTICAL 2-tuple when the flag is off, a 3-tuple with the per-patch bin
-  logits ``(B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)`` (or ``None`` when the
-  probe is disabled) when on;
-* invariant I1 — the forecast (``q_tau``, ``median``) is byte-identical whether or
-  not ``return_time`` is set (the head never feeds q_tau/median in the forward);
-* the trunk coupling — with ``TIME_PROBE_DETACH=False`` a probe-only loss reaches
-  BOTH ``time_head`` and the trunk (``patch_embed``); with detach it isolates the trunk;
-* the presence/absence of ``time_head`` tracking ``config.TIME_PROBE_ENABLED``;
-* invariant I2 — building WITH vs WITHOUT the probe leaves forecast init RNG untouched.
-
-The bin helpers themselves (``time_of_day_bin_target`` / ``time_of_day_decode_bins`` /
-``time_inter_patch_jump_hours`` and the cross-window pair
-``time_cross_window_consistency_loss`` / ``time_cross_window_jump_hours``) are
-covered in ``tests/test_time_probe_bins.py``.
-
-The forward inputs come from ``tests.forward_inputs.right_edge_inputs`` — the
-four-tensor contract ``(patches, attn_mask, anchor_bg, mask_idx)`` — so the probe
-tests exercise the same masked-set harness as the model tests.  The probe reads
-one hidden state per HEAD SLOT, so its logits are ``(B, M, TIME_PROBE_N_BINS)``
-and slot ``j`` is patch ``mask_idx[:, j]``: a right-edge span makes ``M ==
-PREDICTION_PATCHES`` and slot ``j`` the patch at ``pred_start + j``, which is the
-only case in which the old ``pred_start_hour + 0.5*j`` target is correct.
+The bin helpers themselves are covered in ``tests/test_time_probe_bins.py``.
 """
 
 import math
@@ -45,24 +20,12 @@ from tests.forward_inputs import right_edge_inputs
 
 
 def _forward_inputs(B: int = 2):
-    """CPU ``(patches, attn_mask, anchor_bg, mask_idx)`` for a right-edge forecast.
-
-    Args:
-        B: batch size.
-
-    Returns:
-        The four forward tensors, with ``T = MIN_CONTEXT_PATCHES +
-        PREDICTION_PATCHES`` and ``M = PREDICTION_PATCHES`` (every slot valid).
-    """
+    """``(patches, attn_mask, anchor_bg, mask_idx)`` right-edge, every slot valid."""
     return right_edge_inputs(B, all_true_mask=True)
 
 
-# ============================================================================
-# utils circular-hour helpers (the retained, decoded-hour operators)
-# ============================================================================
-
 def test_circular_hour_error_values():
-    """The circular (wrap-around) hour distance is the shorter of the two arcs, in [0, 12]."""
+    """The shorter of the two arcs, in [0, 12]."""
     from utils import circular_hour_error
 
     cases = [
@@ -82,7 +45,7 @@ def test_circular_hour_error_values():
 
 
 def test_circular_hour_residual_signed():
-    """The signed residual keeps direction (ahead/behind); |residual| == circular error."""
+    """Signed keeps direction; |residual| == the unsigned circular error."""
     from utils import circular_hour_residual, circular_hour_error
 
     assert torch.allclose(circular_hour_residual(torch.tensor(1.0), torch.tensor(23.0)),
@@ -91,7 +54,7 @@ def test_circular_hour_residual_signed():
                           torch.tensor(-2.0), atol=1e-4)   # 11pm reads 2h BEHIND 1am
     assert torch.allclose(circular_hour_residual(torch.tensor(6.0), torch.tensor(6.0)),
                           torch.tensor(0.0), atol=1e-4)
-    # |residual| must equal the (unsigned) circular error for every non-antipodal pair.
+    # holds for every non-antipodal pair
     p = torch.arange(0.0, 24.0, 0.25)
     t = (p + torch.linspace(-11.0, 11.0, p.numel())) % 24.0
     assert torch.allclose(circular_hour_residual(p, t).abs(),
@@ -100,21 +63,20 @@ def test_circular_hour_residual_signed():
 
 
 def test_clock_bias_and_precision():
-    """Circular bias/precision recover a known constant offset and a symmetric jitter."""
     from utils import circular_bias_hours, circular_std_hours
 
     true = torch.arange(0.0, 24.0)
 
-    # (a) a constant +2 h offset: all bias, ~zero spread.
+    # a constant +2 h offset: all bias, ~zero spread
     pred_off = (true + 2.0) % 24.0
     assert torch.allclose(circular_bias_hours(pred_off, true), torch.tensor(2.0), atol=1e-3)
     assert float(circular_std_hours(pred_off, true)) < 1e-2
 
-    # (b) a perfect clock: zero bias, zero spread.
+    # a perfect clock: zero bias, zero spread
     assert torch.allclose(circular_bias_hours(true, true), torch.tensor(0.0), atol=1e-4)
     assert float(circular_std_hours(true, true)) < 1e-4
 
-    # (c) symmetric ±1 h jitter: ~zero bias, ~1 h precision.
+    # symmetric ±1 h jitter: ~zero bias, ~1 h precision
     jitter = torch.ones(24)
     jitter[1::2] = -1.0
     pred_jit = (true + jitter) % 24.0
@@ -126,17 +88,8 @@ def test_clock_bias_and_precision():
           f"pm1h jitter -> bias~{bias:.1e} sd~{sd:.2f}h checks out")
 
 
-# ============================================================================
-# model.forward return_time contract
-# ============================================================================
-
 def test_forward_return_time_arity():
-    """``return_time=False`` -> 2-tuple; ``return_time=True`` -> 3-tuple.
-
-    The third element is the per-patch bin logits
-    ``(B, PREDICTION_PATCHES, TIME_PROBE_N_BINS)`` when the probe is enabled,
-    else ``None``.
-    """
+    """The 3rd element is the per-patch bin logits, or ``None`` when the probe is off."""
     from model import T1DMAI
 
     torch.manual_seed(0)
@@ -164,14 +117,14 @@ def test_forward_return_time_arity():
 
 
 def test_probe_does_not_perturb_forecast():
-    """Invariant I1: ``q_tau`` / ``median`` are byte-identical with and without
-    ``return_time`` — the probe reads a detached pooled copy and never writes back."""
+    """``q_tau`` / ``median`` are byte-identical with and without ``return_time``: the
+    probe head never feeds them."""
     from model import T1DMAI
 
     torch.manual_seed(0)
     model = T1DMAI().eval()
-    # Build the inputs ONCE and feed the identical tensors to both calls; the
-    # forward draws no RNG, so any difference would come solely from the probe.
+    # one set of inputs for both calls; the forward draws no RNG, so any difference
+    # comes solely from the probe
     patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B=2)
 
     with torch.no_grad():
@@ -186,10 +139,7 @@ def test_probe_does_not_perturb_forecast():
 
 
 def test_detach_isolates_trunk():
-    """A probe-only loss must reach ``time_head`` but leave the trunk grad-free.
-
-    Only meaningful when the probe is built and detached; skipped otherwise.
-    """
+    """A probe-only loss reaches ``time_head`` and leaves the trunk grad-free."""
     from model import T1DMAI
 
     if not (config.TIME_PROBE_ENABLED and config.TIME_PROBE_DETACH):
@@ -201,17 +151,17 @@ def test_detach_isolates_trunk():
 
     _, _, time_pred = model(patches, attn_mask, anchor_bg, mask_idx, return_time=True)
     assert time_pred is not None, "enabled probe must return a time_pred"
-    # Probe-only objective (MSE to a fixed non-trivial target).
+    # probe-only objective: MSE to a fixed non-trivial target
     target = torch.ones_like(time_pred)
     loss = (time_pred - target).pow(2).mean()
 
     model.zero_grad()
     loss.backward()
 
-    # Trunk: the detach severs the graph, so patch_embed gets no (or zero) grad.
+    # the detach severs the graph, so patch_embed gets no grad, or a zero one
     pe_grad = model.patch_embed.weight.grad
     trunk_touched = pe_grad is not None and int(torch.count_nonzero(pe_grad)) > 0
-    # Probe: the first Linear of the 2-layer SiLU MLP must receive a real gradient.
+    # the first Linear of the 2-layer SiLU MLP must get a real gradient
     th_grad = model.time_head[0].weight.grad
     probe_nonzero = th_grad is not None and int(torch.count_nonzero(th_grad)) > 0
 
@@ -222,10 +172,8 @@ def test_detach_isolates_trunk():
 
 
 def test_undetached_probe_shapes_trunk():
-    """CRUCIAL setting: with ``TIME_PROBE_DETACH=False`` a probe-only loss reaches
-    BOTH the ``time_head`` AND the shared trunk (``patch_embed``) — the representation
-    is co-trained on circadian phase.  Skipped when the probe is disabled or detached.
-    """
+    """At ``TIME_PROBE_DETACH=False`` a probe-only loss reaches both ``time_head`` and
+    the trunk: the representation is co-trained on circadian phase."""
     from model import T1DMAI
 
     if not (config.TIME_PROBE_ENABLED and not config.TIME_PROBE_DETACH):
@@ -255,7 +203,6 @@ def test_undetached_probe_shapes_trunk():
 
 
 def test_time_head_presence():
-    """``model.time_head`` is built iff ``config.TIME_PROBE_ENABLED``."""
     from model import T1DMAI
 
     model = T1DMAI()
@@ -266,15 +213,11 @@ def test_time_head_presence():
 
 
 def test_probe_construction_preserves_forecast_init_rng(monkeypatch):
-    """I2: building the model WITH vs WITHOUT the probe yields byte-identical
-    FORECAST weights under a fixed seed.
+    """Building with vs without the probe must give byte-identical forecast weights.
 
-    The probe's ``nn.Linear`` construction consumes RNG; if that draw lands in
-    the main stream it shifts every subsequently-inited forecast weight (a subtle
-    'the probe isn't free' regression). The head is therefore built under a
-    saved/restored RNG state and re-inited last, so enabling it must not move a
-    single forecast weight. This is the test that was missing when the shift
-    first slipped in.
+    The probe's ``nn.Linear`` consumes RNG; in the main stream that draw shifts every
+    forecast weight inited after it, so the head is built under a saved/restored RNG
+    state and re-inited last.
     """
     import model as model_mod
 
@@ -299,12 +242,7 @@ def test_probe_construction_preserves_forecast_init_rng(monkeypatch):
     assert not mismatched, f"probe construction shifted forecast init for: {mismatched[:6]}"
 
 
-# ============================================================================
-# cross-window (paired-window) consistency — end-to-end training-step smoke
-# ============================================================================
-
 def _stats():
-    """Load or compute normalization stats (mirrors tests/test_data.py)."""
     import os
     from normalization import (compute_normalization_stats,
                                load_normalization_stats, NORM_STATS_FILE)
@@ -314,19 +252,12 @@ def _stats():
 
 
 def test_cross_window_training_step_smoke():
-    """End-to-end (data.py -> 2 model forwards -> L_cross -> backward) on a tiny
-    ``num_workers=0`` batch: the 2nd (next_window) forward runs, the cross-window
-    penalty is FINITE, and its co-training gradient reaches BOTH the probe head and
-    the shared trunk (``patch_embed``) — with all values finite (NaN-propagation
-    guard never fires).  Also checks the ``tod_xwin_jump_h`` witness is a finite
-    ``(B,)``.  The second forward consumes the SHIPPED ``next_window`` tensors —
-    ``patches`` / ``attn_mask`` / ``anchor_bg`` / ``mask_idx``, the same fields
-    train.py S2 hands the model — so a collate that builds window k+1's attention
-    mask from the wrong masked set fails here; the local rebuild below is an
-    independent oracle pinning that one field.  The penalty is
-    ``utils.time_cross_window_consistency_loss`` at the fixed one-horizon advance,
-    not train.py's per-sample variant: what is covered is the data.py -> model
-    plumbing, not train.py's own surface.
+    """data.py -> two forwards -> L_cross -> backward, on a tiny ``num_workers=0`` batch.
+
+    The second forward consumes the SHIPPED ``next_window`` tensors, the same fields
+    train.py hands the model, so a collate that builds window k+1's mask from the wrong
+    masked set fails here. The penalty is ``utils``'s at a fixed one-horizon advance,
+    not train.py's per-sample variant: this covers the data.py -> model plumbing only.
     """
     from data import T1DMDataset, collate_fn
     from model import T1DMAI
@@ -355,16 +286,10 @@ def test_cross_window_training_step_smoke():
     attn_mask = batch['attn_mask']
     bfd = batch['bg_formula_data']
 
-    # Window k carries the sampled masked set; window k+1 carries its OWN
-    # right-edge span, so each forward takes its own (anchor_bg, mask_idx) AND its
-    # own attention mask.  The two windows share n_ctx and therefore the left-pad,
-    # but NOT the masked set: reusing window k's mask would tell the second
-    # forward that a different set of rows is the one being predicted.
-    #
-    # The rebuild is an ORACLE, not the input: it derives window k+1's mask from
-    # n_context_patches and the shipped masked set alone, and the shipped field is
-    # pinned to it.  The forward below then runs on the shipped field, so a collate
-    # that hands the second window the wrong mask fails this test.
+    # the two windows share n_ctx and so the left-pad, but NOT the masked set: window
+    # k+1 has its own right-edge span, so it needs its own anchor_bg, mask_idx and
+    # attention mask. The rebuild is an ORACLE, not the input — the forward below runs
+    # on the shipped field, which is pinned to it.
     max_T = patches.shape[1]
     is_pad = torch.zeros(B, max_T, dtype=torch.bool)
     nw_masked = torch.zeros(B, max_T, dtype=torch.bool)
@@ -394,7 +319,7 @@ def test_cross_window_training_step_smoke():
     model.zero_grad()
     l_cross.backward()
 
-    # Co-training: the cross-window gradient reaches BOTH probe head and trunk.
+    # the cross-window gradient must reach both the probe head and the trunk
     th_grad = model.time_head[0].weight.grad
     pe_grad = model.patch_embed.weight.grad
     probe_ok = th_grad is not None and torch.isfinite(th_grad).all() \
@@ -404,7 +329,7 @@ def test_cross_window_training_step_smoke():
     assert probe_ok, "L_cross produced no finite gradient on the probe head"
     assert trunk_ok, "L_cross must co-train the trunk (finite patch_embed grad expected)"
 
-    # The cross-window witness is a finite per-sample hour deviation.
+    # the witness is a finite per-sample hour deviation
     xwin = time_cross_window_jump_hours(
         time_pred_k, time_pred_next, TIME_PROBE_N_BINS, PREDICTION_HORIZON_HOURS)
     assert xwin.shape == (B,) and torch.isfinite(xwin).all()

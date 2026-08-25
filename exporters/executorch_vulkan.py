@@ -1,24 +1,12 @@
-"""ExecuTorch Vulkan (GPU compute) exporter — T1DMDROID issue 20 feasibility spike.
+"""ExecuTorch Vulkan (GPU) exporter: the XNNPACK exporter's graph under ``VulkanPartitioner``.
 
-Lowers the SAME modified ``head_raw`` + ``time_logits`` forward the XNNPACK exporter
-uses (external struct mask, right-edge slice, graph cut at ``head_raw``, dual output),
-but with the ``VulkanPartitioner`` instead of ``XnnpackPartitioner``. It exists to
-answer ONE question cheaply, on host, before anyone builds a custom AAR:
-
-    How much of this transformer graph does the ExecuTorch Vulkan backend actually
-    accept (delegate to the GPU), and which ops does it reject (fall back to the
-    portable CPU kernels)?
-
-The suspects for rejection are the transformer-specific ops the NPU/GPU delegates
-tend not to cover: RoPE (complex-ish rotate-half + trig on positions), the SDPA with
-a float additive mask, the per-head QK RMSNorm, and the ``einsum('sk,bpkc->bpsc')``
-step-basis projection. If the graph barely delegates, that is a legitimate STOP: report
-it and skip the custom-AAR / on-device measurement, because a graph shredded into dozens
-of tiny GPU subgraphs interleaved with CPU fallbacks will lose to a clean XNNPACK CPU run
-on a ~2.16 M-param model where dispatch overhead already dominates.
-
-fp32 CPU XNNPACK remains the authority (safety rule E); nothing here changes that. This
-module only prints a report and, optionally, writes a ``.vulkan.pte`` + descriptor.
+Answers one question on host, before any custom AAR: how much of this transformer graph the Vulkan backend
+delegates, and which ops it leaves on the portable CPU kernels. The usual rejects are RoPE, SDPA with a float
+additive mask, per-head QK RMSNorm, and the ``einsum('sk,bpkc->bpsc')`` step-basis projection.
+Barely delegating is a STOP: on a ~2.16 M-param model, a graph shredded into tiny GPU subgraphs interleaved
+with CPU fallbacks loses to a clean XNNPACK CPU run, where dispatch overhead already dominates.
+fp32 CPU XNNPACK stays the authority (safety rule E). This module reports, and on request writes a
+``.vulkan.pte`` plus descriptor.
 """
 
 from __future__ import annotations
@@ -34,8 +22,7 @@ import torch
 
 import config as cfg
 from exporters.modified_forward import HeadRawForward, load_model
-# Reuse the EXACT representative input the XNNPACK exporter traces against, so the
-# partition report is about the SAME graph on the SAME input.
+# same representative input as XNNPACK, so the report is about one graph on one input
 from exporters.executorch_xnnpack import build_representative_input
 
 ENGINE = "executorch_vulkan_fp32"
@@ -48,24 +35,13 @@ def executorch_version() -> str:
 
 
 def install_vulkan_preprocess_fake_mode_fix() -> None:
-    """Cure the ExecuTorch-1.3.1 Vulkan-preprocess ``FakeTensorMode`` mismatch.
+    """Cure the ExecuTorch-1.3.1 Vulkan-preprocess ``FakeTensorMode`` mismatch. Safe to call twice.
 
-    ``VulkanBackend.preprocess`` runs the constant-fold/fuse passes (``FuseBatchNorm``,
-    ``FuseClamp``, …) over EACH delegated subgraph via ``_ExportPassBase.call``, which
-    re-traces the graph under a fake-tensor mode. To pick that mode it calls
-    ``inputs(graph_module)``; the stock ``inputs`` unwraps a lifted-constant placeholder
-    to its REAL ``.constant`` tensor. A subgraph whose sole placeholder is such a
-    constant then yields ZERO fake inputs, so ``call`` spawns a FRESH ``FakeTensorMode``
-    and the re-trace mixes it with the subgraph's own (single) export-time mode — the
-    ``AssertionError: fake mode ... doesn't match mode ...`` that blocked serialization.
-
-    The fix returns the placeholder's FAKE ``val`` (never ``.constant``), so every pass
-    re-traces under the graph's own single mode. This is numerically exact: the interp
-    only needs shape/dtype metadata; real constant values are read by the passes straight
-    from the ExportedProgram's state_dict, not from these inputs. (This model has no
-    BatchNorm/conv-clamp, so those passes are structural no-ops regardless.)
-
-    Idempotent; safe to call more than once.
+    Stock ``_ExportPassBase.inputs`` unwraps a lifted-constant placeholder to its REAL ``.constant``, so a
+    subgraph whose only placeholder is such a constant yields ZERO fake inputs, ``call`` spawns a FRESH
+    ``FakeTensorMode``, and the re-trace hits ``AssertionError: fake mode ... doesn't match mode ...``.
+    Returning the FAKE ``val`` instead keeps every pass on the graph's own mode. Numerically exact: the
+    passes read real constants from the ExportedProgram's state_dict, not from these inputs.
     """
     from executorch.exir import pass_base as _pb
 
@@ -102,8 +78,7 @@ def install_vulkan_preprocess_fake_mode_fix() -> None:
 
 
 def _ensure_flatc() -> None:
-    """Point ``FLATC_EXECUTABLE`` at the bundled flatc (bin/ is off PATH under abs-path
-    venv invocation), mirroring the XNNPACK exporter."""
+    """Point ``FLATC_EXECUTABLE`` at the bundled flatc — bin/ is off PATH under abs-path venv invocation."""
     if os.environ.get("FLATC_EXECUTABLE"):
         return
     import sys
@@ -124,18 +99,12 @@ def _target_name_node(n) -> str:
 
 
 def serialize_vulkan_pte(wrapper, patches, struct, slot_sel, out_path: str, force_fp16: bool = False) -> dict:
-    """Full ``to_edge_transform_and_lower(Vulkan) -> to_executorch`` -> write ``out_path``.
+    """``to_edge_transform_and_lower(Vulkan) -> to_executorch`` -> ``out_path``, plus a census of the program.
 
-    Requires ``install_vulkan_preprocess_fake_mode_fix()`` to have run. Returns a census
-    of the SERIALIZED program: delegate-subgraph count, ops absorbed inside the delegate
-    payloads, and the residual (CPU-fallback) op types left in the top graph.
-
-    When ``force_fp16`` is set the ``VulkanPartitioner`` is built with
-    ``compile_options={"force_fp16": True}``: the graph builder's ``get_effective_dtype``
-    maps every fp32 GPU tensor (weights + activations) to fp16 storage+compute (constants
-    clamped to the fp16 range), while the input/output STAGING buffers keep their original
-    fp32 dtype (``get_staging_dtype``) — so the Java ``Tensor.fromBlob(FloatArray)`` I/O
-    boundary is unchanged and only the on-GPU math runs at half precision.
+    Needs ``install_vulkan_preprocess_fake_mode_fix()`` first. The census counts delegate subgraphs, ops
+    absorbed in the payloads, and the CPU-fallback op types left in the top graph.
+    ``force_fp16`` maps every fp32 GPU tensor to fp16 storage and compute, constants clamped to the fp16
+    range, while the I/O STAGING buffers stay fp32 — the ``Tensor.fromBlob(FloatArray)`` boundary is unchanged.
     """
     from executorch.exir import to_edge_transform_and_lower
     from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
@@ -184,14 +153,12 @@ def serialize_vulkan_pte(wrapper, patches, struct, slot_sel, out_path: str, forc
 
 
 def cpu_faithful_deltas(wrapper, patches, struct, slot_sel) -> dict:
-    """Reference numeric check on host: lower the SAME graph to the PORTABLE CPU runtime
-    (no delegation) and compare its head_raw + time_logits to the eager modified forward.
+    """Host check: the SAME graph on the PORTABLE CPU runtime, head_raw and time_logits vs the eager forward.
 
-    The Vulkan ``.pte`` is the SAME exported graph with ~95% of ops delegated; the pip
-    ExecuTorch python runtime carries no ``VulkanBackend`` (it is Android-only in the
-    vendored custom AAR), so the GPU-executed numerics delta is measured ON-DEVICE against
-    the fp32 XNNPACK authority. This host check proves the exported graph itself is
-    faithful (the math the GPU shaders must reproduce)."""
+    The pip ExecuTorch python runtime carries no ``VulkanBackend`` — it is Android-only in the vendored AAR —
+    so the GPU numerics delta is a DEVICE measurement against the fp32 XNNPACK authority. This proves only
+    that the exported graph is faithful: the math the shaders must reproduce.
+    """
     import config as _cfg
     from executorch.exir import to_edge_transform_and_lower
     from exporters.executorch_xnnpack import run_pte_outputs
@@ -227,12 +194,12 @@ def _target_name(node) -> str:
 
 
 def _count_call_functions(gm) -> "collections.Counter[str]":
-    """Count call_function targets in a graph module (aten/edge ops only)."""
+    """Count call_function targets in a graph module; aten/edge ops only."""
     c: "collections.Counter[str]" = collections.Counter()
     for node in gm.graph.nodes:
         if node.op == "call_function":
             name = _target_name(node)
-            # skip pure symbolic-int / getitem plumbing; keep tensor ops
+            # plumbing, not a tensor op
             if name in ("<built-in function getitem>", "getitem"):
                 continue
             c[name] += 1
@@ -240,18 +207,14 @@ def _count_call_functions(gm) -> "collections.Counter[str]":
 
 
 def _delegate_op_counts(lowered_gm) -> "tuple[int, collections.Counter[str]]":
-    """Walk into each executorch_call_delegate's payload and count the ops it absorbed.
+    """Ops absorbed per ``executorch_call_delegate`` payload -> ``(n_subgraphs, Counter)``.
 
-    Returns (n_delegate_subgraphs, Counter of ops that ran on the GPU delegate).
-    Best-effort: the LoweredBackendModule stores the delegated subgraph as
-    ``original_module`` (an ExportedProgram) whose graph we can re-count.
+    Best-effort: each ``LoweredBackendModule`` keeps its subgraph as ``original_module``, which is re-counted.
     """
     n_subgraphs = 0
     absorbed: "collections.Counter[str]" = collections.Counter()
-    # named submodules of the top graph module hold the LoweredBackendModules
     lowered_mods = {}
     for name, sub in lowered_gm.named_modules():
-        # LoweredBackendModule instances carry an `original_module` ExportedProgram
         if sub.__class__.__name__ == "LoweredBackendModule":
             lowered_mods[name] = sub
     for node in lowered_gm.graph.nodes:
@@ -268,8 +231,7 @@ def _delegate_op_counts(lowered_gm) -> "tuple[int, collections.Counter[str]]":
 
 
 class _SkipCapture(logging.Handler):
-    """Capture the partitioner's '[no operator implementation], skipping ...' lines —
-    they name the exact ops the Vulkan backend has no shader for."""
+    """Capture the partitioner's 'skipping ...' lines: they name the ops Vulkan has no shader for."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -282,13 +244,10 @@ class _SkipCapture(logging.Handler):
 
 
 def partition_report(wrapper, patches, struct, slot_sel) -> dict:
-    """torch.export -> to_edge -> VulkanPartitioner().partition() and read the tags.
+    """torch.export -> to_edge -> ``VulkanPartitioner().partition()``, read off the delegation tags.
 
-    We call the partitioner DIRECTLY (not the full to_edge_transform_and_lower) so we
-    read the delegation decision — which nodes are tagged for the GPU vs left for the
-    portable CPU kernels — WITHOUT the SPIR-V preprocess/serialization step, which
-    trips an unrelated torch-2.12 / ExecuTorch-1.3.1 fake-mode bug in a shared pass.
-    The partition decision is exactly the feasibility signal Step 1 asks for.
+    The partitioner is called DIRECTLY, not through ``to_edge_transform_and_lower``, to skip the SPIR-V
+    preprocess/serialization step, which trips a torch-2.12 / ExecuTorch-1.3.1 fake-mode bug in a shared pass.
     """
     from executorch.exir import to_edge
     from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
@@ -302,7 +261,7 @@ def partition_report(wrapper, patches, struct, slot_sel) -> dict:
     edge = to_edge(ep)
     edge_ep = edge.exported_program()
 
-    # full op census of the whole edge graph, before any delegation
+    # whole-graph census, before delegation
     base_counts = _count_call_functions(edge_ep.graph_module)
     total_ops = sum(base_counts.values())
 

@@ -1,20 +1,5 @@
-"""Guard the training values migrated from the deleted training_config.json.
-
-The JSON tier used to carry the real run hyperparameters and silently override
-config.py; with it gone, config.py is the single source of truth and nothing
-validates the values anymore. These tests assert the migrated values exist and
-are in sane ranges — so a future edit that reverts a value fails loudly instead
-of silently training at the wrong LR/batch.
-"""
-
-
 def test_active_config_migrated_values():
-    """The active config carries the migrated live values.
-
-    ``NUM_WORKERS`` is not among them: it is a property of the machine the run is
-    on, not of the training recipe, and pinning it here fails on every host that
-    is not the one the value was written for. Its range is checked below.
-    """
+    """NUM_WORKERS not pinned: host property, not recipe. Range-checked below."""
     import config
     assert config.BATCH_SIZE == 64
     assert config.PATIENT_UNIFORM_SAMPLE_PROB == 0.0
@@ -35,9 +20,6 @@ def test_migrated_values_in_sane_ranges():
 
 
 def test_redesign_provenance_and_knobs_migrated():
-    """The risk-v4 redesign advances the provenance stamps; DILATE is restored on
-    the risk-v4 arch — ARCH_VERSION / LOSS_SCHEMA name the architecture and loss,
-    RoPE drops to base 1000, and the DILATE knobs replace the retired TILDE-Q ones."""
     import config
     assert config.ARCH_VERSION == 'risk-v4'
     assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-v3'

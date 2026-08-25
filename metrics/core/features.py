@@ -1,47 +1,26 @@
-"""
-Model-input bridge — converts a Segment into the model's normalized
-``N_INPUT_FEATURES``-feature input stack
-``[bg_absolute, carbs, insulin, exercise_equiv, bg_masked]``: four normalized
-signal channels plus the per-patch ``bg_masked`` announcement bit, which is 0.0
-throughout a stack of observed readings (a Segment is a record of what happened;
-the masked set is chosen downstream, by the builder that knows it).
+"""Model-input bridge: Segment -> the normalized ``N_INPUT_FEATURES`` stack
+``[bg_absolute, carbs, insulin, exercise_equiv, bg_masked]``.
 
-The model's carb/insulin channels are the simulator's absorption/action *curves*,
-so raw events must be convolved with simulator-matched kernels (validated in
-``scratch/kernel_match.py`` to reproduce the simulator's channels at r=0.94 carb,
-0.99 bolus).  The kernels here are the *analytic* forms rebuilt from the
-simulator's documented constants (reproducible, no dependence on a captured run):
+bg (feat 0) is Kovatchev risk space — ``kovatchev_f`` BEFORE the z-score; carb, insulin and exercise are log1p+z.
+``bg_masked`` is 0.0 throughout: a Segment records what happened, and the masked set is chosen downstream.
+
+The carb/insulin channels are the simulator's absorption/action CURVES, so raw events are convolved with
+analytic kernels rebuilt from the simulator's constants (``scratch/kernel_match.py``: r=0.94 carb, 0.99 bolus
+against the simulator's own channels):
 
     carb     mean meal mixture  (fast/med/slow gamma + protein/fat tail)
-    insulin  gamma k=3, θ=25    (the rapid bolus-action kernel)
-    exercise gamma k=3, θ=15    (the carbohydrate-equivalent disposal curve)
+    insulin  gamma k=3, θ=25    (rapid bolus action)
+    exercise gamma k=3, θ=15    (carbohydrate-equivalent disposal)
 
-Insulin is fed as one rapid-delivery series — bolus IU plus CSII basal converted
-from rate (IU/h → IU/step) — convolved with the rapid kernel.  A long-acting
-analogue reaching ``basal_rate`` as a 24-h-spread rate is approximated as rapid
-here.
+Insulin is one rapid-delivery series — bolus IU plus CSII basal at IU/h → IU/step; a long-acting analogue
+arriving as a 24 h-spread rate is approximated as rapid.
 
-Exercise (feat 3) is the simulator's carbohydrate-*equivalent* glucose-disposal
-curve in g/step, on the same log1p+z transform as carb.  A source with no activity
-record fills ``Segment.exercise`` with zeros, so the column is structurally present
-and identically zero; it is written explicitly rather than left at the allocation
-default, because for a ``SPARSE_LOG1P`` channel an unwritten column
-sits at z = 0, which is a phantom dose and not "no session" (no session is
-``normalize(log1p(0))``, z = -0.1387 under the balanced pool).  A source that ever
-does fill the column must convert its own quantity to g/step carbohydrate-equivalent
-first — the trained scale is g/step, not an intensity.
+Exercise (feat 3) is g/step carbohydrate-EQUIVALENT disposal, on carb's log1p+z transform, never an intensity.
+A source with no activity record writes explicit zeros: an unwritten sparse column sits at z = 0, a phantom
+dose, while no session is ``normalize(log1p(0))``, z = -0.1387 under the balanced pool.
 
-``EXERCISE_KERNEL`` is the appearance shape of ONE announced session, unit area,
-for a counterfactual that injects a session as a point event (``metrics/whatif.py``).
-It is NOT part of ``segment_to_channels``: a Segment's ``exercise`` field already
-holds the resolved per-step curve, so nothing on the input path convolves it.
-
-The risk-space redesign dropped ``bg_delta``, the IS/HGO latent channels, and the
-four temporal sin/cos features from the input stack entirely (they were never
-observable outside the simulator / the model no longer consumes them), so this bridge emits
-exactly the signal channels ``CHANNEL_NAMES`` retains.  bg (feat 0) is a
-Kovatchev risk-space channel (``kovatchev_f`` applied BEFORE the z-score); carb,
-insulin and exercise keep the log1p+z transform.
+``EXERCISE_KERNEL`` is the unit-area shape of ONE announced session, for ``metrics/whatif.py``'s point-event
+counterfactual. ``segment_to_channels`` never convolves it — a Segment's ``exercise`` is already per-step.
 """
 from __future__ import annotations
 
@@ -66,11 +45,9 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 from .schema import Segment, GRID_MIN
 
-# Truncation horizon shared by all three kernels.  The tail past it is folded back
-# in by the unit-area renormalization below, so the truncation is a stated
-# approximation rather than lost mass: measured against the same kernel built out
-# to 2400 min, 240 min retains 0.99314 of the meal mixture, 0.99616 of the bolus
-# gamma and 0.99998 of the exercise gamma (k=3, θ=15, mean 45 min).
+# Truncation horizon, minutes; the unit-area renormalization folds the tail back in rather than losing it.
+# Against the same kernels out to 2400 min, 240 min holds 0.99314 of the meal mixture, 0.99616 of the bolus
+# gamma, 0.99998 of the exercise gamma (k=3, θ=15, mean 45 min).
 _CARB_KERNEL_MIN = 240
 _BOLUS_KERNEL_MIN = 240
 _EXERCISE_KERNEL_MIN = 240
@@ -100,25 +77,12 @@ def _bolus_kernel() -> np.ndarray:
 
 
 def _exercise_kernel() -> np.ndarray:
-    """Unit-area appearance shape of one exercise session.
+    """Unit-area shape of one exercise session: a SINGLE ``EXERCISE_GAMMA_K`` / ``EXERCISE_GAMMA_THETA`` gamma.
 
-    A SINGLE gamma, ``EXERCISE_GAMMA_K`` / ``EXERCISE_GAMMA_THETA``, which is what
-    the simulator schedules for a session: it draws
-    ``gamma_curve(duration * carb_equiv_per_min, k, θ, duration + 90)`` and adds
-    the result into ``total_exercise``.  Two differences from that draw, both
-    deliberate:
-
-    * the session's own support is ``duration + 90`` min and varies per draw, so
-      it cannot be a kernel constant; this truncates at the fixed
-      ``_EXERCISE_KERNEL_MIN`` the other two kernels use and renormalizes to unit
-      area, folding the 2e-5 residual tail back in.
-    * the magnitude is factored out — the caller supplies the session's grams of
-      carbohydrate-equivalent disposal, so this carries shape only.
-
-    NOT the meal mixture: ``CARB_KERNEL`` is a three-way meal-type mixture plus a
-    protein/fat tail, and its long tail puts only 0.854 of its mass inside a 2 h
-    horizon against this curve's 0.986, so reusing it would announce a session
-    the simulator never produces.
+    The simulator's per-session support is ``duration + 90`` min and varies per draw, so it cannot be a
+    constant: this truncates at ``_EXERCISE_KERNEL_MIN`` and renormalizes, folding the 2e-5 tail back in.
+    Shape only — the caller supplies the session's grams. NOT ``CARB_KERNEL``, whose long tail leaves 0.854
+    of its mass inside 2 h against this curve's 0.986.
     """
     k = gamma_curve(1.0, EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, _EXERCISE_KERNEL_MIN)
     return k / k.sum()
@@ -140,19 +104,11 @@ def _convolve(amounts: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 
 
 def segment_to_channels(seg: Segment) -> dict[str, np.ndarray]:
-    """Convert a Segment's raw events into the model's absorption/action channels.
+    """Raw events -> ``carb`` (g/step absorption), ``insulin`` (IU/step action), ``exercise`` (g/step disposal).
 
-    A Segment carrying pre-resolved ``carb_curve`` / ``insulin_curve`` (a source
-    whose events already store the series the producer fed the model) short-circuits
-    the kernels and returns those channels as-is — the kernels below exist only to
-    reconstruct what such a source already knows.  The three published cohorts leave
-    both ``None`` and take the convolution path unchanged.
-
-    Returns dict with ``carb`` (g/step absorption), ``insulin`` (IU/step action) and
-    ``exercise`` (g/step carbohydrate-equivalent glucose disposal).  ``exercise``
-    passes through un-convolved on both paths: it is already a per-step channel, and
-    every adapter fills it with zeros.  Both paths must carry it, or the feature
-    stack's raw-column lookup has no entry for feat 3.
+    A Segment carrying pre-resolved ``carb_curve`` / ``insulin_curve`` short-circuits the kernels and returns
+    those as-is. ``exercise`` passes through un-convolved on BOTH paths — it is already per-step, and both must
+    carry it or the feature stack's raw-column lookup has no feat 3.
     """
     if seg.carb_curve is not None:
         assert seg.insulin_curve is not None, "carb_curve without insulin_curve"
@@ -167,34 +123,19 @@ def segment_to_channels(seg: Segment) -> dict[str, np.ndarray]:
 
 
 def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.ndarray:
-    """Build the normalized (N, F) input stack for a whole Segment.
+    """The normalized ``(N, F)`` input stack for a whole Segment.
 
-    Every channel of ``CHANNEL_NAMES`` (bg, carb, insulin, exercise) is normalized
-    per ``stats``: bg (feat 0) through the Kovatchev risk transform BEFORE the
-    z-score (``RISK_SPACE_CHANNELS``), carb/insulin/exercise through log1p
-    (``SPARSE_LOG1P_CHANNELS``).  The redesign removed ``bg_delta``, the IS/HGO
-    latents, and the temporal sin/cos features from the stack, so there is nothing
-    to mean-impute and no temporal tail.
-
-    Exercise (feat 3) is zero on a source with no activity record but is still
-    written explicitly:
-    an unwritten column would sit at z = 0, a phantom dose, where the true
-    no-session value is ``normalize(log1p(0))``.
-
-    Feat ``BG_MASKED_FEAT`` is the ``bg_masked`` announcement bit, not a signal: it
-    carries no normalization statistics and never crosses the z-score.  Every step
-    of a Segment is an OBSERVED reading, so the column is 0.0 throughout; the
-    masked set is written into the patches downstream, by the builder that knows
-    it (``inference._build_patches_tensor`` rewrites BOTH halves of the column, so
-    a bit riding in from here could not survive as a phantom announcement either).
+    Per ``stats``: bg (feat 0) through the Kovatchev transform BEFORE the z-score (``RISK_SPACE_CHANNELS``),
+    carb/insulin/exercise through log1p (``SPARSE_LOG1P_CHANNELS``). Exercise (feat 3) is written explicitly
+    even when zero — an unwritten column sits at z = 0, a phantom dose, not ``normalize(log1p(0))``.
+    Feat ``BG_MASKED_FEAT`` is the announcement bit: no statistics, no z-score, 0.0 throughout, since every
+    step of a Segment is OBSERVED; the masked set is written downstream.
     """
     n = len(seg)
     ch = segment_to_channels(seg)
 
-    # The model consumes RAW post-noise signals: every signal channel (bg feat0,
-    # carb feat1, insulin feat2, exercise feat3) is used raw BEFORE normalization,
-    # mirroring ``data._build_sample`` (same clamps — bg to the physical BG range,
-    # the sparse carb/insulin/exercise floored at 0; no FIR smoothing).
+    # raw post-noise, mirroring ``data._build_sample``: bg to the physical range, the sparse three floored
+    # at 0, no smoothing
     bg = np.clip(seg.cgm, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float64)
     carb = np.clip(ch['carb'], 0.0, None).astype(np.float64)
     insulin = np.clip(ch['insulin'], 0.0, None).astype(np.float64)
@@ -202,10 +143,8 @@ def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.
 
     feats = np.zeros((n, N_INPUT_FEATURES), dtype=np.float32)
     raw = {0: bg, 1: carb, 2: insulin, 3: exercise}
-    # Length check, not a name list: the guard that matters is that every NORMALIZED
-    # column gets written, since an unwritten one is a silent z = 0.  The normalized
-    # channels occupy columns 0..BG_MASKED_FEAT-1 and the mask bit sits above them,
-    # so the stack is exactly one column WIDER than CHANNEL_NAMES.
+    # every normalized column must be written — an unwritten one is a silent z = 0.
+    # Normalized channels are 0..BG_MASKED_FEAT-1, mask bit above: the stack is one column wider.
     assert len(CHANNEL_NAMES) == len(raw) == BG_MASKED_FEAT < N_INPUT_FEATURES, (
         f"{len(CHANNEL_NAMES)} CHANNEL_NAMES, {len(raw)} raw columns, "
         f"BG_MASKED_FEAT {BG_MASKED_FEAT}, N_INPUT_FEATURES {N_INPUT_FEATURES}"
@@ -221,12 +160,9 @@ def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.
 
 
 def smoothed_cgm(cgm: np.ndarray) -> np.ndarray:
-    """RAW CGM (mg/dL), bg-clamped — the comparison ground truth for every metric.
+    """RAW CGM (mg/dL), bg-clamped — the truth every metric and anchor is scored against.
 
-    The model consumes raw post-noise signals, so the truth a forecast is scored
-    against (and the persistence/last-context anchors derived from it) is the raw
-    CGM, physical-range clamped, that ``build_feature_stack`` feeds the model. Name
-    kept for its many call-sites; no FIR smoothing is applied.
+    No smoothing despite the name, kept for its call sites: the model consumes raw post-noise signals.
     """
     return np.clip(np.asarray(cgm, dtype=np.float64), BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
 

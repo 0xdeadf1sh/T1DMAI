@@ -1,45 +1,21 @@
 """The bit-identity gate: a checked-in reference, and the round trip.
 
-``scratch/bitident.py`` freezes a reference forward and compares against it.
-Running it is what makes a later disagreement with the historical tables
-ATTRIBUTABLE: without a gate, "the objective changed" and "I introduced a bug"
-produce the same table and nothing separates them.
+IDENTITY -- ``tests/bitident_ref.json`` is a forward frozen at one config and
+travels with the repository, so a forward change moves one side only. Refreeze
+deliberately, when its stamped config moves, never to turn a red test green::
 
-Two halves, and the first is not implied by the second:
+    venv/bin/python -m tests.test_bitident
 
-  * IDENTITY -- ``tests/bitident_ref.json`` holds a forward frozen at one
-    config and travels with the repository, so a change to the forward moves
-    one side of the comparison and not the other.  This is the half that
-    catches a change.  Refreeze it deliberately, when the config it is stamped
-    with moves, and never to turn a red test green::
+REPRODUCIBILITY -- the ``tmp_path`` round trip builds both sides in one process, so
+a forward change moves both and it sees none.
 
-        venv/bin/python -m tests.test_bitident
+JSON with each tensor's bytes in base64, because ``*.pt`` is gitignored and an
+untracked reference is the failure this half exists to prevent.
 
-  * REPRODUCIBILITY -- the ``tmp_path`` round trip freezes and compares in one
-    process, so it holds at any capacity and any sampler arm.  Both of its
-    sides move together under a forward change, so it sees none.
-
-The reference is JSON carrying each tensor's own bytes in base64, because
-``*.pt`` is gitignored and a reference that is not tracked is exactly the
-failure this half exists to prevent.  Bit-exactness survives the encoding.
-
-The implementation is untracked, so a clean checkout carries the reference and
-not the forward that froze it.  This module then skips at module level and
-warns; see the guard below for why it is neither raised nor merely skipped.
-
-A reference answers at ONE config.  Where it cannot answer today's question --
-another capacity, another masked set, another batch geometry, another torch --
-this xfails, naming what moved and what to run; only a real disagreement at a
-matching stamp is a failure.
-
-Two things are gated, and the second is not implied by the first:
-
-  * ``head_raw``, ``q_tau`` and ``median`` at max|delta| == 0.0 exactly.  A
-    tolerance here would admit exactly the drift the gate exists to catch.
-  * the attention mask over ALL rows, PADDED ONES INCLUDED.  A pad row that
-    wrongly opens onto the visible columns changes no forward output -- pad
-    columns are blocked, so a pad row never feeds a real row -- so an
-    output-only check passes straight over it.
+Gated at max|delta| == 0.0 exactly: ``head_raw``, ``q_tau``, ``median``, plus the
+attention mask over ALL rows, PADDED ONES INCLUDED — a pad row wrongly opening onto
+visible columns changes no output, since pad columns are blocked, so an output-only
+check passes straight over it.
 """
 
 import base64
@@ -57,21 +33,11 @@ import config
 BITIDENT = Path(__file__).resolve().parent.parent / "scratch" / "bitident.py"
 REFERENCE = Path(__file__).resolve().parent / "bitident_ref.json"
 
-# The implementation is untracked -- ``scratch/`` is gitignored -- so on a clean
-# checkout it is simply absent.  Two failure modes to miss between, and this
-# guard is placed to hit neither:
-#
-#   * RAISING here aborts COLLECTION, and with no conftest.py to contain it that
-#     ends the whole session at zero tests.  One absent gate then costs every
-#     other test in the repository, and the exit code says "collection error"
-#     rather than naming what is missing.
-#   * SKIPPING alone reads as green: `-q` prints one `s`, and a gate nobody can
-#     tell is off gates nothing.
-#
-# So both: the skip keeps the rest of the suite running, and the warning is what
-# the skip cannot be mistaken for green through -- pytest prints its warnings
-# summary under `-q`, so an ungated forward is named on every run and not only
-# under `-rs`.
+# ``scratch/`` is gitignored, so a clean checkout has no implementation. Skip AND
+# warn, never raise: raising aborts collection with no conftest.py to contain it,
+# ending the session at zero tests; skipping alone reads as green under `-q`.
+# pytest prints its warnings summary under `-q`, so an ungated forward is named on
+# every run rather than only under `-rs`.
 if not BITIDENT.exists():
     _ABSENT = (
         "BIT-IDENTITY GATE OFF -- the forward is UNGATED. Its implementation "
@@ -88,18 +54,15 @@ _spec = importlib.util.spec_from_file_location("bitident_gate", BITIDENT)
 bitident = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bitident)
 
-# Interior (neither edge), non-abutting, and inside the SHORTEST row's real
-# region: ``build_batch`` left-pads a MIN_CONTEXT_PATCHES row up to the
-# MAX_CONTEXT_PATCHES one, so every column here must be at least
-# ``MAX_CONTEXT_PATCHES - MIN_CONTEXT_PATCHES``. Derived rather than hardcoded
-# because the previous literals silently fell into the pad when the context
-# window moved 16-48 -> 48-96.
+# interior, non-abutting, inside the SHORTEST row's real region: ``build_batch``
+# left-pads a MIN_CONTEXT_PATCHES row up to MAX_CONTEXT_PATCHES, so every column
+# must clear MAX - MIN. Derived, never hardcoded — literals fall into the pad the
+# next time the context window moves.
 _INFILL_FLOOR = config.MAX_CONTEXT_PATCHES - config.MIN_CONTEXT_PATCHES
 INFILL_SPANS = [(_INFILL_FLOOR + 6, 2), (_INFILL_FLOOR + 12, 3)]
 
-# The batch's own shape and content, which ``capacity()`` does not carry: these
-# move the frozen inputs rather than the arithmetic over them, so a reference at
-# another value of any of them answers a different question.
+# the batch's shape and content, which ``capacity()`` does not carry: these move the
+# frozen inputs rather than the arithmetic, so another value answers another question
 GEOMETRY_KEYS = (
     "PATCH_SIZE",
     "N_INPUT_FEATURES",
@@ -125,10 +88,10 @@ def _decode(d: dict) -> torch.Tensor:
 
 
 def _stamp() -> dict:
-    """What the reference must have been frozen at to be comparable at all.
+    """What the reference must have been frozen at to be comparable.
 
-    Capacity and the masked set are NOT here: ``compare`` stamps and rejects
-    those itself, and restating its rule here would be a second copy of it.
+    Capacity and the masked set are ``compare``'s to stamp and reject, not a second
+    copy here.
     """
     return {
         "geometry": {k: int(getattr(config, k)) for k in GEOMETRY_KEYS},
@@ -194,10 +157,9 @@ def _unanswerable(doc: dict) -> str | None:
 def pinned():
     """One thread, and the global RNG left as it was found.
 
-    The reduction order in the attention matmuls is thread-count dependent, so
-    a freeze and a compare at different thread counts are not bitwise
-    comparable on a loaded box.  ``build_model`` reseeds the global generator,
-    which is forked here so no other test module inherits it.
+    Attention matmul reduction order is thread-count dependent, so a freeze and a
+    compare at different thread counts are not bitwise comparable. ``build_model``
+    reseeds the global generator, forked here so no other module inherits it.
     """
     prior = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -217,12 +179,8 @@ def frozen(pinned, tmp_path_factory):
 
 
 def test_forward_matches_the_checked_in_reference(pinned, tmp_path):
-    """Today's forward against a reference frozen before today's changes.
-
-    The round trip below cannot do this: it builds both sides from the code in
-    front of it, so a forward that shifts every output by a constant shifts
-    both sides identically and passes.
-    """
+    """The round trip below builds both sides from the code in front of it, so a
+    forward shifting every output by a constant passes it."""
     doc = json.loads(REFERENCE.read_text())
     print(f"[DUMP] reference {REFERENCE} stamp {doc['stamp']}")
 
@@ -248,7 +206,6 @@ def test_forward_matches_the_checked_in_reference(pinned, tmp_path):
 
 
 def test_round_trip_is_bit_identical(frozen):
-    """Freeze, rebuild, and require an exact match on every gated tensor."""
     ref = torch.load(frozen, weights_only=False)
     assert ref["capacity"] == bitident.capacity()
 
@@ -269,10 +226,8 @@ def test_round_trip_is_bit_identical(frozen):
 def test_mask_matches_over_padded_rows(frozen):
     """The pad rows agree, and they are closed.
 
-    Equality over the pad rows is checked on its own because it is the half a
-    head_raw comparison cannot see, and the closure rule is checked because
-    freeze and compare build the mask through the same call: the round trip
-    gates reproducibility, this gates the rule itself.
+    A head_raw comparison cannot see either: freeze and compare build the mask
+    through the same call, so the round trip gates reproducibility, this the rule.
     """
     ref = torch.load(frozen, weights_only=False)
     batch = bitident.build_batch()
@@ -310,11 +265,8 @@ def test_compare_rejects_a_perturbed_reference(frozen, tmp_path):
 
 
 def test_compare_rejects_a_foreign_reference(frozen, tmp_path):
-    """Another capacity or another masked set is rejected, never compared.
-
-    Both report a large delta if let through, which reads as a broken change
-    rather than as a reference that cannot answer the question.
-    """
+    """Another capacity or masked set is rejected, never compared: let through, both
+    report a large delta, reading as a broken change rather than a stale reference."""
     ref = torch.load(frozen, weights_only=False)
     ref["capacity"] = dict(ref["capacity"], D_MODEL=ref["capacity"]["D_MODEL"] * 2)
     path = tmp_path / "wrong_capacity.pt"

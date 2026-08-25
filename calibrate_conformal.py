@@ -1,37 +1,34 @@
 """Fit region-binned split-conformal quantile corrections on the reserved partition.
 
-Post-hoc calibration step (run AFTER training): loads a checkpoint, runs the model
-over the disjoint ``CALIBRATION_RESERVE_*`` simulator partition, fits the
-per-horizon / per-quantile ``delta`` ONCE PER REGION BIN (``mondrian.fit_mondrian``),
-stores it back into the checkpoint under ``conformal_delta``, and reports
-raw-vs-marginal-vs-binned excursion-peak coverage on a disjoint test band so the
-effect is visible.
+Run AFTER training: loads a checkpoint, runs the model over the disjoint
+``CALIBRATION_RESERVE_*`` simulator partition, fits the per-step / per-quantile ``delta``
+ONCE PER REGION BIN (``mondrian.fit_mondrian``), stores it back into the checkpoint under
+``conformal_delta``, and reports raw-vs-marginal-vs-binned excursion-peak coverage on a
+disjoint test band.
 
 THIS IS THE BAND THAT SHIPS. ``ckpt['conformal_delta']`` is what
 ``metrics/core/report.py`` attaches to the model and what every ``inference.predict``
-call applies, so a marginal fit here leaves the deployed correction marginal
-however many evaluation paths are binned.
+call applies, so a marginal fit here leaves the deployed correction marginal however many
+evaluation paths are binned.
 
-TWO PROTOCOLS, ONE OF THEM SHIPPED. The forecast protocol (the trailing masked
-span) is what feeds the alarm path, and it is the only protocol whose delta is
-written to ``conformal_delta``. The infill protocol — an interior masked span,
-bracketed by visible evidence on both sides — is fitted separately, announces
-every marginal fallback on stdout, and is stored under ``conformal_delta_infill``
-with ``shipped = False``. Infill residuals are the easier ones (its slots sit at
-two-sided ``d`` = 1..2), and folding them into the shipped band would buy an
-apparently tighter interval the forecast cannot honour.
+TWO PROTOCOLS, ONE OF THEM SHIPPED. The forecast protocol (the trailing masked span)
+feeds the alarm path and is the only one whose delta is written to ``conformal_delta``.
+The infill protocol — an interior masked span, bracketed by visible evidence on both
+sides — is fitted separately, announces every marginal fallback on stdout, and is stored
+under ``conformal_delta_infill`` with ``shipped = False``. Its slots sit at two-sided
+``d`` = 1..2, so folding them into the shipped band would buy an apparently tighter
+interval the forecast cannot honour.
 
-The corrections live in mg/dL and are fit on the distribution they will serve; re-fit
-on a held-out slice of that cohort (coverage validity needs cal/test exchangeability).
+The corrections live in mg/dL and must be re-fit on a held-out slice of the distribution
+they will serve — coverage validity needs cal/test exchangeability.
 
 Usage:
     python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt [--n-cal 64]
     python calibrate_conformal.py --checkpoint checkpoints_blind/t1dmai_best.pt --blind
 
-``--blind`` fits under the unconditioned policy ``train_blind.py`` trains, and the
-flag must agree with the checkpoint's own ``masked_channel_policy`` — a mismatch
-is refused, because the delta that would ship was fitted on a distribution the
-model does not run in.
+``--blind`` fits under the unconditioned policy ``train_blind.py`` trains, and must agree
+with the checkpoint's own ``masked_channel_policy`` — a mismatch is refused, because the
+delta that would ship was fitted on a distribution the model does not run in.
 """
 from __future__ import annotations
 
@@ -59,15 +56,11 @@ LEVELS = config.QUANTILE_LEVELS
 MED = LEVELS.index(0.5)
 LO, HI, H10 = LEVELS.index(0.05), LEVELS.index(0.95), LEVELS.index(0.10)
 
-# --------------------------------------------------------------------------- #
-# The infill protocol
-# --------------------------------------------------------------------------- #
-# One interior span, in the middle of the context, alongside the mandatory
-# forecast span — ``inference._resolve_mask_spans`` requires the whole future zone
-# to be masked whatever else is, since it carries no observed BG at all.  The
-# interior span is bracketed on both sides, so its slots sit at two-sided
-# ``d`` = min(j+1, L-j): 1, 2, 2, 1 at L = 4.  That is the easy regime, and it is
-# exactly why this protocol's residuals are fitted and stored apart from the
+# One interior span mid-context, alongside the mandatory forecast span —
+# ``inference._resolve_mask_spans`` requires the whole future zone masked whatever else
+# is, since it carries no observed BG at all. The interior span is bracketed on both
+# sides, so its slots sit at two-sided ``d`` = min(j+1, L-j): 1, 2, 2, 1 at L = 4. That
+# easy regime is why this protocol's residuals are fitted and stored apart from the
 # forecast's rather than pooled with them.
 INFILL_SPAN_LEN = 4
 INFILL_START_PATCH = config.MAX_CONTEXT_PATCHES // 2
@@ -84,35 +77,26 @@ INFILL_D_PER_STEP = np.repeat(
     config.PATCH_SIZE)
 
 ANNOUNCE = (0, 1, 2)                       # carb, insulin, exercise
-# Every announceable channel is announced, and that is checked rather than left to
-# read correctly: an announced set short of ``CHANNEL_TO_FEAT`` leaves the dropped
-# slot at ``normalize(0)``, which for exercise_equiv is a legal "no session" value
-# (−0.139 z on the balanced pool). The correction would then be fitted on a regime
-# training never saw, and stored into the checkpoint as if it were the model's.
+# Checked rather than left to read correctly: an announced set short of
+# ``CHANNEL_TO_FEAT`` leaves the dropped slot at ``normalize(0)``, which for
+# exercise_equiv is a legal "no session" value (−0.139 z on the balanced pool). The
+# correction would then be fitted on a regime training never saw and stored into the
+# checkpoint as if it were the model's.
 assert ANNOUNCE == tuple(config.CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(config.CHANNEL_TO_FEAT)}")
 
 
 def _check_policy(ckpt: dict, blind: bool) -> str:
-    """The checkpoint's masked-channel policy, or ``SystemExit`` if it is not
-    the one this fit would run.
+    """The checkpoint's masked-channel policy; ``SystemExit`` if it is not this fit's.
 
-    A conformal delta is valid only under cal/test exchangeability with the
-    distribution the model runs in, and the two policies ARE different
-    distributions — one announces the future plan, the other withholds it. The
-    delta lands in ``ckpt['conformal_delta']``, which is the band that ships, so
-    a fit under the wrong policy is not a bad number on a page: it is a wrong
-    interval on the phone.
+    A conformal delta is valid only under cal/test exchangeability with the distribution
+    the model runs in, and the two policies ARE different distributions — one announces
+    the future plan, the other withholds it. The delta lands in
+    ``ckpt['conformal_delta']``, the band that ships, so a fit under the wrong policy is
+    a wrong interval on the phone, not a bad number on a page.
 
-    An absent key reads as announced. The key was introduced with the blind
-    trainer, which always stamps it, so nothing that lacks it is blind.
-
-    Args:
-        ckpt: the loaded checkpoint dict.
-        blind: whether ``--blind`` was passed.
-
-    Returns:
-        The checkpoint's policy string, when it matches.
+    An absent key reads as announced: the key arrived with the blind trainer, which
+    always stamps it.
     """
     stored = str((ckpt.get('training_config') or {}).get(
         'masked_channel_policy', masked_channel_policy(blind=False)))
@@ -131,17 +115,13 @@ def _check_policy(ckpt: dict, blind: bool) -> str:
 def _blind_context(ctx, fill: dict[int, float]):
     """A copy of ``ctx`` with the infill span's dose channels withheld.
 
-    The interior span this script masks sits INSIDE the context, so its doses
-    arrive through ``context_window`` rather than through an override, and
-    ``inference._build_patches_tensor`` withholds only bg there — the announced
-    policy. Under the blind policy they go with the bg, and this is where.
+    The interior span this script masks sits INSIDE the context, so its doses arrive
+    through ``context_window`` rather than through an override, and
+    ``inference._build_patches_tensor`` withholds only bg there — the announced policy.
+    Under the blind policy the doses go with the bg, and this is where.
 
-    Args:
-        ctx: ``(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)`` context patches.
-        fill: ``data.zero_dose_fill``'s ``{feat: z}``.
-
-    Returns:
-        A new tensor of the same shape; ``ctx`` is not modified.
+    ctx: ``(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)``; not modified.
+    fill: ``data.zero_dose_fill``'s ``{feat: z}``.
     """
     import torch
     n_ctx = ctx.shape[0]
@@ -156,23 +136,20 @@ def _collect(model, seeds, stats, device, infill: bool = True,
              blind: bool = False) -> dict:
     """Run the model over fresh sim patients under both protocols.
 
-    Returns a dict of stacked arrays:
-
-    ``q`` ``(N,H,K)`` / ``true`` ``(N,H)`` / ``peak`` ``(N,)`` / ``exc`` ``(N,)`` /
-    ``patient`` ``(N,)`` — the FORECAST protocol (the trailing masked span), and
-    ``iq`` ``(Ni,H,K)`` / ``itrue`` ``(Ni,H)`` / ``ipatient`` ``(Ni,)`` — the INFILL
+    Stacked arrays: ``q`` ``(N,H,K)`` / ``true`` ``(N,H)`` / ``peak`` ``(N,)`` / ``exc``
+    ``(N,)`` / ``patient`` ``(N,)`` for the FORECAST protocol (the trailing masked span),
+    and ``iq`` ``(Ni,H,K)`` / ``itrue`` ``(Ni,H)`` / ``ipatient`` ``(Ni,)`` for the INFILL
     protocol, empty when ``infill`` is False.
 
-    The infill pass masks the interior span AND the forecast zone in one forward
-    (the future zone carries no observed BG, so it is never left visible), then
-    keeps the interior rows only: ``mask_idx < MAX_CONTEXT_PATCHES``.
+    The infill pass masks the interior span AND the forecast zone in one forward (the
+    future zone carries no observed BG, so it is never left visible), then keeps the
+    interior rows only: ``mask_idx < MAX_CONTEXT_PATCHES``.
 
-    ``blind`` calibrates under the unconditioned policy ``train_blind.py`` trains:
-    nothing is announced in the future zone (which leaves it at the same
-    ``normalize(0)`` the blind fill is), and the interior span's doses are
-    withheld with its bg. Split conformal is only valid on the distribution the
-    model runs under, so this has to match the checkpoint — ``main`` refuses a
-    mismatch rather than fitting a band on the wrong regime.
+    ``blind`` calibrates under the unconditioned policy ``train_blind.py`` trains: nothing
+    announced in the future zone (which leaves it at the same ``normalize(0)`` the blind
+    fill is), and the interior span's doses withheld with its bg. Split conformal is valid
+    only on the distribution the model runs under, so this must match the checkpoint —
+    ``main`` refuses a mismatch.
     """
     import sim_data as S
     from sim_data import build_sim_feature_stack, _smooth_sim_bg, _future_overrides
@@ -230,9 +207,8 @@ def _collect(model, seeds, stats, device, infill: bool = True,
 def _peak_coverage(q, true, j, exc):
     """Excursion-peak coverage, lower-edge escape, hypo-edge escape and MEAN WIDTH.
 
-    The width travels with the coverage because the two are traded against each
-    other: a correction that widens every interval raises coverage and says
-    nothing on its own.
+    The width travels with the coverage because the two are traded against each other: a
+    correction that widens every interval raises coverage and says nothing on its own.
     """
     rows = [i for i in range(len(q)) if exc[i]]
     c90 = np.mean([q[i, j[i], LO] <= true[i, j[i]] <= q[i, j[i], HI] for i in rows])
@@ -283,9 +259,7 @@ def main() -> None:
     cal = _collect(model, cal_seeds, stats, device, infill=do_infill, blind=args.blind)
     test = _collect(model, test_seeds, stats, device, infill=do_infill, blind=args.blind)
 
-    # ------------------------------------------------------------------ #
     # The FORECAST protocol — the only one that ships.
-    # ------------------------------------------------------------------ #
     cal_bin = mondrian.region_bin(mondrian.forecast_destination(cal['q'], MED))
     test_bin = mondrian.region_bin(mondrian.forecast_destination(test['q'], MED))
     delta, marginal, meta = mondrian.fit_mondrian(
@@ -318,9 +292,7 @@ def main() -> None:
     mondrian.print_bin_report(fc_report, 0.90,
                               "forecast protocol, per region bin and per d")
 
-    # ------------------------------------------------------------------ #
     # The INFILL protocol — its own coarse fit, never written to the band.
-    # ------------------------------------------------------------------ #
     idelta = imeta = None
     if do_infill and len(cal['iq']) and len(test['iq']):
         print(f"\ninfill protocol: interior span ({INFILL_START_PATCH}, {INFILL_SPAN_LEN}), "
@@ -341,18 +313,16 @@ def main() -> None:
             0.90, "infill protocol, per region bin and per d (NOT shipped)")
 
     if not args.no_write:
-        # Store as a TORCH tensor, not a numpy array: torch.load(weights_only=True)
-        # (the secure default since PyTorch 2.6, used by load_model and the whole
-        # metrics pipeline) refuses to unpickle numpy's _reconstruct, so a
-        # numpy delta makes the checkpoint unloadable on the safe path. Tensors and
-        # plain python types (the meta below) are weights_only-safe.
+        # A torch tensor, not a numpy array: torch.load(weights_only=True) — the secure
+        # default since PyTorch 2.6, used by load_model and the whole metrics pipeline —
+        # refuses to unpickle numpy's _reconstruct, so a numpy delta makes the checkpoint
+        # unloadable on the safe path.
         #
-        # ``conformal_delta`` is now (n_bins, S, K) and is selected by the window's
-        # own region, so a consumer must group its windows by bin and call
-        # ``conformal.apply_quantile_conformal`` once per group with that bin's
-        # (S, K) slice — ``mondrian.apply_mondrian`` does exactly that. A consumer
-        # that passes the whole stack straight through fails the 2-D assert in
-        # ``conformal.apply_quantile_conformal`` rather than mis-broadcasting.
+        # ``conformal_delta`` is (n_bins, S, K), selected by the window's own region: a
+        # consumer must group its windows by bin and call
+        # ``conformal.apply_quantile_conformal`` once per group with that bin's (S, K)
+        # slice, as ``mondrian.apply_mondrian`` does. Passing the whole stack through
+        # fails that function's 2-D assert rather than mis-broadcasting.
         assert meta['shipped'] is True and meta['protocol'] == 'forecast'
         ckpt['conformal_delta'] = torch.from_numpy(delta.astype(np.float32))
         ckpt['conformal_delta_marginal'] = torch.from_numpy(marginal.astype(np.float32))

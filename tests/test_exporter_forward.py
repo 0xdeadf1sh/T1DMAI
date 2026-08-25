@@ -1,22 +1,8 @@
 """The exported ``HeadRawForward`` wrapper, RUN against the real model.
 
-The wrapper reimplements ``T1DMAI.forward``'s plumbing (external additive mask,
-right-edge slice, graph cut at ``head_raw``), so it re-states the block-call
-signature and the head's reading position.  Both drift silently when the model
-changes: a stale block call raises only when the wrapper is CALLED, and a stale
-reading position never raises at all.  Every test here therefore executes it.
-
-Covered: that the wrapper runs under the current ``TransformerBlock.forward``
-arity; its two output shapes; its numeric agreement with the stock forward's
-internal ``head_raw`` and time-probe logits on the equivalent right-edge masked
-set; that it reads the TRAILING ``PREDICTION_PATCHES`` and not some other window;
-that padding never reaches a prediction token; and that ``torch.export`` traces it
-to a graph reproducing the same numbers.
-
-NOT covered: the ExecuTorch / LiteRT lowering, ``.pte`` / ``.tflite``
-serialization, delegate partitioning, and every on-device numeric.  Those need the
-backends and hardware this suite does not have; ``exporters/executorch_xnnpack.py``
-gates them at export time against a real checkpoint.
+A stale block call raises only when the wrapper is CALLED and a stale reading
+position never raises at all, so every test here executes it. Lowering,
+serialization and on-device numerics are NOT covered.
 """
 
 import pytest
@@ -31,23 +17,22 @@ from model import T1DMAI
 from tests.forward_inputs import right_edge_inputs
 from utils import create_attention_mask
 
-# The export's ONE fixed shape: the real context left-padded into MAX_CONTEXT_PATCHES
-# slots with the prediction patches at the right edge.
+# the export's one fixed shape: context left-padded into MAX_CONTEXT_PATCHES slots,
+# prediction patches at the right edge
 T = cfg.MAX_SEQ_LEN
 C = cfg.MAX_CONTEXT_PATCHES
 P = cfg.PREDICTION_PATCHES
 HEAD_RAW_SHAPE = (1, P, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
 TIME_LOGITS_SHAPE = (1, P, cfg.TIME_PROBE_N_BINS)
 
-# A legal mg/dL anchor. head_raw is cut BEFORE assemble_quantiles, so the anchor
-# never touches the compared tensor — it only has to clear the forward's units
-# tripwire on the stock reference path.
+# head_raw is cut before assemble_quantiles, so this only has to clear the stock
+# forward's mg/dL units tripwire
 ANCHOR_MGDL = 120.0
 
 
 @pytest.fixture(scope="module")
 def model() -> T1DMAI:
-    """One frozen eval-mode model for the whole module (8 blocks is not free)."""
+    """Module-scoped: 8 blocks is not free."""
     torch.manual_seed(0)
     m = T1DMAI().eval()
     for p in m.parameters():
@@ -57,11 +42,9 @@ def model() -> T1DMAI:
 
 @pytest.fixture(scope="module")
 def full_context():
-    """``(patches, struct, bool_mask)`` at ``n_ctx = MAX_CONTEXT_PATCHES`` — no padding.
+    """``(patches, struct, bool_mask)`` at ``n_ctx = MAX_CONTEXT_PATCHES``.
 
-    With every context slot real, the export's struct mask and the stock bool mask
-    describe exactly the same attention pattern, so the two forwards are comparable
-    without a padding caveat.
+    No padding, so struct and bool mask describe the same attention pattern.
     """
     patches, _attn, _anchor, _mask_idx = right_edge_inputs(B=1, n_ctx=C, seed=7)
     struct = build_struct_mask(C, dtype=torch.float32)
@@ -69,12 +52,6 @@ def full_context():
 
 
 def test_wrapper_runs_and_emits_the_two_declared_outputs(model, full_context):
-    """The defect this file exists for: a stale block call raises only on a CALL.
-
-    ``tests/test_exporter_descriptor.py`` passes without ever reaching the wrapper,
-    which is how a four-argument ``TransformerBlock.forward`` and a five-argument
-    call site coexisted.
-    """
     patches, struct, _bool_mask = full_context
     wrapper = HeadRawForward(model).eval()
 
@@ -88,11 +65,7 @@ def test_wrapper_runs_and_emits_the_two_declared_outputs(model, full_context):
 
 
 def test_head_raw_matches_the_stock_forward_on_the_same_masked_set(model, full_context):
-    """The additive struct mask must reproduce the stock bool-mask forward exactly.
-
-    ``exp(NEG_FILL)`` underflows to 0.0 in fp32, so the blocked positions carry the
-    same softmax weight a ``-inf`` bool mask gives them.
-    """
+    """``exp(NEG_FILL)`` underflows to 0.0 in fp32, matching a ``-inf`` bool mask."""
     patches, struct, bool_mask = full_context
     wrapper = HeadRawForward(model).eval()
 
@@ -107,8 +80,7 @@ def test_head_raw_matches_the_stock_forward_on_the_same_masked_set(model, full_c
 
 
 def test_time_logits_match_the_stock_probe(model, full_context):
-    """Output 1 is the co-trained probe read off the SAME hidden states, not a
-    second head — so it tracks the stock ``return_time=True`` path exactly."""
+    """The probe reads the same hidden states, not a second head."""
     patches, struct, bool_mask = full_context
     wrapper = HeadRawForward(model).eval()
 
@@ -122,11 +94,10 @@ def test_time_logits_match_the_stock_probe(model, full_context):
 
 
 def test_head_reads_the_trailing_prediction_patches(model, full_context):
-    """The RIGHT-EDGE SPECIALISATION (SPEC/inference.md §3.1), pinned.
+    """The right-edge specialisation, SPEC/inference.md §3.1.
 
-    The wrapper slices where the general forward gathers, so the agreement above is
-    only evidence of the right reading position if a DIFFERENT position disagrees.
-    A window shifted one patch left must not reproduce it.
+    The wrapper slices where the general forward gathers, so a window shifted one
+    patch left must NOT reproduce the output, or the match proves nothing.
     """
     patches, struct, bool_mask = full_context
     wrapper = HeadRawForward(model).eval()
@@ -157,13 +128,9 @@ def test_head_reads_the_trailing_prediction_patches(model, full_context):
 
 
 def test_struct_mask_is_the_additive_form_of_the_stock_bool_mask():
-    """The exporter's live self-check, as a test.
-
-    ``build_struct_mask`` is a second construction of the attention pattern
-    ``utils.create_attention_mask`` builds; at ``n_ctx = MAX_CONTEXT_PATCHES`` (no
-    padding) the two must agree entry for entry, or the graph ships a mask the model
-    was never trained under.
-    """
+    """``build_struct_mask`` is a second construction of ``create_attention_mask``'s
+    pattern; unpadded they must agree entry for entry or the graph ships a mask the
+    model was never trained under."""
     struct = build_struct_mask(C, dtype=torch.float32)
     stock_bool = create_attention_mask(C, P)
     expected = torch.where(
@@ -177,12 +144,8 @@ def test_struct_mask_is_the_additive_form_of_the_stock_bool_mask():
 
 
 def test_padding_never_reaches_a_prediction_token(model):
-    """Every pad COLUMN is blocked, so pad values cannot move the forecast.
-
-    A short context is left-padded into the fixed ``T``; the pad patches carry
-    whatever the caller left there. Perturbing them must leave ``head_raw``
-    untouched — that is the whole reason the struct mask blocks their columns.
-    """
+    """Pad columns are blocked, so whatever the caller left in a pad patch cannot
+    move ``head_raw``."""
     n_ctx = cfg.MIN_CONTEXT_PATCHES
     pad0 = C - n_ctx
     patches, _attn, _anchor, _mask_idx = right_edge_inputs(B=1, n_ctx=C, seed=11)
@@ -203,8 +166,7 @@ def test_padding_never_reaches_a_prediction_token(model):
 
 
 def test_wrapper_is_torch_exportable(model, full_context):
-    """``torch.export`` is the first step of every engine module, and the only one
-    reachable without the backends. The traced graph must reproduce eager exactly."""
+    """The only export step reachable without the backends."""
     patches, struct, _bool_mask = full_context
     wrapper = HeadRawForward(model).eval()
 

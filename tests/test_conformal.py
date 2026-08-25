@@ -1,9 +1,3 @@
-"""Split-conformal quantile recalibration (``conformal.py``).
-
-Deterministic synthetic checks: the invariants (median fixed, monotone fan,
-zero-delta identity) and that an asymmetric miscalibration is corrected back to
-nominal per-side coverage — harder on the side that was worse.
-"""
 import numpy as np
 
 from conformal import (
@@ -16,8 +10,7 @@ MED = LEVELS.index(0.5)
 
 
 def _make_fan(true, half):
-    """Build an (N, S, K) ascending fan centred on ``true`` with per-level offsets
-    proportional to (τ − 0.5) scaled by ``half`` (a deliberately too-narrow band)."""
+    """(N, S, K) ascending fan on ``true``, offsets (τ−0.5)·half — deliberately too narrow."""
     N, S = true.shape
     K = len(LEVELS)
     off = np.array([(t - 0.5) for t in LEVELS])
@@ -44,12 +37,9 @@ def test_median_fixed_and_monotone():
 
 
 def test_band_coverage_known_fan():
-    # Hand-built fan: 4 windows, 2 steps, 7 levels. Edges LO=0.05 -> col0, HI=0.95 -> col6.
-    # Put the [lo,hi] band at [90,150] everywhere; truths chosen so the count is exact.
     LO, HI = LEVELS.index(0.05), LEVELS.index(0.95)
     N, S, K = 4, 2, len(LEVELS)
     q = np.zeros((N, S, K))
-    # ascending fan per window/step centred on 120 with band [90,150]
     base = np.array([90, 100, 110, 120, 130, 140, 150.0])
     q[...] = base[None, None, :]
     true = np.array([[120, 80],     # in,  below-lo  (out)
@@ -57,42 +47,38 @@ def test_band_coverage_known_fan():
                      [150, 120],    # on-edge(in), in
                      [149, 91]])    # in, in
     cov = band_coverage(q, true, LO, HI)
-    # step0: 4/4 in; step1: 2/4 in (window2 & window3)
+    # step0 4/4 in, step1 2/4 in
     assert np.allclose(cov, [1.0, 0.5]), cov
     print(f"\n[DUMP] band_coverage known fan -> {cov.tolist()} (expect [1.0, 0.5]) ✓")
 
 
 def test_conformal_offset_finite_sample():
-    r = np.arange(100.0)                       # 0..99
-    # UPPER edge (tau>=0.5) uses ceil: ceil((100+1)*0.9)-1 = 91-1 = 90 -> order stat 90.0
+    r = np.arange(100.0)
+    # upper edge, ceil: ceil((100+1)*0.9)-1 = 90
     assert _conformal_offset(r, 0.9) == 90.0
     assert _conformal_offset(r, 0.95) == r[int(np.ceil(101 * 0.95)) - 1]
-    # LOWER edge (tau<0.5) uses floor (conservative for a lower bound) — one order
-    # statistic below the ceil choice, so the lower band edge sits lower and the
-    # hypo edge stays conservative at small N.
+    # lower edge, floor: one order statistic below ceil, conservative at small N
     assert _conformal_offset(r, 0.05) == r[int(np.floor(101 * 0.05)) - 1]
     assert _conformal_offset(r, 0.1) == r[int(np.floor(101 * 0.1)) - 1]
     print("[DUMP] conformal offset order-statistic (floor lower / ceil upper) ✓")
 
 
 def test_lower_edge_conservative_small_n():
-    """At small calibration N the lower (hypo) edge must stay conservative.
+    """ceil on the lower edge escaped ~2x nominal at n=20; floor holds P(true<=edge) <= tau.
 
-    With the anti-conservative ceil order statistic the tau=0.05/0.10 lower edges
-    escaped ~2x nominal at n=20; the floor choice restores P(true<=edge) <= tau.
-    Monte-Carlo over many cal/test draws (single step, qk=0 so residual==truth).
+    qk = 0, so the residual is the truth.
     """
     rng = np.random.default_rng(11)
     for tau, n in [(0.05, 20), (0.10, 20)]:
         esc = []
         for _ in range(4000):
             cal = rng.standard_normal(n)
-            d = _conformal_offset(cal, tau)        # lower-edge offset
+            d = _conformal_offset(cal, tau)
             t = rng.standard_normal()
-            esc.append(t <= d)                     # escape below the lower edge
+            esc.append(t <= d)
         rate = float(np.mean(esc))
         print(f"[DUMP] lower-edge escape tau={tau} n={n} -> {rate:.3f} (target<= {tau})")
-        # conservative: at or below nominal (small slack for MC noise)
+        # +0.02 slack for MC noise
         assert rate <= tau + 0.02, (tau, n, rate)
 
 
@@ -100,12 +86,9 @@ def test_recovers_nominal_coverage_asymmetric():
     rng = np.random.default_rng(7)
     S = 2
     n_cal, n_te = 4000, 4000
-    # Truth ~ N(0,1) per step; the model emits a TOO-NARROW, DOWN-SHIFTED fan, so the
-    # band under-covers and the lower side escapes far more than the upper.
+    # truth N(0,1); fan is too narrow and shifted down, so the lower side escapes most
     cal_true = rng.standard_normal((n_cal, S))
     te_true = rng.standard_normal((n_te, S))
-    # Fan centred on a biased, narrow estimate of 0 (predict ~ -0.4, half-width 0.8 —
-    # far narrower than the true ~N(0,1) needs for 90%, and shifted down).
     def fan(true_like):
         n = true_like.shape[0]
         base = np.full((n, S), -0.4)
@@ -120,7 +103,7 @@ def test_recovers_nominal_coverage_asymmetric():
         return float(np.mean((true >= q[:, :, LO]) & (true <= q[:, :, HI])))
 
     raw_cov = cov(te_q, te_true)
-    raw_lo = below(te_q, te_true, LO)            # should be >> 0.05 (under-covers below)
+    raw_lo = below(te_q, te_true, LO)
     delta = fit_quantile_conformal(cal_q, cal_true, LEVELS, MED)
     te_cal = apply_quantile_conformal(te_q, delta, MED)
     cal_cov = cov(te_cal, te_true)
@@ -132,8 +115,6 @@ def test_recovers_nominal_coverage_asymmetric():
     assert raw_cov < 0.80, "synthetic band should start under-covering"
     assert abs(cal_cov - 0.90) < 0.03, "conformal must restore ~90% coverage"
     assert abs(cal_lo - 0.05) < 0.02 and abs(cal_lo10 - 0.10) < 0.03, "per-level edges calibrated"
-    # The per-level corrections are non-trivial and asymmetric (each side fit from its
-    # own residuals), while the median is left exactly untouched.
     assert np.all(delta[:, MED] == 0.0), "median delta must be 0"
     assert abs(delta[:, LO]).mean() > 1e-3 and abs(delta[:, HI]).mean() > 1e-3, "edges corrected"
     assert not np.allclose(abs(delta[:, LO]).mean(), abs(delta[:, HI]).mean()), "asymmetric correction"

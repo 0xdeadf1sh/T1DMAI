@@ -1,12 +1,4 @@
-"""Smoke test for ``train._run_counterfactual_probe``.
-
-The counterfactual dose-response probe forecasts a baseline on each validation
-sample's true announced pred-zone carbs+insulin, perturbs a single dose, and
-re-forecasts.  This pins only that the probe RUNS end-to-end on a tiny untrained
-net and returns all 11 ``cf_*`` keys with finite (or legitimately-None) values —
-the sign / clinical-quality of the response is NOT asserted (an untrained model
-has no meaningful dose response).
-"""
+"""Smoke only: the net is untrained, so response sign is not asserted."""
 
 import math
 
@@ -14,7 +6,6 @@ import torch
 
 
 def _get_stats():
-    """Load or compute normalization stats."""
     import os
     from normalization import (compute_normalization_stats,
                                load_normalization_stats, NORM_STATS_FILE)
@@ -24,9 +15,6 @@ def _get_stats():
 
 
 def test_counterfactual_probe_smoke():
-    """A fresh ``T1DMAI`` + a tiny on-the-fly val dataset → all 11 cf_* keys,
-    each finite or a legitimate None (rescue rates are None when no baseline
-    hypo/hyper sample exists)."""
     from train import _run_counterfactual_probe
     from model import T1DMAI
     from data import T1DMDataset
@@ -35,7 +23,7 @@ def test_counterfactual_probe_smoke():
     stats = _get_stats()
     device = torch.device('cpu')
 
-    # ~4 samples is enough — the probe iterates min(len, VALIDATION_PROBE_N_PATIENTS).
+    # probe iterates min(len, VALIDATION_PROBE_N_PATIENTS)
     val_dataset = T1DMDataset(master_seed=777, total_steps=4, batch_size=1,
                               normalization_stats=stats, cache_path=None)
 
@@ -57,15 +45,12 @@ def test_counterfactual_probe_smoke():
         f"cf_* key set mismatch: got {sorted(result.keys())}")
     assert len(expected_keys) == 11
 
-    # cf_n must be a positive count of probed samples.
     assert isinstance(result['cf_n'], int) and result['cf_n'] >= 1, (
         f"cf_n must be a positive probe count, got {result['cf_n']!r}")
     assert isinstance(result['cf_hypo_n'], int) and result['cf_hypo_n'] >= 0
     assert isinstance(result['cf_hyper_n'], int) and result['cf_hyper_n'] >= 0
 
-    # Every other value is either a finite float or a legitimate None (rescue
-    # rates are None when no baseline-hypo / -hyper sample exists; the per-sample
-    # means / dirs are non-None whenever cf_n >= 1, which we asserted above).
+    # None means no baseline hypo/hyper sample existed
     for k, v in result.items():
         if k in ('cf_n', 'cf_hypo_n', 'cf_hyper_n'):
             continue
@@ -75,7 +60,6 @@ def test_counterfactual_probe_smoke():
             continue
         assert math.isfinite(float(v)), f"cf key {k} is non-finite: {v}"
 
-    # The per-sample direction / monotonic fractions live in [0, 1].
     for k in ('cf_carb_dir', 'cf_insulin_dir',
               'cf_carb_monotonic', 'cf_insulin_monotonic'):
         assert 0.0 <= float(result[k]) <= 1.0, f"{k}={result[k]} out of [0,1]"

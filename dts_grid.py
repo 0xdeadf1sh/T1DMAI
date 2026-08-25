@@ -5,133 +5,72 @@ Klonoff DC, Freckmann G, Pleus S, Kovatchev BP, Kerr D, Tse C, Li C, et al.
 "The Diabetes Technology Society Error Grid and Trend Accuracy Matrix for
 Glucose Monitors." J Diabetes Sci Technol. 2024 Nov;18(6):1346-1361.
 doi:10.1177/19322968241275701. PMID 39369312. PMCID PMC11531029.
+The grid itself is public domain, so the geometry below carries no attribution
+obligation.
 
-The grid itself is in the PUBLIC DOMAIN (the paper says so in as many words), so
-the geometry below carries no attribution obligation; the citation is here
-because a clinical figure with no source is not checkable.
+Not the Surveillance Error Grid (Klonoff et al. 2014 — the continuous risk
+surface this one smooths and zones), not Parkes/Consensus, not Clarke (scored
+separately by ``train.py``; the two grids disagree by construction and are both
+reported), and not ``cg_ega.py``, which is point AND rate binned by glycemic
+region.
 
-WHICH GRID THIS IS
-------------------
-Three grids get conflated under nearby names, and they are not the same object:
+THE DEFINITION IS THE RISK FUNCTION, NOT THE VERTEX TABLE. This implements the
+closed-form risk function of Supplemental Appendix 2; ``tests/test_dts_grid.py``
+pins it against all 16 published Table A1 edge vertices, which makes the table an
+ORACLE rather than a second implementation. The two disagree by up to 1.11 mg/dL,
+largest on the vertical below-clamp segments where no chord exists at all
+(D-lower and E-lower, 1.11 mg/dL each). That is consistent with the paper's own
+"after rounding and simplification" of the 2.75 and 2.25 coefficients, Table A1
+having been drawn from the unrounded fit — an inference, not something the paper
+states. Either way the tolerance belongs to the table.
 
-* the DTS Error Grid — this one. Five discrete zones A-E on straight-line
-  borders, derived by fitting a smooth risk function to the SEG surface.
-* the Surveillance Error Grid (SEG), Klonoff et al. 2014 — the CONTINUOUS risk
-  surface this grid smooths and zones. Same thresholds, boxy borders.
-* Parkes/Consensus and Clarke — neither is DTS. ``train.py`` scores Clarke
-  separately; the two grids disagree by construction and are both reported.
+2.75 for an OVERESTIMATE against 2.25 for an underestimate is the grid's whole
+clinical content: the panel judged a falsely high reading, which prompts insulin,
+riskier than a falsely low one. It is visible only in LOG space or at an outer
+edge. Exponentiating very nearly cancels it at the A edge — zone A runs 0.80074x
+to 1.19940x of reference, -19.93% against +19.94%, a symmetric +/-20% band by
+coincidence — while the E edge sits at +257% against -79%.
 
-``cg_ega.py`` is a fourth thing again: point AND rate, binned by glycemic region.
-The DTS paper positions its (unimplemented here) Trend Accuracy Matrix as the
-simpler replacement for CG-EGA's rate axis.
+THE 50 mg/dL CLAMP IS A RECONSTRUCTION. The printed formula's third branch
+covers only the corner where BOTH values are under 50. The main text says
+something stronger: the developing clinicians "did not differentiate between
+values <= 50 mg/dL", which is a clamp on EACH argument, and that is what this
+module applies before the ratio. It reproduces every one of the 16 published
+vertices to <= 1.11 mg/dL, which the unclamped formula cannot do at all — the
+flat and vertical border segments of Figure A1 exist only because of it — and it
+makes the function total on [0, inf), where the unclamped log is singular at
+0 mg/dL against this repository's 10 mg/dL physical floor. It is printed nowhere
+in that form, so every zone assignment with either value under 50 mg/dL rests on
+a reading of one English sentence, corroborated numerically. A figure from this
+module quoted against a published DTS number carries that caveat; the only
+available oracle is the Society's own R Shiny tool, whose source is not
+published.
 
-THE DEFINITION IS THE RISK FUNCTION, NOT THE VERTEX TABLE
----------------------------------------------------------
-The paper publishes both a closed-form risk function (Supplemental Appendix 2)
-and a table of border vertices (Table A1) for drawing. This module implements the
-FUNCTION, and ``tests/test_dts_grid.py`` pins it against all 16 published edge
-vertices — which makes the table an ORACLE rather than a second implementation.
+APPLYING A MONITOR GRID TO A FORECAST. The grid grades a glucose MONITOR:
+reference and monitor are simultaneous, and the zones encode the risk of acting
+NOW on a wrong reading of NOW. This module is fed true BG at horizon h against
+the prediction for horizon h — a substitution the source neither makes nor
+mentions, and the same one ``train.py`` already makes for Clarke. It is reported
+as a risk-weighted summary of forecast error, NOT as a clinical accuracy claim
+about a device: a forecast error at 30-120 min has different consequences from a
+measurement error now, and the 2.75/2.25 asymmetry was elicited for readings, not
+forecasts, so whether it points the same way for a prediction is untested and it
+is not re-tuned here. PRED-EGA (Sivananthan et al., Diabetes Technol Ther
+2011;13(8):787-796) is the prediction-specific grid; nothing here replaces it.
 
-The two disagree by up to 1.11 mg/dL, and the reason is NOT that the sloped
-borders are chords of a curve: every contour here is a ray through the origin, so
-a chord through two of its points is the ray. The gap appears on the vertical
-below-clamp segments too, where there is no chord at all, and it is largest
-exactly there (D-lower and E-lower, 1.11 mg/dL each). What it is consistent with
-is the paper's own rounding: Appendix 2 introduces the coefficients with "after
-rounding and simplification", so 2.75 and 2.25 are themselves rounded, and Table
-A1 appears to have been drawn from the unrounded fit. That is an inference, not
-something the paper states. Either way the tolerance belongs to the table, not to
-this implementation.
-
-    Risk = 2.75 * ln(monitor / reference)   when monitor > reference
-           2.25 * ln(monitor / reference)   when monitor <= reference
-
-Zones are taken on the ABSOLUTE value, closed above, so a point exactly on a
-border falls in the LOWER-risk zone::
-
-    A  |Risk| <= 0.5     no risk
-    B  |Risk| <= 1.5     mild
-    C  |Risk| <= 2.5     moderate
-    D  |Risk| <= 3.5     high
-    E  |Risk|  > 3.5     extreme
-
-The asymmetry is deliberate and is the grid's whole clinical content: 2.75 for an
-OVERESTIMATE against 2.25 for an underestimate, because the panel judged a
-falsely high reading (which prompts insulin) riskier than a falsely low one. It
-lives in LOG-ratio space, where the overestimate side of every zone is the
-tighter one — at the A edge, ``+0.1818`` against ``-0.2222``.
-
-Do not read that off the ratios, though. Exponentiating very nearly cancels it at
-the A edge: zone A runs ``0.80074x`` to ``1.19940x`` of reference, i.e. -19.93%
-against +19.94%, so the innermost zone reads as a symmetric +/-20% band by
-coincidence rather than by design. The asymmetry becomes visible further out —
-the E edge sits at ``+257%`` against ``-79%`` — so a check that the coefficients
-are still doing their job has to be made in log space or at an outer edge.
-
-THE 50 mg/dL CLAMP IS A RECONSTRUCTION — read this before trusting a low-BG zone
--------------------------------------------------------------------------------
-The printed formula carries a third branch, "0 if monitor < 50 and reference <
-50", which covers only the corner where BOTH are low. The main text says
-something stronger and more useful: the developing clinicians "did not
-differentiate between values <= 50 mg/dL", which "was tantamount to treating all
-values <= 50 mg/dL as the same" — that is a clamp on EACH argument, not a special
-case for the corner.
-
-This module clamps each argument at ``DTS_LOW_CLAMP_MGDL`` before the ratio. Two
-things justify it and one thing does not:
-
-* it reproduces every one of the 16 published edge vertices to <= 1.11 mg/dL,
-  which the unclamped formula cannot do at all — the flat and vertical border
-  segments of Figure A1 exist only because of it;
-* it makes the function total on [0, inf): without it a reference or monitor of
-  0 mg/dL is a log singularity, and this repository's physical floor is 10 mg/dL;
-* it is NOT printed anywhere in that form. An implementer reading only the
-  appendix would get the low-glucose corner wrong in the other direction.
-
-So: zone assignments where either value is under 50 mg/dL rest on a reading of
-one English sentence, corroborated numerically. If a figure from this module is
-ever quoted against a published DTS number, say so. The only available oracle is
-the Society's own R Shiny tool, whose source is not published.
-
-APPLYING A MONITOR GRID TO A FORECAST
--------------------------------------
-The DTS grid grades a glucose MONITOR: reference and monitor are simultaneous
-measurements, and the zones encode the risk of acting NOW on a wrong reading of
-NOW. This module is fed the true BG at horizon h against the PREDICTION for
-horizon h, which is a substitution the source neither makes nor sanctions — it
-never mentions prediction. It is the same substitution ``train.py`` already makes
-for Clarke, and it is reported here for the same reason: as a risk-weighted
-summary of forecast error, NOT as a clinical accuracy claim about a device.
-
-Two specific caveats worth carrying:
-
-* a forecast error at 30-120 min has different consequences from a measurement
-  error now — there is time to re-measure, and the action taken differs. The
-  panel never scored that scenario;
-* the 2.75/2.25 asymmetry was elicited for readings, not forecasts, and whether
-  it points the same way for a prediction is untested. Do not re-tune it.
-
-A prediction-specific grid exists — PRED-EGA (Sivananthan et al., Diabetes
-Technol Ther 2011;13(8):787-796), built precisely because CG-EGA had to be
-modified before it could assess predictors. Nothing here replaces it.
-
-REPORTING
----------
-The paper is unusually explicit that the headline figure is pZA, the percentage
-in zone A alone, and that reporting "zone A + zone B" as if both were acceptable
-is inappropriate. This module therefore exposes per-zone shares and no A+B
-convenience, and the trainers' tables render all five. No acceptance threshold
-exists for this grid — no ISO or FDA criterion references it — so nothing here
-carries a pass mark. The paper's only calibration anchor is an empirical fit
-across 31 studies, ``MARD = 8 + 0.33 * (96 - pZA)``, which is a rough conversion
-and not a target.
+REPORTING. The headline figure is pZA, the percentage in zone A alone; the paper
+is explicit that reporting "zone A + zone B" as if both were acceptable is
+inappropriate, so this module exposes per-zone shares and no A+B convenience. No
+ISO or FDA criterion references this grid, so nothing here carries a pass mark.
+The paper's only calibration anchor is an empirical fit across 31 studies,
+``MARD = 8 + 0.33 * (96 - pZA)``, a rough conversion and not a target.
 """
 from __future__ import annotations
 
 import numpy as np
 
-# The physical BG floor, the single source of truth for it in this suite. Used
-# below as the units tripwire; see DTS_UNITS_FLOOR_MGDL.
+# The suite's physical BG floor, imported rather than restated; the units
+# tripwire below.
 from T1DMSIM.simulator import BG_CLAMP_MIN
 
 __all__ = [
@@ -147,49 +86,38 @@ __all__ = [
     "dts_zone_fractions",
 ]
 
-# Below this, the panel treated every glucose as the same value; see the module
-# docstring for why this is a clamp on each argument and what that rests on.
+# Below this the panel treated every glucose as the same value. A clamp on EACH
+# argument, reconstructed from the paper's prose — see the module docstring.
 DTS_LOW_CLAMP_MGDL: float = 50.0
 
 # The two limbs of the risk function. Overestimates are penalised harder.
 DTS_OVERESTIMATE_COEFF: float = 2.75
 DTS_UNDERESTIMATE_COEFF: float = 2.25
 
-# |Risk| upper edges of zones A, B, C, D; anything above the last is E. Ascending,
-# and each is CLOSED (a point exactly on an edge takes the lower-risk zone).
+# |Risk| upper edges of zones A, B, C, D; above the last is E. Ascending, and
+# each edge is CLOSED — a point exactly on one takes the lower-risk zone.
 DTS_ZONE_EDGES: tuple[float, ...] = (0.5, 1.5, 2.5, 3.5)
 
 ZONE_NAMES: tuple[str, ...] = ("a", "b", "c", "d", "e")
 assert len(ZONE_NAMES) == len(DTS_ZONE_EDGES) + 1
 
-# The published domain of the grid and of the SEG it derives from: 1-600 mg/dL.
-# Both ends only WARN. The ceiling because the risk function extrapolates cleanly
-# above it and the paper simply does not say; the floor because 1 mg/dL is far too
-# low to serve as a units check — Kovatchev risk over the legal BG range reaches
-# +3.16, so a whole risk-space array can sit above 1.0 and clear it.
+# Published domain of the grid and of the SEG it derives from: 1-600 mg/dL. Both
+# ends only WARN — above 600 the risk function extrapolates cleanly and the paper
+# is silent, and 1 mg/dL is far too low for a units check, since Kovatchev risk
+# over the legal BG range reaches +3.16 and a whole risk-space array clears it.
 DTS_DOMAIN_MIN_MGDL: float = 1.0
 DTS_DOMAIN_MAX_MGDL: float = 600.0
 
 # The UNITS TRIPWIRE is the repository's physical BG floor, NOT the grid's domain
-# floor, and it is imported rather than restated. It matters here more than in
-# most places: the 50 mg/dL clamp above would take an array of z-scores or risk
-# values to 50 in every cell, score zero risk, and report a flawless 100% zone A
-# with nothing downstream able to tell. Every legal mg/dL glucose clears
-# BG_CLAMP_MIN by construction, and the whole realised risk range [-6.82, +3.16]
-# sits below it, so a risk-space array trips loudly.
+# floor: without it the 50 mg/dL clamp takes an array of z-scores or risk values
+# to 50 in every cell, scores zero risk and reports a flawless 100% zone A with
+# nothing downstream able to tell. Every legal mg/dL glucose clears BG_CLAMP_MIN,
+# and the whole realised risk range [-6.82, +3.16] sits below it.
 DTS_UNITS_FLOOR_MGDL: float = BG_CLAMP_MIN
 
 
 def _as_mgdl(x: np.ndarray, name: str) -> np.ndarray:
-    """Validate one side of the pair and return it as float64.
-
-    Args:
-        x: array of glucose values, mg/dL.
-        name: which side, for the assertion message.
-
-    Returns:
-        ``np.float64`` view/copy of ``x``.
-    """
+    """Validate one side of the pair — glucose in mg/dL — and return it as float64."""
     a = np.asarray(x, dtype=np.float64)
     assert np.isfinite(a).all(), f"dts_grid: {name} carries non-finite values"
     assert a.min() >= DTS_UNITS_FLOOR_MGDL, (
@@ -210,18 +138,12 @@ def _as_mgdl(x: np.ndarray, name: str) -> np.ndarray:
 
 
 def dts_risk(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    """SIGNED DTS risk of each (reference, monitor) pair.
+    """SIGNED DTS risk of each (reference, monitor) pair — float64, input shape.
 
-    Positive where the prediction overestimates, negative where it underestimates.
-    Zones are taken on the absolute value; the sign is kept because the direction
-    is the clinically interesting half and a caller may want it.
-
-    Args:
-        y_true: reference glucose (mg/dL), any shape. Here: true BG at the horizon.
-        y_pred: monitor glucose (mg/dL), same shape. Here: the prediction.
-
-    Returns:
-        float64 array of the same shape.
+    ``y_true`` is the reference (here: true BG at the horizon), ``y_pred`` the
+    monitor (here: the prediction), both mg/dL, same shape. Positive where the
+    prediction overestimates. Zones take the absolute value; the sign is kept
+    because the direction is the clinically interesting half.
     """
     ref = _as_mgdl(y_true, "y_true")
     mon = _as_mgdl(y_pred, "y_pred")
@@ -234,36 +156,21 @@ def dts_risk(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
 
 
 def dts_zones(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    """Zone INDEX of each pair: 0 = A, 1 = B, 2 = C, 3 = D, 4 = E.
+    """Zone INDEX of each pair: 0 = A .. 4 = E — the risk ordering, indexing ``ZONE_NAMES``.
 
-    Indices rather than letters so a caller can slice a horizon out and count,
-    and so the ordering is the risk ordering.
-
-    Args:
-        y_true: reference glucose (mg/dL). y_pred: monitor glucose (mg/dL).
-
-    Returns:
-        int8 array of the same shape, indexing ``ZONE_NAMES``.
+    ``y_true`` reference mg/dL, ``y_pred`` monitor mg/dL; int8, input shape.
     """
     risk = np.abs(dts_risk(y_true, y_pred))
-    # ``side='left'`` is what makes each edge CLOSED: |Risk| exactly 0.5 sorts
-    # before the 0.5 edge and stays in A. ``side='right'`` would push every
-    # on-border point up a zone.
+    # ``side='left'`` is what makes each edge CLOSED: |Risk| of exactly 0.5 stays
+    # in A. ``side='right'`` would push every on-border point up a zone.
     return np.searchsorted(np.asarray(DTS_ZONE_EDGES), risk, side="left").astype(np.int8)
 
 
 def dts_zone_counts(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Per-zone point counts plus the total, for accumulation across batches.
+    """``{'a'..'e': count, 'total': count}`` as floats, both arguments mg/dL.
 
-    Counts rather than shares because a validation pass sums these over batches
-    of unequal size and divides once at the end; averaging shares would weight
-    a small batch equally with a large one.
-
-    Args:
-        y_true: reference glucose (mg/dL). y_pred: monitor glucose (mg/dL).
-
-    Returns:
-        ``{'a'..'e': count, 'total': count}`` as floats.
+    Counts rather than shares: a validation pass sums these over batches of
+    unequal size and divides once at the end.
     """
     zones = dts_zones(y_true, y_pred)
     out = {name: float((zones == i).sum()) for i, name in enumerate(ZONE_NAMES)}
@@ -272,14 +179,10 @@ def dts_zone_counts(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
 
 
 def dts_zone_fractions(counts: dict[str, float]) -> dict[str, float | None]:
-    """Per-zone shares in [0, 1] from accumulated counts.
+    """``{'a'..'e': fraction}`` in [0, 1] from :func:`dts_zone_counts`, summed or not.
 
-    Args:
-        counts: from :func:`dts_zone_counts`, or the same keys summed over batches.
-
-    Returns:
-        ``{'a'..'e': fraction}``; every value is None when the total is zero — a
-        zone share over no points is not 0%, it is unmeasured.
+    Every value is None at zero total — a zone share over no points is unmeasured,
+    not 0%.
     """
     total = float(counts.get("total", 0.0))
     if total <= 0.0:

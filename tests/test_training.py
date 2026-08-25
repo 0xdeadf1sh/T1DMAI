@@ -1,14 +1,9 @@
-"""Tests for the risk-space training stack — pinball (rho_τ), soft-DTW / DILATE,
-the learned Kendall-Gal weighting, the combined ``risk_total_loss``, and the
-training-loop plumbing (offset sampler, resume alignment, checkpoint, optimizer
-step).
+"""The risk-space training stack: pinball ρ_τ, soft-DTW / DILATE, the learned
+Kendall-Gal weighting, ``risk_total_loss``, and the loop plumbing — offset sampler,
+resume alignment, checkpoint, optimizer step.
 
-The old loss surface (β-NLL, MDN, BG-aux, focal, trend, alarm, and the per-channel
-metric finalizers) is gone; the BG forecast is a single quantile head trained by
-pinball + DILATE (soft-DTW divergence shape + TDI on the median) in Kovatchev
-risk space, blended by the learned Kendall-Gal uncertainty weighting. The
-median-curvature (L_smooth) penalty, the counterfactual-sensitivity probe, and the
-best_clinical checkpoint gate have likewise been removed.
+The BG forecast is a single quantile head in Kovatchev risk space, trained by
+pinball + DILATE (soft-DTW divergence shape plus TDI on the median).
 """
 
 import math
@@ -18,7 +13,6 @@ import torch
 
 
 def _get_stats():
-    """Helper: load or compute normalization stats."""
     import os
     from normalization import compute_normalization_stats, load_normalization_stats, NORM_STATS_FILE
     if os.path.exists(NORM_STATS_FILE):
@@ -26,38 +20,30 @@ def _get_stats():
     return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
 
 
-# ===========================================================================
-# Pinball loss — rho_τ values + gradients.
-# ===========================================================================
-
 def test_pinball_rho_tau_values():
-    """The check loss ρ_τ(a,b) = (a-b)·(τ - 1[a<b]) is reproduced exactly by
-    pinball_loss on a toy single-level curve, for both an over- and an
-    under-prediction, and the asymmetry tracks τ."""
+    """ρ_τ(a,b) = (a-b)·(τ - 1[a<b]), over- and under-prediction, asymmetry tracking τ."""
     from risk_loss import pinball_loss
 
-    # One patch, one step, a single τ level so the mean == the per-element ρ.
-    a = torch.tensor([[[2.0]]])                  # (B,P,S) target = 2.0
-    # Over-prediction (b > a): a-b<0, so ρ = (a-b)*(τ-1) = (negative)*(τ-1).
+    # one patch, one step, one τ level, so the mean IS the per-element ρ
+    a = torch.tensor([[[2.0]]])                  # (B,P,S) target
     b_over = torch.tensor([[[[3.0]]]])           # (B,P,S,1)
     b_under = torch.tensor([[[[1.0]]]])
 
     for tau in (0.1, 0.5, 0.9):
         lo = float(pinball_loss(b_over, a, (tau,)))
-        # a-b = -1, a<b True ⇒ ρ = (-1)*(τ-1) = 1-τ.
+        # a-b = -1, a<b True => ρ = (-1)*(τ-1) = 1-τ
         assert abs(lo - (1.0 - tau)) < 1e-6, f"over-pred ρ wrong at τ={tau}: {lo}"
         hi = float(pinball_loss(b_under, a, (tau,)))
-        # a-b = +1, a<b False ⇒ ρ = (1)*(τ-0) = τ.
+        # a-b = +1, a<b False => ρ = (1)*(τ-0) = τ
         assert abs(hi - tau) < 1e-6, f"under-pred ρ wrong at τ={tau}: {hi}"
-    # The check loss is non-negative everywhere.
+    # the check loss is non-negative everywhere
     assert float(pinball_loss(b_over, a, (0.5,))) >= 0.0
     print("\n[DUMP] pinball | ρ_τ matches (1-τ) over-pred, τ under-pred ✓")
 
 
 def test_pinball_gradients():
-    """pinball_loss backprops a finite, correctly-signed gradient to q_tau: an
-    over-prediction at a high τ pulls down, an under-prediction at low τ pulls
-    up; the gradient is bounded by [-1, 1] (the check-loss subgradient)."""
+    """Over-prediction at high τ pulls down, under-prediction at low τ pulls up; the
+    gradient stays inside the check-loss subgradient band [-1, 1]."""
     from risk_loss import pinball_loss
 
     a = torch.tensor([[[0.0]]])
@@ -67,22 +53,19 @@ def test_pinball_gradients():
     g = float(q.grad)
     assert math.isfinite(g)
     assert -1.0 - 1e-6 <= g <= 1.0 + 1e-6, f"pinball grad out of subgradient band: {g}"
-    # over-prediction (q>a) at τ=0.9: d/dq (a-q)(τ-1) = -(τ-1) = (1-τ) = 0.1 > 0
-    # so the loss rises with q ⇒ gradient pushes q DOWN (positive grad).
+    # at τ=0.9: d/dq (a-q)(τ-1) = 1-τ = 0.1 > 0, so the loss rises with q and the
+    # positive gradient pushes it DOWN
     assert g > 0.0, f"over-prediction must have positive grad (push down): {g}"
     print(f"\n[DUMP] pinball grad | over-pred @τ=0.9 grad={g:.3f} (push down) ✓")
 
 
-# ===========================================================================
-# soft-DTW / DILATE — grads, γ sweep, divergence-zero, flatten order.
-# ===========================================================================
-
 def test_soft_dtw_grads_and_gamma_sweep():
-    """SoftDTWBatch is differentiable and finite across a γ sweep (including the
-    O(1) DILATE_GAMMA), even at the worst-case risk pair f(BG_CLAMP_MIN) vs
-    f(BG_CLAMP_MAX) over a full 24-step horizon. That pair is derived through the
-    risk transform rather than written as a numeral, so it follows the clamp; the
-    band is asymmetric. The value is bounded below by 0 (squared cost)."""
+    """Differentiable and finite across a γ sweep, even at the worst-case risk pair
+    f(BG_CLAMP_MIN) against f(BG_CLAMP_MAX) over a 24-step horizon.
+
+    That pair is derived through the transform, never written as a numeral, so it
+    follows the clamp; the band is asymmetric.
+    """
     from dilate import SoftDTWBatch, _pairwise_sq_cost
     from config import DILATE_GAMMA
 
@@ -100,9 +83,7 @@ def test_soft_dtw_grads_and_gamma_sweep():
         assert torch.isfinite(g).all(), f"sDTW grad non-finite at γ={gamma}"
         x.grad = None
 
-    # Worst-case risk extremes: the physical clamp carried through f, so the pair
-    # follows BG_CLAMP_MIN/MAX instead of a pinned numeral. The widest cell cost
-    # is (f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))^2.
+    # the widest cell cost is (f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))^2
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     from utils import kovatchev_f
     r_lo, r_hi = kovatchev_f(
@@ -122,9 +103,8 @@ def test_soft_dtw_grads_and_gamma_sweep():
 
 
 def test_dilate_divergence_zero_at_match():
-    """The DILATE shape term is the soft-DTW DIVERGENCE
-    sDTW(m,y) - ½sDTW(m,m) - ½sDTW(y,y), so shape≈0 and its gradient≈0 when
-    m == y (a plain sDTW(x,x) ≠ 0 would not give this)."""
+    """The shape term is the DIVERGENCE ``sDTW(m,y) - ½sDTW(m,m) - ½sDTW(y,y)``, so it
+    and its gradient vanish at m == y; a plain ``sDTW(x,x)`` would not."""
     from dilate import dilate_loss
     from config import DILATE_ALPHA, DILATE_GAMMA
 
@@ -136,34 +116,33 @@ def test_dilate_divergence_zero_at_match():
     loss, shape, tdi = dilate_loss(m, y, alpha=DILATE_ALPHA, gamma=float(DILATE_GAMMA))
     shape_val = float(shape.detach())
     assert abs(shape_val) < 1e-3, f"divergence shape must be ≈0 at m==y, got {shape_val}"
-    # tdi at m==y aligns on the diagonal ⇒ ~0 off-diagonal mass.
+    # at m == y the TDI aligns on the diagonal, so ~0 off-diagonal mass
     g, = torch.autograd.grad(shape, m, retain_graph=True)
     assert g.abs().max() < 1e-2, f"shape grad must vanish at m==y, got {g.abs().max():.3e}"
     print(f"\n[DUMP] dilate | divergence shape={shape_val:.3e}, grad≈0 at m==y ✓")
 
 
 def test_dilate_flatten_order_sensitive():
-    """A P/S transpose changes the loss — guards the patch-major/step-minor
-    flatten order. A shifted-curve toy on the correctly-flattened (B, P*S)
-    trajectory differs from the same data flattened in the wrong (S, P) order."""
+    """A P/S transpose must change the loss, which is what pins the
+    patch-major/step-minor flatten order."""
     from dilate import dilate_loss
     from risk_loss import _to_patch_major
     from config import DILATE_ALPHA, DILATE_GAMMA
 
     B, P, S = 1, 4, 6
-    # A time-monotone ramp in risk space, distinct per (p, s).
+    # a time-monotone ramp in risk space, distinct per (p, s)
     base = torch.arange(P * S, dtype=torch.float32).reshape(1, P, S) * 0.1
     target = base.clone()
-    # The forecast is the target shifted by one step in TRUE time order.
+    # the forecast is the target shifted one step in TRUE time order
     pred = base.clone()
     pred[:, :, :] = base[:, :, :] + 0.3
 
-    # Correct patch-major flatten (time-monotone).
+    # the correct patch-major flatten is time-monotone
     m_pm = _to_patch_major(pred)
     y_pm = _to_patch_major(target)
     loss_pm, _, _ = dilate_loss(m_pm, y_pm, alpha=DILATE_ALPHA, gamma=float(DILATE_GAMMA))
 
-    # WRONG order: transpose P/S before flattening (scrambles the time axis).
+    # WRONG order: transposing P/S before flattening scrambles the time axis
     m_wrong = pred.transpose(1, 2).reshape(B, P * S)
     y_wrong = target.transpose(1, 2).reshape(B, P * S)
     loss_wrong, _, _ = dilate_loss(m_wrong, y_wrong, alpha=DILATE_ALPHA, gamma=float(DILATE_GAMMA))
@@ -175,31 +154,25 @@ def test_dilate_flatten_order_sensitive():
 
 
 def test_to_patch_major_rejects_transpose():
-    """_to_patch_major's internal time-monotonicity sentinel passes for a valid
-    (B,P,S) and the flat output runs time-monotonically (p*S + s)."""
+    """The flat output runs time-monotonically: patch p step s at index p*S + s."""
     from risk_loss import _to_patch_major
     B, P, S = 2, 3, 4
     x = torch.arange(B * P * S, dtype=torch.float32).reshape(B, P, S)
     flat = _to_patch_major(x)
     assert flat.shape == (B, P * S)
-    # Patch p step s must land at flat index p*S + s.
     for p in range(P):
         for s in range(S):
             assert torch.equal(flat[:, p * S + s], x[:, p, s])
     print("\n[DUMP] _to_patch_major | C-contiguous patch-major flatten verified ✓")
 
 
-# ===========================================================================
-# Learned Kendall-Gal weighting + risk_total_loss (f applied once).
-# ===========================================================================
-
 def test_kendall_gal_weighting_combine():
-    """The learned Kendall-Gal weighting is restored: ``risk_total_loss`` combines
-    the pinball and DILATE terms as
-    ``0.5·exp(−2·σ_Q)·L_Q + σ_Q + 0.5·exp(−2·σ_D)·L_D + σ_D`` off the two log-σ
-    params, with the L_smooth penalty gone so no extra term survives.  At
-    ``KENDALL_LOGVAR_INIT == 0`` the exp/σ terms reduce to ``0.5·L_Q + 0.5·L_D``, and
-    the ``log_sigma_Q``/``log_sigma_D`` components echo the (clamped) params."""
+    """``risk_total_loss`` combines the two terms as
+    ``0.5·exp(−2·σ_Q)·L_Q + σ_Q + 0.5·exp(−2·σ_D)·L_D + σ_D``.
+
+    At ``KENDALL_LOGVAR_INIT == 0`` that reduces to ``0.5·L_Q + 0.5·L_D``, and the
+    ``log_sigma_*`` components echo the clamped params.
+    """
     from risk_loss import risk_total_loss, KendallGalWeighting
     from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES
     from utils import assemble_quantiles
@@ -212,10 +185,10 @@ def test_kendall_gal_weighting_combine():
     true_bg = torch.full((B, P, S), 130.0)
     true_bg[:, : P // 2] = 70.0
 
-    weighting = KendallGalWeighting()  # init at KENDALL_LOGVAR_INIT == 0.0
+    weighting = KendallGalWeighting()  # inits at KENDALL_LOGVAR_INIT == 0.0
     total, comp = risk_total_loss(q_tau, median, true_bg, weighting)
 
-    # At log-σ == 0: 0.5·exp(0)·L_Q + 0 + 0.5·exp(0)·L_D + 0 == 0.5(L_Q + L_D).
+    # at log-σ == 0: 0.5·exp(0)·L_Q + 0 + 0.5·exp(0)·L_D + 0 == 0.5(L_Q + L_D)
     expected = 0.5 * comp['loss_Q'] + 0.5 * comp['loss_D']
     assert torch.allclose(total, expected, atol=1e-6), (
         f"Kendall-Gal combine broken at σ=0: {float(total)} != {float(expected)}")
@@ -224,8 +197,8 @@ def test_kendall_gal_weighting_combine():
         "log-σ components must be present under the learned weighting"
     assert abs(float(comp['log_sigma_Q'])) < 1e-6 and abs(float(comp['log_sigma_D'])) < 1e-6
 
-    # The log-σ params are learnable and change the combine: bumping σ_Q down-weights
-    # L_Q (the 0.5·exp(−2σ) prefactor shrinks) and adds the +σ_Q barrier.
+    # bumping σ_Q down-weights L_Q, since the 0.5·exp(−2σ) prefactor shrinks, and adds
+    # the +σ_Q barrier
     with torch.no_grad():
         weighting.log_sigma_Q.add_(1.0)
     total2, comp2 = risk_total_loss(q_tau, median, true_bg, weighting)
@@ -238,9 +211,8 @@ def test_kendall_gal_weighting_combine():
 
 
 def test_risk_total_loss_f_applied_once_and_finite():
-    """risk_total_loss takes a mg/dL target (NOT f-transformed), applies
-    kovatchev_f_target exactly once internally, and returns a finite scalar plus
-    the per-component logging dict. Backprops to q_tau and median."""
+    """The target arrives as mg/dL, NOT f-transformed; ``kovatchev_f_target`` is applied
+    exactly once inside."""
     from risk_loss import risk_total_loss, KendallGalWeighting
     from config import (PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES, QUANTILE_LEVELS)
     from utils import assemble_quantiles
@@ -248,13 +220,13 @@ def test_risk_total_loss_f_applied_once_and_finite():
 
     B, P, S = 2, PREDICTION_PATCHES, PATCH_SIZE
     torch.manual_seed(0)
-    # Build genuine ascending quantiles from a head-raw + anchor so q_tau/median
-    # are self-consistent and grad-bearing.
+    # genuine ascending quantiles off a head_raw + anchor, so q_tau and median are
+    # self-consistent and grad-bearing
     head_raw = torch.randn(B, P, S, 1 + 2 * ((N_QUANTILES - 1) // 2), requires_grad=True)
     last_bg = torch.full((B,), 120.0)
     q_tau, median = assemble_quantiles(head_raw, last_bg)
 
-    # mg/dL target inside the physical band (NOT f'd).
+    # mg/dL target inside the physical band, not f'd
     true_bg = torch.full((B, P, S), 130.0)
     true_bg[:, : P // 2] = 70.0
     assert (true_bg >= sim.BG_CLAMP_MIN).all(), "target must be mg/dL"
@@ -275,8 +247,7 @@ def test_risk_total_loss_f_applied_once_and_finite():
 
 
 def test_risk_total_loss_lower_when_matched():
-    """The combined risk loss is lower when the median tracks the (f'd) target
-    than when it is anti-signed — the basic learnability invariant."""
+    """Lower when the median tracks the f'd target than when it is anti-signed."""
     from risk_loss import risk_total_loss, KendallGalWeighting
     from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES
     from utils import assemble_quantiles, kovatchev_f
@@ -284,12 +255,9 @@ def test_risk_total_loss_lower_when_matched():
     B, P, S = 2, PREDICTION_PATCHES, PATCH_SIZE
     weighting = KendallGalWeighting()
     last_bg = torch.full((B,), 120.0)
-    # Ramp the truth up CONTINUOUSLY across the whole horizon (within-patch AND
-    # cross-patch), so the per-step risk-space target has a nonzero within-patch
-    # rise.  R1's cumulative median is driven by within-patch SLOPE, not within-
-    # patch LEVEL, so a flat-per-patch truth would leave both matched and anti
-    # signs collapsed onto the flat anchor; a continuous ramp keeps the learnability
-    # witness valid under every BG_HEAD_MEDIAN_MODE.
+    # ramp the truth continuously, within-patch and cross-patch: the cumulative median
+    # is driven by within-patch SLOPE, not level, so a flat-per-patch truth collapses
+    # both signs onto the flat anchor
     true_bg = torch.full((B, P, S), 120.0)
     for p in range(P):
         for s in range(S):
@@ -300,10 +268,8 @@ def test_risk_total_loss_lower_when_matched():
 
     def _loss_for(delta_sign: float) -> float:
         head = torch.zeros(B, P, S, 1 + 2 * n_spread)
-        # Per-STEP median delta = sign * (f(true_step) - f(last)).  Under the legacy
-        # flat-anchor path this sets m = anchor + delta directly; under R1's
-        # cumulative path the within-patch ramp + cross-patch rise accumulate to the
-        # same climbing trajectory.  +1 tracks the truth, -1 anti-tracks it.
+        # per-step median delta = sign * (f(true_step) - f(last)): +1 tracks the truth,
+        # -1 anti-tracks it
         for p in range(P):
             for s in range(S):
                 tgt_risk = kovatchev_f(true_bg[:, p, s])
@@ -318,13 +284,8 @@ def test_risk_total_loss_lower_when_matched():
     print(f"\n[DUMP] risk_total_loss | matched={matched:.4f} < anti={anti:.4f} ✓")
 
 
-# ===========================================================================
-# Per-horizon excursion DISPLAY target helper (display-only; kept in train.py).
-# ===========================================================================
-
 def test_excursion_target_declines_with_horizon():
-    """_excursion_target(spec, h) = max(floor, base - slope*(h/30-1)) declines
-    with horizon and floors — the display-only colouring rule for the
+    """``max(floor, base - slope*(h/30-1))``, the display-only colouring rule for the
     Excursions-by-Horizon rows."""
     from train import _excursion_target, _excursion_bucket_horizons, PREDICTION_PATCHES
 
@@ -342,12 +303,7 @@ def test_excursion_target_declines_with_horizon():
     print(f"\n[DUMP] excursion_target | {vals} declines ✓")
 
 
-# ===========================================================================
-# Training-loop plumbing — offset sampler, resume alignment, checkpoint, muon.
-# ===========================================================================
-
 def test_offset_sampler_basic():
-    """_OffsetSampler yields indices starting from the given offset."""
     from train import _OffsetSampler
 
     sampler = _OffsetSampler(total_len=100, offset=40)
@@ -361,7 +317,6 @@ def test_offset_sampler_basic():
 
 
 def test_offset_sampler_zero():
-    """_OffsetSampler with offset=0 behaves like a standard sequential sampler."""
     from train import _OffsetSampler
 
     sampler = _OffsetSampler(total_len=50, offset=0)
@@ -372,7 +327,7 @@ def test_offset_sampler_zero():
 
 
 def test_resume_data_alignment():
-    """After resume, the dataset is indexed from the resumed step, not step 0."""
+    """After a resume the dataset is indexed from the resumed step, not step 0."""
     from data import T1DMDataset
     from train import _OffsetSampler
     from utils import compute_patient_seed
@@ -402,7 +357,6 @@ def test_resume_data_alignment():
 
 
 def test_checkpoint_save_load():
-    """Model can be saved and loaded producing identical (q_tau, median)."""
     from model import T1DMAI
     from tests.forward_inputs import right_edge_inputs
     import os
@@ -435,7 +389,6 @@ def test_checkpoint_save_load():
 
 
 def test_muon_optimizer_step():
-    """Muon and AdamW optimizers update their respective parameters."""
     from model import T1DMAI
     from muon import Muon
     from tests.forward_inputs import right_edge_inputs
@@ -475,7 +428,6 @@ def test_muon_optimizer_step():
 
 
 def test_training_10_steps():
-    """Training loop runs for 10 steps without NaN loss."""
     from train import train
 
     losses = train(
@@ -497,8 +449,7 @@ def test_training_10_steps():
 
 
 def test_training_100_steps_loss_trend():
-    """Loss stays stable (does not diverge) over 100 steps. A stability check,
-    not a convergence check (on-the-fly data trains a fresh patient each step)."""
+    """Stability, not convergence: on-the-fly data trains a fresh patient every step."""
     from train import train
 
     losses = train(
@@ -524,19 +475,17 @@ def test_training_100_steps_loss_trend():
     print(f"\n[DUMP] training_100step | first25={first:.4f} last25={last:.4f} "
           f"worst25={worst:.4f}")
 
-    # The Kendall-Gal-weighted risk loss (pinball + DILATE) can go negative via the
-    # +log_sigma barrier terms; compare absolute drift in magnitude to tolerate the
-    # fresh-per-step on-the-fly data.
+    # the weighted loss can go negative through the +log_sigma barriers, so compare
+    # drift in magnitude
     assert math.isfinite(worst) and math.isfinite(last)
     assert worst < abs(first) + max(2.0, 1.5 * abs(first)), (
         f"loss spiked mid-run: worst25={worst:.4f} vs first25={first:.4f}")
 
 
 def test_weight_decay_schedule_correction():
-    """AdamC (arXiv 2506.02285): the normalized Muon matrices get their weight
-    decay rescaled by the schedule ratio (gamma_t/gamma_max) each step, so the
-    effective per-step decay is gamma_t^2/gamma_max * lambda; the output-head
-    Muon group, the AdamW-decayed group, and the Kendall group are untouched."""
+    """AdamC (arXiv 2506.02285): the normalized Muon matrices have their weight decay
+    rescaled by gamma_t/gamma_max each step, so the effective decay is
+    gamma_t^2/gamma_max * lambda. The output-head, AdamW and Kendall groups are untouched."""
     from model import T1DMAI
     from risk_loss import KendallGalWeighting
     from train import _build_optimizers, _update_lr
@@ -547,15 +496,15 @@ def test_weight_decay_schedule_correction():
     muon_opt, adam_opt = _build_optimizers(
         model, weighting, muon_lr=0.02, adam_lr=0.003, muon_momentum=0.95)
 
-    # Locate the corrected (normalized) and output Muon groups by their flag.
+    # locate the corrected (normalized) and output Muon groups by their flag
     corrected_group = next(g for g in muon_opt.param_groups if g.get('wd_corrected', False))
     output_group = next(g for g in muon_opt.param_groups if not g.get('wd_corrected', False))
 
     def _in(group: dict, param: torch.Tensor) -> bool:
         return any(p is param for p in group['params'])
 
-    # Output projections are excluded from the correction; a normalized matrix
-    # (the patch embedding) is included.
+    # output projections are excluded from the correction, a normalized matrix such as
+    # the patch embedding is included
     assert _in(output_group, model.bg_head[-1].weight)
     assert not _in(corrected_group, model.bg_head[-1].weight)
     if model.time_head is not None:
@@ -564,15 +513,14 @@ def test_weight_decay_schedule_correction():
     assert _in(corrected_group, model.patch_embed.weight)
     assert not _in(output_group, model.patch_embed.weight)
 
-    # Identify the AdamW groups: the decayed embedding/1D group and the wd=0
-    # Kendall group.
+    # the AdamW groups: the decayed embedding/1D one and the wd=0 Kendall one
     adam_decayed = next(g for g in adam_opt.param_groups if g['weight_decay'] != 0.0)
     kendall_group = next(g for g in adam_opt.param_groups if g['weight_decay'] == 0.0)
 
     warmup_steps, total_steps, lr_min_ratio = 2000, 100000, 0.001
 
     def ratio(step: int) -> float:
-        # Byte-identical to _update_lr's warmup + cosine multiplier.
+        # byte-identical to _update_lr's warmup + cosine multiplier
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
@@ -596,18 +544,16 @@ def test_weight_decay_schedule_correction():
         assert adam_decayed['weight_decay'] == ADAM_WEIGHT_DECAY
         assert kendall_group['weight_decay'] == 0.0
 
-    # At peak LR (ratio == 1, i.e. step == warmup_steps) the corrected effective
-    # decay is bit-identical to plain decoupled decay peak*lambda.
+    # at peak LR (ratio == 1, step == warmup_steps) the corrected effective decay is
+    # bit-identical to plain decoupled decay, peak*lambda
     _update_lr(muon_opt, adam_opt, warmup_steps, 0.02, 0.003, warmup_steps, total_steps,
                lr_min_ratio, wd_correction=True)
     assert ratio(warmup_steps) == 1.0
     assert corrected_group['lr'] * corrected_group['weight_decay'] == 0.02 * MUON_WEIGHT_DECAY
 
-    # wd_correction=False restores the constant baseline decay even deep in the
-    # cosine tail. Drive the corrected group to a drifted tail value FIRST
-    # (ratio << 1) with the correction on, WITHOUT an intervening ratio==1 reset,
-    # so the off-path assertion genuinely exercises the idempotent restore rather
-    # than reading a value some earlier peak-LR call left at base.
+    # drive the group to a drifted tail value (ratio << 1) with the correction ON and
+    # no intervening ratio==1 reset, so the off-path assertion exercises the restore
+    # rather than reading a value an earlier peak-LR call left at base
     _update_lr(muon_opt, adam_opt, 99000, 0.02, 0.003, warmup_steps, total_steps,
                lr_min_ratio, wd_correction=True)
     assert corrected_group['weight_decay'] < MUON_WEIGHT_DECAY   # drifted below base
@@ -618,21 +564,13 @@ def test_weight_decay_schedule_correction():
           f"{corrected_group['weight_decay']:.6e} == baseline {MUON_WEIGHT_DECAY:.6e} ✓")
 
 
-# ===========================================================================
-# CSV log schemas — the header and the row writer come from ONE list.
-# ===========================================================================
-
 def test_csv_header_and_row_same_length():
     """Header and row writer stay element-for-element aligned.
 
-    They used to be two mirrored literals per log, 136 columns each for the
-    validation log; a metric added to one alone shifted every column after it
-    with no error to catch it. Both now come from one ``(name, decimals)`` spec,
-    so the length equality is what checks that the extraction still holds.
-
-    The checkpoint's ``val_record`` is a THIRD surface and is deliberately NOT
-    compared here: it carries keys no CSV column has and misses columns the CSV
-    writes, so an equality assert against it fails on the first run.
+    Both come from one ``(name, decimals)`` spec, so the length equality is what
+    checks that the extraction still holds. The checkpoint's ``val_record`` is a THIRD
+    surface, deliberately not compared: it carries keys no CSV column has and misses
+    columns the CSV writes.
     """
     import csv
     import io
@@ -652,8 +590,8 @@ def test_csv_header_and_row_same_length():
             f"{sorted({c for c in header if header.count(c) > 1})}"
         )
 
-        # Through the writer the loop actually uses, so a widening that only
-        # appears once the row is serialised is caught as well as one in the list.
+        # through the writer the loop uses, so a widening that appears only once the
+        # row is serialised is caught too
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(header)
@@ -667,13 +605,7 @@ def test_csv_header_and_row_same_length():
 
 
 def test_val_log_has_no_dead_alias():
-    """``val_pinball`` is gone rather than duplicating ``val_loss_Q``.
-
-    ``risk_total_loss`` emits no ``pinball`` component, so the column fell
-    through to ``loss_Q`` and the two were bit-identical on every row ever
-    written. The pinball term IS ``loss_Q``; two names for it read as two
-    measurements.
-    """
+    """The pinball term IS ``loss_Q``, and two names for it read as two measurements."""
     from train import _val_log_columns
 
     names = [c for c, _ in _val_log_columns()]
@@ -685,16 +617,11 @@ def test_val_log_has_no_dead_alias():
 def test_val_log_bins_masked_bg_on_d():
     """Every masked-BG family is reported per ``d``, and none is pooled.
 
-    ``d`` is the distance in patches to the nearest visible evidence on either
-    side. The sampler concentrates supervision at small ``d``, so a pooled
-    masked-BG scalar falls without the model improving and must not exist to be
-    selected on. The forecast protocol's per-patch end-horizons ARE
-    ``d = 1..PREDICTION_PATCHES`` one-sided; infill carries its own namespace and
-    its linear-interpolation baseline.
-
-    Both axes and the infill column names come from ``metrics.protocols``, so
-    this test reads them from there too — a local range here would be the second
-    copy the log surface was rebuilt to remove.
+    ``d`` is the distance in patches to the nearest visible evidence on either side.
+    The sampler concentrates supervision at small ``d``, so a pooled masked-BG scalar
+    falls without the model improving and must not exist to be selected on. Both axes
+    and the infill names come from ``metrics.protocols``: a local range would be a
+    second copy.
     """
     from config import PREDICTION_PATCHES
     from metrics.protocols import FORECAST, INFILL, column, reachable_d
@@ -705,7 +632,7 @@ def test_val_log_bins_masked_bg_on_d():
     fc_d = reachable_d(FORECAST)
     inf_d = reachable_d(INFILL)
 
-    # The forecast horizons and its d bins are the same axis, one for one.
+    # the forecast horizons and its d bins are one axis, one for one
     assert len(eh) == len(fc_d) == PREDICTION_PATCHES
 
     for h in eh:
@@ -717,14 +644,13 @@ def test_val_log_bins_masked_bg_on_d():
             col = column(INFILL, fam, d)
             assert col in names, f"missing {col}"
 
-    # Sharpness sits beside coverage everywhere coverage is reported.
+    # sharpness sits beside coverage everywhere coverage is reported
     for col in [c for c in names if c.startswith('coverage90@')]:
         assert col.replace('coverage90@', 'sharp90@') in names, (
             f"{col} has no sharpness companion")
 
-    # No pooled masked-BG scalar: one of these family names carrying no axis
-    # suffix would be exactly that. metrics.protocols.column refuses to build an
-    # infill name without a d; this checks none reached the list another way.
+    # a family name with no axis suffix IS a pooled masked-BG scalar;
+    # ``metrics.protocols.column`` refuses to build one, this catches another route
     for fam in ('crps', 'winkler90'):
         assert fam not in names, f"{fam} is pooled over d"
     for name in names:

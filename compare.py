@@ -1,38 +1,19 @@
 #!/usr/bin/env python3
-"""
-Cross-model comparison over the trained checkpoints under ``models/``.
+"""Cross-model comparison over the trained checkpoints under ``models/``.
 
-Compares the three capacities (nano, small, medium) on every horizon and probe the
-per-model metric directories carry, and writes high-resolution figures and
-machine-readable JSON. No markdown is produced.
+Writes high-resolution figures and machine-readable JSON; no markdown.
 
-Reporting basis
----------------
-``metrics/core/suite.py`` scores each horizon twice and the two are NOT interchangeable:
+Two reporting bases, NOT interchangeable.  ``median_line`` is the genuine point forecast
+``f_inv(median)`` and the headline basis here — RMSE, MAE, MARD, Clarke, skill.  Band-scored is
+``pred_eff = clip(true, q_lo, q_hi)``: zero error wherever the truth falls inside the 50% band,
+a band-geometry diagnostic and not a point forecast.  Every emitted record carries a ``basis``
+field and every accessor is named for the basis it reads.  CG-EGA and hypo/hyper detection have
+no median-line counterpart and are reported band-scored, labelled so.
 
-``median_line``   the genuine point forecast ``f_inv(median)``. The basis published
-                  numbers use, and the basis this script reports as headline accuracy
-                  (RMSE, MAE, MARD, Clarke, skill).
-``band-scored``   the top-level block, computed on ``pred_eff = clip(true, q_lo, q_hi)``
-                  — zero error wherever the truth falls inside the 50% band. Useful as
-                  a band-geometry diagnostic, not comparable to a point forecast.
+Palette and chrome come from ``metrics/figstyle.py``, the single copy; one hue job per figure —
+capacity rides the ordinal blue ladder, the evaluation source keeps its categorical hue.
 
-Every emitted record carries a ``basis`` field, and every accessor here is named for
-the basis it reads, so the two can never be confused at a call site. Two families have
-no median-line counterpart and are reported band-scored, labelled as such: CG-EGA
-(scored on ``pred_eff``) and hypo/hyper detection (keyed off the τ alarm band edges).
-
-Colour discipline
------------------
-Palette and chrome come from the suite's single copy at ``metrics/figstyle.py``; this
-script adds no second copy. Per that module's rule a mark encodes exactly one job, so
-each figure carries exactly one hue job: capacity rides one ordinal blue ladder, and
-the evaluation source keeps its fixed categorical hue.
-
-Usage
------
-    python compare.py                 # writes comparison/{figures,data}
-    python compare.py --out somewhere
+    python compare.py [--out DIR]
 """
 from __future__ import annotations
 
@@ -47,9 +28,8 @@ from typing import Any
 import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-# The trained-checkpoint tree, one directory per capacity. The GUI discovers its
-# checkpoint from the same root — a second root is how the two start disagreeing
-# about which checkpoint "medium" names.
+# One directory per capacity. The GUI discovers its checkpoint from the same root — a second
+# root is how the two start disagreeing about which checkpoint "medium" names.
 MODEL_ROOT = os.path.join(ROOT, 'models')
 
 sys.path.insert(0, os.path.join(ROOT, 'metrics'))
@@ -59,13 +39,9 @@ import matplotlib.pyplot as plt                                          # noqa:
 from matplotlib.lines import Line2D                                      # noqa: E402
 from matplotlib.patches import Patch                                     # noqa: E402
 
-# ---------------------------------------------------------------------------- #
-# The grid.
-# ---------------------------------------------------------------------------- #
 SIZES = ('nano', 'small', 'medium')
-# One training variant and one evaluation source. Both axes are kept as tuples
-# rather than inlined: every figure below iterates them, and a second source
-# would otherwise mean re-threading a loop through forty call sites.
+# Tuples rather than inlined, though each holds one entry: every figure iterates them, so a
+# second source is one edit instead of a loop re-threaded through forty call sites.
 VARIANTS = ('sim',)
 COHORTS = ('sim',)
 HORIZONS = ('30', '60', '120')
@@ -85,9 +61,6 @@ COHORT_LABEL = dict(fs.COHORT_LABEL, sim='T1DMSIM')
 
 
 
-# ---------------------------------------------------------------------------- #
-# Small helpers.
-# ---------------------------------------------------------------------------- #
 def _f(v: Any) -> float:
     """A metric as float, with a missing or unrepresentable value as NaN."""
     if v is None:
@@ -196,9 +169,6 @@ def loglog_fit(x: list[float], y: list[float]) -> dict[str, float]:
     return {'exponent': float(b), 'coefficient': float(np.exp(a)), 'r2': r2, 'n': int(ok.sum())}
 
 
-# ---------------------------------------------------------------------------- #
-# Loading.
-# ---------------------------------------------------------------------------- #
 def load_params() -> dict[str, dict[str, Any]]:
     """Parameter count and architecture provenance, read from the checkpoints."""
     import torch
@@ -254,9 +224,6 @@ def n_params(M: dict, size: str) -> float:
     return _f((M['params'].get(size) or {}).get('n_params'))
 
 
-# ---------------------------------------------------------------------------- #
-# Figure chrome.
-# ---------------------------------------------------------------------------- #
 FIGDIR = ''
 DATADIR = ''
 WRITTEN: list[str] = []
@@ -283,18 +250,16 @@ def dump(obj: Any, name: str) -> str:
     return path
 
 
-# Header geometry is measured in INCHES, not figure fractions: the fonts are in
-# points, so a fractional offset that clears the title on a tall figure collides
-# with it on a short one.
+# INCHES, not figure fractions: the fonts are in points, so a fractional offset that clears the
+# title on a tall figure collides with it on a short one.
 HEADER_IN = 0.86          # reserved band above the panels
 TITLE_IN = 0.17           # title baseline, from the top edge
 SUBTITLE_IN = 0.42        # subtitle baseline, from the top edge
 LEGEND_IN = 0.13          # legend top, from the top edge
 
 
-# Below this width the title and the legend cannot share a line, so the legend
-# drops under the subtitle and the reserved band grows to hold it. The ladder
-# collapsed to a single evaluation source, which is what made these figures narrow.
+# Below this width the title and the legend cannot share a line: the legend drops under the
+# subtitle and the reserved band grows to hold it.
 NARROW_IN = 11.0
 MIN_FIG_IN = 8.0          # floor on figure width, so a title has room to sit
 
@@ -362,9 +327,6 @@ def blank(ax) -> None:
     ax.grid(False)
 
 
-# ---------------------------------------------------------------------------- #
-# A. Capacity, cost and training dynamics.
-# ---------------------------------------------------------------------------- #
 def fig_capacity(M: dict) -> None:
     fig, axes = grid(1, 4, w=3.5, h=3.0)
     ax = axes[0][0]
@@ -436,9 +398,6 @@ def fig_pretrain(M: dict) -> None:
     save(fig, 'fig02_pretrain_dynamics.png')
 
 
-# ---------------------------------------------------------------------------- #
-# B. Accuracy, on the median line.
-# ---------------------------------------------------------------------------- #
 def _accuracy_panel(M: dict, ax, cohort: str, h: str, key: str) -> bool:
     drew = False
     for v in VARIANTS:
@@ -602,9 +561,6 @@ def fig_scaling(M: dict, scaling: dict) -> None:
     save(fig, 'fig08_scaling_law.png')
 
 
-# ---------------------------------------------------------------------------- #
-# C. Clinical grids.
-# ---------------------------------------------------------------------------- #
 def fig_clarke(M: dict) -> None:
     keys = [('clarke_A', 'zone A (%)'), ('clarke_AB', 'zone A+B (%)'), ('clarke_D', 'zone D (%)')]
     fig, axes = grid(len(keys), len(COHORTS), w=3.3, h=2.5)
@@ -676,9 +632,6 @@ def fig_cgega(M: dict) -> None:
     save(fig, 'fig10_cgega.png')
 
 
-# ---------------------------------------------------------------------------- #
-# D. Excursion detection, off the alarm band edges.
-# ---------------------------------------------------------------------------- #
 def fig_detection(M: dict, event: str, fname: str) -> None:
     fig, axes = grid(2, len(COHORTS), w=3.3, h=2.6)
     for i, stat in enumerate(('recall', 'precision')):
@@ -774,9 +727,6 @@ def fig_night_onset(M: dict) -> None:
 
 
 
-# ---------------------------------------------------------------------------- #
-# E. Uncertainty and calibration.
-# ---------------------------------------------------------------------------- #
 def fig_conformal(M: dict) -> None:
     fig, axes = grid(2, len(COHORTS), w=3.3, h=2.6)
     for j, c in enumerate(COHORTS):
@@ -962,9 +912,8 @@ def fig_whatif_quality(M: dict) -> None:
 def _empty_future_probed(M: dict) -> bool:
     """Did any run actually probe the empty-future arm?
 
-    It needs raw carb/bolus EVENTS to strip, and a simulator segment carries
-    pre-resolved channels only — ``whatif.run`` marks both arms ``not_probed``
-    rather than reporting the null arm relabelled. Drawing the figure anyway
+    It needs raw carb/bolus EVENTS to strip and a simulator segment carries pre-resolved
+    channels only, so ``whatif.run`` marks both arms ``not_probed``.  Drawing the figure anyway
     ships three "no data" panels, which read as a measured zero.
     """
     for size in SIZES:
@@ -1042,9 +991,6 @@ def fig_ranking(rankings: dict) -> None:
     save(fig, 'fig27_ranking.png')
 
 
-# ---------------------------------------------------------------------------- #
-# JSON products.
-# ---------------------------------------------------------------------------- #
 def build_models(M: dict) -> dict:
     out = {}
     for size in SIZES:
@@ -1276,7 +1222,6 @@ def build_index() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------- #
 def main() -> None:
     global FIGDIR, DATADIR
     ap = argparse.ArgumentParser(description=(__doc__ or 'model comparison').strip().split('\n')[0])

@@ -1,22 +1,7 @@
-"""
-T1DMAI GUI Renderer — chart drawing primitives.
-================================================
+"""Chart drawing primitives for ``gui.py``: no mutable state beyond the per-call ``ChartTransform``.
 
-Pure rendering helpers used by ``gui.py``.  Nothing here owns mutable state
-beyond the per-call ``ChartTransform`` — every drawing routine takes the
-target surface, the transform, and the data, and just blits.
-
-Provides:
-  * ``ChartTransform`` — conversion between screen pixels and chart
-    (patch, value) coordinates.  All chart code goes through here so
-    panning / zooming is a single transform update.
-  * ``draw_grid`` / ``draw_axes`` / ``draw_curve`` / ``draw_now_line`` — the
-    drawing primitives. Patch-aligned major gridlines fall every 6 hours
-    (= 6 × ``_PATCHES_PER_HOUR`` patches).
-
-pygame is imported lazily inside a try/except so this module loads cleanly
-in environments where pygame isn't available (e.g. headless test runs).
-``PYGAME_AVAILABLE`` is the gate every drawing routine checks at entry.
+pygame is imported in a try/except so the module loads headless; ``PYGAME_AVAILABLE`` is the
+gate every drawing routine checks at entry.
 """
 
 import math
@@ -32,41 +17,17 @@ except ImportError:
     PYGAME_AVAILABLE = False
 
 
-# Global UI scale factor. Multiply font sizes, widget rects, and layout
-# spacings by this to produce final pixel values, so the whole interface
-# scales as one piece for hi-DPI / large displays. Both ``gui.py`` and
-# ``gui_controls.py`` import ``UI_SCALE`` and ``ui_px`` from here so they
-# stay in lockstep.
+# Multiplies every font size, widget rect and layout spacing; ``gui.py`` and
+# ``gui_controls.py`` import it from here rather than keeping their own.
 UI_SCALE: float = 1.5
 
 
 def ui_px(v: float) -> int:
-    """Scale a design-time pixel value by ``UI_SCALE`` and round to int."""
     return int(round(v * UI_SCALE))
 
 
-# ============================================================================
-# Coordinate Transform
-# ============================================================================
-
 class ChartTransform:
-    """
-    Bidirectional coordinate transform between screen pixels and chart data space.
-
-    Screen coordinates: (0, 0) at top-left, x→right, y→down.
-    Chart coordinates: (x=time in patches, y=data value) with y-axis inverted
-    (lower data values appear lower on screen).
-
-    Args:
-        screen_x: Left edge of chart area in screen pixels.
-        screen_y: Top edge of chart area in screen pixels.
-        screen_w: Width of chart area in pixels.
-        screen_h: Height of chart area in pixels.
-        chart_x_min: Minimum time value (patch index or minutes).
-        chart_x_max: Maximum time value.
-        chart_y_min: Minimum data value (bottom of chart).
-        chart_y_max: Maximum data value (top of chart).
-    """
+    """Screen pixels ((0, 0) top-left, y down) ↔ chart space (x in patches, y the value, y up)."""
 
     def __init__(
         self,
@@ -89,35 +50,14 @@ class ChartTransform:
         self.cy_max = chart_y_max
 
     def chart_to_screen(self, cx: float, cy: float) -> tuple[float, float]:
-        """
-        Convert chart coordinates to screen coordinates.
-
-        Args:
-            cx: Chart x value (time).
-            cy: Chart y value (data).
-
-        Returns:
-            (sx, sy): Screen pixel coordinates.
-        """
         x_range = max(self.cx_max - self.cx_min, 1e-9)
         y_range = max(self.cy_max - self.cy_min, 1e-9)
 
         sx = self.sx + (cx - self.cx_min) / x_range * self.sw
-        # Y is inverted: higher data value → lower screen y (higher on screen)
         sy = self.sy + (1.0 - (cy - self.cy_min) / y_range) * self.sh
         return sx, sy
 
     def screen_to_chart(self, sx: float, sy: float) -> tuple[float, float]:
-        """
-        Convert screen coordinates to chart coordinates.
-
-        Args:
-            sx: Screen x in pixels.
-            sy: Screen y in pixels.
-
-        Returns:
-            (cx, cy): Chart coordinates.
-        """
         x_range = max(self.cx_max - self.cx_min, 1e-9)
         y_range = max(self.cy_max - self.cy_min, 1e-9)
 
@@ -126,12 +66,10 @@ class ChartTransform:
         return cx, cy
 
     def x_to_screen(self, cx: float) -> float:
-        """Convert chart x to screen x only."""
         x_range = max(self.cx_max - self.cx_min, 1e-9)
         return self.sx + (cx - self.cx_min) / x_range * self.sw
 
     def y_to_screen(self, cy: float) -> float:
-        """Convert chart y to screen y only."""
         y_range = max(self.cy_max - self.cy_min, 1e-9)
         return self.sy + (1.0 - (cy - self.cy_min) / y_range) * self.sh
 
@@ -142,7 +80,6 @@ class ChartTransform:
         chart_y_min: float | None = None,
         chart_y_max: float | None = None,
     ) -> None:
-        """Update chart bounds in place."""
         if chart_x_min is not None:
             self.cx_min = chart_x_min
         if chart_x_max is not None:
@@ -153,28 +90,21 @@ class ChartTransform:
             self.cy_max = chart_y_max
 
 
-# ============================================================================
-# Pygame Drawing Utilities (only available when pygame is installed)
-# ============================================================================
-
 def draw_grid(
     surface: Any,
     transform: ChartTransform,
     n_context_patches: int,
-    major_interval_patches: float = 12.0,  # default: 6 h grid (= 6 × _PATCHES_PER_HOUR patches)
-    minor_interval_patches: float = 2.0,   # default: hourly (= _PATCHES_PER_HOUR patches)
+    major_interval_patches: float = 12.0,  # 6 h, at _PATCHES_PER_HOUR = 2
+    minor_interval_patches: float = 2.0,   # 1 h
     grid_color: tuple[int, int, int] = (48, 48, 56),
     minor_color: tuple[int, int, int] = (36, 36, 44),
     font: Any = None,
     text_color: tuple[int, int, int] = (140, 140, 155),
 ) -> None:
-    """
-    Draw time gridlines (and optionally labels) on the chart.
+    """Time gridlines, and labels when ``font`` is given.
 
-    Intervals are in patches and may be fractional; the loop walks
-    ``np.arange`` so sub-patch divisions render when the user is
-    zoomed in. The intervals are usually picked adaptively by the caller
-    (see ``_adaptive_time_intervals`` in ``gui.py``).
+    Intervals are in patches and may be fractional, so sub-patch divisions render when zoomed
+    in; the caller usually picks them adaptively (``gui._adaptive_time_intervals``).
     """
     if not PYGAME_AVAILABLE:
         return
@@ -195,7 +125,7 @@ def draw_grid(
             sx = int(transform.x_to_screen(p))
             if sx < sx_left or sx > sx_right:
                 continue
-            # Skip those that coincide with major lines.
+            # a minor line landing on a major one
             if abs((p / major) - round(p / major)) < 1e-6:
                 continue
             pygame.draw.line(surface, minor_color, (sx, chart_top), (sx, chart_bottom))
@@ -209,7 +139,7 @@ def draw_grid(
         pygame.draw.line(surface, grid_color, (sx, chart_top), (sx, chart_bottom))
         if font is not None:
             from config import PATCH_SIZE as _PS
-            # patches × (steps/patch) × STEP_MINUTES (== 5 = 30 / PATCH_SIZE)
+            # patches × steps/patch × 5 min/step
             total_minutes = int(round(p * _PS * 5))
             hours = (total_minutes // 60) % 24
             minutes = total_minutes % 60
@@ -226,12 +156,9 @@ def draw_y_band(
     color: tuple[int, int, int],
     alpha: int = 28,
 ) -> None:
-    """Fill a horizontal band between two chart-y values.
+    """Fill a horizontal band between two chart-space y values, numerically low/high.
 
-    ``chart_y_low``/``chart_y_high`` are in chart data space (numerically
-    low/high — the function handles the screen-y inversion). The band is
-    clipped to the chart rect, so callers can pass values that fall
-    outside the current vertical view without manual clamping.
+    Clipped to the chart rect, so an out-of-view value needs no clamping first.
     """
     if not PYGAME_AVAILABLE:
         return
@@ -255,18 +182,7 @@ def draw_now_line(
     font: Any = None,
     text_color: tuple[int, int, int] = (220, 220, 230),
 ) -> None:
-    """
-    Draw the vertical NOW divider line separating context from prediction.
-
-    Args:
-        surface: Pygame surface.
-        transform: ChartTransform.
-        n_context_patches: Position of the NOW line.
-        color: Line color.
-        alpha: Line alpha (0-255).
-        font: Pygame font for "NOW" label.
-        text_color: Label color.
-    """
+    """The vertical NOW divider at patch ``n_context_patches``, context from prediction."""
     if not PYGAME_AVAILABLE:
         return
 
@@ -292,18 +208,7 @@ def draw_curve(
     width: int = 2,
     alpha: int = 255,
 ) -> None:
-    """
-    Draw a line curve on the chart.
-
-    Args:
-        surface: Pygame surface.
-        transform: ChartTransform.
-        times: (N,) array of x values (patch indices).
-        values: (N,) array of y values.
-        color: Line color.
-        width: Line width in pixels.
-        alpha: Line alpha (0-255).
-    """
+    """Line curve: ``times`` ``(N,)`` patch indices, ``values`` ``(N,)`` chart-space."""
     if not PYGAME_AVAILABLE or len(times) < 2:
         return
 
@@ -337,7 +242,6 @@ def draw_text(
     y: int,
     color: tuple[int, int, int] = (220, 220, 230),
 ) -> None:
-    """Draw text at screen position (x, y)."""
     if not PYGAME_AVAILABLE or font is None:
         return
     img = font.render(text, True, color)
@@ -351,7 +255,6 @@ def draw_color_swatch(
     color: tuple[int, int, int],
     size: int = 12,
 ) -> None:
-    """Draw a small colored square swatch."""
     if not PYGAME_AVAILABLE:
         return
     pygame.draw.rect(surface, color, (x, y, size, size))
@@ -370,24 +273,11 @@ def draw_clock_face(
     tick_color: tuple[int, int, int] | None = None,
     R: float | None = None,
 ) -> None:
-    """Blit a ``utils.ClockGeometry`` clock-face histogram onto a pygame surface.
+    """Blit a ``utils.ClockGeometry`` clock face; ``cx``/``cy``/``radius`` in screen pixels.
 
-    Thin adapter — all trigonometry lives in ``utils.clock_wedge_geometry``; the
-    only host-specific step is the y-DOWN screen flip
-    ``(x, y) -> (cx + radius*x, cy - radius*y)`` (the geometry is y-up unit-disk).
-
-    Args:
-        surface: pygame surface to draw onto.
-        cx, cy: clock-face center in screen pixels.
-        radius: clock-face radius in screen pixels.
-        geom: a ``utils.ClockGeometry`` (``wedges (n_bins, arc_segments+2, 2)``,
-            ``magnitudes (n_bins,)``, ``hand (2,)``, ``R``) — y-up unit coords.
-        face_color: filled backing disk color.
-        wedge_color: per-bin wedge fill color.
-        hand_color: resultant-hand line color.
-        tick_color: optional 12/3/6/9 tick color; ``None`` skips the ticks.
-        R: unused for geometry (invariant, already baked into ``geom``); accepted
-            so callers may pass ``geom.R`` explicitly without effect.
+    All trigonometry lives in ``utils.clock_wedge_geometry``, whose coords are y-up unit-disk;
+    the only host step is the y-DOWN flip ``(x, y) -> (cx + radius*x, cy - radius*y)``.
+    ``tick_color=None`` skips the 12/3/6/9 ticks; ``R`` is already baked into ``geom``.
     """
     if not PYGAME_AVAILABLE:
         return

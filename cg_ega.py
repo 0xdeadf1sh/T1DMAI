@@ -1,48 +1,37 @@
-"""
-Continuous Glucose-Error Grid Analysis (CG-EGA).
+"""Continuous Glucose-Error Grid Analysis (CG-EGA), vectorized numpy, mg/dL.
 
-Vectorized numpy port of the dotXem/CG-EGA reference implementation
-(https://github.com/dotXem/CG-EGA), which adapts the Continuous Glucose-EGA of
-Kovatchev et al. 2004 (Diabetes Care 27(8):1922) to glucose PREDICTION.
-
-The zone boundaries and the AP/BE/EP filter matrices below are that
-reimplementation's, NOT the published paper's, and the two differ on three points:
-the rate widening ``mod`` is applied to both bounds rather than only to the one the
+Port of the dotXem/CG-EGA reference (https://github.com/dotXem/CG-EGA), which adapts
+the Continuous Glucose-EGA of Kovatchev et al. 2004 (Diabetes Care 27(8):1922) to
+glucose PREDICTION. The zone boundaries and the AP/BE/EP filter matrices below are that
+reimplementation's, NOT the published paper's, and the two differ on three points: the
+rate widening ``mod`` is applied to both bounds rather than only to the one the
 published grid widens; the hyperglycemia benign filter marks its ``lD`` cell benign
 where the published grid marks it erroneous; and the upper-C boundary carries the
-``22/17`` slope below rather than the published ``1.03``. Two of the three
-under-report danger. Transcribing dotXem is deliberate — it is what makes this table
-and T1DMDROID's Rust port one statistic — but no figure produced here may be quoted
-against a published CG-EGA value without stating the departures. They are enumerated,
-with their safety direction, in T1DMCOMMON's ``SPEC/invariants.md`` §6.3, which counts
-four rather than three: its fourth is the shared ``last_bg`` anchoring fixed there and
-used below, a considered choice rather than a grid transcription error, and so not one
-of the three enumerated here.
+``22/17`` slope below rather than the published ``1.03``. Two of the three under-report
+danger. Transcribing dotXem is deliberate — it is what makes this table and T1DMDROID's
+Rust port one statistic — but no figure produced here may be quoted against a published
+CG-EGA value without stating the departures. ``../T1DMCOMMON/SPEC/invariants.md`` §6.3
+enumerates them with their safety direction and counts four: its fourth is the shared
+``last_bg`` anchoring used below, a considered choice rather than a transcription error.
 
-CG-EGA grades a forecast on TWO axes at once and combines them into a single
-clinical verdict per point:
+Two axes per point, combined into one clinical verdict:
 
-  * P-EGA (point) — 5 zones A,B,C,D,E — is the predicted BG VALUE close enough
-    to the true value, with the acceptance band widened when BG is moving fast
-    (the ``mod`` rate-of-change term)?
-  * R-EGA (rate)  — 8 zones A,B,uC,lC,uD,lD,uE,lE — does the predicted RATE of
-    change (mg/dL/min) agree with the true rate?
+  * P-EGA (point) — 5 zones A,B,C,D,E — is the predicted BG VALUE close enough, with
+    the acceptance band widened when BG is moving fast (the ``mod`` rate term)?
+  * R-EGA (rate) — 8 zones A,B,uC,lC,uD,lD,uE,lE — does the predicted RATE of change
+    (mg/dL/min) agree with the true rate?
 
-The (R-mark, P-mark) pair is looked up per glycemic region (hypo / eu / hyper)
-in the AR/BE/EP filter matrices and reduced to one of:
+The (R-mark, P-mark) pair is looked up per glycemic region in the AP/BE/EP filter
+matrices and reduced to AP (accurate), BE (benign error, clinically harmless) or EP
+(erroneous, clinically dangerous).
 
-  * AP — Accurate Prediction (clinically correct)
-  * BE — Benign Error (wrong but clinically harmless)
-  * EP — Erroneous Prediction (clinically dangerous)
-
-Region is assigned by the TRUE BG of each point: hypo ``y_true <= 70``,
-eu ``70 < y_true <= 180``, hyper ``y_true > 180`` (mg/dL).
-
-``y_true`` is the reference on EVERY axis — that region binning, the ±20% acceptance
-band, the zone-D excursion gates, the rate-dependent ``mod`` widening and the R-EGA
-abscissa all read it. The argument order is therefore load-bearing: transposing the
-two trajectories re-buckets points between the regions, so every denominator moves
-and the result is a well-formed table of a different statistic.
+Region comes from the TRUE BG of each point: hypo ``y_true <= 70``, eu
+``70 < y_true <= 180``, hyper ``y_true > 180`` (mg/dL). ``y_true`` is the reference on
+EVERY axis — that region binning, the ±20% acceptance band, the zone-D excursion gates,
+the ``mod`` widening and the R-EGA abscissa all read it. Argument order is therefore
+load-bearing: transposing the two trajectories re-buckets points between the regions,
+so every denominator moves and the result is a well-formed table of a different
+statistic.
 
 All public functions take and return mg/dL; rates are mg/dL/min.
 """
@@ -57,11 +46,9 @@ __all__ = [
     "cg_ega_fractions",
 ]
 
-# ---------------------------------------------------------------------------
-# AP/BE/EP filter matrices (8 R-marks × region P-cols), VERBATIM from the
-# reference. Rows are the 8 R-marks [A, B, uC, lC, uD, lD, uE, lE]; columns are
-# the region's selected P-marks (see _REGION_P_COLS below).
-# ---------------------------------------------------------------------------
+# AP/BE/EP filter matrices (8 R-marks × region P-cols), VERBATIM from the reference.
+# Rows are the 8 R-marks [A, B, uC, lC, uD, lD, uE, lE]; columns are the region's
+# selected P-marks (see _REGION_P_COLS below).
 _FILTER_AP_HYPO = np.array(
     [[1, 0, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0],
      [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]], dtype=bool)
@@ -100,10 +87,9 @@ _REGION_FILTERS: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "hyper": (_FILTER_AP_HYPER, _FILTER_BE_HYPER),
 }
 
-# Per-region AP/BE/EP label table over the FULL (8 R-marks × 5 P-marks) grid,
-# precomputed so classification is a pure fancy-index gather. Encoding:
-# 0 = AP, 1 = BE, 2 = EP. A (R,P) cell whose P-mark is not among the region's
-# filter columns (e.g. P=B or C in hypo) is EP (it is in neither AP nor BE).
+# Per-region AP/BE/EP label table over the FULL (8 R-marks × 5 P-marks) grid, so
+# classification is a pure fancy-index gather. 0 = AP, 1 = BE, 2 = EP. A (R,P) cell
+# whose P-mark is not among the region's filter columns is EP — neither AP nor BE.
 _LABEL_AP, _LABEL_BE, _LABEL_EP = 0, 1, 2
 
 
@@ -111,7 +97,7 @@ def _region_label_table(region: str) -> np.ndarray:
     """(8, 5) AP/BE/EP code table for one region (0=AP, 1=BE, 2=EP)."""
     f_ap, f_be = _REGION_FILTERS[region]
     cols = _REGION_P_COLS[region]
-    table = np.full((8, 5), _LABEL_EP, dtype=np.int8)  # default EP
+    table = np.full((8, 5), _LABEL_EP, dtype=np.int8)
     for j, p in enumerate(cols):
         table[:, p] = np.where(f_ap[:, j], _LABEL_AP,
                                np.where(f_be[:, j], _LABEL_BE, _LABEL_EP))

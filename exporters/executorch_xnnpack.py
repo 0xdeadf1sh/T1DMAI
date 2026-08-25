@@ -1,20 +1,13 @@
-"""ExecuTorch XNNPACK (CPU fp32) exporter.
+"""ExecuTorch XNNPACK (CPU fp32) exporter — the reference and the authority.
 
-Loads the EMA checkpoint, wraps it in the modified forward (external struct mask,
-external slot selection, graph cut at ``head_raw``), ``torch.export``s it, lowers
-to ExecuTorch XNNPACK -> an fp32 ``<id>.xnnpack.pte``, writes the BG head beside it
-as a flat fp32 side file, emits the descriptor, and verifies on host that:
+EMA checkpoint -> modified forward -> ``torch.export`` -> ``<id>.xnnpack.pte``, the BG head beside it as a
+flat fp32 side file, plus the descriptor. Verified on host:
 
-  (1) the modified (struct-mask, slot-selection) forward matches the STOCK
-      bool-mask/gather forward's internal ``head_raw``, for a trailing forecast AND
-      for a masked set with an infill span in it,
-  (2) the lowered ``.pte`` run through the ExecuTorch python runtime matches the
-      eager modified forward, on both masked sets, and
-  (3) the head side file reproduces ``head_raw`` from the graph's own
-      ``slot_hidden`` — the property the on-device adapter path rests on.
-
-CPU fp32 XNNPACK is the reference/authority; the NPU fp16 path is a separate,
-deferred engine module.
+  (1) modified (struct mask, slot selection) vs STOCK (bool mask, gather) ``head_raw``, for a trailing
+      forecast AND for a masked set with an infill span,
+  (2) the lowered ``.pte`` vs the eager modified forward, on both masked sets,
+  (3) the head side file reproducing ``head_raw`` from the graph's own ``slot_hidden`` — what the on-device
+      adapter path rests on.
 """
 
 from __future__ import annotations
@@ -47,17 +40,17 @@ from exporters.head_weights import write_head_weights
 
 ENGINE = "executorch_xnnpack_fp32"
 VERIFY_TOL = 1e-3
-# The head side file is the SAME arithmetic in a different order, so it agrees far
-# more tightly than the runtime gate above; a looser bound here would pass a head
-# paired with the wrong graph.
+# the head file is the same arithmetic reordered, so it agrees far more tightly than the runtime gate;
+# a looser bound would pass a head paired with the wrong graph
 HEAD_TOL = 1e-4
 
 
 class Window:
-    """One built export input: the padded patches, the additive mask, the slot
-    selection, and the per-slot anchors that name the same masked set to the stock
-    forward. Built by :func:`build_representative_input`; the fields are set there
-    so the two paths cannot describe different masked sets."""
+    """One built export input: padded patches, additive mask, slot selection, per-slot anchors.
+
+    All set in :func:`build_representative_input`, so the modified and stock paths cannot describe
+    different masked sets.
+    """
 
     patches: torch.Tensor      # (1, T, PATCH_DIM)
     struct: torch.Tensor       # (T, T) additive
@@ -78,11 +71,10 @@ def executorch_version() -> str:
 def _slot_anchor_cells(spans, n_ctx):
     """The ``(patch, step)`` context cell each masked slot anchors on.
 
-    One-sided and left-preferring: the last step of the span's left neighbour, or
-    the first step of the right neighbour when the span opens the window. Every slot
-    of one span carries the same cell. Only a VISIBLE cell may be named — feat 0 of a
-    masked patch is a legal-looking z that decodes to an ordinary mg/dL, so a wrong
-    index yields a plausible anchor rather than an error.
+    One-sided, left-preferring: the left neighbour's last step, or the right neighbour's first when the span
+    opens the window; every slot of a span shares it.
+    Only a VISIBLE cell may be named — feat 0 of a masked patch is a legal z that decodes to an ordinary
+    mg/dL, so a wrong index yields a plausible anchor, not an error.
     """
     patch_idx: list[int] = []
     step_idx: list[int] = []
@@ -106,31 +98,23 @@ def build_representative_input(
     seq_len: int | None = None,
     mask_spans=None,
 ) -> Window:
-    """A plausible normalized fixed-``T`` input from a SYNTHETIC BG series.
+    """A plausible normalized fixed-``T`` input from a SYNTHETIC BG series; no simulator or sensor needed.
 
-    No simulator / sensor needed: a smooth diurnal BG curve with meal-driven
-    excursions, a light constant basal, boluses and one exercise bout — passed
-    through the exact training preprocessing (clamp bg / floor the rest ->
-    normalize; no smoothing) and the shipped ``_build_patches_tensor`` so the
-    patches / mask / masked-set bit are construction-identical to a real run.
-
-    The graph is a SINGLE fixed shape ``T``, default
-    ``MAX_CONTEXT_PATCHES + PREDICTION_PATCHES``, with the real context LEFT-PADDED
-    into the context slots (the future patches at the right edge) — exactly how
-    training's ``collate_fn`` pads, so the absolute RoPE positions match training.
-    ``_build_patches_tensor`` emits only ``n_ctx + P`` tokens, so we prepend
-    ``(T - P) - n_ctx`` zero pad patches here; the struct mask blocks every pad
-    COLUMN, so the pad values never reach a masked token.
-
-    ``mask_spans`` is the masked set in UNPADDED window coordinates (what
-    ``inference.predict`` takes). None selects the trailing forecast.
+    A diurnal curve with meal excursions, light basal, boluses and one exercise bout, through the exact
+    training preprocessing and the shipped ``_build_patches_tensor``, so patches, mask and mask bit are
+    construction-identical to a real run.
+    Fixed shape ``T``, default ``MAX_CONTEXT_PATCHES + PREDICTION_PATCHES``, real context LEFT-PADDED as
+    training's ``collate_fn`` pads, so absolute RoPE positions match training. ``_build_patches_tensor``
+    emits ``n_ctx + P`` tokens, so ``(T - P) - n_ctx`` zero patches are prepended; the struct mask blocks
+    every pad COLUMN, so pad values never reach a masked token.
+    ``mask_spans`` is in UNPADDED window coordinates, as ``inference.predict`` takes it; None = trailing forecast.
     """
     T = int(seq_len or cfg.MAX_SEQ_LEN)
     c = T - cfg.PREDICTION_PATCHES
     n_ctx = int(n_ctx or c)
     n_steps = n_ctx * cfg.PATCH_SIZE
     t = np.arange(n_steps, dtype=np.float64)
-    # Diurnal drift 90..170 mg/dL + gaussian meal excursions, one per simulated day.
+    # diurnal drift 90..170 mg/dL plus one gaussian meal excursion per simulated day
     bg = 120.0 + 30.0 * np.sin(2.0 * np.pi * t / max(288.0, n_steps / 7.0))
     for center, amp, width in ((0.35 * n_steps, 55.0, 18.0), (0.72 * n_steps, 40.0, 14.0)):
         bg += amp * np.exp(-0.5 * ((t - center) / width) ** 2)
@@ -140,26 +124,23 @@ def build_representative_input(
     insulin = np.full(n_steps, 0.02, dtype=np.float64)          # basal action
     insulin[int(0.30 * n_steps):int(0.30 * n_steps) + 10] += 0.25
     insulin[int(0.68 * n_steps):int(0.68 * n_steps) + 10] += 0.20
-    # Exercise is a carbohydrate-EQUIVALENT disposal curve in g/step, not an
-    # intensity: one bout, on the same scale as the meals above.
+    # carbohydrate-EQUIVALENT disposal in g/step, not an intensity: one bout, the meals' scale
     exercise = np.zeros(n_steps, dtype=np.float64)
     exercise[int(0.55 * n_steps):int(0.55 * n_steps) + 12] = 1.5
 
-    # No smoothing: raw signals, bg clamped to the physical range, the rest floored
-    # at 0 (matching data._build_sample / inference).
+    # no smoothing: bg clamped to the physical range, the rest floored at 0, as data._build_sample does
     signals = {
         'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX),
         'carb_intake': np.maximum(carb, 0.0),
         'insulin_combined': np.maximum(insulin, 0.0),
         'exercise_equiv': np.maximum(exercise, 0.0),
     }
-    # Stacked in CHANNEL_NAMES order — normalization owns that order, and a channel
-    # added there raises here rather than silently landing in the wrong column.
+    # CHANNEL_NAMES order: normalization owns it, and a channel added there raises here rather than
+    # landing in the wrong column
     raw = np.stack([signals[name] for name in CHANNEL_NAMES], axis=-1).astype(np.float32)
     feats = normalize(raw, stats)                                       # (N, C) z-space
-    # Input feats 0..C-1 are the normalized signal channels in CHANNEL_NAMES order;
-    # feat BG_MASKED_FEAT is the mask BIT, which carries no statistics and whose only
-    # writer on this path is ``_build_patches_tensor``, so the context leaves it 0.
+    # feats 0..C-1 are the signal channels; feat BG_MASKED_FEAT is the mask BIT, written only by
+    # ``_build_patches_tensor``, so the context leaves it 0
     assert len(CHANNEL_NAMES) == BG_MASKED_FEAT, (
         f"{len(CHANNEL_NAMES)} signal channels but bg_masked sits at feat "
         f"{BG_MASKED_FEAT}; the signal block is no longer feats [0, {BG_MASKED_FEAT})"
@@ -177,8 +158,7 @@ def build_representative_input(
         pad = torch.zeros(pad0, cfg.PATCH_DIM, dtype=patches.dtype)
         patches = torch.cat([pad, patches], dim=0)                      # (T, PATCH_DIM)
 
-    # Context-side masked patches, shifted into padded coordinates. The future zone
-    # is masked unconditionally by window_labels.
+    # context-side masked patches in padded coordinates; window_labels masks the future zone itself
     extra = [p + pad0 for s, L in spans for p in range(s, s + L) if p < n_ctx]
     visible, is_pad, idx_abs = window_labels(n_ctx, extra, T)
     struct = build_struct_mask_from_visible(visible, is_pad, dtype=torch.float32)
@@ -191,8 +171,7 @@ def build_representative_input(
     assert n_masked == anchor_v.numel(), (
         f"{n_masked} masked patches but {anchor_v.numel()} anchors"
     )
-    # Padded slots read patch 0 and carry a legal mg/dL anchor; ``valid`` discards
-    # their outputs downstream.
+    # padded slots read patch 0 with a legal mg/dL anchor; ``valid`` discards their outputs
     mask_idx = torch.zeros(1, m, dtype=torch.int64)
     mask_idx[0, :n_masked] = torch.tensor(idx_abs, dtype=torch.int64)
     anchors = torch.full((1, m), float(anchor_v[0]), dtype=torch.float32)
@@ -213,12 +192,10 @@ def build_representative_input(
 
 
 def stock_head_raw(model, w: Window) -> torch.Tensor:
-    """Capture the STOCK ``T1DMAI.forward``'s internal ``head_raw`` (bool-mask,
-    gather-by-index path) on the same masked set.
+    """The STOCK forward's internal ``head_raw`` — bool mask, gather by index — on the same masked set.
 
-    ``head_raw`` is a forward local, so we transiently swap the module-global
-    ``assemble_quantiles`` (bound in ``model.py``) for a capturing shim, run the real
-    forward, and read the tapped tensor back.
+    ``head_raw`` is a forward local, so ``model.py``'s module-global ``assemble_quantiles`` is transiently
+    swapped for a capturing shim.
     """
     captured: dict[str, torch.Tensor] = {}
     orig = model_module.assemble_quantiles
@@ -237,8 +214,7 @@ def stock_head_raw(model, w: Window) -> torch.Tensor:
 
 
 def eager_time_logits(model, w: Window) -> torch.Tensor:
-    """Stock ``T1DMAI.forward(..., return_time=True)`` per-slot time-probe logits —
-    the eager reference the exported ``time_logits`` output is validated against."""
+    """Stock forward's per-slot time-probe logits: the reference the exported ``time_logits`` is checked against."""
     with torch.no_grad():
         _q, _m, time_pred = model(
             w.patches, w.bool_mask, w.anchors, w.mask_idx, return_time=True,
@@ -248,12 +224,10 @@ def eager_time_logits(model, w: Window) -> torch.Tensor:
 
 
 def head_from_hidden(head_path: str, block: dict, slot_hidden: torch.Tensor) -> torch.Tensor:
-    """Reproduce ``head_raw`` from ``slot_hidden`` and the flat head side file.
+    """``head_raw`` rebuilt from ``slot_hidden`` and the flat head file — the on-device adapter path in miniature.
 
-    This is the on-device adapter path in miniature: read the tensors in file order,
-    run the same two-hidden-layer SiLU MLP, and expand through the within-patch
-    basis. Any disagreement with the graph's own ``head_raw`` means the side file
-    and the ``.pte`` are not the same head.
+    Tensors in file order, the same two-hidden-layer SiLU MLP, expanded through the within-patch basis.
+    Disagreement with the graph's own ``head_raw`` means the side file and the ``.pte`` are different heads.
     """
     buf = np.fromfile(head_path, dtype="<f4")
     off = 0
@@ -277,17 +251,12 @@ def head_from_hidden(head_path: str, block: dict, slot_hidden: torch.Tensor) -> 
 
 
 def export_pte(wrapper, w: Window, out_path: str) -> dict:
-    """torch.export the wrapper and lower to ExecuTorch XNNPACK; write ``out_path``.
-
-    Returns a small dict of {delegated, total, non_delegated_ops} for the op-support
-    note.
-    """
+    """Export and lower to ExecuTorch XNNPACK -> ``out_path``; returns the op-support census."""
     from executorch.exir import to_edge_transform_and_lower
     from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 
-    # executorch serializes the XNNPACK subgraph via the `flatc` compiler. When the
-    # venv is invoked by absolute path (no activation) its bin/ is off PATH, so point
-    # FLATC_EXECUTABLE at the bundled binary if the caller hasn't already.
+    # executorch serializes the subgraph through `flatc`, and an abs-path venv invocation leaves bin/ off
+    # PATH, so point FLATC_EXECUTABLE at the bundled binary
     if not os.environ.get("FLATC_EXECUTABLE"):
         import sys
         import importlib.util
@@ -309,8 +278,7 @@ def export_pte(wrapper, w: Window, out_path: str) -> dict:
     with open(out_path, "wb") as f:
         f.write(et_prog.buffer)
 
-    # Op-support introspection: which ops stayed on the portable CPU runtime
-    # (i.e. were NOT delegated to XNNPACK).
+    # which ops stayed on the portable CPU runtime, undelegated
     info = {"non_delegated_ops": []}
     try:
         edm = lowered.exported_program().graph_module
@@ -331,8 +299,7 @@ def export_pte(wrapper, w: Window, out_path: str) -> dict:
 
 
 def run_pte_outputs(pte_path: str, patches, struct, slot_sel) -> list:
-    """Execute the ``.pte`` -> the full ordered list of output tensors
-    ``[head_raw, time_logits, slot_hidden]``."""
+    """Run the ``.pte`` -> outputs in order: ``[head_raw, time_logits, slot_hidden]``."""
     args = [patches.contiguous(), struct.contiguous(), slot_sel.contiguous()]
     try:
         from executorch.runtime import Runtime
@@ -348,12 +315,11 @@ def run_pte_outputs(pte_path: str, patches, struct, slot_sel) -> list:
 
 
 def write_time_head_golden(model, w: Window, out_path: str) -> None:
-    """Emit the Rust decode golden for ``utils.time_of_day_resultant``.
+    """The Rust decode golden for ``utils.time_of_day_resultant``.
 
-    Rows pair a 12-logit input with T1DMAI's own softmax probs + resultant (hour, R),
-    so the Rust port is gated against T1DMAI's geometry core. Mixes the deployed
-    model's real per-slot logits with hand-built synthetic distributions (one-hot,
-    uniform, bimodal, sharp, wrap-around) to exercise the circular reduction.
+    Each row pairs a logit vector with T1DMAI's own softmax probs and resultant ``(hour, R)``, so the Rust
+    port is gated against this geometry core. Real per-slot logits plus synthetic distributions — one-hot,
+    uniform, bimodal, sharp, wrap-around — to exercise the circular reduction.
     """
     n = cfg.TIME_PROBE_N_BINS
     real = eager_time_logits(model, w)[0]                              # (M, n_bins)
@@ -367,9 +333,8 @@ def write_time_head_golden(model, w: Window, out_path: str) -> None:
         v[k] = hi
         return v
     rows_logits += [
-        # uniform + antipodal are R->0 sentinels: the resultant vanishes so `hour` is
-        # pure cancellation noise (NOT a portable target); the Rust test must gate the
-        # hour assertion on R >= R_degenerate_eps and only check R there.
+        # uniform and antipodal are R->0 sentinels: the resultant vanishes and `hour` is cancellation
+        # noise, so the hour assertion is gated on R >= R_degenerate_eps
         ("uniform_zeros", [0.0] * n),
         ("antipodal_0_6", [3.0 if k in (0, 6) else 0.0 for k in range(n)]),
         ("onehot_bin0", onehot(0)),
@@ -394,8 +359,7 @@ def write_time_head_golden(model, w: Window, out_path: str) -> None:
             "probs": [float(x) for x in probs.tolist()],
             "hour": float(hour.item()),
             "R": Rv,
-            # hour is a well-defined circular target only when the resultant is
-            # non-degenerate; at R~0 it is FP-noise and must not be asserted.
+            # hour is a circular target only where the resultant is non-degenerate; at R~0 it is FP noise
             "hour_defined": Rv >= R_DEGEN_EPS,
         })
 
@@ -453,9 +417,8 @@ def main() -> None:
     c = T - cfg.PREDICTION_PATCHES
     m = cfg.MAX_MASKED_PATCHES
 
-    # Two masked sets over the same geometry: the trailing forecast the app runs
-    # every cycle, and one with an infill span in the middle of the context — the
-    # case the previous right-edge export could not represent at all.
+    # two masked sets on one geometry: the trailing forecast the app runs every cycle, and an infill span
+    # in the middle of the context
     w_fc = build_representative_input(stats, seq_len=T)
     infill_spans = [(c // 2, 4), (c, cfg.PREDICTION_PATCHES)]
     w_inf = build_representative_input(stats, seq_len=T, mask_spans=infill_spans)
@@ -463,7 +426,7 @@ def main() -> None:
           f"struct={tuple(w_fc.struct.shape)} slot_sel={tuple(w_fc.slot_sel.shape)}")
     print(f"[input] forecast slots={w_fc.n_masked} infill slots={w_inf.n_masked}")
 
-    # --- struct builder must equal the stock create_attention_mask (no pad) ---
+    # the struct builder must equal the stock create_attention_mask, no pad
     from utils import create_attention_mask
     stock_bool = create_attention_mask(c, cfg.PREDICTION_PATCHES)
     struct_stock = torch.where(
@@ -477,7 +440,7 @@ def main() -> None:
     tl_shape = (1, m, cfg.TIME_PROBE_N_BINS)
     sh_shape = (1, m, cfg.D_MODEL)
 
-    # --- (1) modified (struct + slot_sel) vs stock (bool + gather) ---
+    # (1) modified (struct + slot_sel) vs stock (bool + gather)
     deltas: dict[str, float] = {}
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         with torch.no_grad():
@@ -486,14 +449,13 @@ def main() -> None:
         assert tl_mod.shape == tl_shape, f"{name}: time_logits {tuple(tl_mod.shape)} != {tl_shape}"
         assert sh_mod.shape == sh_shape, f"{name}: slot_hidden {tuple(sh_mod.shape)} != {sh_shape}"
         hr_stock = stock_head_raw(model, w)
-        # Only the REAL slots are compared: a padded slot repeats patch 0 in both
-        # paths, so it agrees, but nothing downstream reads it.
+        # REAL slots only: a padded slot repeats patch 0 on both paths and nothing downstream reads it
         n = w.n_masked
         d = float((hr_mod[:, :n] - hr_stock[:, :n]).abs().max())
         deltas[f"struct_{name}"] = d
         print(f"[verify] modified vs stock head_raw ({name:8s})     max|Δ| = {d:.3e}")
 
-    # --- export + lower (three inputs, three outputs) ---
+    # export + lower: three inputs, three outputs
     work_dir = args.work_dir or args.out_dir
     os.makedirs(work_dir, exist_ok=True)
     pte_name = f"{args.model_id}.xnnpack.pte"
@@ -502,7 +464,7 @@ def main() -> None:
     print(f"[export] wrote {pte_work} ({os.path.getsize(pte_work)} bytes)")
     print(f"[export] op-support: {op_info}")
 
-    # --- head side file (the adapter seam) ---
+    # head side file: the adapter seam
     os.makedirs(args.out_dir, exist_ok=True)
     head_name = f"{args.model_id}.head.bin"
     head_path = os.path.join(args.out_dir, head_name)
@@ -510,7 +472,7 @@ def main() -> None:
     print(f"[head] wrote {head_path} ({head_block['bytes']} bytes, "
           f"sha256={head_block['sha256'][:12]}…)")
 
-    # --- (2) .pte vs eager modified, on BOTH masked sets ---
+    # (2) .pte vs eager modified, on BOTH masked sets
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         outs = run_pte_outputs(pte_work, w.patches, w.struct, w.slot_sel)
         assert len(outs) == 3, (
@@ -531,37 +493,36 @@ def main() -> None:
         print(f"[verify] pte vs eager time_logits  ({name:8s})     max|Δ| = "
               f"{deltas[f'time_{name}']:.3e}")
 
-        # --- (3) the head side file reproduces head_raw from the graph's own hidden ---
+        # (3) the head side file reproduces head_raw from the graph's own hidden
         hr_head = head_from_hidden(head_path, head_block, sh_pte)
         deltas[f"head_{name}"] = float((hr_head[:, :n] - hr_pte[:, :n]).abs().max())
         print(f"[verify] head file vs pte head_raw ({name:8s})     max|Δ| = "
               f"{deltas[f'head_{name}']:.3e}")
 
-    # --- padded-context sanity: the shortest context the artifact accepts ---
+    # padded-context sanity: the shortest context the artifact accepts
     w16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES, seq_len=T)
     o16 = run_pte_outputs(pte_work, w16.patches, w16.struct, w16.slot_sel)
     finite16 = bool(all(torch.isfinite(o).all() for o in o16))
     print(f"[verify] padded n_ctx={cfg.MIN_CONTEXT_PATCHES} pte outputs finite = {finite16}")
 
-    # --- Rust decode golden for the time probe (opt-in) ---
+    # Rust decode golden for the time probe, opt-in
     golden_path = args.golden
     if golden_path:
         write_time_head_golden(model, w_fc, golden_path)
         print(f"[golden] wrote {golden_path}")
 
-    # --- descriptor ---
+    # descriptor
     desc = build_descriptor(
         model_id=args.model_id, engine=ENGINE, executorch_version=et_ver,
         artifact_filename=pte_name, normalization_stats=stats, precision="fp32",
         model_card=build_model_card(model, ck), head=head_block, seq_len=T,
     )
-    # Named after the artifact, not a fixed "descriptor.json": several models share
-    # one out-dir, and the app's ModelStore discovers `*.descriptor.json` either way.
+    # named after the artifact, since several models share one out-dir; ModelStore globs `*.descriptor.json`
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.xnnpack.descriptor.json")
     write_descriptor(desc, desc_path)
     print(f"[descriptor] wrote {desc_path}")
 
-    # --- copy artifact into out-dir if it was built elsewhere ---
+    # copy the artifact into out-dir if it was built elsewhere
     pte_final = os.path.join(args.out_dir, pte_name)
     if os.path.abspath(pte_work) != os.path.abspath(pte_final):
         shutil.copy2(pte_work, pte_final)

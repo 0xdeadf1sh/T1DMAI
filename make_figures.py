@@ -1,10 +1,7 @@
-"""Render paper-style training/validation figures for a T1DMAI run.
+"""Training/validation figures for one T1DMAI run.
 
 Reads logs/{training_log.csv, validation_log.csv, training_summary.json,
-resolved_config.json} and writes a fixed set of PNG figures into figures/.
-
-Usage:
-    python make_figures.py
+resolved_config.json}; writes PNGs into figures/.
 """
 
 from __future__ import annotations
@@ -22,22 +19,15 @@ REPO = Path(__file__).resolve().parent
 LOG_DIR = REPO / "logs"
 OUT_DIR = REPO / "figures"
 
-# Every cgega_* column in logs/validation_log.csv (and in each checkpoint's
-# val_history) is written by train.py from the CG-EGA call site's fixed argument
-# order, so a log a retrain has regenerated scores (pred, true) and is publishable.
-# This flag is the single gate on every consumer of those columns — here and in
-# make_card.py, which imports it — so the panels are suppressed rather than
-# deleted. It governs ONLY the validation-log columns; metrics/ and metrics/core/
-# recompute CG-EGA from stored forecasts and are unaffected.
-#
-# TRUE means the tree being rendered must carry REGENERATED logs. Columns written
-# before the argument order was fixed hold the transposed statistic, cannot be
-# recomputed, and will now be published as though they were sound — so re-render a
-# capacity only from its own post-retrain logs.
+# The single gate on every consumer of the validation log's cgega_* columns — here and in
+# make_card.py, which imports it — so a doubtful panel is suppressed, not deleted. It governs
+# ONLY those columns; metrics/ and metrics/core/ recompute CG-EGA from stored forecasts.
+# TRUE asserts the tree being rendered carries REGENERATED logs: columns written before the
+# CG-EGA call site's argument order was fixed hold the statistic transposed, cannot be
+# recomputed, and would be published as though sound. Render a capacity from its own logs only.
 CGEGA_COLUMNS_TRUSTWORTHY = True
 
-# Architecture label shown in figure suptitles, derived from the resolved
-# config at run time (set by run()).
+# figure-suptitle architecture label, off the resolved config; set by run()
 _ARCH_LABEL = ""
 
 
@@ -116,9 +106,6 @@ def _suptitle(fig, title: str) -> None:
     fig.suptitle(f"{title}  —  {_ARCH_LABEL}", fontsize=12.5, y=1.005)
 
 
-# ---------------------------------------------------------------- figures
-
-
 def fig_loss(train, val, outdir: Path) -> None:
     fig, ax = plt.subplots(figsize=(8.2, 4.8))
     s_train = train["step"]
@@ -192,10 +179,9 @@ def fig_bg_rmse_horizons(val, outdir: Path) -> None:
 
 
 def fig_clinical(val, outdir: Path) -> None:
-    # (column, colour, higher_is_better, annotation, y-label, title). The CG-EGA
-    # panel is appended only when its source column is trustworthy; the figure is
-    # then laid out over however many panels survive, so a suppressed one leaves
-    # a narrower figure rather than an empty axis.
+    # (column, colour, higher_is_better, annotation, y-label, title); the CG-EGA panel is
+    # appended only when its column is trustworthy, and the figure lays out over the survivors,
+    # so a suppressed panel narrows the figure rather than leaving an empty axis
     panels = [
         ("evalfix_mard@30", "#1f4e8c", False, "best {val:.2f}% @ {step}",
          "MARD @30m  [%]", "Mean Absolute Relative Difference (@30 min)"),
@@ -255,14 +241,10 @@ def fig_excursion(val, outdir: Path) -> None:
 
 
 def fig_calibration(val, outdir: Path) -> None:
-    """Marginal coverage of the central-90% quantile band (the outer
-    ``QUANTILE_LEVELS`` edges, τ 0.05 / 0.95), per horizon — beside the width
-    that bought it.
+    """Marginal coverage of the central-90% band (τ 0.05 / 0.95) per horizon, beside its width.
 
-    Coverage alone is not a calibration statement: a band wide enough covers
-    everything. The sharpness axis is always drawn, so a run that reaches 0.90
-    cannot be read without the mg/dL width it took. When the validation pass
-    emitted no ``sharp90@`` column the axis says so rather than disappearing.
+    Coverage alone says nothing — a wide enough band covers everything — so the sharpness axis
+    is always drawn, and says so when the run emitted no ``sharp90@`` column.
     """
     fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.8))
     s = val["step"]
@@ -550,9 +532,8 @@ def fig_clarke_zones(val, outdir: Path) -> None:
     plt.close(fig)
 
 
-# tod_* validation columns that fig_time_of_day consumes; the figure is skipped
-# entirely when none is present or every one is all-NaN (a probe-off run, i.e.
-# config.TIME_PROBE_ENABLED False, writes them but leaves them empty).
+# The figure is skipped when none is present or all are NaN — a probe-off run
+# (TIME_PROBE_ENABLED False) writes the columns but leaves them empty.
 _TOD_COLUMNS = (
     "tod_mae_h", "tod_p90_h", "tod_mae_hiconf",
     "tod_acc_1h", "tod_acc_2h", "tod_acc_bin",
@@ -566,25 +547,18 @@ def _tod_present(val: dict[str, np.ndarray]) -> bool:
 
 
 def fig_time_of_day(val, outdir: Path) -> None:
-    """Time-of-day probe reliability over training, read straight from the
-    tod_* validation columns (no model forward needed).
+    """Time-of-day probe reliability over training, off the tod_* columns; no forward needed.
 
-    Panel A — circular error in hours (tod_mae_h, tod_p90_h, tod_mae_hiconf),
-    lower is better, against the uniform-guess chance floor. For a target drawn
-    uniformly over the 24 h clock the expected absolute circular error is 6 h, so
-    that line is a fixed illustrative reference (a distributional math fact, not
-    a config constant). Panel B — accuracy percentages (±1 h, ±2 h, 4-bin) with
-    their uniform-guess chance lines (a ±1 h window spans 2 of 24 h ⇒ ≈8.3%, ±2 h
-    ⇒ ≈16.7%, one of four bins ⇒ 25%; all illustrative). Panel C — reliability:
-    signed circular bias (target 0), circular-sd precision, gross-error rate
-    (>3 h), and the confidence magnitude R.
+    A: circular error in hours, against a 6 h chance floor — the expected absolute circular
+    error for a target drawn uniformly over the 24 h clock, a math fact, not a config constant.
+    B: accuracy %, chance lines ±1 h ⇒ 2/24 ≈ 8.3%, ±2 h ⇒ ≈16.7%, one of four bins ⇒ 25%.
+    C: signed circular bias (target 0), circular sd, gross-error rate (>3 h), confidence R.
     """
     if not _tod_present(val):
         return
     fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.6))
     s = val["step"]
 
-    # Panel A — error in hours (lower is better).
     ax = axes[0]
     err_series = [
         ("MAE", "tod_mae_h", "#1f4e8c", "-"),
@@ -605,7 +579,6 @@ def fig_time_of_day(val, outdir: Path) -> None:
     ax.set_title("Clock error (lower = better)")
     ax.legend(loc="best")
 
-    # Panel B — accuracy % (higher is better); chance lines are uniform-guess.
     ax = axes[1]
     acc_series = [
         ("±1 h", "tod_acc_1h", "#1f4e8c", 100.0 * 2.0 / 24.0),
@@ -626,8 +599,7 @@ def fig_time_of_day(val, outdir: Path) -> None:
     ax.set_title("Clock accuracy (chance = dotted)")
     ax.legend(loc="best")
 
-    # Panel C — reliability. Left axis carries the O(1) hour/R series, a twin
-    # right axis the gross-error percentage.
+    # left axis the O(1) hour/R series, twin right axis the gross-error percentage
     ax = axes[2]
     handles = []
     bias = val.get("tod_bias_h")
@@ -665,10 +637,8 @@ def fig_tir(val, outdir: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.4))
     s = val["step"]
 
-    # pred_tir / true_tir / tir_err are FRACTIONS in the log — the validation
-    # table renders them as `* 100.0`. Scaling here is what makes this panel and
-    # that table the same statistic instead of one reading 100x low against its
-    # own percentage axis.
+    # pred_tir / true_tir / tir_err are FRACTIONS in the log; the validation table renders them
+    # `* 100.0`, and scaling here is what keeps this panel the same statistic
     ax = axes[0]
     pred = val.get("pred_tir")
     true = val.get("true_tir")
@@ -681,11 +651,8 @@ def fig_tir(val, outdir: Path) -> None:
     ax.set_title("Time-in-range: predicted vs true")
     ax.legend(loc="best")
 
-    # ABSOLUTE, not signed. The producer is `(pred_frac - true_frac).abs()`
-    # accumulated per window, so the two directions cancelled inside it and the
-    # series cannot be negative: a "pred - true" title invites reading a sign
-    # that is not carried, and a zero line the series can never reach reads as a
-    # target rather than as an unattainable bound.
+    # ABSOLUTE, not signed: the producer accumulates `(pred_frac - true_frac).abs()` per window,
+    # so the sign is already gone and a "pred - true" title would invite reading one
     ax = axes[1]
     err = val.get("tir_err")
     if err is not None and np.isfinite(err).any():
@@ -700,9 +667,6 @@ def fig_tir(val, outdir: Path) -> None:
     fig.tight_layout()
     fig.savefig(outdir / "fig15_tir.png")
     plt.close(fig)
-
-
-# ---------------------------------------------------------------- driver
 
 
 def run() -> None:
@@ -758,9 +722,8 @@ def run() -> None:
     if _tod_present(val):
         figures.append("fig16_time_of_day.png")
 
-    # Best-over-training CG-EGA. Withheld with the rest of the cgega_* readers —
-    # a best-over-run taken from a transposed column would sit in summary.json
-    # beside corrected metrics/ numbers and contradict them.
+    # Withheld with the rest of the cgega_* readers: a best-over-run off a transposed column
+    # would sit in summary.json beside corrected metrics/ numbers and contradict them.
     cgega_best = {}
     if CGEGA_COLUMNS_TRUSTWORTHY:
         cgega_best = {

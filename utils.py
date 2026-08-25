@@ -1,53 +1,4 @@
-"""
-T1DMAI Utilities — seed hashing, attention mask, risk transform, weight EMA.
-============================================================================
-
-This module is the pile of small, well-defined helpers that didn't earn a
-module of their own:
-
-* ``compute_patient_seed`` — turns ``(master_seed, step, position)`` into a
-  deterministic 63-bit patient seed via SHA-256.  The training loop uses this
-  for every sample, so the same training run always touches the same
-  patients in the same order.  The model itself doesn't see the seed —
-  it is only used to drive the simulator deterministically.
-
-* ``create_attention_mask_from_visible`` — produces the attention mask used by
-  every temporal self-attention layer, from a ``(B, T)`` VISIBLE/MASKED/PAD
-  labelling.  Visible positions see visible positions, masked positions see
-  everything real, padding is blocked in both directions bar the diagonal.
-  ``create_attention_mask(n_context, n_prediction)`` is the right-edge
-  (forecast) shim over it.  Neither memoizes.
-
-* ``kovatchev_f`` / ``kovatchev_f_target`` / ``kovatchev_f_inv`` — the sole
-  bridge between mg/dL physical space (b) and Kovatchev *risk* space (c).
-  ``f`` is the symmetrizing risk transform of Kovatchev et al.; it bakes the
-  clinical hypo>hyper asymmetry into the loss geometry (equal risk-distance =
-  larger danger at low BG).  ``f`` is NEVER differentiated — targets and the
-  ``last_bg`` anchor are constants.  ``kovatchev_f`` carries the *units
-  tripwire* (a hard assert that its argument is physical mg/dL, so a z-scored
-  value trips it loudly); ``kovatchev_f_target`` is the target-path variant
-  with a physical clamp backstop; ``kovatchev_f_inv`` is the only (c)→(b)
-  inverse, clamping the risk input first and the mg/dL output second.
-
-* ``assemble_quantiles`` — turns the BG head's raw per-slot output (a median
-  delta + spreads) into an ascending 7-quantile fan in risk space, anchored
-  per masked slot at ``f(anchor_bg)``.  Returns ``(q_tau, median)``.  The
-  smooth-basis median projection runs PER SPAN, at the per-span dimension
-  ``global_median_dim(L)``.
-
-* ``last_bg_mgdl_from_context`` — denormalizes a context ``bg_absolute`` cell
-  into mg/dL, the shared (a)→(b) bridge that produces the anchor at inference.
-  Vectorised over an arbitrary set of ``(patch, step)`` cells; the rightmost
-  cell is the default.
-
-* ``ModelEMA`` — maintains a shadow copy of the model's float parameters and
-  buffers, blended after every accepted optimizer step as
-  ``θ_ema ← decay·θ_ema + (1-decay)·θ``.  Validation runs under EMA to
-  smooth out per-batch optimizer jitter on threshold metrics like hypo
-  recall.  ``apply_to`` is a context manager that swaps the shadow into
-  the model for the duration of a ``with`` block, then restores the live
-  weights so training keeps going on the un-smoothed parameters.
-"""
+"""Seed hashing, attention masks, Kovatchev risk transform, quantile assembly, weight EMA."""
 
 import hashlib
 import math
@@ -62,96 +13,47 @@ import torch.nn as nn
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 
-# Kovatchev risk-transform constants, re-anchored to the [40, 400] mg/dL device
-# range: f(g) = SCALE * (ln(g)^POWER - OFFSET). The clinically-validated power
-# POWER = 1.084 is kept from Kovatchev et al. (it encodes the hypo > hyper danger
-# asymmetry); SCALE and OFFSET are re-solved so f(40) = -sqrt(10) and
-# f(400) = +sqrt(10) — i.e. the risk 10*f^2 saturates at 100 exactly at both
-# anchors. The zero-risk euglycemic center consequently sits at ~128 mg/dL (the
-# log^POWER center of [40, 400]). These endpoints are verified in a unit test.
-# The anchors are NOT the physical clamp: [BG_CLAMP_MIN, BG_CLAMP_MAX] is
-# [10, 400] mg/dL, wider below, so the realised risk range is asymmetric —
-# [f(10), f(400)] = [-6.8198, +3.1623] and risk reaches ~465 at the floor. That
-# clamp is applied in kovatchev_f_target and kovatchev_f_np; kovatchev_f itself
-# only asserts the floor and warns above the ceiling.
+# f(g) = SCALE*(ln(g)^POWER - OFFSET), Kovatchev et al. POWER kept; SCALE/OFFSET
+# re-solved so f(40) = -sqrt(10), f(400) = +sqrt(10) — risk 10*f^2 hits 100 at both.
+# Anchors are NOT the clamp [BG_CLAMP_MIN, BG_CLAMP_MAX] = [10, 400] mg/dL, so the
+# realised risk range [f(10), f(400)] = [-6.8198, +3.1623] is asymmetric by design.
 _KOVATCHEV_SCALE = 2.2211457449985317
 _KOVATCHEV_POWER = 1.084
 _KOVATCHEV_OFFSET = 5.540076976170212
 
 def compute_patient_seed(master_seed: int, step: int, position: int) -> int:
+    """SHA-256 of (master_seed, step, position) to a 63-bit seed.
+
+    Mod 2^63-1 keeps it inside int64 clear of the sign bit; collision rate over a
+    ~1e5-step run is ~5e-7.
     """
-    Deterministically hash ``(master_seed, step, position)`` to a 63-bit seed.
-
-    SHA-256 gives us collision resistance across all (step, position) pairs in
-    a training run.  We mod by 2^63 - 1 because that fits inside int64
-    (the dtype torch / numpy seeds expect) while staying clear of the sign
-    bit, and the resulting collision rate over a ``TOTAL_STEPS`` × batch run
-    (~1e5 steps) is ~5e-7.
-
-    Args:
-        master_seed: Integer master seed for the whole training run.
-        step: Training step index.
-        position: Position within the batch.
-
-    Returns:
-        patient_seed: Integer in [0, 2^63 - 1].
-    """
-    # Stringifying the tuple before hashing means we never have to worry about
-    # endian issues across machines — every Python str.encode() is UTF-8.
     key = f"{master_seed}:{step}:{position}"
     digest = hashlib.sha256(key.encode()).hexdigest()
-    # ``int(digest, 16)`` turns the hex digest into a 256-bit integer; we mod
-    # down to 63 bits to keep it inside int64.
     return int(digest, 16) % (2**63 - 1)
 
 
 def create_attention_mask_from_visible(
     visible: torch.Tensor, is_pad: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    """Per-sample attention mask for an arbitrary masked set — the general form.
+    """Per-sample attention mask for an arbitrary masked set. True = attend.
 
-    A sequence position is one of three things: VISIBLE (its ``bg_absolute`` is
-    observed), MASKED (its BG is withheld and the head predicts it), or PAD (a
-    left-padding slot carrying no data).  ``visible`` labels the first,
-    ``is_pad`` the third, and MASKED is everything left over.  The mask is
-    NOT a function of position: a masked span may sit at the right edge
-    (forecast), at the left edge (backcast) or anywhere between (infill).
+    visible row → visible col allowed; visible row → masked col BLOCKED (evidence
+    never reads a prediction); masked row → any real col allowed; pad row and pad col
+    blocked except the diagonal.
 
-    Rule (True = attend, False = block)::
-
-        visible row → visible col   allowed   (bidirectional among evidence)
-        visible row → masked  col   blocked   (evidence never reads a prediction)
-        masked  row → any real col  allowed   (a prediction reads everything)
-        pad row / pad col           blocked, except the diagonal
-
-    Built in exactly four lines, all four load-bearing::
-
-        attn  = vis[:, None, :] | masked[:, :, None]
-        attn &= ~is_pad[:, None, :]          # nothing reads a pad column
-        attn &= ~is_pad[:, :, None]          # a pad row reads nothing but itself
-        attn[:, diag, diag] = True           # no all-False row (softmax NaN)
-
-    Dropping line 3 leaves a pad row neither masked nor row-filtered, so it
-    opens onto every visible column.  The forward OUTPUT is unchanged either
-    way — pad columns are blocked, so a pad row never feeds a real row — which
-    is why only a full-mask comparison catches it, never a head/output gate.
-    Line 4 is the SOLE reason a pad row is not all-False once line 3 is in
-    place: it is not redundant with anything.
-
-    Nothing is memoized.  The masked set varies per sample, and no cheap key
-    identifies it — a memo on ``(n_context, n_prediction)`` hands one sample's
-    mask to another with no shape error and no way to notice.  Each call
-    returns a fresh tensor.
+    Trap: dropping ``attn &= ~is_pad[:, :, None]`` opens a pad row onto every visible
+    column and leaves the forward OUTPUT unchanged — only a full-mask comparison
+    catches it. The diagonal write is the sole guard against an all-False row
+    (softmax NaN). Never memoized: no cheap key identifies a masked set.
 
     Args:
-        visible: ``(B, T)`` bool, True where the position's BG is observed.
-            Entries at PAD positions are ignored (lines 2-3 dominate).
+        visible: ``(B, T)`` bool, True where the position's BG is observed; entries
+            at PAD positions are ignored.
         is_pad: ``(B, T)`` bool left-padding flags, or None for no padding.
 
     Returns:
-        attn: ``(B, T, T)`` bool, True = attend.  ``model.forward`` gives it the
-            head axis with ``unsqueeze(1)`` before SDPA — never straight, which
-            would align B onto the head axis.
+        attn: ``(B, T, T)`` bool. ``model.forward`` gives it the head axis with
+            ``unsqueeze(1)`` — passing it straight aligns B onto the head axis.
     """
     assert visible.dtype == torch.bool and visible.ndim == 2, (
         f"visible must be (B, T) bool, got {tuple(visible.shape)} {visible.dtype}"
@@ -174,20 +76,9 @@ def create_attention_mask_from_visible(
 
 
 def create_attention_mask(n_context: int, n_prediction: int) -> torch.Tensor:
-    """Right-edge shim over :func:`create_attention_mask_from_visible`.
+    """``(C+P, C+P)`` bool right-edge mask: C visible patches then P masked, no padding.
 
-    The special case where the masked span is the trailing ``n_prediction``
-    patches — a forecast — with no padding.  It builds the ``(1, T)`` visible
-    bool internally and returns the ``(T, T)`` mask, which is what the export
-    self-check and the single-sample call sites still ask for.  It does NOT
-    memoize; see the general form for why no memo can be correct.
-
-    Args:
-        n_context: Number of leading VISIBLE patches (C).
-        n_prediction: Number of trailing MASKED patches (P).
-
-    Returns:
-        mask: ``(C+P, C+P)`` bool tensor, freshly built on every call.
+    Built fresh on every call; see the general form for why no memo can be correct.
     """
     T = n_context + n_prediction
     visible = torch.zeros(1, T, dtype=torch.bool)
@@ -196,30 +87,12 @@ def create_attention_mask(n_context: int, n_prediction: int) -> torch.Tensor:
 
 
 def kovatchev_f(g: torch.Tensor) -> torch.Tensor:
-    """Kovatchev risk transform mg/dL (b) → risk (c), with the UNITS TRIPWIRE.
+    """Kovatchev risk transform mg/dL (b) → risk (c). The UNITS TRIPWIRE.
 
-    ``f(g) = _KOVATCHEV_SCALE * (ln(g)^_KOVATCHEV_POWER - _KOVATCHEV_OFFSET)``
-    (Kovatchev et al. 2000; the three constants live at the module top) — the
-    symmetrizing transform whose risk-distance equates the clinical danger of a
-    low and a high excursion, so the loss geometry inherits the hypo>hyper
-    asymmetry for free.
-
-    This variant is the **units tripwire**: it hard-asserts its argument is
-    physical mg/dL (``g >= BG_CLAMP_MIN - 1e-3``), so a z-scored value trips it
-    loudly: the z-score guarantee is ``z_max < BG_CLAMP_MIN - 1e-3``, the assert's
-    own threshold, so no z-space tensor passes it.  It is reserved for CONTROLLED
-    callers that must never carry z-space — the ``f(last_bg)`` anchor and any
-    re-``f`` of an inverted value.
-    The upper bound is a soft warning only (``g > BG_CLAMP_MAX + 1e-3``) since a
-    legitimate physical BG never exceeds the simulator clamp.  ``f`` is NEVER
-    differentiated — every call site feeds it a constant (detached) tensor.
-
-    Args:
-        g: physical BG in mg/dL, any shape; every element must be
-            ``>= BG_CLAMP_MIN - 1e-3``.
-
-    Returns:
-        risk: same shape as ``g``, in Kovatchev risk space.
+    Hard-asserts ``g >= BG_CLAMP_MIN - 1e-3``, which no z-scored value satisfies, so
+    a z-space leak trips loudly. Reserved for controlled callers that must never
+    carry z-space — ``f(anchor_bg)`` and any re-``f`` of an inverted value. Above
+    ``BG_CLAMP_MAX + 1e-3`` warns only, and does not clamp. Never differentiated.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     assert (g >= BG_CLAMP_MIN - 1e-3).all(), (
@@ -237,21 +110,11 @@ def kovatchev_f(g: torch.Tensor) -> torch.Tensor:
 
 
 def kovatchev_f_target(g: torch.Tensor) -> torch.Tensor:
-    """Kovatchev risk transform for the TARGET path: physical clamp, then ``f``.
+    """Kovatchev risk transform, TARGET path: physical clamp then ``f``.
 
-    The forecast target is the RAW ``bg_observed`` (the same raw signal fed as the
-    model input — no smoothing), which provably comes from cache mg/dL → never
-    z-space.  As a rare physical backstop this path clamps to
-    ``[BG_CLAMP_MIN, BG_CLAMP_MAX]`` BEFORE ``f`` (warning only if it actually
-    clamps beyond a small tolerance), then applies the same risk transform.  The
-    clamp here is a PHYSICAL backstop, not a unit guard — the unit tripwire lives
-    on ``kovatchev_f`` (``last_bg`` / re-f).
-
-    Args:
-        g: smoothed target BG in mg/dL, any shape.
-
-    Returns:
-        risk: same shape as ``g``, in Kovatchev risk space.
+    Clamps to ``[BG_CLAMP_MIN, BG_CLAMP_MAX]``, warning when it bites beyond a small
+    tolerance — a physical backstop, not a unit guard. The tripwire is on
+    :func:`kovatchev_f`.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     if (g < BG_CLAMP_MIN - 1e-3).any() or (g > BG_CLAMP_MAX + 1e-3).any():
@@ -268,35 +131,14 @@ def kovatchev_f_target(g: torch.Tensor) -> torch.Tensor:
 def kovatchev_f_inv(r: torch.Tensor) -> torch.Tensor:
     """Inverse Kovatchev risk transform risk (c) → mg/dL (b). Sole (c)→(b) helper.
 
-    Belt-and-suspenders against both failure modes of a naive inverse:
-
-    1. Clamp the **risk input** first to ``[f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]``,
-       both bounds computed from the clamp (≈ ``[-6.8198, +3.1623]``, asymmetric:
-       the floor sits well below the ``f(40) = -sqrt(10)`` anchor).  This guarantees the
-       reconstructed base ``(r/_KOVATCHEV_SCALE + _KOVATCHEV_OFFSET)`` is ``>= 0``
-       (no negative-base / complex / NaN for ``r`` far below range) and bounded
-       above (no fp32 ``exp`` overflow for ``r`` far above range).
-    2. ``g = exp((r/_KOVATCHEV_SCALE + _KOVATCHEV_OFFSET)^(1/_KOVATCHEV_POWER))`` —
-       the exact inverse of ``kovatchev_f``.
-    3. Clamp the **output** to ``[BG_CLAMP_MIN, BG_CLAMP_MAX]`` (a final physical
-       backstop; the input clamp already keeps it inside this band).
-
-    Used for the median AND every quantile band edge at every reporting /
-    inference / rolling site.  Like ``f`` it is never differentiated.
-
-    Args:
-        r: risk-space value, any shape.
-
-    Returns:
-        g: physical BG in mg/dL, same shape, in ``[BG_CLAMP_MIN, BG_CLAMP_MAX]``.
+    Scrubs non-finite input to the band edges (``clamp`` propagates NaN), clamps the
+    risk input to ``[f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]`` ≈ ``[-6.8198, +3.1623]`` so
+    the base stays >= 0 and ``exp`` cannot overflow fp32, then clamps the mg/dL output
+    to ``[BG_CLAMP_MIN, BG_CLAMP_MAX]``. Never differentiated.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     r_lo = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
-    # ``clamp`` propagates NaN (NaN compares false against both bounds), so a
-    # non-finite risk input would otherwise leak straight through to a NaN mg/dL.
-    # Scrub NaN/±inf to the band edges FIRST so the inverse can never silently
-    # emit a non-finite physical BG; finite values are untouched.
     r = torch.nan_to_num(r, nan=r_lo, posinf=r_hi, neginf=r_lo)
     r = r.clamp(r_lo, r_hi)
     base = r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET  # >= 0 after the input clamp
@@ -305,21 +147,12 @@ def kovatchev_f_inv(r: torch.Tensor) -> torch.Tensor:
 
 
 def kovatchev_f_np(g: "np.ndarray") -> "np.ndarray":
-    """NumPy Kovatchev risk transform mg/dL (b) → risk (c) for the INPUT path.
+    """NumPy Kovatchev risk transform mg/dL (b) → risk (c), INPUT path.
 
-    The ``bg_absolute`` INPUT channel is fed in risk space (``f`` applied BEFORE the
-    z-score) as the sole input path, and every input-build / stat-fit site is NumPy
-    (``data.py``, ``normalization.py``), whereas :func:`kovatchev_f` is torch-only and
-    carries the units tripwire.  This is the NumPy sibling for those sites, with the
-    same PHYSICAL clamp backstop as :func:`kovatchev_f_target` — it clamps the raw
-    input bg to ``[BG_CLAMP_MIN, BG_CLAMP_MAX]`` before ``f``, keeping the stat fit
-    and the input transform bit-consistent and always well-defined.
-
-    Args:
-        g: physical BG in mg/dL, any shape.
-
-    Returns:
-        risk: same shape as ``g``, in Kovatchev risk space.
+    Sibling of :func:`kovatchev_f` for the NumPy input-build and stat-fit sites
+    (``data.py``, ``normalization.py``), carrying the same physical clamp to
+    ``[BG_CLAMP_MIN, BG_CLAMP_MAX]`` as :func:`kovatchev_f_target` — not the tripwire —
+    so the stat fit and the input transform stay bit-consistent.
     """
     g = np.clip(g, BG_CLAMP_MIN, BG_CLAMP_MAX)
     return _KOVATCHEV_SCALE * (np.log(g) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
@@ -328,17 +161,7 @@ def kovatchev_f_np(g: "np.ndarray") -> "np.ndarray":
 def kovatchev_f_inv_np(r: "np.ndarray") -> "np.ndarray":
     """NumPy inverse Kovatchev risk transform risk (c) → mg/dL (b).
 
-    NumPy sibling of :func:`kovatchev_f_inv` for the NumPy denormalize path,
-    mirroring its belt-and-suspenders guards exactly: scrub non-finite inputs to
-    the band edges, clamp the risk input to ``[f(BG_CLAMP_MIN), f(BG_CLAMP_MAX)]``
-    so the base is non-negative and ``exp`` cannot overflow, then clamp the mg/dL
-    output to the physical range.
-
-    Args:
-        r: risk-space value, any shape.
-
-    Returns:
-        g: physical BG in mg/dL, same shape, in ``[BG_CLAMP_MIN, BG_CLAMP_MAX]``.
+    Mirrors :func:`kovatchev_f_inv` guard for guard.
     """
     import numpy as np
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
@@ -352,36 +175,17 @@ def kovatchev_f_inv_np(r: "np.ndarray") -> "np.ndarray":
 
 
 def time_of_day_bin_centers(n_bins: int) -> torch.Tensor:
-    """Center hours of the ``n_bins`` circular hour-of-day bins.
-
-    The bins tile ``[0, 24)`` exactly with width ``24 / n_bins``; center ``k`` sits
-    at the middle of bin ``k``.
-
-    Args:
-        n_bins: number of bins, ``>= 1``.
-
-    Returns:
-        ``(n_bins,)`` fp32 tensor of center hours in ``(0, 24)``.
-    """
+    """``(n_bins,)`` center hours of the circular hour-of-day bins, width ``24/n_bins``."""
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     return (torch.arange(n_bins, dtype=torch.float32) + 0.5) * (24.0 / n_bins)
 
 
 def time_of_day_bin_target(hour: torch.Tensor, n_bins: int, smooth_bins: float) -> torch.Tensor:
-    """Soft circular hour-of-day target distribution over ``n_bins`` bins.
+    """``(..., n_bins)`` soft circular hour-of-day target; rows sum to 1.
 
-    Treats the bins as ordered and circular: the label mass placed on bin ``k`` decays
-    as a wrapped Gaussian of the circular bin-distance between ``hour`` and center ``k``,
-    then the row is normalized to sum to 1.  With ``smooth_bins <= 0`` the target
-    collapses to a one-hot at the nearest (circular) bin.
-
-    Args:
-        hour: ``(...,)`` hours in ``[0, 24)``.
-        n_bins: number of bins, ``>= 1``.
-        smooth_bins: wrapped-Gaussian std in units of bins; ``<= 0`` => one-hot.
-
-    Returns:
-        ``(..., n_bins)`` fp32 distribution; rows sum to 1.
+    Label mass decays as a wrapped Gaussian of circular bin-distance, std
+    ``smooth_bins`` in bins; ``smooth_bins <= 0`` gives a one-hot at the nearest bin.
+    ``hour`` is ``(...,)`` in ``[0, 24)``.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     hour = hour.to(torch.float32)
@@ -397,19 +201,10 @@ def time_of_day_bin_target(hour: torch.Tensor, n_bins: int, smooth_bins: float) 
 
 
 def time_of_day_resultant(probs: torch.Tensor, n_bins: int) -> torch.Tensor:
-    """Mean resultant vector of a bin distribution on the hour-of-day circle.
+    """``(..., 2)`` probability-weighted mean of ``(cos, sin)`` over the bin-center angles.
 
-    Maps each bin center to its angle ``th_k = 2*pi*center_k/24`` and forms the
-    probability-weighted mean of ``(cos th_k, sin th_k)``.  Its length lies in
-    ``[0, 1]`` and reads as concentration/confidence.
-
-    Args:
-        probs: ``(..., n_bins)`` non-negative weights (rows need not be normalized,
-            but a resultant length in ``[0, 1]`` assumes rows sum to 1).
-        n_bins: number of bins, ``>= 1``.
-
-    Returns:
-        ``(..., 2)`` fp32 = ``(sum_k p_k cos th_k, sum_k p_k sin th_k)``.
+    ``probs`` is ``(..., n_bins)`` non-negative; a resultant length in ``[0, 1]``
+    assumes rows sum to 1.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     centers = time_of_day_bin_centers(n_bins).to(probs.device)
@@ -420,18 +215,10 @@ def time_of_day_resultant(probs: torch.Tensor, n_bins: int) -> torch.Tensor:
 
 
 def time_of_day_decode_bins(logits: torch.Tensor, n_bins: int) -> "tuple[torch.Tensor, torch.Tensor]":
-    """Decode per-bin logits to a circular-mean hour and its confidence.
+    """``(..., n_bins)`` logits → ``(hour, R)``.
 
-    Softmaxes the logits, forms the resultant vector, and reads the hour from its
-    angle and the confidence from its length.
-
-    Args:
-        logits: ``(..., n_bins)`` raw bin logits.
-        n_bins: number of bins, ``>= 1``.
-
-    Returns:
-        ``(hour, R)`` where ``hour`` is ``(...,)`` in ``[0, 24)`` and ``R`` is
-        ``(...,)`` resultant length in ``[0, 1]`` (concentration / confidence).
+    ``hour`` is ``(...,)`` in ``[0, 24)`` from the resultant angle; ``R`` is ``(...,)``
+    its length in ``[0, 1]``, read as confidence.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     probs = torch.softmax(logits, dim=-1)
@@ -446,16 +233,9 @@ def time_of_day_decode_bins(logits: torch.Tensor, n_bins: int) -> "tuple[torch.T
 def time_of_day_bin_ce(
     logits: torch.Tensor, target_hours: torch.Tensor, n_bins: int, smooth_bins: float
 ) -> torch.Tensor:
-    """Cross-entropy of per-bin logits against the soft circular hour target.
+    """Scalar fp32 CE of ``(..., n_bins)`` logits against the soft circular hour target.
 
-    Args:
-        logits: ``(..., n_bins)`` raw bin logits.
-        target_hours: ``(...,)`` hours in ``[0, 24)`` (broadcast-matching ``logits[..., 0]``).
-        n_bins: number of bins, ``>= 1``.
-        smooth_bins: wrapped-Gaussian soft-label std in bins; ``<= 0`` => one-hot.
-
-    Returns:
-        Scalar fp32 cross-entropy ``-(tgt * log_softmax(logits)).sum(-1).mean()``.
+    ``target_hours`` is ``(...,)`` in ``[0, 24)``; ``smooth_bins <= 0`` => one-hot.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     tgt = time_of_day_bin_target(target_hours, n_bins, smooth_bins)
@@ -470,27 +250,18 @@ def time_cross_window_consistency_loss(
     advance_hours: float,
     valid: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    """Paired-window phase-advance penalty coupling two INDEPENDENT forward passes.
+    """Scalar phase-advance penalty coupling two INDEPENDENT forward passes.
 
-    Window ``k+1``'s prediction origin sits exactly ``advance_hours`` (one forecast
-    horizon) after window ``k``'s, so rotating window ``k``'s origin-patch resultant
-    vector by ``dtheta = 2*pi*advance_hours/24`` must land on window ``k+1``'s
-    origin-patch resultant.  Matching them in the raw ``(cos, sin)`` plane (atan2-free,
-    stable gradient) couples the two clocks.  Unlike the within-window advance penalty
-    this is NOT redundant: the two windows are separate forwards with different
-    contexts, so only an explicit cross-window term ties their difference to one horizon.
-    Only the origin patch (index 0) of each window is used.
+    Window k+1's origin sits ``advance_hours`` (one horizon) after window k's, so k's
+    origin-patch resultant rotated by ``2*pi*advance_hours/24`` must land on k+1's.
+    Matched in the raw ``(cos, sin)`` plane — atan2-free, stable gradient. Only patch 0
+    of each window is used. Not redundant with a within-window advance penalty: the
+    two windows are separate forwards over different contexts.
 
     Args:
-        logits_k:    ``(B, P, n_bins)`` window k per-patch bin logits.
-        logits_next: ``(B, P, n_bins)`` window k+1 per-patch bin logits.
-        n_bins: number of bins, ``>= 1``.
-        advance_hours: clock advance between the two origins, in hours (== the horizon).
-        valid: ``(B,)`` bool or ``None``.  When given only ``True`` rows enter the mean
-            (a finite ``0`` when none are valid); ``None`` => plain mean over ``B``.
-
-    Returns:
-        Scalar fp32 loss.
+        logits_k, logits_next: ``(B, P, n_bins)`` per-patch bin logits.
+        valid: ``(B,)`` bool — only True rows enter the mean (a finite 0 when none);
+            None => plain mean over B.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     assert logits_k.dim() == 3 and logits_next.dim() == 3, (
@@ -518,21 +289,11 @@ def time_cross_window_jump_hours(
     n_bins: int,
     advance_hours: float,
 ) -> torch.Tensor:
-    """Per-sample cross-window clock-advance deviation, in hours (the no-jump witness).
+    """``(B,)`` fp32 ``|cross-window clock step − advance_hours|`` in hours, off patch 0.
 
-    Decodes the origin-patch (index 0) clock of both windows, measures the signed
-    circular step between them, and returns ``|step - advance_hours|``.  ``~0`` means
-    the rolling clock advances by exactly one horizon across the window seam.  The
-    caller masks by the per-sample validity flag.
-
-    Args:
-        logits_k:    ``(B, P, n_bins)`` window k per-patch bin logits.
-        logits_next: ``(B, P, n_bins)`` window k+1 per-patch bin logits.
-        n_bins: number of bins, ``>= 1``.
-        advance_hours: expected clock advance between the two origins, in hours.
-
-    Returns:
-        ``(B,)`` fp32 ``|advance deviation|`` in hours.
+    ~0 means the rolling clock advances by exactly one horizon across the window seam.
+    The caller masks by the per-sample validity flag.
+    ``logits_k``/``logits_next`` are ``(B, P, n_bins)``.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     assert logits_k.dim() == 3 and logits_next.dim() == 3, (
@@ -548,20 +309,10 @@ def time_cross_window_jump_hours(
 def time_inter_patch_jump_hours(
     logits: torch.Tensor, n_bins: int, advance_hours: float
 ) -> torch.Tensor:
-    """Per-sample mean deviation of the inter-patch clock advance, in hours.
+    """``(B,)`` fp32 mean ``|inter-patch clock step − advance_hours|`` in hours.
 
-    The "no jumping" witness: decodes each patch to an hour, measures the signed
-    circular step between consecutive patches, and averages ``|step - advance_hours|``.
     ~0 means the predicted clock marches forward one patch at a time.
-
-    Args:
-        logits: ``(B, P, n_bins)`` per-patch bin logits.
-        n_bins: number of bins, ``>= 1``.
-        advance_hours: expected clock advance between consecutive patches, in hours.
-
-    Returns:
-        ``(B,)`` fp32 mean absolute advance-deviation in hours
-        (``logits.new_zeros(B)`` when ``P < 2``).
+    ``logits`` is ``(B, P, n_bins)``; ``P < 2`` returns zeros.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     assert logits.dim() == 3, f"expected (B, P, n_bins), got {tuple(logits.shape)}"
@@ -573,19 +324,10 @@ def time_inter_patch_jump_hours(
 
 
 def _resultant_np(probs: np.ndarray, n_bins: int) -> "tuple[float, float]":
-    """Numpy twin of ``time_of_day_resultant`` for one bin distribution.
+    """``(cos, sin)`` resultant of one ``(n_bins,)`` distribution.
 
-    Maps bin center ``center_k = (k + 0.5) * 24 / n_bins`` to its angle
-    ``th_k = 2*pi*center_k/24`` and forms the probability-weighted mean of
-    ``(cos th_k, sin th_k)`` — kept byte-for-byte in step with the torch version so
-    the geometry core never drifts from the trained probe.
-
-    Args:
-        probs: ``(n_bins,)`` non-negative weights (assumed to sum to ~1).
-        n_bins: number of bins, ``>= 1``.
-
-    Returns:
-        ``(cos, sin)`` = ``(sum_k p_k cos th_k, sum_k p_k sin th_k)``.
+    Kept in step with :func:`time_of_day_resultant` so the geometry core never drifts
+    from the trained probe.
     """
     assert n_bins >= 1, f"need n_bins >= 1, got {n_bins}"
     assert probs.shape[-1] == n_bins, f"expected last dim {n_bins}, got {probs.shape}"
@@ -597,19 +339,11 @@ def _resultant_np(probs: np.ndarray, n_bins: int) -> "tuple[float, float]":
 
 
 def _fractional_roll(row: np.ndarray, shift_bins: float) -> np.ndarray:
-    """Wrap-correct circular shift of a ``(n_bins,)`` row by a real number of bins.
+    """Circular shift of a ``(n_bins,)`` row by a real number of bins.
 
-    ``np.roll(row, k)`` moves bin ``i -> i+k``; a *forward-in-time* rotation (a later
-    hour, higher bin index) uses a positive ``shift_bins``. A fractional shift is the
-    linear blend of the two adjacent integer rolls, so the circular adjacency of
-    bin ``n_bins-1`` and bin ``0`` is preserved.
-
-    Args:
-        row: ``(n_bins,)`` values.
-        shift_bins: real-valued shift in bins (may be negative / fractional).
-
-    Returns:
-        ``(n_bins,)`` shifted row.
+    Positive ``shift_bins`` moves forward in time (higher bin index). A fractional
+    shift blends the two adjacent integer rolls, preserving the ``n_bins-1``↔``0``
+    adjacency.
     """
     assert row.ndim == 1, f"expected 1-D row, got {row.shape}"
     lo = int(math.floor(shift_bins))
@@ -619,23 +353,13 @@ def _fractional_roll(row: np.ndarray, shift_bins: float) -> np.ndarray:
 
 def aggregate_origin_belief(probs: np.ndarray, advance_hours: float,
                             bin_hours: float) -> np.ndarray:
-    """Fuse the P per-patch beliefs into a single origin-phase belief.
+    """Fuse ``(P, n_bins)`` per-patch beliefs into one ``(n_bins,)`` origin belief, sum 1.
 
-    Patch ``p``'s belief is the origin belief advanced by ``p*advance_hours`` (the
-    probe's trained property ``tgt_hour[p] = origin + p*advance``), so DE-ROTATE patch
-    ``p`` by ``-p*advance_hours`` (a shift of ``-p*advance_hours/bin_hours`` bins via
-    ``_fractional_roll``), average the P de-rotated rows, and renormalize to sum 1.
-    Agreement across patches sharpens the fused belief; disagreement diffuses it, so
-    its resultant length self-weights the inter-patch consistency. Wrap-safe.
-
-    Args:
-        probs: ``(P, n_bins)`` per-patch softmax rows (each sums ~1).
-        advance_hours: elapsed clock advance between consecutive patches, in hours.
-        bin_hours: origin-hour bin width in hours (``24 / n_bins``).
-
-    Returns:
-        ``(n_bins,)`` fused origin-phase belief summing to 1; ``P == 1`` returns row 0
-        unchanged.
+    Patch ``p``'s belief is the origin advanced by ``p*advance_hours``, so de-rotate it
+    by ``-p*advance_hours/bin_hours`` bins, average, renormalize. Agreement across
+    patches sharpens the fused belief, disagreement diffuses it, so its resultant
+    length self-weights inter-patch consistency. Wrap-safe. ``bin_hours`` is
+    ``24/n_bins``; ``P == 1`` returns row 0 unchanged.
     """
     assert probs.ndim == 2, f"expected (P, n_bins), got {probs.shape}"
     assert bin_hours > 0.0, f"need bin_hours > 0, got {bin_hours}"
@@ -654,12 +378,11 @@ def aggregate_origin_belief(probs: np.ndarray, advance_hours: float,
 class ClockGeometry(NamedTuple):
     """Drawable circular-histogram geometry for one hour-of-day belief (y-up unit disk).
 
-    Fields:
-        wedges: ``(n_bins, arc_segments+2, 2)`` y-up unit coords; vertex 0 is the
-            center ``(0, 0)``, the rest trace bin ``k``'s outer arc at radius ``m_k``.
-        magnitudes: ``(n_bins,)`` wedge outer radii in ``[0, 1]``.
-        hand: ``(2,)`` y-up unit coords of the resultant hand, length ``R``.
-        R: resultant length in ``[0, 1]`` — rotation-INVARIANT.
+    wedges: ``(n_bins, arc_segments+2, 2)``; vertex 0 is the center ``(0, 0)``, the
+        rest trace bin ``k``'s outer arc at radius ``m_k``.
+    magnitudes: ``(n_bins,)`` wedge outer radii in ``[0, 1]``.
+    hand: ``(2,)`` resultant hand, length ``R``.
+    R: resultant length in ``[0, 1]`` — rotation-INVARIANT.
     """
     wedges: np.ndarray
     magnitudes: np.ndarray
@@ -668,16 +391,9 @@ class ClockGeometry(NamedTuple):
 
 
 def _hour_to_unit(hour: np.ndarray) -> np.ndarray:
-    """Map hour(s) to the FROZEN y-up clock disk: ``u(h) = (sin(2*pi*h/24), cos(2*pi*h/24))``.
+    """FROZEN y-up clock map ``u(h) = (sin(2*pi*h/24), cos(2*pi*h/24))`` → ``(..., 2)``.
 
-    Hour 0 sits at 12-o'clock top and hours increase clockwise (h=6 -> right,
-    h=12 -> bottom, h=18 -> left).
-
-    Args:
-        hour: array of hours (any shape).
-
-    Returns:
-        ``(..., 2)`` y-up unit vectors.
+    Hour 0 at 12-o'clock top, hours increasing clockwise (6 right, 12 bottom, 18 left).
     """
     a = hour * (2.0 * math.pi / 24.0)
     return np.stack([np.sin(a), np.cos(a)], axis=-1)
@@ -687,39 +403,22 @@ _CLOCK_TICK_HOURS = (0.0, 6.0, 12.0, 18.0)
 
 
 def clock_reference_ticks() -> np.ndarray:
-    """Y-up unit vectors for the fixed 0/6/12/18-hour dial reference ticks.
+    """``(4, 2)`` y-up unit vectors for the fixed 0/6/12/18 h dial ticks.
 
-    Sourced from the single frozen convention ``_hour_to_unit`` so host adapters
-    (pygame, matplotlib) draw the reference ticks without re-deriving any
-    trigonometry — the dial convention lives in exactly one place.
-
-    Returns:
-        ``(4, 2)`` y-up unit vectors for hours 0, 6, 12, 18.
+    From :func:`_hour_to_unit`, so host adapters re-derive no trigonometry.
     """
     return _hour_to_unit(np.array(_CLOCK_TICK_HOURS))
 
 
 def clock_wedge_geometry(probs: np.ndarray, rotation_hours: float = 0.0,
                          arc_segments: int = 6) -> ClockGeometry:
-    """Circular-histogram geometry for one belief on the hour-of-day dial.
+    """``ClockGeometry`` for one ``(n_bins,)`` belief on the hour-of-day dial.
 
-    Bin ``k`` spans hours ``[k*bin_hours, (k+1)*bin_hours)`` with center
-    ``(k+0.5)*bin_hours`` (``bin_hours = 24/n_bins`` inferred from ``probs``). A
-    continuous RIGID rotation adds ``rotation_hours`` to every mapped hour BEFORE the
-    ``u(h)`` map (angles only, NO re-binning) so cursor motion is smooth and exact.
-    Magnitude ``m_k = p_k / p.max()`` (an all-zero belief yields zeros, ``R=0``, no
-    NaN). The hand points along ``u(mean_hour + rotation_hours)`` scaled by ``R``, and
-    ``R`` is invariant under ``rotation_hours`` because rotation preserves the
-    resultant length.
-
-    Args:
-        probs: ``(n_bins,)`` non-negative belief (softmax row; ``n_bins`` inferred).
-        rotation_hours: rigid dial rotation applied to every hour, in hours.
-        arc_segments: number of arc chords per wedge (``>= 1``).
-
-    Returns:
-        ``ClockGeometry`` (wedges ``(n_bins, arc_segments+2, 2)``, magnitudes
-        ``(n_bins,)``, hand ``(2,)``, R float).
+    Bin ``k`` spans hours ``[k*bin_hours, (k+1)*bin_hours)``, ``bin_hours = 24/n_bins``
+    inferred from ``probs``. ``rotation_hours`` is added to every mapped hour BEFORE the
+    ``u(h)`` map — angles only, no re-binning — so cursor motion is smooth and ``R`` is
+    invariant under it. ``m_k = p_k / p.max()``; an all-zero belief gives zeros and
+    ``R = 0``, no NaN. ``arc_segments >= 1`` chords per wedge.
     """
     assert probs.ndim == 1, f"expected (n_bins,), got {probs.shape}"
     assert arc_segments >= 1, f"need arc_segments >= 1, got {arc_segments}"
@@ -751,20 +450,18 @@ def circular_hour_error(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> tor
 
 
 def circular_hour_residual(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> torch.Tensor:
-    """Signed circular residual (pred - true) wrapped to (-12, 12] hours (...,).
+    """Signed circular residual (pred − true) wrapped to (-12, 12] hours (...,).
 
-    Positive => the clock reads ahead of truth, negative => behind. Its absolute
-    value equals ``circular_hour_error``; the sign is what bias/precision need.
+    Positive => the clock reads ahead of truth. Its absolute value equals
+    ``circular_hour_error``; the sign is what bias/precision need.
     """
     return (pred_hour - true_hour + 12.0) % 24.0 - 12.0
 
 
 def circular_bias_hours(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> torch.Tensor:
-    """Signed systematic clock offset: the circular mean of the residual, in (-12, 12] hours.
+    """Scalar signed systematic clock offset in (-12, 12] hours — a correctable constant.
 
-    ~0 means no consistent fast/slow drift; a nonzero value is a *correctable* constant
-    offset. Computed as the angle of the mean resultant vector (naive averaging of angles
-    is wrong across the 24 h wrap). Returns a scalar tensor.
+    The angle of the mean resultant vector; naive angle averaging breaks at the 24 h wrap.
     """
     two_pi = 2.0 * math.pi
     delta = circular_hour_residual(pred_hour, true_hour) * (two_pi / 24.0)
@@ -773,27 +470,19 @@ def circular_bias_hours(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> tor
 
 
 def circular_std_hours(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> torch.Tensor:
-    """Circular standard deviation of the residual, in hours (spread about the bias).
+    """Scalar circular std of the residual in hours: ``sqrt(-2 ln R_bar)``.
 
-    ``sqrt(-2 ln R_bar)`` with ``R_bar`` the mean resultant length: 0 h = perfectly
-    consistent phase, growing without bound as the residuals approach a uniform smear.
-    ``R_bar`` is clamped to ``[1e-6, 1.0]``: the lower bound keeps a near-uniform
-    distribution finite (rather than ``inf``); the upper bound guards the
-    perfectly-consistent case, where ``cos.mean()**2 + sin.mean()**2`` can round just
-    above ``1.0`` in fp32, making ``log(R_bar) > 0`` and ``sqrt(-2·log R_bar)`` the
-    square root of a negative — a NaN. Returns a scalar tensor.
+    ``R_bar`` is clamped to ``[1e-6, 1.0]``: the floor keeps a near-uniform smear finite
+    rather than ``inf``; the ceiling stops fp32 rounding just above 1.0 turning
+    ``sqrt(-2 log R_bar)`` into the square root of a negative — a NaN.
     """
     two_pi = 2.0 * math.pi
     delta = circular_hour_residual(pred_hour, true_hour) * (two_pi / 24.0)
     r_bar = torch.sqrt(
         torch.cos(delta).mean() ** 2 + torch.sin(delta).mean() ** 2
     ).clamp(1e-6, 1.0)
-    # ``+ 0.0`` normalises the SIGN of zero. The perfectly-consistent case the
-    # upper clamp exists for gives ``log(1.0) = 0.0``, ``-2 * 0.0 = -0.0`` and
-    # ``sqrt(-0.0) = -0.0``, which formats as "-0.00 h" on the validation table —
-    # a negative standard deviation. ``clamp(min=0.0)`` does NOT fix it (it
-    # returns -0.0); IEEE addition of +0.0 is the operation that maps -0.0 to
-    # +0.0 and leaves every other value bit-identical.
+    # ``+ 0.0`` maps -0.0 to +0.0 (``sqrt(-0.0) == -0.0`` prints as "-0.00 h" on the
+    # validation table); ``clamp(min=0.0)`` returns -0.0 and does not fix it.
     return torch.sqrt(-2.0 * torch.log(r_bar)) * (24.0 / two_pi) + 0.0
 
 
@@ -804,35 +493,18 @@ def get_global_median_basis(
     n: int, k: int, kind: str = 'dct',
     device: "torch.device | None" = None, dtype: "torch.dtype | None" = None,
 ) -> torch.Tensor:
-    """Fixed ``(n, k)`` orthonormal low-frequency basis for the GLOBAL median
-    projection (R3), built once per ``(n, k, kind)`` and cached.
+    """``(n, k)`` fixed orthonormal low-frequency basis for the per-span median projection.
 
-    Identical construction to :func:`model.make_step_basis` (DCT-II cosine modes or
-    orthonormal polynomials, ascending frequency/degree, L2-orthonormal columns) but
-    evaluated over a whole masked SPAN, ``n = L * PATCH_SIZE`` for a span of ``L``
-    patches, rather than a single patch.  ``assemble_quantiles`` projects the span's
-    per-patch median delta onto ``span`` of these ``k`` columns; with ``k`` small the
-    median is confined to a smooth low-frequency subspace (periods below ~``2*n/k``
-    steps — including the per-patch seam sawtooth — are unrepresentable), and the
-    projection is an L2 contraction (``||proj(x)|| <= ||x||``) so the per-patch offset
-    cannot drift.  ``k`` comes from :func:`global_median_dim`, which scales it with
-    ``L``; the function itself is closed-form in ``(n, k)`` and indifferent to which
-    span it serves.
+    Same construction as :func:`model.make_step_basis` (DCT-II cosine modes or
+    orthonormal polynomials, ascending frequency/degree) but over a whole masked span,
+    ``n = L * PATCH_SIZE``. Periods below ~``2n/k`` steps — the per-patch seam sawtooth
+    included — are unrepresentable, and the projection is an L2 contraction
+    (``||proj(x)|| <= ||x||``) so the per-patch offset cannot drift. ``k`` is
+    ``global_median_dim(L)``, which the caller clamps to ``min(G_L, n)``. Col 0 is the
+    constant DC mode.
 
-    The cache is keyed by ``(n, k, kind, device, dtype)``, so the basis materializes
-    once already resident on the requested ``device``/``dtype`` (no per-forward H2D copy
-    or dtype cast on the hot path); each call returns a defensive clone of that
-    device-resident tensor so an in-place edit by any caller can never poison the cache.
-
-    Args:
-        n: span length in timesteps, ``L * PATCH_SIZE`` (``>= 1``).
-        k: number of basis columns ``G_L``, ``1 <= k <= n`` (caller clamps to ``min(G_L, n)``).
-        kind: ``'dct'`` (DCT-II) or ``'poly'`` (orthonormal polynomials).
-        device: target device for the returned tensor (default: CPU/cache device).
-        dtype: target dtype (default: float32).
-
-    Returns:
-        ``(n, k)`` tensor with L2-orthonormal columns; col 0 is the constant DC mode.
+    Cached per ``(n, k, kind, device, dtype)``, so the hot path does no host→device copy
+    or dtype cast; each call returns a clone, so an in-place edit cannot poison the cache.
     """
     assert 1 <= k <= n, f"need 1 <= G ({k}) <= P*S ({n})"
     resolved_device = torch.device('cpu') if device is None else torch.device(device)
@@ -851,43 +523,23 @@ def get_global_median_basis(
         else:
             raise ValueError(
                 f"unknown BG_HEAD_STEP_BASIS_TYPE {kind!r} (want 'dct' or 'poly')")
-        basis = basis / basis.norm(dim=0, keepdim=True)            # orthonormal columns
-        basis = basis.to(torch.float32)                            # canonical fp32
-        # Materialize once at the requested device/dtype (same op order as before:
-        # fp32 canonical → .to(device, dtype)), so the hot path is a device-local
-        # clone rather than a per-forward host→device copy.
+        basis = basis / basis.norm(dim=0, keepdim=True)
+        basis = basis.to(torch.float32)
         basis = basis.to(device=resolved_device, dtype=resolved_dtype)
         _GLOBAL_MEDIAN_BASIS_CACHE[key] = basis
-    # Defensive clone so the returned tensor never aliases the process-wide cache:
-    # an in-place edit by any caller must not poison it.
     return basis.clone()
 
 
 def global_median_dim(span_patches: int) -> int:
-    """``G_L`` — the smooth-basis dimension for a masked span of ``L`` patches.
+    """``G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * L / PREDICTION_PATCHES))``, ``>= 1``.
 
-    ``G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * L / PREDICTION_PATCHES))``, so
-    the configured ``G`` is reproduced exactly at ``L == PREDICTION_PATCHES`` and
-    scales down with shorter spans::
-
-        L        1     2     3     4( == PREDICTION_PATCHES)
-        n = L*S  6    12    18    24
-        G_L      3     6     9    12
-        2n/G_L  4.0   4.0   4.0   4.0     (shortest representable period, steps)
-
-    A FIXED ``G`` is a defect here rather than an approximation: at ``L = 1`` the
-    projection would be ``min(G, n) = 6`` columns over ``n = 6`` points — the
-    identity to 1e-5 — so the anti-drift contraction is ABSENT, not weakened, and
-    every fan assert still passes.  What ``G_L`` holds roughly constant is the
-    fraction of the span the basis can bend, not the cutoff period: the cutoff
-    ``2n/G_L`` above is what to report, not a claim that the period is fixed.
-
-    Args:
-        span_patches: span length ``L`` in patches (``>= 1``).
-
-    Returns:
-        ``G_L >= 1``.  The caller still clamps to ``min(G_L, n)`` before building
-        the basis.
+    Reproduces the configured ``G`` exactly at ``L == PREDICTION_PATCHES`` and scales
+    down with shorter spans. A FIXED ``G`` is a defect, not an approximation: at
+    ``L = 1`` the projection would have as many columns as the span has steps — the
+    identity — so the anti-drift contraction is ABSENT rather than weakened, with every
+    fan assert still green. What ``G_L`` holds roughly constant is the fraction of the
+    span the basis can bend; the cutoff period ``2n/G_L`` varies with ``L`` and is what
+    to report. The caller still clamps to ``min(G_L, n)``.
     """
     from config import BG_HEAD_MEDIAN_GLOBAL_DIM, PREDICTION_PATCHES
     assert span_patches >= 1, f"span_patches must be >= 1, got {span_patches}"
@@ -900,20 +552,16 @@ def _span_layout(
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Group the ``M`` head slots into contiguous masked spans.
 
-    Slot ``j`` continues slot ``j-1``'s span iff their patch indices are adjacent
-    (``mask_idx[j] == mask_idx[j-1] + 1``) and, when ``valid`` is given, both are
-    real.  The sampler never lets two masked spans abut — a visible patch always
-    separates them — so adjacency in ``mask_idx`` identifies a span exactly.
-    Padded slots gather patch 0, which can never continue a span (that would need
-    a predecessor at patch −1), so they fall out as singletons and cannot merge
-    into a real span even when a real span does start at patch 0.
-
-    ``mask_idx is None`` means the legacy single-span layout: all ``M`` slots are
-    one contiguous span, reproducing the trailing prediction zone exactly.
+    Slot ``j`` continues slot ``j-1`` iff ``mask_idx[j] == mask_idx[j-1] + 1`` and, when
+    ``valid`` is given, both are real. The sampler never lets two masked spans abut, so
+    adjacency in ``mask_idx`` identifies a span exactly. Padded slots gather patch 0 and
+    cannot continue a span (that needs a predecessor at patch −1), so they fall out as
+    singletons even when a real span does start at patch 0.
+    ``mask_idx is None`` => all ``M`` slots are one contiguous span.
 
     Returns:
-        start: ``(B, M)`` int64 — the slot index at which each slot's span begins.
-        length: ``(B, M)`` int64 — the span's length ``L`` in patches, per slot.
+        start: ``(B, M)`` int64 slot index at which each slot's span begins.
+        length: ``(B, M)`` int64 span length ``L`` in patches, per slot.
     """
     ar = torch.arange(M, device=device)
     if mask_idx is None:
@@ -925,8 +573,7 @@ def _span_layout(
         new = torch.cat(
             [torch.ones(B, 1, dtype=torch.bool, device=device), ~cont], dim=1)
     ar_b = ar.unsqueeze(0).expand(B, M)
-    # Running max of "index if a span starts here else -1" = the current span's
-    # start slot.  new[:, 0] is always True, so every slot resolves to >= 0.
+    # Running max of "index if a span starts here else -1" = the current span's start.
     start = torch.cummax(
         torch.where(new, ar_b, torch.full_like(ar_b, -1)), dim=1).values
     ones = torch.ones(B, M, dtype=torch.long, device=device)
@@ -938,22 +585,15 @@ def _span_layout(
 def _median_global_per_span(
     delta: torch.Tensor, start: torch.Tensor, length: torch.Tensor, kind: str,
 ) -> torch.Tensor:
-    """Project each span's median delta onto its own low-frequency subspace.
+    """``(B, M, S)`` median delta projected onto each span's own low-frequency subspace.
 
-    One matmul per distinct span length present in the batch (at most four under
-    ``MASK_SPAN_LENGTHS``, plus singletons from padded slots): spans of equal ``L``
-    share ``n = L * PATCH_SIZE`` and ``G_L``, so they stack into a single
-    ``(n_spans, n)`` block.  Slots are contiguous within a span, so the gather is
-    ``start + arange(L)`` and the scatter back writes each slot exactly once.
+    One matmul per distinct span length in the batch: spans of equal ``L`` share
+    ``n = L * PATCH_SIZE`` and ``G_L``, so they stack into a single ``(n_spans, n)``
+    block. Slots are contiguous within a span, so the gather is ``start + arange(L)``
+    and the scatter back writes each slot exactly once.
 
-    Args:
-        delta: ``(B, M, S)`` per-slot median delta (risk space).
-        start: ``(B, M)`` span-start slot index (see :func:`_span_layout`).
-        length: ``(B, M)`` span length in patches.
-        kind: ``BG_HEAD_STEP_BASIS_TYPE``.
-
-    Returns:
-        ``(B, M, S)`` projected delta, span by span.
+    ``delta`` is risk space; ``start``/``length`` come from :func:`_span_layout`;
+    ``kind`` is ``BG_HEAD_STEP_BASIS_TYPE``.
     """
     B, M, S = delta.shape
     ar = torch.arange(M, device=delta.device)
@@ -989,100 +629,73 @@ def assemble_quantiles(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble the BG head's raw output into an ascending risk-space quantile fan.
 
-    The head emits ``1 + 2*N_SPREADS`` raw numbers per step (col0 = median delta;
-    cols ``1..N_SPREADS`` = the ``τ>.5`` spreads nearest→far .75/.9/.95; cols
-    ``N_SPREADS+1..2*N_SPREADS`` = the ``τ<.5`` spreads nearest→far .25/.1/.05).
-    Spreads are passed through ``softplus`` + ``BG_QUANTILE_SPREAD_MIN`` (a strict
-    positive floor against σ-collapse) and accumulated by ``cumsum`` so the fan is
-    monotone by construction.  The anchor ``f(anchor_bg)`` is detached (a constant),
-    held flat across the ``PATCH_SIZE`` steps of ITS OWN slot; each of the ``M``
-    masked slots carries its own anchor.
+    ``head_raw`` columns: col 0 median delta; cols ``1..N_SPREADS`` the ``τ>.5`` spreads
+    nearest→far ``.75/.9/.95``; cols ``N_SPREADS+1..2*N_SPREADS`` the ``τ<.5`` spreads
+    nearest→far ``.25/.1/.05``. Spreads pass through ``softplus`` +
+    ``BG_QUANTILE_SPREAD_MIN`` (a strict positive floor against σ-collapse) and are
+    accumulated by ``cumsum``, so the fan is monotone by construction. The anchor
+    ``f(anchor_bg)`` is detached and held flat across the ``PATCH_SIZE`` steps of its own
+    slot.
 
-    The ``M`` axis is a set of masked patches gathered by index, not a trailing
-    horizon: a span may end at patch ``T−1`` (forecast), start at patch 0
-    (backcast) or sit between visible patches (infill).  Slots are grouped into
-    contiguous spans from ``mask_idx`` (:func:`_span_layout`) and every median
-    mode is evaluated PER SPAN — nothing accumulates or low-passes across the
-    visible patches that separate two spans.
+    The ``M`` axis is a gathered set of masked patches, not a trailing horizon: a span may
+    end at patch ``T−1`` (forecast), start at patch 0 (backcast) or sit between visible
+    patches (infill). Slots are grouped into spans by :func:`_span_layout`, and every
+    median mode is evaluated PER SPAN — nothing accumulates or low-passes across the
+    visible patches separating two spans.
 
-    Median assembly is gated by ``config.BG_HEAD_MEDIAN_MODE`` (R3, three modes):
+    ``config.BG_HEAD_MEDIAN_MODE``:
 
-    * ``'global'`` (DEFAULT, R3): the per-patch median delta ``delta = head_raw[..., 0]``
-      is reshaped ``(n_spans, L*S)`` C-contiguous patch-major (matching
-      ``risk_loss._to_patch_major``) and PROJECTED onto a fixed low-frequency DCT-II
-      subspace ``span(Bg)`` over the span's own ``n = L*S`` steps: ``z = delta_flat @ Bg``,
-      ``delta_global = z @ Bgᵀ``, ``m = anchor + delta_global``.  A
-      projection is an **L2 CONTRACTION** (``||proj(x)|| <= ||x||``), so the per-patch
-      offset ``o[p] = m[:,p,0] − anchor`` is bounded and non-monotone in ``p`` — it
-      CANNOT drift or amplify, structurally killing R1's unconstrained-integrator drift.
-      The subspace dimension is ``global_median_dim(L)``, NOT a fixed ``G``: a fixed
-      ``G`` degenerates to the identity at ``L = 1`` and loses the contraction with
-      every fan assert still green.  The low-pass leaves the median smooth (the
-      per-patch period-2 / seam sawtooth is unrepresentable), so C0 seam-continuity
-      is intentionally NOT pinned.
-      At init (delta≈0 ⇒ z≈0 ⇒ delta_global≈0) ``m ≈ anchor`` everywhere (persistence).
-    * ``'cumulative'`` (R1, BIT-IDENTICAL legacy): each patch CONTINUES from the previous
-      patch's endpoint, WITHIN ITS SPAN.  With ``d = head_raw[..., 0]``,
-      ``d_rel = d − d[..., :1]``, ``rise = d[..., -1] − d[..., 0]``, and the EXCLUSIVE
-      cumsum of ``rise`` over the slots of one span (``o == 0`` at each span's first
-      slot) gives ``m = anchor + o[..., None] + d_rel`` — **C0
-      continuity** at every seam and the FIRST step of each span pinned EXACTLY to
-      that span's anchor.
-    * ``'independent'`` (BIT-IDENTICAL legacy): ``m = anchor + delta`` — each patch's
-      within-patch median curve is INDEPENDENT, so the median can jump at the seams.
+    * ``'global'``: the span's per-patch median delta is reshaped ``(n_spans, L*S)``
+      C-contiguous patch-major (matching ``risk_loss._to_patch_major``, so the basis
+      low-passes the TIME axis) and projected onto a fixed low-frequency DCT-II subspace
+      of dimension ``global_median_dim(L)``. A projection is an L2 CONTRACTION, so the
+      per-patch offset is bounded and non-monotone in ``p`` and cannot drift or amplify.
+      C0 seam-continuity is deliberately NOT pinned. At init ``m ≈ anchor`` everywhere.
+    * ``'cumulative'``: each patch continues from the previous patch's endpoint WITHIN ITS
+      SPAN — C0 at every seam, and each span's first step pinned exactly to its anchor.
+    * ``'independent'``: ``m = anchor + delta``; the median may jump at the seams.
 
-    Under every mode ``median == q_tau[..., 3]`` and the ascending fan hold: only the
-    value of ``m`` changes; the ± band structure (``head_raw[..., 1:]`` → softplus →
-    cumsum, plus ``carry_spread``) is untouched.
+    Under every mode ``median == q_tau[..., 3]`` and the ascending fan hold: only ``m``
+    changes, never the ± band structure.
 
-    ``carry_spread`` (risk space, default ``0.0`` → bit-identical to a bare fan)
-    seeds the cumulative spread base on BOTH sides of the median:
-    ``q(τ>.5) = m + hypot(c_up, cumsum(d+))`` and
-    ``q(τ<.5) = m − hypot(c_dn, cumsum(d−))`` — QUADRATURE, because the carry is
-    another roll's increment and independent increments add variances; adding the
-    two is the perfectly-correlated bound.
-    It is PER LEVEL — a trailing axis of ``2*N_SPREADS`` in the spread columns' own
-    layout, ``[.75 .9 .95 | .25 .1 .05]`` — and a scalar widens all six alike.  One
-    value across the levels re-seeds every level from the outermost one's carry, so
-    the fan flattens into a slab (`SPEC/inference.md` §8.1).  NO runtime caller passes it — the
-    sole non-test call site is ``model.py``'s forward, which takes the default.
-    ``inference.predict_rolling`` needs the same widening but cannot reach this
-    argument (the assembly runs inside ``model.forward``), so it accumulates its own
-    six per-level risk-space offsets and applies the identical quadrature composition
-    post-forward on the returned ``q_tau``.  Keep the two in step: a change to the algebra here must be
-    mirrored there, or the rolling band silently stops matching the fan it widens.
+    ``carry_spread`` (risk space, default ``0.0`` → bit-identical to a bare fan) seeds the
+    cumulative spread base on BOTH sides: ``q(τ>.5) = m + hypot(c_up, cumsum(d+))``,
+    ``q(τ<.5) = m − hypot(c_dn, cumsum(d−))`` — QUADRATURE, because the carry is another
+    roll's increment and independent increments add variances; adding the two is the
+    perfectly-correlated bound. It is PER LEVEL — a trailing axis of ``2*N_SPREADS`` in
+    the spread columns' own layout ``[.75 .9 .95 | .25 .1 .05]`` — and a scalar widens all
+    six alike. One value shared across the levels re-seeds every level from the outermost
+    one's carry and flattens the fan into a slab
+    (``../T1DMCOMMON/SPEC/inference.md`` §8.1). No runtime caller passes it: the sole
+    non-test call site is ``model.forward``, which takes the default.
+    ``inference.predict_rolling`` needs the same widening but cannot reach this argument
+    (the assembly runs inside ``model.forward``), so it repeats the identical quadrature
+    post-forward on the returned ``q_tau``. Change the algebra here and it must be mirrored
+    there, or the rolling band silently stops matching the fan it widens.
 
     Args:
-        head_raw: ``(B, M, S, 1 + 2*N_SPREADS)`` raw head output (risk space), one
-            slot per masked patch.
-        anchor_bg_mgdl: ``(B, M)`` per-slot anchor BG (mg/dL), ONE-SIDED and
-            left-preferring: the last step of the span's LEFT neighbour, or the
-            first step of the right neighbour when the span starts at patch 0.
-            Every slot of a span carries the same value, so the anchor is NOT the
-            nearest visible evidence for a slot near the span's right edge — it
-            ignores the near side, which costs no information (masked rows attend
-            both ways) and only makes this offset parameterisation work harder.
-            Evaluation bins on the two-sided distance ``d``, never on this.
-            ``(B,)`` is accepted as the legacy single-span form (one broadcast
-            ``last_bg``) and then ``mask_idx`` must be None.
-        mask_idx: ``(B, M)`` int64 patch index of each slot.  Required whenever
-            ``anchor_bg_mgdl`` is ``(B, M)``: it is what identifies the spans, and
-            without it the whole ``M`` axis would silently low-pass as one span.
-            None selects the legacy layout (all ``M`` slots one contiguous span),
-            which reproduces the trailing prediction zone exactly.
-        valid: ``(B, M)`` bool, False on padded slots.  Optional — padded slots
-            gather patch 0 and fall out as their own singleton spans either way;
-            passing ``valid`` additionally pins their median to their anchor, so
-            no gradient reaches ``head_raw[..., 0]`` there.
-        carry_spread: risk-space scalar, tensor broadcastable to ``(B, M, S, 1)``
-            (every level alike), or one broadcastable to ``(B, M, S, 2*N_SPREADS)``
-            in the spread columns' layout ``[.75 .9 .95 | .25 .1 .05]`` (per level).
-            Seeds the cumulative spread base (default ``0.0``).
+        head_raw: ``(B, M, S, 1 + 2*N_SPREADS)`` risk space, one slot per masked patch.
+        anchor_bg_mgdl: ``(B, M)`` per-slot anchor BG in mg/dL, ONE-SIDED and
+            left-preferring — the last step of the span's LEFT neighbour, or the first step
+            of the right neighbour when the span starts at patch 0. Every slot of a span
+            carries the same value, so it is NOT the nearest visible evidence for a slot at
+            the span's right edge; evaluation bins on the two-sided distance ``d``, never
+            on this. ``(B,)`` is the legacy single-span form, and then ``mask_idx`` must be
+            None.
+        mask_idx: ``(B, M)`` int64 patch index of each slot. Required whenever
+            ``anchor_bg_mgdl`` is ``(B, M)`` — without it the whole ``M`` axis silently
+            low-passes as one span. None selects the legacy single-span layout.
+        valid: ``(B, M)`` bool, False on padded slots. Optional — padded slots fall out as
+            singleton spans either way; passing ``valid`` additionally pins their median to
+            their anchor, so no gradient reaches ``head_raw[..., 0]`` there.
+        carry_spread: risk-space scalar, a tensor broadcastable to ``(B, M, S, 1)`` (every
+            level alike), or one broadcastable to ``(B, M, S, 2*N_SPREADS)`` in the spread
+            columns' layout ``[.75 .9 .95 | .25 .1 .05]`` (per level).
 
     Returns:
-        q_tau: ``(B, M, S, N_QUANTILES)`` quantiles in risk space, ascending in τ
-            (index-for-index with ``QUANTILE_LEVELS``).
-        median: ``(B, M, S)`` median in risk space (== ``q_tau[..., 3]``).
+        q_tau: ``(B, M, S, N_QUANTILES)`` risk space, ascending in τ, index-for-index with
+            ``QUANTILE_LEVELS``.
+        median: ``(B, M, S)`` risk space (== ``q_tau[..., 3]``).
     """
     from config import (
         N_SPREADS, N_QUANTILES, BG_QUANTILE_SPREAD_MIN,
@@ -1122,11 +735,9 @@ def assemble_quantiles(
             f"{tuple(valid.shape)} {valid.dtype}"
         )
 
-    # Anchor: f(anchor_bg), detached (a constant), flat across the slot's S steps.
-    # Clamp the persistence anchor into the physical BG range first — a CGM-noisy
-    # last reading can sit just above the simulator ceiling (e.g. 402 mg/dL), and
-    # the anchor is a constant, so clamping silences kovatchev_f's ceiling warning
-    # without touching any gradient.
+    # Clamp first: a CGM-noisy last reading can sit just above the simulator ceiling
+    # (e.g. 402 mg/dL). The anchor is a constant, so this silences kovatchev_f's
+    # ceiling warning and touches no gradient.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     anchor = kovatchev_f(anchor_bm.detach().clamp(BG_CLAMP_MIN, BG_CLAMP_MAX))  # (B,M)
     anchor = anchor.unsqueeze(-1)                        # (B, M, 1)
@@ -1136,19 +747,9 @@ def assemble_quantiles(
         f"BG_HEAD_MEDIAN_MODE must be 'global'/'cumulative'/'independent', "
         f"got {BG_HEAD_MEDIAN_MODE!r}")
     if BG_HEAD_MEDIAN_MODE == 'global':
-        # R3 GLOBAL SMOOTH-BASIS median: project each span's median delta onto a
-        # fixed low-frequency DCT-II subspace over that span's own L*S steps.  A
-        # projection is an L2 contraction, so the per-patch offset cannot drift
-        # (kills R1's integrator).  The flattening is C-contiguous patch-major
-        # (flat = p*S + s), matching risk_loss._to_patch_major so the basis
-        # low-passes the TIME axis.
         delta_med = _median_global_per_span(
             delta, start, length, BG_HEAD_STEP_BASIS_TYPE)
     elif BG_HEAD_MEDIAN_MODE == 'cumulative':
-        # Cumulative cross-patch-continuity median (R1): each patch continues from
-        # the previous patch's endpoint.  d_rel zeroes each patch's curve at step 0;
-        # the exclusive cumsum of the per-patch rise carries the offset forward —
-        # restarted at every span, by subtracting the cumsum at the span's start.
         d_rel = delta - delta[..., :1]                   # (B,M,S) zero-based; d_rel[...,0]==0
         rise = delta[..., -1] - delta[..., 0]            # (B,M) net within-patch rise
         excl = torch.cumsum(rise, dim=1) - rise          # (B,M) EXCLUSIVE cumsum
@@ -1164,9 +765,6 @@ def assemble_quantiles(
     spread = F.softplus(head_raw[..., 1:]) + BG_QUANTILE_SPREAD_MIN  # (B,M,S,2*N_SPREADS)
     d_up = spread[..., :N_SPREADS]                       # τ>.5: .75/.9/.95
     d_dn = spread[..., N_SPREADS:]                       # τ<.5: .25/.1/.05
-    # The carry is PER LEVEL when its last axis is 2*N_SPREADS, in the spread
-    # columns' own layout ([.75 .9 .95 | .25 .1 .05]); a scalar or a trailing 1
-    # widens every level alike, which is what the legacy default 0.0 does.
     c_up = c_dn = carry_spread
     if isinstance(carry_spread, torch.Tensor) and carry_spread.ndim and carry_spread.shape[-1] != 1:
         assert carry_spread.shape[-1] == 2 * N_SPREADS, (
@@ -1175,10 +773,8 @@ def assemble_quantiles(
         )
         c_up, c_dn = carry_spread[..., :N_SPREADS], carry_spread[..., N_SPREADS:]
     o_up, o_dn = torch.cumsum(d_up, dim=-1), torch.cumsum(d_dn, dim=-1)
-    # The carry is a DIFFERENT roll's increment, so it composes with this span's own spread in
-    # QUADRATURE — independent increments add variances, and adding the two is the
-    # perfectly-correlated bound (twice too wide by the fourth roll).  Skipped outright when there
-    # is no carry, which keeps every training and single-window caller bit-identical.
+    # Skipped outright when there is no carry, which keeps every training and
+    # single-window caller bit-identical.
     if not _carry_is_zero(carry_spread):
         c_up = torch.as_tensor(c_up, dtype=o_up.dtype, device=o_up.device)
         c_dn = torch.as_tensor(c_dn, dtype=o_dn.dtype, device=o_dn.device)
@@ -1186,8 +782,7 @@ def assemble_quantiles(
     up = m.unsqueeze(-1) + o_up                          # (B,M,S,N_SPREADS) ascending
     dn = m.unsqueeze(-1) - o_dn                          # (B,M,S,N_SPREADS) descending
 
-    # Assemble ascending τ: [.05 .1 .25 | .5 | .75 .9 .95].
-    # dn is [.25 .1 .05] (descending in value) → flip to [.05 .1 .25] (ascending).
+    # dn is [.25 .1 .05], descending in value → flip to ascending [.05 .1 .25].
     q_tau = torch.cat([dn.flip(-1), m.unsqueeze(-1), up], dim=-1)  # (B,M,S,N_QUANTILES)
     assert q_tau.shape[-1] == N_QUANTILES, (
         f"assembled {q_tau.shape[-1]} quantiles, expected {N_QUANTILES}"
@@ -1200,41 +795,29 @@ def last_bg_mgdl_from_context(
     patch_idx: "torch.Tensor | Sequence[int] | None" = None,
     step_idx: "torch.Tensor | Sequence[int] | None" = None,
 ) -> torch.Tensor:
-    """Anchor BG (mg/dL) read out of the normalized context — the (a)→(b) bridge.
+    """Anchor BG in mg/dL read out of the normalized context — the (a)→(b) bridge.
 
-    The pipeline runs on RAW post-noise signals (no input/target smoothing): the
-    context ``bg_absolute`` channel is the raw observed BG that produced the
-    training input and target.  So the anchor is simply that context cell
-    denormalized to mg/dL — it matches the training anchor as the SAME physical
-    mg/dL, to within a sub-ulp round-trip difference (``data._build_sample`` reads
-    the anchor off the raw mg/dL array directly, while inference reconstructs it
-    via a z-unscale→f_inv round-trip training never does).  ``bg_absolute`` is the
-    RISK-space input channel — feat 0 is ``z( f(bg) )`` (Kovatchev ``f`` applied
-    before the z-score) as the sole input path — so the inverse is the plain
-    z-score un-scale followed unconditionally by ``kovatchev_f_inv_np`` back to
-    mg/dL; ``model.forward`` re-applies ``f`` internally.
+    feat 0 is ``z(f(bg))``, the sole input path, so the inverse is a plain z-unscale
+    followed unconditionally by ``kovatchev_f_inv_np``; ``model.forward`` re-applies ``f``
+    internally. The pipeline runs on RAW post-noise signals, so this matches the training
+    anchor (``data._build_sample`` reads it off the raw mg/dL array) as the same physical
+    value, to within a sub-ulp round-trip difference.
 
-    The general masked objective needs ``M`` anchors per sample, one per masked
-    slot, each at a different ``(patch, step)`` cell — the last step of the span's
-    left neighbour, or the first step of the right neighbour for a span starting
-    at patch 0.  Pass them as index tensors and all ``M`` cross in ONE host
-    transfer and one float64 NumPy inverse; the default reads the rightmost cell
-    and returns ``(1,)``, bit-identical to the single-anchor form it replaces.
-    Only visible cells may be indexed: feat 0 of a MASKED patch is a legal-looking
-    ``z`` that decodes to an ordinary mg/dL, so a wrong index yields a plausible
-    anchor rather than an error.
+    All ``M`` cells cross in ONE host transfer and one float64 NumPy inverse. Only VISIBLE
+    cells may be indexed: feat 0 of a MASKED patch is a legal-looking ``z`` that decodes to
+    an ordinary mg/dL, so a wrong index yields a plausible anchor rather than an error.
 
     Args:
         context: ``(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)`` normalized context.
-        stats: normalization statistics dict (must carry ``bg_absolute``).
-        patch_idx: ``(M,)`` patch indices (negatives count from the right).
+        stats: normalization statistics; must carry ``bg_absolute``.
+        patch_idx: ``(M,)`` patch indices, negatives counting from the right.
             Default: the last patch.
-        step_idx: ``(M,)`` within-patch step indices, same length as
-            ``patch_idx``.  Default: the last step.
+        step_idx: ``(M,)`` within-patch step indices, same length as ``patch_idx``.
+            Default: the last step.
 
     Returns:
-        anchor: ``(M,)`` BG in mg/dL, clamped to the physical range — ``(1,)`` in
-        the default single-cell form.
+        anchor: ``(M,)`` mg/dL clamped to the physical range — ``(1,)`` in the default
+        single-cell form.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     import numpy as np
@@ -1246,8 +829,7 @@ def last_bg_mgdl_from_context(
         "pass patch_idx and step_idx together, or neither"
     )
     if patch_idx is None:
-        # Last context BG cell (newest patch, newest step).  Left-padding sits at
-        # the FAR left, so the rightmost cell is always real data.
+        # Left-padding sits at the FAR left, so the rightmost cell is always real data.
         p = torch.tensor([-1], dtype=torch.long)
         s = torch.tensor([-1], dtype=torch.long)
     else:
@@ -1264,11 +846,7 @@ def last_bg_mgdl_from_context(
     )
     bg_mean = stats['bg_absolute']['mean']
     bg_std = stats['bg_absolute']['std']
-    # feat 0 is z( f(bg) ) — the sole input path — so un-z-scoring yields a RISK
-    # value; invert it back to mg/dL so the anchor handed to model.forward stays
-    # physical (forward re-applies f internally — this keeps model.py / the loss
-    # untouched).  One transfer for all M cells; the arithmetic is float64, as it
-    # was when this read a single Python float.
+    # float64 arithmetic, as when this read a single Python float.
     p = p.to(context.device)
     s = s.to(context.device)
     z = context[p, s, 0].detach().float().cpu().numpy().astype(np.float64)
@@ -1278,49 +856,30 @@ def last_bg_mgdl_from_context(
 
 
 class ModelEMA:
-    """
-    Exponential moving average of a model's floating-point state.
+    """Exponential moving average of a model's float parameters and buffers.
 
-    Maintains a shadow ``state_dict`` that's blended after every accepted
-    optimizer step.  Validation can be run under the EMA via the
-    ``apply_to(model)`` context manager — the shadow is swapped into the
-    model for the duration of the ``with`` block, then the live weights
-    are restored on exit so training continues on the un-smoothed
-    parameters.
+    ``apply_to(model)`` swaps the shadow in for the duration of a ``with`` block, then
+    restores the live weights so training continues on the un-smoothed parameters.
 
-    Why bother?  Threshold-crossing metrics (hypo recall, TIR error)
-    are extremely sensitive to small μ shifts.  With Muon at momentum
-    ``MUON_MOMENTUM`` the per-step weight jitter in μ-space is large relative to the
-    clinical cutoffs, so consecutive validations 100 steps apart bounce
-    around even when the loss is monotonically decreasing.  Averaging
-    weights over a ~1k-step window smooths that out without altering
-    the training trajectory itself.
+    Validation runs under the shadow because threshold-crossing metrics (hypo recall, TIR
+    error) are very sensitive to small μ shifts, and Muon's per-step weight jitter is large
+    next to the clinical cutoffs.
 
-    Args:
-        model: The live model whose parameters will be tracked.
-        decay: EMA decay factor in [0, 1).  Typical 0.999 (≈1k-step
-            smoothing) or 0.9999 (≈10k-step smoothing).
+    decay: in [0, 1). 0.999 ≈ a 1k-step window, 0.9999 ≈ 10k.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
         if not 0.0 <= decay < 1.0:
             raise ValueError(f"decay must be in [0, 1), got {decay}")
         self.decay = decay
-        # Two parallel data structures so update() can iterate without doing
-        # a fresh ``model.named_*()`` walk on every step:
-        #   shadow      — the smoothed copy (the thing we read at validation)
-        #   _param_refs — direct references into the live model so update()
-        #                 can blend without needing the model again
+        # shadow — the smoothed copy read at validation.
+        # _param_refs — live-model references, so update() need not re-walk named_*().
         self.shadow: dict[str, torch.Tensor] = {}
         self._param_refs: list[tuple[str, torch.Tensor]] = []
-        # Skip non-persistent buffers — they're typically things like RoPE
-        # caches or attention masks that don't represent learned state, so
-        # there is no value in averaging them and including them would just
-        # bloat the checkpoint.
+        # Non-persistent buffers (RoPE caches, masks) are not learned state.
         non_persistent = getattr(model, '_non_persistent_buffers_set', set())
         for name, param in model.named_parameters():
-            # Only float tensors are EMA-tracked (int64 buffers, bool masks,
-            # etc. are passed through unchanged by apply_to below).
+            # Non-float tensors pass through apply_to unchanged.
             if torch.is_floating_point(param):
                 self.shadow[name] = param.detach().clone()
                 self._param_refs.append((name, param))
@@ -1334,12 +893,9 @@ class ModelEMA:
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
         """Blend the model's current float tensors into the shadow copy."""
-        # Gather the (shadow, live) pairs whose incoming live weights are FINITE.
-        # A single NaN/inf folded into the shadow would persist forever
-        # (decay*NaN + ... == NaN on every subsequent step), permanently poisoning
-        # the EMA validation weights, so a non-finite tensor is skipped per-tensor
-        # (its shadow keeps its last good value).  Selecting the finite subset
-        # BEFORE the foreach preserves that exact per-tensor skip semantics.
+        # One NaN/inf folded into the shadow would persist forever (decay*NaN == NaN),
+        # so a non-finite tensor is skipped per tensor and its shadow keeps its last
+        # good value. Selecting the finite subset BEFORE the foreach preserves that.
         sel_shadow: list[torch.Tensor] = []
         sel_live: list[torch.Tensor] = []
         for name, ref in self._param_refs:
@@ -1350,41 +906,32 @@ class ModelEMA:
                 sel_shadow.append(self.shadow[name])
                 sel_live.append(ref)
         if sel_shadow:
-            # Batched in-place blend: mathematically identical, per tensor, to
-            # ``shadow.mul_(decay).add_(live, alpha=1-decay)`` == decay*shadow +
-            # (1-decay)*live, but fused across all tensors to cut launch overhead.
+            # Fused equivalent of shadow.mul_(decay).add_(live, alpha=1-decay).
             torch._foreach_mul_(sel_shadow, self.decay)
             torch._foreach_add_(sel_shadow, sel_live, alpha=1.0 - self.decay)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        # Defensive clone so the caller can't mutate our shadow accidentally
-        # (checkpoints are saved from this dict).
+        # Defensive clone: checkpoints are saved from this dict.
         return {k: v.detach().clone() for k, v in self.shadow.items()}
 
     def load_state_dict(self, sd: dict[str, torch.Tensor]) -> None:
-        # Same defensive clone on the way in — the caller might keep a
-        # reference to the dict and mutate it after handing it to us.
+        # Defensive clone: the caller may keep the dict and mutate it afterwards.
         self.shadow = {k: v.detach().clone() for k, v in sd.items()}
 
     def to(self, device: torch.device) -> "ModelEMA":
-        # Move every shadow tensor to ``device``.  Important when the
-        # checkpoint was loaded onto CPU and we then ``.to('cuda')`` later.
         self.shadow = {k: v.to(device) for k, v in self.shadow.items()}
         return self
 
     @contextmanager
     def apply_to(self, model: nn.Module) -> Iterator[None]:
-        """
-        Context manager that swaps shadow weights into ``model`` for the
-        duration of the ``with`` block, then restores the live weights on
-        exit.  The backup snapshot is taken from ``model.state_dict()``
-        directly (not from ``self._param_refs``) so we restore *exactly*
-        the live state even if other code mutated the model during the block.
+        """Swap the shadow into ``model`` for the ``with`` block; restore live weights on exit.
+
+        The backup is taken from ``model.state_dict()``, not ``_param_refs``, so the
+        restore is exact even if other code mutated the model during the block.
         """
         backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        # Start from a copy of the backup so non-EMA-tracked buffers (int64
-        # counters, etc.) keep their live values even while the float weights
-        # are temporarily replaced by the shadow copy.
+        # Start from the backup so non-EMA-tracked buffers (int64 counters) keep their
+        # live values while the float weights are replaced.
         merged = dict(backup)
         for k, v in self.shadow.items():
             merged[k] = v
@@ -1392,5 +939,4 @@ class ModelEMA:
         try:
             yield
         finally:
-            # Always restore — even on exceptions raised inside the with block.
             model.load_state_dict(backup, strict=True)

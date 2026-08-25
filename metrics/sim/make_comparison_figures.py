@@ -1,14 +1,7 @@
-"""
-In-domain T1DMSIM comparison figures: simulated-CGM-vs-predicted BG across fresh
-simulator patients, in the announced-event regime. Writes metrics/sim/figures/
-{sim_trajectories,parity,clarke}.png on the current checkpoint. The BG panels are
-conditioned on the announced future carbs/insulin.
+"""In-domain T1DMSIM figures: simulated CGM vs predicted BG, conditioned on the announced future doses.
 
-Risk-space redesign note: the model now outputs only a BG quantile forecast, so
-the former 24 h carb/insulin/IS/HGO channel-overlay panels (which compared deleted
-dynamics outputs to simulator truth) are dropped — only the BG comparison remains.
-
-Usage:  CUDA_VISIBLE_DEVICES="" python metrics/sim/make_comparison_figures.py
+Writes metrics/sim/figures/{sim_trajectories,parity,clarke}.png off the current checkpoint.
+Run:  CUDA_VISIBLE_DEVICES="" python metrics/sim/make_comparison_figures.py
 """
 from __future__ import annotations
 
@@ -32,7 +25,7 @@ _HI_IDX = QUANTILE_LEVELS.index(0.95)
 
 
 def _fmt_hour(h: float) -> str:
-    """Format a fractional hour-of-day in [0, 24) as 'HH:MM'."""
+    """Fractional hour-of-day in [0, 24) as 'HH:MM'."""
     h = h % 24.0
     hh = int(h)
     mm = int(round((h - hh) * 60.0))
@@ -50,8 +43,7 @@ def main():
     figdir = os.path.join(HERE, 'figures')
     os.makedirs(figdir, exist_ok=True)
 
-    # The SIM figure path is where the stored sim delta is valid (sim cal/test
-    # exchangeability holds): thread it so the trajectory band ribbon is calibrated.
+    # sim cal/test exchangeability holds here, so the stored delta is valid
     rows = collect_sim_rows(model, stats, runs, device, cap=24,
                             conformal_delta=model.conformal_delta)
     pred = np.stack([r['pred'] for r in rows]); true = np.stack([r['true'] for r in rows])
@@ -62,8 +54,7 @@ def main():
     examples = []
     for i in picks:
         label = f"{rows[i]['patient']} · swing {motion[i]:.0f} mg/dL"
-        # Append the model's time-of-day forecast clock when the TOD probe is on
-        # (probe-off rows carry NaN pred_hour); the true origin clock is shown alongside.
+        # probe-off rows carry NaN pred_hour
         pred_hour = rows[i].get('pred_hour', float('nan'))
         true_hour = rows[i].get('true_hour', float('nan'))
         tod_r = rows[i].get('tod_R', float('nan'))
@@ -73,8 +64,7 @@ def main():
         ex = {'ctx_tail': rows[i]['ctx_tail'], 'true_future': rows[i]['true'],
               'pred_future': rows[i]['pred'], 'label': label,
               'time_probs': rows[i].get('time_probs')}
-        # Calibrated 90% band ribbon (single-pass only; rolling rows carry bands=None),
-        # sliced to the plotted prediction length.
+        # calibrated 90% ribbon, single-pass only — rolling rows carry bands=None
         b = rows[i].get('bands')
         if b is not None:
             plen = len(rows[i]['pred'])

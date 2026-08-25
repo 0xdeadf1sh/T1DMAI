@@ -1,8 +1,6 @@
-"""Tests for the CG-EGA clinical-accuracy metric (cg_ega.py).
+"""CG-EGA (cg_ega.py); perfect prediction => 100% AP is the load-bearing case.
 
-The load-bearing correctness test is perfect-prediction => 100% AP everywhere.
-A port-equivalence test re-evaluates the exact boolean zone conditions
-transcribed in ``scratch/_cgega_reference.py`` as an independent oracle.
+``scratch/_cgega_reference.py``'s zone conditions are re-derived as an oracle.
 """
 from __future__ import annotations
 
@@ -12,11 +10,8 @@ import pytest
 import cg_ega
 
 
-# --------------------------------------------------------------------------- #
-# Oracle: the EXACT zone conditions copied from scratch/_cgega_reference.py.
-# These re-implement P-EGA / R-EGA independently of cg_ega.py so a divergence
-# in either direction is caught.
-# --------------------------------------------------------------------------- #
+# P-EGA / R-EGA re-implemented from scratch/_cgega_reference.py, independently of
+# cg_ega.py, so a divergence in either direction is caught
 def _oracle_p_marks(y_true, y_pred, dy_true):
     mod = np.zeros_like(y_true, dtype=np.float64)
     mod[((dy_true > -2) & (dy_true <= -1)) | ((dy_true >= 1) & (dy_true < 2))] = 10
@@ -62,7 +57,6 @@ def _realistic_traj(seed: int = 0, n: int = 12, t: int = 24):
 
 
 def test_perfect_prediction_is_all_accurate():
-    """y_pred == y_true => dy match (R-EGA A) and value match (P-EGA A) => AP."""
     y, last = _realistic_traj(seed=1)
     counts = cg_ega.cg_ega_counts(y, y, last)
     fr = cg_ega.cg_ega_fractions(counts)
@@ -97,20 +91,20 @@ def test_fractions_sum_to_one_per_region():
 
 
 def test_opposite_rate_is_erroneous():
-    """Truth falling fast (−2 mg/dL/min), prediction rising fast (+2) => the
-    rate is catastrophically wrong (R-EGA uE) => EP regardless of region.
+    """Truth −2 mg/dL/min against prediction +2 => R-EGA uE => EP.
 
-    Hold the true series strictly above 70 mg/dL so every point is euglycemic
-    (region is assigned by the TRUE value), isolating the rate axis."""
+    The true series stays above 70 mg/dL so every point is euglycemic — region
+    comes off the TRUE value — isolating the rate axis.
+    """
     T = 6
     last = np.array([180.0])
     y_true = (180.0 + np.arange(1, T + 1) * (-10.0)).reshape(1, T)  # −2 mg/dL/min, 170..120
     y_pred = (180.0 + np.arange(1, T + 1) * (10.0)).reshape(1, T)   # +2 mg/dL/min
     marks = cg_ega.cg_ega_marks(y_true, y_pred, last)
-    # every step has dy_true=-2 (<-1) & dy_pred=+2 (>1) => uE (index 6).
+    # dy_true = -2, dy_pred = +2 => uE, index 6
     assert np.all(marks["r_mark"] == 6), \
         f"expected R-EGA uE for opposite fast rates, got {marks['r_mark']}"
-    # all true values 120..170 are euglycemic.
+    # true 120..170 is euglycemic
     assert np.all(marks["region"] == "eu"), f"region: {marks['region']}"
     counts = cg_ega.cg_ega_counts(y_true, y_pred, last)
     assert counts["ap_eu"] == 0 and counts["be_eu"] == 0, \
@@ -120,23 +114,22 @@ def test_opposite_rate_is_erroneous():
 
 
 def test_large_point_error_is_erroneous():
-    """A STABLE point with a huge value error => P-EGA E => EP. True hyper (300),
-    prediction deep hypo (50): P-EGA E (y_true>180 & y_pred<70). Both flat
-    (dy≈0 => R-EGA A), so the EP verdict is driven by the POINT axis alone."""
+    """True hyper 300 against a stable prediction of 50 => P-EGA E => EP.
+
+    Both series are flat (dy ≈ 0 => R-EGA A), so the point axis alone forces EP.
+    """
     T = 6
     last_t = np.array([300.0])
-    y_true = np.full((1, T), 300.0)   # stable hyper, true
-    y_pred = np.full((1, T), 50.0)    # stable but wildly low prediction
+    y_true = np.full((1, T), 300.0)
+    y_pred = np.full((1, T), 50.0)
     marks = cg_ega.cg_ega_marks(y_true, y_pred, last_t)
     pm = cg_ega._p_ega_marks(np.full(T, 300.0), np.full(T, 50.0), np.zeros(T))
-    # P-EGA E: (y_true>180) & (y_pred < 70 - mod), mod=0 here. index 4 for EVERY
-    # step — the point axis alone forces EP irrespective of the rate mark.
+    # P-EGA E is index 4; mod = 0 here
     assert np.all(pm == 4), f"true-hyper/pred-hypo should be P-EGA E, got {pm}"
     assert np.all(marks["p_mark"] == 4), f"pipeline p_mark: {marks['p_mark']}"
     counts = cg_ega.cg_ega_counts(y_true, y_pred, last_t)
-    # hyper filters: P column E is all-EP in filter_EP_hyper -> AP/BE both 0,
-    # so the (R,P)=(*, E) cell is EP for every R-mark (incl. the t=0 lC transient
-    # from the prediction's jump off the shared anchor).
+    # P column E is all-EP in the hyper filter, so every R-mark cell is EP —
+    # including the t=0 lC transient off the shared anchor
     assert counts["ap_hyper"] == 0 and counts["be_hyper"] == 0, \
         f"large point error must be EP, got {counts}"
     assert counts["ep_hyper"] == T, f"expected all EP, got {counts}"
@@ -144,15 +137,10 @@ def test_large_point_error_is_erroneous():
 
 
 def test_counts_are_asymmetric_in_the_two_trajectories():
-    """Swapping the two trajectories must change the table.
+    """``cg_ega_counts``'s FIRST argument is the reference on every axis: region,
+    the ±20% denominator, the zone-D gates and the ``mod`` widening.
 
-    ``cg_ega_counts(y_true, y_pred, ...)`` takes the FIRST argument as the reference on
-    every axis — the glycemic region, the ±20% acceptance denominator, the zone-D
-    excursion gates and the rate-dependent ``mod`` widening. Nothing else in this file
-    can see that: the load-bearing perfect-prediction case passes ``(y, y)`` and is
-    invariant under the swap, and every other test calls in the documented order. A
-    caller that reverses the two arguments therefore produces a well-formed table of a
-    different statistic and no test notices. Pin the asymmetry itself.
+    Reversed, a caller gets a well-formed table of a different statistic.
     """
     T = 8
     last = np.array([120.0, 300.0])
@@ -177,8 +165,6 @@ def test_counts_are_asymmetric_in_the_two_trajectories():
 
 
 def test_port_equivalence_against_reference_conditions():
-    """For a random batch, the cg_ega P/R marks must equal the oracle marks
-    re-derived straight from the reference boolean conditions."""
     y_true, last_t = _realistic_traj(seed=7, n=16, t=20)
     y_pred, _ = _realistic_traj(seed=8, n=16, t=20)
     # anchor pred at a perturbed true-anchor so the dy_pred[t=0] is well-defined
@@ -197,8 +183,7 @@ def test_port_equivalence_against_reference_conditions():
     assert np.array_equal(p_got, p_ref), "P-EGA marks diverge from reference"
     assert np.array_equal(r_got, r_ref), "R-EGA marks diverge from reference"
 
-    # And the full per-point AP/BE/EP classification reproduces a hand-rolled
-    # reference lookup over the same marks (exercise the filter matrices).
+    # per-point AP/BE/EP against a hand-rolled lookup over the same marks
     region = np.where(yt <= 70, "hypo", np.where(yt <= 180, "eu", "hyper"))
     ap_ref = np.zeros(yt.shape, dtype=bool)
     be_ref = np.zeros(yt.shape, dtype=bool)
@@ -214,7 +199,6 @@ def test_port_equivalence_against_reference_conditions():
             ap_ref[i] = bool(f_ap[reg][r_got[i]][j])
             be_ref[i] = (not ap_ref[i]) and bool(f_be[reg][r_got[i]][j])
         # pm not in region cols => neither AP nor BE => EP
-    # cg_ega's vectorized classification:
     counts_per = []
     for i in range(yt.shape[0]):
         reg = region[i]
@@ -228,8 +212,7 @@ def test_port_equivalence_against_reference_conditions():
     print(f"[DUMP] port-equivalence OK on {yt.shape[0]} points")
 
 
-# Reference filter matrices (VERBATIM from scratch/_cgega_reference.py) as plain
-# python lists, used by the port-equivalence oracle above.
+# filter matrices, verbatim from scratch/_cgega_reference.py
 _ref_AP_hypo = [[1, 0, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]
 _ref_BE_hypo = [[0, 0, 0], [0, 0, 0], [1, 0, 0], [1, 0, 0], [0, 0, 0], [1, 0, 0], [0, 0, 0], [1, 0, 0]]
 _ref_AP_eu = [[1, 1, 0], [1, 1, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]

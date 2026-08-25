@@ -11,13 +11,11 @@ The sampler draws, for a window of ``T`` patches::
                spread uniformly over n_spans + 1 gaps, one MANDATORY visible
                patch between neighbours
 
-Every reference figure in this file is ENUMERATED from the live
-``MASK_SPAN_LENGTHS`` / ``MAX_MASKED_PATCHES`` / ``MASK_MAX_SPANS`` /
-``MASK_RIGHT_EDGE_QUOTA``, never written down.  Those knobs are retuned between
-runs, and a percentage frozen for one setting fails a CORRECT sampler at the
-next — the arithmetic such a constant protects is the sampler's own, so pinning
-it tests nothing the enumeration does not test better.  What the tests assert is
-the structure that holds at every setting:
+Every reference figure is ENUMERATED from the live ``MASK_SPAN_LENGTHS`` /
+``MAX_MASKED_PATCHES`` / ``MASK_MAX_SPANS`` / ``MASK_RIGHT_EDGE_QUOTA``, never written
+down: the knobs are retuned between runs, and a frozen percentage fails a CORRECT
+sampler at the next setting. What is asserted is the structure that holds at every
+setting:
 
   * placement is uniform CONDITIONAL on ``(n_spans, length vector)`` WITHIN each
     branch — that, and nothing wider, is what the sampler guarantees;
@@ -30,29 +28,24 @@ the structure that holds at every setting:
     is that conditional on ``n_spans`` every feasible vector is equally likely;
   * spans never abut, and no draw exceeds ``MAX_MASKED_PATCHES``.
 
-**The marginal is computed in CLOSED FORM here, never sampled.**  The interior is
-flat to a fraction of a percent, while at 10⁵ draws the per-position 1σ is ~1% of
-the mean — so a perfectly correct sampler misreports the flatness in every
-replicate, and resolving it by sampling would need ~4×10⁷ draws per ``T``.  The
-closed form costs milliseconds and is exact.  The sampler itself is drawn from
-only where the claim is about the LIVE sampler, and then it is compared against
-the enumerated reference with a stated z tolerance against the binomial sem.
+**The marginal is computed in CLOSED FORM here, never sampled.** The interior is
+flat to a fraction of a percent, while at 10⁵ draws the per-position 1σ is ~1% of the
+mean, so a correct sampler misreports the flatness in every replicate and sampling it
+out would take ~4×10⁷ draws per ``T``. The sampler is drawn from only where the claim
+is about the LIVE sampler, then compared against the enumeration in σ.
 
-Two further traps in how the marginal is read: do NOT pool over ``T`` (the
-windows have different lengths, so a pooled histogram mixes different tapers),
-and do NOT measure in LEFT-PADDED coordinates — the pooled padded histogram of a
-perfectly correct sampler ramps two orders of magnitude across the window and is
-not even monotone.  Every figure below is per ``T`` and in the window's own
-coordinates.
+Two traps in reading the marginal: do NOT pool over ``T``, whose windows have
+different lengths and so different tapers, and do NOT measure in LEFT-PADDED
+coordinates — the pooled padded histogram of a correct sampler ramps two orders of
+magnitude across the window and is not even monotone. Every figure below is per ``T``
+and in the window's own coordinates.
 
 Worked example, asserted nowhere: at ``MASK_SPAN_LENGTHS = (1, 2, 3, 4)`` with
 ``MAX_MASKED_PATCHES = 8`` the enumeration reads span-length shares
-29.55 / 27.27 / 23.86 / 19.32%, ``E[#masked] = 4.659091``,
-``P(#masked = 8) = 11.17%``, 41.76% of head slots padded and an interior flat to
-1.504 / 0.829 / 0.548% at ``T = 20 / 36 / 52``.  At ``(1, ..., 8)`` with
-``MAX_MASKED_PATCHES = 12`` the masked-patch mean reads 7.402896.  Every one of
-those moves with the knobs, and each is derived where it is used rather than
-compared against a figure written here.
+29.55 / 27.27 / 23.86 / 19.32%, ``E[#masked] = 4.659091``, ``P(#masked = 8) = 11.17%``,
+41.76% of head slots padded, and an interior flat to 1.504 / 0.829 / 0.548% at
+``T = 20 / 36 / 52``. At ``(1, ..., 8)`` with ``MAX_MASKED_PATCHES = 12`` the
+masked-patch mean reads 7.402896. Every one moves with the knobs.
 """
 
 from collections import Counter
@@ -68,25 +61,20 @@ from config import (MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS,
                     MIN_CONTEXT_PATCHES, PATCH_SIZE, PREDICTION_PATCHES)
 import data
 from data import sample_mask_spans, _mask_slots
-# The d grouping and the exact per-d shares live in d_balance and are reused
-# rather than re-derived: a second enumeration is a second thing to drift.
+# the d grouping and per-d shares live in d_balance and are reused, never re-derived:
+# a second enumeration is a second thing to drift
 from d_balance import N_D_GROUPS, _group, d_distribution
 
 
-# How far an empirical frequency may sit from its enumerated reference, in units
-# of the binomial (or delta-method) standard error.  Every sampled comparison in
-# this file uses these; nothing uses a relative-percentage band, which is a
-# tolerance that silently tightens or loosens as the knobs move.
+# how far an empirical frequency may sit from its enumerated reference, in binomial
+# (or delta-method) standard errors. Never a relative-percentage band, which tightens
+# and loosens on its own as the knobs move.
 _Z_TOL = 5.0            # pooled statistics: hundreds of z, all at high counts
 _COND_Z_TOL = 6.0       # per-bucket conditional check: ~2500 z at low counts
 
 # The live quota as an EXACT rational, so the closed form below stays exact.
 _QUOTA = Fraction(str(MASK_RIGHT_EDGE_QUOTA))
 
-
-# ---------------------------------------------------------------------------
-# Exact enumeration of the sampler's distribution.
-# ---------------------------------------------------------------------------
 
 def _length_vectors() -> list[tuple[Fraction, tuple[int, ...]]]:
     """Every ``(probability, length vector)`` the sampler can draw.
@@ -227,10 +215,6 @@ class _CountingRng:
         return getattr(self._rng, name)
 
 
-# ---------------------------------------------------------------------------
-# (1) Placement, by exact enumeration and against the live sampler.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("T", [20, 36, 52])
 def test_mask_placement_interior_is_flat(T):
     """Placement is uniform CONDITIONAL on ``(n_spans, length vector)`` within
@@ -331,18 +315,15 @@ def test_mask_placement_interior_is_flat(T):
 
 @pytest.mark.parametrize("T", [20, 36, 52])
 def test_mask_placement_edge_taper(T):
-    """The marginal tapers at the LEFT end and climbs monotonically inward, and
-    the right end carries the quota's ramp instead of the mirror taper.
+    """The marginal tapers at the LEFT end and climbs monotonically inward; the right
+    end carries the quota's ramp instead of the mirror taper.
 
-    A span cannot start left of 0, so the outermost positions are reachable by
-    strictly fewer arrangements than the interior — that deficit and its monotone
-    climb are the properties a curriculum breaks first.  Their MAGNITUDE is a
-    function of the span ceiling (the taper is ``MASK_SPAN_LENGTHS[-1] - 1``
-    positions wide, and deeper the higher the ceiling), so the magnitude is
-    derived, printed and never pinned.  On the right the quota inverts the taper:
-    the one position it can never cover is the separator it charges ahead of the
-    pinned span, which sits at or below the plateau while everything right of it
-    sits above."""
+    A span cannot start left of 0, so the outermost positions are reachable by fewer
+    arrangements — that deficit and its climb are what a curriculum breaks first. The
+    taper is ``MASK_SPAN_LENGTHS[-1] - 1`` positions wide and deepens with the ceiling,
+    so its magnitude is derived and printed, never pinned. On the right, the one
+    position the quota cannot cover is the separator it charges ahead of the pinned span.
+    """
     marg = _position_marginal(T)
     lo, hi = _plateau(T)
     mean = sum(marg[lo:hi]) / (hi - lo)
@@ -380,18 +361,15 @@ def test_mask_placement_edge_taper(T):
 
 
 def test_length_distribution_is_whole_vector_rejection():
-    """Conditional on ``n_spans``, EVERY feasible length vector is equally likely.
+    """Conditional on ``n_spans``, EVERY feasible length vector is equally likely — the
+    observable signature of redrawing the WHOLE vector on overflow.
 
-    That is the observable signature of redrawing the whole vector on overflow.
-    Redrawing one element instead — the natural half-fix — leaves the feasible set
-    identical and its probabilities uneven, so the shapes and the budget look
-    right while the length distribution, and hence the ``d`` histogram the metrics
-    are binned on, has moved.  The share of each length, ``E[#masked]``,
-    ``P(#masked = MAX_MASKED_PATCHES)`` and the padded fraction of the head's
-    slots all follow from that law and are enumerated, printed, and checked
-    against the live sampler — not pinned, since every one of them moves when the
-    knobs are retuned.  None of them moves with the quota, which is the point:
-    the quota changes placement and nothing else."""
+    Redrawing one element leaves the feasible set identical and its probabilities
+    uneven, so the shapes and the budget look right while the ``d`` histogram the
+    metrics bin on has moved. The shares, ``E[#masked]``, ``P(#masked = MAX)`` and the
+    padded fraction all follow from that law, and none of them moves with the quota,
+    which changes placement and nothing else.
+    """
     shares = {L: Fraction(0) for L in MASK_SPAN_LENGTHS}
     n_spans_mean = Fraction(0)
     masked_mean = _masked_patch_mean()
@@ -464,10 +442,9 @@ def test_length_distribution_is_whole_vector_rejection():
         f"P(#masked == {MAX_MASKED_PATCHES}) = {emp_full * 100:.3f}% vs the "
         f"enumerated {pf * 100:.3f}% ({z_full:.2f}σ)")
 
-    # E[#masked] is also what sets the padded fraction of the head's M slots, so
-    # the `valid` machinery runs on the great majority of samples, not on an edge
-    # case.  (At MASK_SPAN_LENGTHS = (1,2,3,4), MAX_MASKED_PATCHES = 8 this
-    # evaluates to 41.76% padded.)
+    # E[#masked] sets the padded fraction of the head's M slots, so the ``valid``
+    # machinery runs on most samples, not on an edge case: 41.76% padded at
+    # MASK_SPAN_LENGTHS = (1,2,3,4), MAX_MASKED_PATCHES = 8
     pad_pct = (MAX_MASKED_PATCHES - float(masked_mean)) / MAX_MASKED_PATCHES * 100.0
     assert 0.0 <= pad_pct < 100.0
     print(f"\n[DUMP] lengths | shares {{{', '.join(f'{L}: {pct[L]:.2f}%' for L in MASK_SPAN_LENGTHS)}}}; "
@@ -476,10 +453,6 @@ def test_length_distribution_is_whole_vector_rejection():
           f"{[len(_feasible_vectors(n)) for n in range(1, MASK_MAX_SPANS + 1)]} feasible "
           f"vectors per arity (budget rejects: {rejects}), all equiprobable to {_Z_TOL}σ ✓")
 
-
-# ---------------------------------------------------------------------------
-# (2) The right-edge quota.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("T", [20, 52])
 def test_flush_right_frequency_matches_the_enumeration(T):
@@ -511,14 +484,12 @@ def test_flush_right_frequency_matches_the_enumeration(T):
 
 
 def test_quota_zero_never_consumes_the_placement_draw(monkeypatch):
-    """At quota 0 the branch draw is short-circuited, so the rng stream is the
-    pre-quota sampler's exactly.
+    """At quota 0 the branch draw is short-circuited, so the mask stream is not merely
+    distributed the same as the pre-quota sampler's, it IS that stream.
 
-    This is what makes a quota-0 run bit-comparable with one that predates the
-    quota: the mask stream is not merely distributed the same, it is the same
-    stream.  Lose the short circuit — evaluate ``rng.random()`` and then compare —
-    and every mask after the first shifts by one draw while every distribution in
-    this file still passes."""
+    Lose the short circuit — evaluate ``rng.random()`` and then compare — and every
+    mask after the first shifts by one draw while every distribution here still passes.
+    """
     T = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
     n_draws = 500
 
@@ -529,12 +500,12 @@ def test_quota_zero_never_consumes_the_placement_draw(monkeypatch):
         f"the placement draw was consumed {counting.n_random} times at quota 0 — "
         f"the short circuit is gone and the mask stream has shifted")
 
-    # The proxy is transparent: a plain Generator on the same seed draws the same
-    # masks, so the count above is a statement about the sampler, not about it.
+    # the proxy is transparent: a plain Generator on the same seed draws the same
+    # masks, so the count above is about the sampler, not about the proxy
     plain = np.random.default_rng(24680)
     assert zero_spans == [sample_mask_spans(T, plain) for _ in range(n_draws)]
 
-    # And at the live quota the draw IS consumed, once per call.
+    # at the live quota the draw IS consumed, once per call
     monkeypatch.setattr(data, 'MASK_RIGHT_EDGE_QUOTA', float(MASK_RIGHT_EDGE_QUOTA))
     counting = _CountingRng(np.random.default_rng(24680))
     live_spans = [sample_mask_spans(T, counting) for _ in range(n_draws)]
@@ -549,20 +520,19 @@ def test_quota_zero_never_consumes_the_placement_draw(monkeypatch):
 
 @pytest.mark.parametrize("T", [20, 36, 52])
 def test_right_edge_draws_are_flush_and_still_separated(T):
-    """A flush-right draw pins the LAST span at ``T - L`` and leaves at least one
-    visible patch before it.
+    """A flush-right draw pins the LAST span at ``T - L`` and leaves a visible patch
+    before it.
 
-    The pinned span is the one place the separator rule could be dropped — the
-    branch places it outside the composition — and a span abutting it would be
-    read as one longer span by ``utils._span_layout``, silently merging two
-    anchors and two DILATE buckets into one."""
+    The branch places that span outside the composition, so it is the one place the
+    separator could be dropped — and a span abutting it reads as one longer span to
+    ``utils._span_layout``, merging two anchors and two DILATE buckets into one.
+    """
     rng = np.random.default_rng(777_000 + T)
     flush = multi = 0
     for _ in range(20_000):
         spans = sample_mask_spans(T, rng)
-        # It is the LAST span the branch pins, never an earlier one: an interior
-        # span reaching T-1 would mean the composition ran past the prefix it was
-        # given, and the pinned span would sit on top of it.
+        # the branch pins the LAST span, never an earlier one: an interior span
+        # reaching T-1 means the composition ran past its prefix
         assert all(s + L < T for s, L in spans[:-1]), \
             f"a span other than the last reaches the window edge: {spans} at T={T}"
         start, length = spans[-1]
@@ -582,19 +552,16 @@ def test_right_edge_draws_are_flush_and_still_separated(T):
           f"a preceding span, every one pinned at T-L and separated ✓")
 
 
-# ---------------------------------------------------------------------------
-# (6) Structural guarantees of the drawn spans.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("T", [20, 36, 52])
 def test_spans_never_abut_and_fit_the_budget(T):
-    """Over 4000 draws per ``T``: at most MASK_MAX_SPANS spans, every length in
-    MASK_SPAN_LENGTHS, at most MAX_MASKED_PATCHES masked patches, every span inside
-    the window, and AT LEAST ONE VISIBLE PATCH between neighbours.
+    """At most MASK_MAX_SPANS spans, every length in MASK_SPAN_LENGTHS, at most
+    MAX_MASKED_PATCHES masked patches, all inside the window, one visible patch between
+    neighbours.
 
-    The separator is not cosmetic: it is what makes the anchor, the per-span median
-    basis and the DILATE length bucket well defined per span.  Two spans with
-    nothing between them are one longer span, and nothing downstream would say so."""
+    The separator is what makes the anchor, the per-span median basis and the DILATE
+    length bucket well defined; two spans with nothing between them are one longer span
+    and nothing downstream would say so.
+    """
     rng = np.random.default_rng(20250813 + T)
     seen_lengths = set()
     seen_counts = set()
@@ -663,26 +630,18 @@ def test_mask_slots_pad_and_distance():
 
 
 def test_anchor_is_farther_than_the_nearest_evidence_for_a_third_of_slots():
-    """Some supervision anchors FARTHER than the nearest visible evidence, and it
-    is exactly the right half of the two-sided spans that does.
+    """Some supervision anchors FARTHER than the nearest visible evidence — exactly the
+    right half of the two-sided spans.
 
-    The anchor is one-sided and left-preferring — the whole span shares the last
-    step of its left neighbour — while ``d`` is the distance to the nearest visible
-    patch on EITHER side.  So for a slot ``j`` of a two-sided span of ``L`` patches
-    the anchor sits ``j+1`` away and ``d`` is ``min(j+1, L-j)``: they part company
-    exactly when ``2j+1 > L``.  A one-sided span has only one neighbour and the two
-    always agree, so the quota — which makes one-sided spans commonplace — lowers
-    this share rather than raising it.  That costs no information (a masked row
-    attends to everything); it only makes the head's offset parameterisation work
-    harder, and it does mean any metric binned on ``d`` reports a distance the
-    anchor did not use.
+    For slot ``j`` of a two-sided span of ``L`` the anchor sits ``j+1`` away while ``d``
+    is ``min(j+1, L-j)``, so they part company when ``2j+1 > L``. A one-sided span has
+    one neighbour and the two always agree, so the quota LOWERS this share. It costs no
+    information — a masked row attends to everything — but any metric binned on ``d``
+    reports a distance the anchor did not use.
 
-    The MECHANISM is what is asserted — a non-zero share, arising only in the right
-    half of two-sided spans.  The share itself is enumerated over
-    ``(T, n_spans, length vector, placement branch, gap composition)`` with ``T``
-    uniform over the window lengths the picker draws, and cross-checked against
-    ``_mask_slots`` itself; it moves with the span ceiling and the quota and is
-    never pinned — the test prints the live value rather than asserting one."""
+    The MECHANISM is asserted, never the share, which moves with the ceiling and the
+    quota and is only printed.
+    """
     lengths_T = [n + PREDICTION_PATCHES
                  for n in range(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1)]
     p_T = 1.0 / len(lengths_T)
@@ -757,17 +716,13 @@ def test_anchor_is_farther_than_the_nearest_evidence_for_a_third_of_slots():
 
 
 def test_sampler_agrees_with_the_closed_form_coarsely():
-    """The live sampler must match both closed forms it feeds: the per-position
-    placement marginal at ``T = 52``, and the per-``d`` shares ``d_balance``
-    enumerates and ``metrics.protocols.SAMPLER_REFERENCE`` is produced from.
+    """The live sampler against both closed forms it feeds: the per-position marginal at
+    ``T = 52``, and ``d_balance``'s per-``d`` shares.
 
-    This is a COARSE check and cannot be anything else: at 60 000 draws the
-    per-position 1σ is ~1% of the mean, several times the interior spread the
-    enumeration above measures, so the tolerance is stated in σ against the
-    binomial sem rather than as a percentage band — a percentage band tightens or
-    loosens on its own as the span ceiling moves.  What it catches is a placement
-    rule wrong by a lot — a quota applied at the wrong rate, a curriculum, a
-    missing separator — which moves whole regions of the histogram."""
+    COARSE by necessity: at 60 000 draws the per-position 1σ is ~1% of the mean, several
+    times the interior spread enumerated above. What it catches is a placement rule
+    wrong by a lot — a quota at the wrong rate, a curriculum, a missing separator.
+    """
     T = 52
     n_draws = 60_000
     rng = np.random.default_rng(4242)
@@ -824,11 +779,9 @@ def test_sampler_agrees_with_the_closed_form_coarsely():
             f"d_balance's enumerated {ref[g] * 100:.3f}% ({zg:.2f}σ) — every "
             "d-binned metric is being read against a mixture the sampler does not "
             "draw")
-    # metrics.protocols.SAMPLER_REFERENCE is a FROZEN copy of this same histogram,
-    # written down so a realised figure can be read against it without re-running
-    # the enumeration. sampler_reference_applies() compares only the KNOBS, so
-    # nothing else would notice the numbers going stale under a knob that did not
-    # move — a widened span ceiling, say, or a quota retuned at equal ceiling.
+    # SAMPLER_REFERENCE is a FROZEN copy of this histogram, so a realised figure can be
+    # read against it without re-running the enumeration. sampler_reference_applies()
+    # compares only the KNOBS, so nothing else notices the numbers going stale.
     from metrics.protocols import SAMPLER_REFERENCE
     for g in range(N_D_GROUPS):
         frozen = SAMPLER_REFERENCE['share_pct'][g + 1] / 100.0

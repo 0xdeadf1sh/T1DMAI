@@ -1,50 +1,10 @@
-"""
-T1DMAI Risk-space BG loss — pinball quantile loss + DILATE, Kendall-Gal weighted.
-=================================================================================
+"""Risk-space BG loss: pinball + per-span DILATE, Kendall-Gal weighted.
 
-The redesign forecasts BG in **Kovatchev risk space** (space (c) of the frozen
-contract): the model emits an ascending bundle of quantiles per future timestep,
-and the target glucose trajectory is risk-transformed exactly once here, at the
-top of :func:`risk_total_loss`.
-
-The supervised set is the **masked patches** of a window, gathered into the
-head's ``M`` fixed slots (``MAX_MASKED_PATCHES``); a sample with fewer masked
-patches pads the surplus and the padded slots gather patch 0, so both terms below
-take a ``(B, M)`` ``valid`` mask and neither may reduce over the slot axis by
-shape alone.  A trailing forecast is one case of this: it arrives as a single
-dense right-edge span, and the ``valid``/``mask_idx`` defaults reproduce the
-pre-masking loss exactly.
-
-Two complementary terms supervise the forecast:
-
-* **L_Q — pinball (quantile) loss.** The pinball / check loss over all seven
-  quantile levels, including τ=0.5.  τ=0.5 is kept deliberately as a *pointwise*
-  level anchor: it pins the median to the target value at each step, complementing
-  DILATE's warp-invariant shape objective (which is insensitive to a constant
-  level offset).  The pinball loss is computed in risk space against ``y_risk``
-  and averaged **per masked patch** — over the valid slots only, denominator
-  included.
-
-* **L_D — DILATE on the median.** A shape (divergence soft-DTW) + temporal
-  (TDI) loss (Le Guen & Thome, NeurIPS 2019) on the median trajectory only,
-  evaluated **once per masked span**: spans are bucketed by length ``L``, each
-  bucket stacked to ``(n_b, L*S)`` patch-major for one ``dilate_loss`` call, and
-  the per-bucket scalars combined by a span-count-weighted mean.  An empty bucket
-  is never dispatched — ``dilate_loss`` would return NaN from a mean over zero
-  rows.  DILATE is **recomputed at validation** (at ``VAL_BATCH_SIZE``) — the
-  soft-DTW dynamic program runs in both phases.
-
-The two losses are combined by **learned Kendall-Gal homoscedastic uncertainty
-weighting** (Kendall, Gal & Cipolla, CVPR 2018): each term carries a learned
-log-σ, and the combine ``L_KG = ½·exp(−2·log_σ_Q)·L_Q + log_σ_Q +
-½·exp(−2·log_σ_D)·L_D + log_σ_D`` lets the optimizer trade the two objectives
-adaptively rather than at a fixed ratio.  The two log-σ live on a small
-:class:`KendallGalWeighting` module (:mod:`train.py` keeps it off the weight EMA
-and in its own AdamW group), and the numerically-safe ``exp(−2·log_σ)`` form
-avoids the ``1/σ²`` division of the naive parameterization.
-
-Everything here is fp32-native (no autocast, no bf16).  ``kovatchev_f_target`` is
-the *only* (b)→(c) bridge on the target path and is applied exactly once.
+The supervised set is a window's MASKED patches, gathered into the head's ``M``
+slots; a padded slot gathers patch 0, so neither term may reduce over the slot
+axis by shape alone — both take the ``(B, M)`` ``valid`` flag. ``kovatchev_f_target``
+is the only (b)->(c) bridge on the target path and runs once, at the top of
+:func:`risk_total_loss`. fp32 throughout — no autocast, no bf16.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -58,17 +18,10 @@ from utils import kovatchev_f_target
 
 
 class KendallGalWeighting(nn.Module):
-    """Learned homoscedastic-uncertainty weighting of the pinball and DILATE terms.
+    """The two 0-d Kendall-Gal log-σ (Kendall, Gal & Cipolla, CVPR 2018).
 
-    Holds the two Kendall-Gal log-variance parameters (Kendall, Gal & Cipolla,
-    CVPR 2018), one per loss term, as scalar :class:`nn.Parameter` s.  The module
-    is kept deliberately tiny (two 0-d parameters) so :mod:`train.py` can give it
-    its own AdamW group (weight_decay 0, never Muon) and exclude it from the
-    weight EMA by simply never passing it to :class:`ModelEMA`.
-
-    Attributes:
-        log_sigma_Q: scalar log-σ for the pinball term ``L_Q``.
-        log_sigma_D: scalar log-σ for the DILATE term ``L_D``.
+    Off ``model`` so :class:`ModelEMA` structurally never sees them; their own AdamW
+    group, weight_decay 0, never Muon — a log-variance must not decay toward 0.
     """
 
     _CLAMP_LO: float = -7.0
@@ -81,18 +34,12 @@ class KendallGalWeighting(nn.Module):
         self.log_sigma_D = nn.Parameter(torch.zeros(()) + init)
 
     def clamped(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the two log-σ clamped to ``[_CLAMP_LO, _CLAMP_HI]``.
-
-        Returns:
-            ``(log_sigma_Q, log_sigma_D)``, each a clamped 0-d tensor.
-        """
         lo, hi = self._CLAMP_LO, self._CLAMP_HI
         return (self.log_sigma_Q.clamp(lo, hi), self.log_sigma_D.clamp(lo, hi))
 
 
-# Per-(levels, dtype, device) cache of the τ tensor: rebuilding it every call is
-# a host→device copy on the hot path.  The levels are a fixed constant tuple, so
-# the cached tensor is bit-identical to a fresh ``torch.as_tensor`` each call.
+# Rebuilding τ per call is a host->device copy on the hot path; the levels are a
+# fixed tuple, so the cached tensor is bit-identical to a fresh ``as_tensor``.
 _TAU_CACHE: Dict[Tuple, torch.Tensor] = {}
 
 
@@ -102,40 +49,14 @@ def pinball_loss(
     levels: Tuple[float, ...],
     valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Pinball (quantile / check) loss over all quantile levels, in risk space.
+    """``ρ_τ(a,b) = (a-b)·(τ - 1[a<b])`` over all τ, risk space, mean over (valid slot, step, τ).
 
-    For each quantile level ``τ`` and prediction ``b = q_τ`` against target
-    ``a = y_risk``, the per-element check loss is
-    ``ρ_τ(a, b) = (a - b) · (τ - 1[a < b])``.  The result is the mean over the
-    supervised slots (slot × step) and over the quantile levels, reduced to a
-    scalar.
-
-    τ=0.5 is **retained** (a pointwise level anchor that complements DILATE's
-    warp-invariant median shape loss).
-
-    **The reduction is per MASKED PATCH, not per head slot.**  The head emits a
-    fixed ``M`` slots (``MAX_MASKED_PATCHES``) and a sample with fewer masked
-    patches pads the surplus; a padded slot gathers patch 0, so its ρ is a real
-    number against a real target and must be *removed from the denominator*, not
-    merely zeroed in the numerator.  Zeroing the numerator alone still divides by
-    ``B·M·S·Q`` and rescales ``L_Q`` against ``L_D`` by the padded fraction — a
-    level that ``log_sigma_Q`` absorbs, silently moving the converged Q:D balance
-    while every per-sample relative weight, and so every loss curve, looks
-    unchanged.
-
-    Args:
-        q_tau: predicted quantiles in risk space, ``(B, M, PATCH_SIZE,
-            N_QUANTILES)``, ascending τ.
-        y_risk: risk-space target glucose, ``(B, M, PATCH_SIZE)``.
-        levels: the quantile levels ``τ``, length ``N_QUANTILES``, ascending.
-        valid: ``(B, M)`` bool — True where the slot holds a real masked patch,
-            False for a padded slot.  ``None`` (the default) means every slot is
-            real and takes the plain ``rho.mean()``, which is what a caller
-            holding a dense right-edge span wants and is bit-identical to the
-            pre-masking reduction.
-
-    Returns:
-        Scalar pinball loss, mean over ``(valid slots, S, τ)``.
+    q_tau ``(B, M, PATCH_SIZE, N_QUANTILES)`` ascending τ; y_risk ``(B, M, PATCH_SIZE)``.
+    τ=0.5 is kept as the pointwise level anchor beside DILATE's warp-invariant shape.
+    valid ``(B, M)``: a padded slot must leave the DENOMINATOR, not just the numerator —
+    zeroing the numerator alone still divides by ``B·M·S·Q``, rescaling L_Q against L_D by
+    the padded fraction, which ``log_sigma_Q`` then absorbs with every loss curve unchanged.
+    ``None`` = every slot real, the dense right-edge case.
     """
     assert q_tau.dim() == 4, f"q_tau must be (B,M,S,Q), got {tuple(q_tau.shape)}"
     assert y_risk.dim() == 3, f"y_risk must be (B,M,S), got {tuple(y_risk.shape)}"
@@ -146,9 +67,7 @@ def pinball_loss(
     assert q_tau.shape[-1] == len(levels), (
         f"q_tau has {q_tau.shape[-1]} quantiles but {len(levels)} levels given"
     )
-    # The four asserts above pass for ANY M and catch every malformed rank/width,
-    # but none of them can see ``valid`` — a (B,) or transposed mask would
-    # broadcast silently and reweight the loss.
+    # No assert above sees ``valid``: a (B,) or transposed mask broadcasts and reweights.
     assert valid is None or tuple(valid.shape) == tuple(y_risk.shape[:2]), (
         f"valid {None if valid is None else tuple(valid.shape)} must be "
         f"(B,M) = {tuple(y_risk.shape[:2])}"
@@ -162,48 +81,32 @@ def pinball_loss(
     a = y_risk.unsqueeze(-1)  # (B,M,S,1)  broadcast over τ
     b = q_tau  # (B,M,S,Q)
     diff = a - b  # (B,M,S,Q)
-    rho = diff * (tau - (diff < 0).to(q_tau.dtype))  # (a-b)*(τ - 1[a<b])
+    rho = diff * (tau - (diff < 0).to(q_tau.dtype))
     if valid is None:
         return rho.mean()
     w = valid.to(rho.dtype)  # (B,M)
-    # Denominator is the WEIGHT MASS · S · Q — clamped at 1 so an all-padded
-    # batch returns an exact 0.0 (numerator is 0 too) instead of 0/0. It tracks
-    # the numerator's weights rather than counting slots; counting slots here
-    # would rescale the loss by the mean weight.
+    # WEIGHT MASS · S · Q, not a slot count (which would rescale by the mean weight);
+    # clamped at 1 so an all-padded batch returns an exact 0.0 rather than 0/0.
     denom = (w.sum() * float(rho.shape[2] * len(levels))).clamp_min(1.0)
     return (rho * w[:, :, None, None]).sum() / denom
 
 
-# Set of ``(p, s, device)`` for which the patch-major time-monotonicity sentinel
-# has already been verified.  The probe depends only on the shape and device, and
-# ``torch.sort`` + ``torch.equal`` force a host sync; running it once per unique
-# key removes that sync from the hot path while preserving the assertion semantics.
+# ``(p, s, device)`` keys whose monotonicity sentinel has run: sort + equal force a
+# host sync, and the probe depends on nothing else.
 _PATCH_MAJOR_PROBE_VERIFIED: set = set()
 
 
 def _to_patch_major(x: torch.Tensor) -> torch.Tensor:
-    """Reshape an ``(N, P, S)`` trajectory to ``(N, P*S)`` patch-major/step-minor.
+    """(N, P, S) -> (N, P*S) patch-major: patch ``p`` step ``s`` lands at ``p*S + s``.
 
-    The flatten is C-contiguous so that patch ``p`` step ``s`` lands at flat index
-    ``p*S + s`` — i.e. time runs monotonically along the flat axis (patch-major,
-    step-minor).  This ordering is load-bearing for DILATE's temporal alignment;
-    a P/S transpose would silently scramble the time axis.
-
-    Args:
-        x: ``(N, P, PATCH_SIZE)`` — ``N`` rows of ``P`` consecutive patches.  On
-            the bucketed DILATE path ``N`` is a bucket's span count and ``P`` its
-            span length ``L``, not the batch size and ``PREDICTION_PATCHES``.
-
-    Returns:
-        ``(N, P * PATCH_SIZE)``, time-monotone along axis 1.
+    Time therefore runs monotonically along axis 1, which DILATE's alignment depends on;
+    a P/S transpose scrambles the time axis with no shape error. On the bucketed path
+    ``N`` is a bucket's span count and ``P`` its span length ``L``.
     """
     assert x.dim() == 3, f"expected (N,P,S), got {tuple(x.shape)}"
     b, p, s = x.shape
     flat = x.reshape(b, p * s)
-    # Time-monotonicity sentinel: a constructed arange must remain sorted after
-    # the reshape, guarding the patch-major flatten order against a P/S swap.  It
-    # depends only on ``(p, s, device)``, so verify each unique key once — the
-    # ``torch.sort``/``torch.equal`` otherwise force a host sync twice per step.
+    # A constructed arange must stay sorted through the reshape — the P/S-swap guard.
     probe_key = (p, s, x.device)
     if probe_key not in _PATCH_MAJOR_PROBE_VERIFIED:
         probe = (
@@ -223,46 +126,24 @@ def _span_buckets(
     b: int,
     m: int,
 ) -> Dict[int, Tuple[List[int], List[int]]]:
-    """Group the head's masked slots into contiguous spans, bucketed by length.
+    """Contiguous masked spans bucketed by length: ``{L: (rows, starts)}``, one entry per span.
 
-    Two valid slots belong to the same span iff they are adjacent in the slot
-    axis **and** their patch indices differ by exactly one.  That test is only
-    equivalent to "same span" because the mask sampler guarantees a mandatory
-    visible patch between neighbouring spans — two spans that abutted would be
-    indistinguishable from one longer span here, and would then share a DILATE
-    bucket, an anchor and a median basis they do not in fact share.
+    A length with no span is ABSENT, never present-and-empty. ``mask_idx``/``valid`` ``None``
+    = slot ``j`` is patch ``j``, every slot real — one dense right-edge span per row.
 
-    The grouping runs on the host: bucket membership is data-dependent Python
-    control flow (an empty bucket must not be dispatched at all), so exactly one
-    device→host transfer of the two ``(B, M)`` index tensors is unavoidable.  It
-    is a single small sync per call, not one per span.
-
-    Args:
-        mask_idx: ``(B, M)`` int64 patch index per head slot, ascending over the
-            valid slots of a row.  ``None`` means slot ``j`` is patch ``j``, i.e.
-            one dense span per row — the legacy right-edge forecast.
-        valid: ``(B, M)`` bool, True for a real masked patch.  ``None`` means
-            every slot is real.
-        b: batch size.
-        m: head slot count.
-
-    Returns:
-        ``{L: (rows, starts)}`` — for each span length ``L`` present, the row
-        index and the first slot index of every span of that length.  Lengths
-        with no spans are **absent**, never present-and-empty.
+    Adjacent in the slot axis AND patch indices one apart IS "same span" only because the
+    sampler charges a mandatory visible separator between spans. Grouping is host-side —
+    an empty bucket must not be dispatched — so one D2H copy of the two (B, M) index
+    tensors per call, never one per span.
     """
     v = (torch.ones(b, m, dtype=torch.bool) if valid is None
          else valid.detach().to("cpu", torch.bool))
     idx = (torch.arange(m, dtype=torch.int64).expand(b, m) if mask_idx is None
            else mask_idx.detach().to("cpu", torch.int64))
 
-    # A slot continues the span to its left iff that neighbour is valid and sits
-    # exactly one patch earlier; everything else opens a new span.
     cont = torch.zeros_like(v)
     if m > 1:
-        # Slot order carries the span structure: two adjacent valid slots out of
-        # ascending patch order would be split into two spans, or (on a repeat)
-        # merged, with no shape error anywhere downstream.
+        # Out-of-order valid slots split or merge spans with no shape error downstream.
         adjacent = v[:, 1:] & v[:, :-1]
         assert not bool((adjacent & (idx[:, 1:] <= idx[:, :-1])).any()), (
             "mask_idx must be strictly ascending over a row's valid slots"
@@ -270,8 +151,7 @@ def _span_buckets(
         cont[:, 1:] = adjacent & (idx[:, 1:] == idx[:, :-1] + 1)
     starts = v & ~cont                                          # (B, M)
 
-    # Span id within the row (1-based over starts), keyed per row so a single
-    # scatter_add counts every span's slots at once.
+    # Span id within the row, keyed per row so one scatter_add counts every span at once.
     gid = starts.to(torch.int64).cumsum(dim=1)                  # (B, M)
     keyed = torch.arange(b, dtype=torch.int64).unsqueeze(1) * (m + 1) + gid
     counts = torch.zeros(b * (m + 1), dtype=torch.int64)
@@ -295,72 +175,25 @@ def risk_total_loss(
     valid: Optional[torch.Tensor] = None,
     mask_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Total risk-space BG loss: pinball + DILATE, Kendall-Gal weighted.
+    """Pinball + per-span DILATE, Kendall-Gal weighted. The target is f-transformed once, here.
 
-    The Kovatchev risk transform is applied to the target **exactly once** here
-    (``y_risk = kovatchev_f_target(true_bg_mgdl)``), then shared by both terms.
+    ``L = ½·exp(−2·log_σ_Q)·L_Q + log_σ_Q + ½·exp(−2·log_σ_D)·L_D + log_σ_D``, log-σ clamped [-7, 7].
 
-    The two terms are combined by learned Kendall-Gal homoscedastic-uncertainty
-    weighting in its numerically-safe form::
+    DILATE runs on the MEDIAN only, once per masked SPAN: spans bucketed by length ``L``,
+    each stacked ``(n_b, L*S)`` patch-major for one :func:`dilate.dilate_loss` call.
+    An empty bucket is NEVER dispatched — ``dilate_loss`` means over the batch axis, so
+    ``(0, H)`` returns NaN with no exception, and that NaN passes ``val_total <
+    best_val_loss`` (False for NaN against inf) leaving the run with no best checkpoint;
+    ``0.0 * nan = nan``, so weighting does not rescue it. Buckets combine by a
+    SPAN-COUNT-WEIGHTED mean, never concatenated: DILATE is not scale-free in ``H = L·S``,
+    so ``alpha`` weights a different mixture per bucket and ``log_sigma_D`` absorbs it —
+    hence ``loss_D_L{L}`` and ``n_spans_L{L}`` logged beside the combined value.
 
-        log_σ_Q, log_σ_D = weighting.clamped()
-        L = ½·exp(−2·log_σ_Q)·L_Q + log_σ_Q + ½·exp(−2·log_σ_D)·L_D + log_σ_D
-
-    ``log_σ_Q`` / ``log_σ_D`` are the two learned scalars on ``weighting``
-    (:class:`KendallGalWeighting`), clamped to ``[-7, 7]``.
-
-    DILATE is computed on the **median only** (its shape/temporal objective), in
-    risk space, **once per masked span** rather than once per sample.  A span is
-    a maximal run of adjacent masked patches; spans are bucketed by length ``L``
-    and each bucket is stacked to ``(n_b, L*S)`` patch-major for a single
-    :func:`dilate.dilate_loss` call.  Two rules govern that:
-
-    * **An empty bucket is never dispatched.**  ``dilate_loss`` reduces over the
-      batch axis with ``.mean()``, so a ``(0, H)`` input returns ``(nan, nan,
-      nan)`` with no exception and no shape assert — and a fixed protocol can
-      leave a bucket empty in *every* batch (a right-edge forecast of
-      ``PREDICTION_PATCHES`` never populates ``L < PREDICTION_PATCHES``).  That
-      NaN would flow through the running totals and past ``val_total <
-      best_val_loss``, which is False for NaN against ``float('inf')``, ending
-      the run with no best checkpoint.  A span-count-weighted mean does not
-      rescue it: ``0.0 * nan = nan``.  Dispatching the empty bucket anyway also
-      pays the full ``2H-1`` anti-diagonal sweep for nothing.
-    * **Buckets combine by a span-count-weighted mean of the per-bucket
-      scalars** — never by concatenation and never unweighted.  DILATE is not
-      scale-free in ``H = L·S``: the shape term grows with ``H`` while the
-      normalised TDI (``Ω[i,j] = ((i-j)/H)²``) does not track it, so ``alpha``
-      weights a different mixture in each bucket.  ``log_sigma_D`` is learned and
-      absorbs that mixture silently, so the effective Q:D ratio now moves with
-      ``MASK_SPAN_LENGTHS`` even though both log-σ *parameters* are pinned.  The
-      per-bucket ``loss_D_L{L}`` and the span-length histogram ``n_spans_L{L}``
-      are therefore logged beside the combined value: two runs are comparable
-      only at an equal span-length mixture.
-
-    Args:
-        q_tau: predicted quantiles in risk space, ``(B, M, PATCH_SIZE,
-            N_QUANTILES)``, ascending τ.  ``M`` is the head's slot count
-            (``MAX_MASKED_PATCHES``), or ``PREDICTION_PATCHES`` on a caller that
-            still hands a dense right-edge span.
-        median: predicted median in risk space (== ``q_tau[..., 3]``),
-            ``(B, M, PATCH_SIZE)``.
-        true_bg_mgdl: target glucose in **mg/dL** (space (b), raw mg/dL),
-            ``(B, M, PATCH_SIZE)``.
-        weighting: the :class:`KendallGalWeighting` module holding the two learned
-            log-σ parameters combined here.
-        valid: ``(B, M)`` bool — True where the slot holds a real masked patch.
-            ``None`` (the default) means every slot is real, which is exactly the
-            dense right-edge case and reproduces the pre-masking loss.
-        mask_idx: ``(B, M)`` int64 patch index per slot, ascending over a row's
-            valid slots.  ``None`` means slot ``j`` is patch ``j`` — one dense
-            span per row, one bucket, one ``dilate_loss`` call.
-
-    Returns:
-        ``(total, components)`` where ``total`` is the scalar Kendall-Gal combined
-        loss and ``components`` is a dict of detached-for-logging scalars:
-        ``{loss_Q, loss_D, loss_D_shape, loss_D_tdi, log_sigma_Q, log_sigma_D}``
-        plus, per span length ``L``, ``loss_D_L{L}`` and the span count
-        ``n_spans_L{L}``, plus ``n_masked_mean`` and ``n_spans_mean`` (the mean
-        masked-patch and span counts per sample).  The counters are host scalars.
+    q_tau ``(B, M, PATCH_SIZE, N_QUANTILES)`` risk space ascending τ; median ``(B, M,
+    PATCH_SIZE)`` risk, ``== q_tau[..., QUANTILE_LEVELS.index(0.5)]``; true_bg_mgdl
+    ``(B, M, PATCH_SIZE)`` raw mg/dL. valid / mask_idx
+    ``(B, M)``, ``None`` = the dense right-edge case. Returns ``(total, components)``,
+    components detached for logging; the counters are host scalars.
     """
     assert q_tau.dim() == 4, f"q_tau must be (B,M,S,Q), got {tuple(q_tau.shape)}"
     assert median.dim() == 3, f"median must be (B,M,S), got {tuple(median.shape)}"
@@ -372,8 +205,7 @@ def risk_total_loss(
         f"q_tau {tuple(q_tau.shape)} and median {tuple(median.shape)} "
         "must share (B,M,S)"
     )
-    # Neither assert above can see ``valid`` or ``mask_idx``: both pass for any M
-    # and a wrongly-shaped mask would broadcast rather than raise.
+    # No assert above sees ``valid`` / ``mask_idx``: a wrong shape broadcasts, never raises.
     assert valid is None or tuple(valid.shape) == tuple(median.shape[:2]), (
         f"valid {None if valid is None else tuple(valid.shape)} must be "
         f"(B,M) = {tuple(median.shape[:2])}"
@@ -385,13 +217,11 @@ def risk_total_loss(
 
     b_size, n_slots, n_steps = median.shape
 
-    # (b)->(c) target bridge — applied EXACTLY ONCE, shared by pinball + DILATE.
+    # (b)->(c) target bridge, EXACTLY ONCE, shared by both terms.
     y_risk = kovatchev_f_target(true_bg_mgdl)  # (B,M,S) risk space
 
-    # --- L_Q: pinball over all quantile levels (incl. τ=0.5), per masked patch ---
     loss_Q = pinball_loss(q_tau, y_risk, config.QUANTILE_LEVELS, valid=valid)
 
-    # --- L_D: DILATE on the median only, one call per span-length bucket ---
     buckets = _span_buckets(mask_idx, valid, b_size, n_slots)
     dev = median.device
     per_bucket: Dict[int, torch.Tensor] = {}
@@ -402,16 +232,13 @@ def risk_total_loss(
         rows_l, starts_l = buckets[length]
         n_b = len(rows_l)
         if n_b == 0:
-            # An empty bucket is NEVER dispatched: dilate_loss means over the
-            # batch axis and would return NaN for it. _span_buckets does not
-            # emit one, so this only fires if that ever changes.
+            # _span_buckets emits no empty bucket; this fires only if that changes.
             continue
         rows = torch.as_tensor(rows_l, dtype=torch.long, device=dev)      # (n_b,)
         starts = torch.as_tensor(starts_l, dtype=torch.long, device=dev)  # (n_b,)
         slots = starts.unsqueeze(1) + torch.arange(length, device=dev)    # (n_b, L)
-        # Gathering only the span's slots is also what makes a padded slot's
-        # gradient EXACTLY zero on this term: it is never read, so no grad path
-        # to it exists at all (as opposed to one multiplied by zero).
+        # Gathering only the span's slots leaves a padded slot NO grad path at all,
+        # rather than one multiplied by zero.
         m_b = _to_patch_major(median[rows.unsqueeze(1), slots])           # (n_b, L*S)
         y_b = _to_patch_major(y_risk[rows.unsqueeze(1), slots])
         l_b, s_b, t_b = dilate_loss(
@@ -429,8 +256,7 @@ def risk_total_loss(
         n_masked_total += n_b * length
 
     if num_loss is None:
-        # No populated bucket at all (every slot padded). Emit an exact zero on
-        # the loss dtype/device rather than a 0/0 NaN.
+        # Every slot padded: an exact zero on the loss dtype/device, not a 0/0 NaN.
         loss_D = median.new_zeros(())
         loss_D_shape = median.new_zeros(())
         loss_D_tdi = median.new_zeros(())
@@ -440,7 +266,6 @@ def risk_total_loss(
         loss_D_shape = num_shape / denom
         loss_D_tdi = num_tdi / denom
 
-    # --- Kendall-Gal combine (numerically-safe exp(−2·log_σ) form) ---
     log_sigma_Q, log_sigma_D = weighting.clamped()
     total = (0.5 * torch.exp(-2.0 * log_sigma_Q) * loss_Q + log_sigma_Q
              + 0.5 * torch.exp(-2.0 * log_sigma_D) * loss_D + log_sigma_D)
@@ -453,10 +278,8 @@ def risk_total_loss(
         "log_sigma_Q": log_sigma_Q.detach(),
         "log_sigma_D": log_sigma_D.detach(),
     }
-    # Per-bucket DILATE and the span-length histogram. The key set is the union
-    # of the configured span lengths and the realised ones, so a bucket that is
-    # empty this batch still reports a column (0 spans) instead of dropping out
-    # of the log.
+    # Configured span lengths UNION realised ones, so a bucket empty this batch still
+    # reports 0 spans instead of dropping out of the log.
     zero = median.new_zeros(())
     for length in sorted(set(config.MASK_SPAN_LENGTHS) | set(buckets)):
         components[f"loss_D_L{length}"] = per_bucket.get(length, zero)

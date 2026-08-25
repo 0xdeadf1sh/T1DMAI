@@ -1,30 +1,14 @@
-"""
-profile_simulator.py — measure where T1DMSimulator spends its time.
-=====================================================================
-
-The on-the-fly DataLoader path runs the simulator inside every worker; if
-the worker can't keep up with batch consumption the GPU starves.  This
-script profiles a single ``simulate_discard_warmup`` call so you can see
-which simulator hot path dominates per-sample wall time and decide whether
-to (a) reduce the requested simulation hours or (b) raise NUM_WORKERS.
-
-We profile at ``HOURS = 720.0`` to expose cold-path cost; the on-the-fly
-training path uses ``ON_THE_FLY_SIM_HOURS`` (~200 h) per sample, so the
-actual training cost will look like roughly a third of the figures reported
-here.
-"""
+"""Profile one ``simulate_discard_warmup`` call: where T1DMSimulator spends its time."""
 import cProfile
 import pstats
 from data import _make_simulator, simulate_discard_warmup
 
 PATIENT_SEED = 12345
-HOURS = 720.0  # heaviest realistic simulator request
+HOURS = 720.0  # heaviest realistic request; training uses ON_THE_FLY_SIM_HOURS (~200 h), so ~1/3 of these figures
 
 sim = _make_simulator(PATIENT_SEED, uniform_skills=False)
 
-# Warm-up call so import / lazy-init costs don't pollute the profile.  Using
-# a *different* simulator instance below ensures the warm-up doesn't advance
-# the RNG state of the profiled run.
+# Fresh simulator below: the warm-up must not advance the profiled run's RNG.
 _ = simulate_discard_warmup(sim, 24.0)
 
 sim = _make_simulator(PATIENT_SEED, uniform_skills=False)

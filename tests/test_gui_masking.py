@@ -1,10 +1,8 @@
-"""Tests for the GUI's free-form masking model (``gui_state``, no display).
+"""The GUI's free-form masking model (``gui_state``, no display).
 
-The masked set the GUI emits is the same object ``data.sample_mask_spans`` draws
-and ``inference.predict`` takes, so it must satisfy the same four rules
-``inference._resolve_mask_spans`` asserts: sorted, never abutting, inside the
-window, and with the whole future zone masked.  Everything here runs on the pure
-functions, so no pygame surface and no model is needed.
+The emitted set is what ``inference.predict`` takes, so it obeys the four rules
+``inference._resolve_mask_spans`` asserts: sorted, never abutting, inside the window,
+whole future zone masked.
 """
 
 import numpy as np
@@ -20,9 +18,6 @@ from gui_state import (
 
 N_CTX = 48
 N_PRED = 4
-
-
-# ---------------------------------------------------------------- the budget
 
 
 def test_capacity_is_the_head_minus_the_forecast():
@@ -46,7 +41,6 @@ def test_cap_refuses_the_span_that_would_breach_it():
 
 
 def test_cap_counts_the_forecast_span():
-    """A user set exactly at the cap emits MAX_MASKED_PATCHES total."""
     st = GUIState()
     st.context = np.zeros((N_CTX, PATCH_SIZE, 5))
     assert st.add_mask_span(0, user_mask_capacity(N_PRED), N_PRED) == ''
@@ -54,9 +48,6 @@ def test_cap_counts_the_forecast_span():
     print(f"[DUMP] total masked | {total}")
     assert total == MAX_MASKED_PATCHES
     assert st.mask_budget_left(N_PRED) == 0
-
-
-# ---------------------------------------------------------------- the separator
 
 
 def test_abutting_spans_merge_into_one():
@@ -97,14 +88,10 @@ def test_span_outside_the_window_is_refused():
     assert validate_user_spans([MaskSpan(N_CTX + 2, 1)], N_CTX, N_PRED)
 
 
-# ---------------------------------------------------------------- what is emitted
-
-
 @pytest.mark.parametrize("preset", MASK_PRESETS)
 def test_emitted_set_satisfies_the_inference_contract(preset):
-    """Sorted, non-abutting, in bounds, whole future zone masked — the four rules
-    ``inference._resolve_mask_spans`` asserts, checked here rather than crashing
-    a prediction thread."""
+    """``inference._resolve_mask_spans``'s four rules, checked here rather than in a
+    prediction thread."""
     spans = preset_user_spans(preset, N_CTX, N_PRED)
     emitted = emit_mask_spans(spans, N_CTX, N_PRED)
     seq_len = N_CTX + N_PRED
@@ -125,8 +112,7 @@ def test_emitted_set_satisfies_the_inference_contract(preset):
 
 
 def test_forecast_preset_emits_the_trailing_span_alone():
-    """The trailing forecast is the DEFAULT and still one preset of the same
-    objective, not a separate mode."""
+    """The trailing forecast is the default, and still a preset, not a mode."""
     emitted = emit_mask_spans(
         preset_user_spans(MASK_PRESET_FORECAST, N_CTX, N_PRED), N_CTX, N_PRED,
     )
@@ -139,8 +125,7 @@ def test_begin_fill_starts_at_patch_zero():
 
 
 def test_infill_is_interior():
-    """Never at patch 0 — that case is begin-fill, and its anchor comes from the
-    right neighbour instead of the left."""
+    """Never at patch 0: that is begin-fill, anchored from the right neighbour."""
     spans = preset_user_spans(MASK_PRESET_INFILL, N_CTX, N_PRED)
     assert spans and spans[0].start >= 1
     assert spans[0].last <= N_CTX - 2
@@ -152,8 +137,7 @@ def test_emit_refuses_an_illegal_set():
 
 
 def test_emitted_set_is_accepted_by_inference():
-    """The real contract, not a restatement of it: hand every preset's emitted
-    set to the resolver ``inference.predict`` runs."""
+    """The real resolver ``inference.predict`` runs, not a restatement of it."""
     from inference import _resolve_mask_spans
     for preset in MASK_PRESETS:
         spans = preset_user_spans(preset, N_CTX, N_PRED)
@@ -161,9 +145,6 @@ def test_emitted_set_is_accepted_by_inference():
         resolved = _resolve_mask_spans(emitted, N_CTX)
         print(f"[DUMP] resolved {preset} | {resolved}")
         assert resolved == emitted
-
-
-# ---------------------------------------------------------------- OOD hints
 
 
 def test_in_distribution_presets_raise_no_ood_marker():
@@ -185,10 +166,10 @@ def test_too_many_spans_is_flagged():
 
 
 def test_length_and_distance_hints_are_unreachable_today():
-    """The user's budget is MAX_MASKED_PATCHES - n_pred = max(MASK_SPAN_LENGTHS),
-    so no span the cap admits can be longer than the length law, and none can sit
-    farther than that from evidence.  Both hints are dead at these constants —
-    pinned here so the day the constants move, this test says which one changed.
+    """The budget is MAX_MASKED_PATCHES - n_pred = max(MASK_SPAN_LENGTHS), so no span
+    the cap admits can outrun the length law and both hints are dead.
+
+    Pinned so that when the constants move, this names which one changed.
     """
     budget = user_mask_capacity(N_PRED)
     max_len = max(MASK_SPAN_LENGTHS)
@@ -199,8 +180,8 @@ def test_length_and_distance_hints_are_unreachable_today():
 
 
 def test_long_span_hint_reads_the_length_law(monkeypatch):
-    """The threshold is MASK_SPAN_LENGTHS', not a literal 8: shorten the law and
-    a span the old law allowed becomes out of distribution."""
+    """The threshold is MASK_SPAN_LENGTHS, never a literal: shorten the law and a span
+    it used to allow goes out of distribution."""
     import gui_state
     monkeypatch.setattr(gui_state.config, 'MASK_SPAN_LENGTHS', (1, 2, 3))
     emitted = [(10, 4), (N_CTX, 2)]
@@ -211,14 +192,12 @@ def test_long_span_hint_reads_the_length_law(monkeypatch):
 
 
 def test_distance_never_exceeds_span_length():
-    """Why the distance hint can never fire on its own.
+    """``d`` is the distance to the nearest visible evidence on EITHER side, so a
+    two-sided span caps it at ``ceil(L/2)`` and a one-sided one at ``L``: ``d <= L``
+    always, and the length hint fires first.
 
-    ``d`` is the distance to the nearest visible evidence on EITHER side, so a
-    two-sided span caps it at ``ceil(L/2)`` and a one-sided span at ``L``: ``d <=
-    L`` for every span, always.  ``d > max(MASK_SPAN_LENGTHS)`` therefore implies
-    ``L > max(MASK_SPAN_LENGTHS)``, and the length hint has already fired.  The
-    distance check is kept because it is the condition the objective is actually
-    about — this test is what says it is currently subsumed.
+    The distance check stays because it is the condition the objective is about; this
+    test is what says it is subsumed today.
     """
     from data import _mask_slots
     for emitted, n_ctx, n_pred in [
@@ -236,16 +215,12 @@ def test_distance_never_exceeds_span_length():
 
 
 def test_oversized_set_is_reported_not_crashed():
-    """``_mask_slots`` has only MAX_MASKED_PATCHES slots. An over-budget set is
-    refused upstream, so this is a guard, not a path — it must say so rather than
-    index past the head."""
+    """``_mask_slots`` has only MAX_MASKED_PATCHES slots, and an over-budget set is
+    refused upstream, so this must report rather than index past the head."""
     emitted = [(0, MAX_MASKED_PATCHES), (N_CTX, N_PRED)]
     flags = mask_span_ood(emitted, N_CTX, N_PRED)
     print(f"[DUMP] oversized | {flags}")
     assert len(flags) == 2 and 'slots' in flags[0]
-
-
-# ---------------------------------------------------------------- the anchor
 
 
 def test_anchor_is_the_left_neighbour_last_step():
@@ -255,7 +230,7 @@ def test_anchor_is_the_left_neighbour_last_step():
 
 
 def test_anchor_of_a_span_at_patch_zero_is_the_right_neighbour():
-    """The only no-left-neighbour case there is — the begin-fill one."""
+    """The only no-left-neighbour case there is."""
     patch, step = span_anchor_cell(0, 3)
     print(f"[DUMP] anchor begin-fill | span (0,3) → patch {patch} step {step}")
     assert (patch, step) == (3, 0)
@@ -269,17 +244,13 @@ def test_anchor_matches_datas_own_rule():
 
 
 def test_selected_anchor_falls_back_to_the_forecast():
-    """With nothing selected the readout is the context edge, exactly what it
-    showed before masking existed."""
+    """With nothing selected the readout is the context edge."""
     st = GUIState()
     st.context = np.zeros((N_CTX, PATCH_SIZE, 5))
     assert st.selected_anchor_cell(N_PRED) == (N_CTX - 1, PATCH_SIZE - 1)
     assert st.add_mask_span(10, 2, N_PRED) == ''
     st.selected_mask_idx = 0
     assert st.selected_anchor_cell(N_PRED) == (9, PATCH_SIZE - 1)
-
-
-# ---------------------------------------------------------------- per-policy doses
 
 
 def test_announced_policy_keeps_the_recorded_doses():
@@ -300,8 +271,7 @@ def test_blind_policy_takes_the_zero_dose_fill():
 
 
 def test_blind_fill_needs_stats():
-    """Without stats there is no z-space to place normalize(0) in, so the fill is
-    withheld rather than guessed."""
+    """No stats, no z-space to place normalize(0) in, so the fill is withheld."""
     from data import masked_channel_policy
     assert mask_dose_fill(masked_channel_policy(blind=True), None) is None
 
@@ -316,12 +286,9 @@ def _fake_stats() -> dict[str, dict[str, float]]:
     return {c: {'mean': 0.4, 'std': 1.3} for c in CHANNEL_NAMES}
 
 
-# ---------------------------------------------------------------- state lifetime
-
-
 def test_context_change_clears_the_spans():
-    """Spans hold absolute patch positions, so a context that grows or is
-    replaced would leave them masking different data than the user drew."""
+    """Spans hold absolute patch positions, so a replaced context leaves them masking
+    data the user never drew over."""
     st = GUIState()
     st.context = np.zeros((N_CTX, PATCH_SIZE, 5))
     assert st.add_mask_span(10, 2, N_PRED) == ''
@@ -342,13 +309,9 @@ def test_remove_one_span():
     assert len(st.mask_spans) == 1
 
 
-# ---------------------------------------------------------------- slot → patch
-
-
 def test_contiguous_runs_split_at_the_separator():
     """``mask_idx`` is one slot per masked patch in span order, so a break in the
-    sequence IS a span boundary — the adjacency rule ``utils._span_layout`` uses.
-    """
+    sequence IS a span boundary — ``utils._span_layout``'s adjacency rule."""
     from gui import _contiguous_runs
     runs = _contiguous_runs(np.array([4, 5, 6, 20, 21, 48, 49, 50, 51]))
     print(f"\n[DUMP] runs | {runs}")
@@ -358,8 +321,8 @@ def test_contiguous_runs_split_at_the_separator():
 
 
 def test_context_curve_breaks_over_a_masked_span():
-    """The true BG under a masked span is the answer; drawing it there turns the
-    fan into a comparison the user did not ask for."""
+    """The true BG under a masked span is the answer; drawing it turns the fan into a
+    comparison the user did not ask for."""
     from gui import _split_at_masked
     times = np.arange(0, 10, 0.5, dtype=np.float32)
     values = np.zeros_like(times)
@@ -368,9 +331,6 @@ def test_context_curve_breaks_over_a_masked_span():
     assert len(segs) == 2
     assert segs[0][-1].size and float(segs[0][0].max()) < 3.0
     assert float(segs[1][0].min()) >= 5.0
-
-
-# ---------------------------------------------------------------- end to end
 
 
 def _fake_context(n_ctx: int):
@@ -398,11 +358,8 @@ def _gui_state_with_context(policy: str):
 
 @pytest.mark.parametrize("policy", ["announced", "blind"])
 def test_prediction_rows_land_on_the_masked_patches(policy):
-    """The whole path: user spans → emitted set → forward → per-row patch index.
-
-    ``span_patches`` is what the chart places each fan by, so a slot→patch
-    mismatch here is a fan drawn over the wrong stretch of the day.
-    """
+    """``span_patches`` is what the chart places each fan by, so a slot→patch mismatch
+    is a fan drawn over the wrong stretch of the day."""
     import torch
     from gui import _run_prediction
     from model import T1DMAI
@@ -428,9 +385,8 @@ def test_prediction_rows_land_on_the_masked_patches(policy):
 
 
 def test_blind_withholds_doses_on_masked_patches_only():
-    """Under 'blind' the masked spans carry data.zero_dose_fill; every visible
-    patch keeps the record, and the trailing zone is inference's own
-    normalize(0) — which IS the fill."""
+    """Masked spans carry ``data.zero_dose_fill``; a visible patch keeps its record, and
+    the trailing zone is inference's own ``normalize(0)``, which IS the fill."""
     from config import MASKABLE_FEATS, N_INPUT_FEATURES
     from data import zero_dose_fill
     from gui import _masked_context

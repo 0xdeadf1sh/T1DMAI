@@ -1,20 +1,8 @@
 """Band-scored metric basis (``metrics.core.suite``).
 
-The headline real/sim level metrics score the BAND-PROJECTED forecast
-``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])`` instead of the
-median line. These are deterministic synthetic checks of the four properties the
-change rests on:
-
-  * ``band_project`` is zero-error inside the band, the distance to the nearer edge
-    outside it, and the identity on a collapsed band;
-  * every band-scored level metric is ≤ its ``median_line`` twin on the same windows,
-    with EXACT equality when the band is degenerate;
-  * ``band_cov50`` / ``band_width`` are read at the horizon step only, and match a
-    hand-counted construction;
-  * ``bands=None`` still emits the pre-band block verbatim — same key set, same values
-    as the banded run's ``median_line``.
-
-No model and no simulator: pure numpy arrays, fast.
+The headline level metrics score
+``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``, not the
+median line.
 """
 from __future__ import annotations
 
@@ -31,37 +19,31 @@ LO = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)
 HI = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)
 MED = QUANTILE_LEVELS.index(0.5)
 
-# The exact per-horizon key set ``compute_suite`` emitted before the band basis landed;
-# ``bands=None`` must still emit it verbatim (no median_line, no band_* keys).
+# the per-horizon key set ``bands=None`` must emit verbatim: no median_line, no band_*
 PRE_BAND_KEYS = {
     'rmse_point', 'mae_point', 'rmse_winmean', 'mae_winmean', 'rmse_macro', 'mard',
     'clarke_A', 'clarke_AB', 'clarke_D', 'clarke_E', 'skill_point',
     'rmse_persist_point', 'rmse_persist_winmean', 'hypo', 'hyper', 'n_windows',
 }
-# The block ``_point_block`` emits for one basis — the keys the band-scored row and its
-# ``median_line`` twin share.
+# ``_point_block``'s keys: shared by the band-scored row and its ``median_line`` twin
 POINT_KEYS = ('rmse_point', 'mae_point', 'rmse_winmean', 'mae_winmean', 'rmse_macro',
               'mard', 'clarke_A', 'clarke_AB', 'clarke_D', 'clarke_E', 'skill_point')
 ERROR_KEYS = ('rmse_point', 'mae_point', 'rmse_winmean', 'mae_winmean', 'rmse_macro', 'mard')
 
 
 def _fan(center: np.ndarray, half: float) -> np.ndarray:
-    """``(N, S, N_QUANTILES)`` ascending fan centred on ``center`` ``(N, S)``.
-
-    Level τ sits at ``center + 2·half·(τ − 0.5)``, so the scored band
-    ``[τ_LO, τ_HI] = [0.25, 0.75]`` spans ``center ± half/2``.
-    """
+    """``(N, S, N_QUANTILES)`` ascending fan on ``center`` ``(N, S)``: level τ at
+    ``center + 2·half·(τ − 0.5)``, so the scored band spans ``center ± half/2``."""
     off = np.array([(t - 0.5) * 2.0 for t in QUANTILE_LEVELS])
     return center[:, :, None] + half * off[None, None, :]
 
 
 def _degenerate_fan(center: np.ndarray, spread: float = 20.0) -> np.ndarray:
-    """``(N, S, N_QUANTILES)`` fan whose scored band has COLLAPSED onto the median.
+    """``(N, S, N_QUANTILES)`` fan whose scored band has collapsed onto the median.
 
-    Every level in ``[METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI]`` (the alarm taus too,
-    which are numerically the same pair) sits exactly on ``center``; the outer levels
-    still spread, so the fan stays ascending and the band-projected forecast must
-    reduce to the median line exactly.
+    Every level in ``[METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI]`` — the alarm taus are
+    the same pair — sits on ``center``; the outer levels still spread, so the fan
+    stays ascending.
     """
     off = np.array([0.0 if METRIC_BAND_TAU_LO <= t <= METRIC_BAND_TAU_HI
                     else (t - 0.5) * 2.0 * spread for t in QUANTILE_LEVELS])
@@ -70,13 +52,10 @@ def _degenerate_fan(center: np.ndarray, spread: float = 20.0) -> np.ndarray:
 
 def _synthetic(n_windows: int = 60, seed: int = 3, half: float = 20.0
                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray]:
-    """A band-vs-median test case: ``(pred, true, last_bg, patients, bands)``.
+    """``(pred, true, last_bg, patients, bands)``; ``pred`` is ``(n_windows, PRED_STEPS)``.
 
-    ``pred`` ``(n_windows, PRED_STEPS)`` is the median line — a random walk off a
-    per-window level spread across the whole clinical range, so both excursion regions
-    are populated — and ``true`` a noisy copy whose spread (σ ≈ 18 mg/dL) leaves a good
-    fraction of the truth INSIDE the ±``half``/2 band and the rest outside, so both
-    regimes of the projection are exercised.
+    Levels span the whole clinical range so both excursion regions populate, and the
+    truth's σ ≈ 18 mg/dL leaves part of it inside the ±half/2 band and part outside.
     """
     rng = np.random.default_rng(seed)
     drift = np.cumsum(rng.standard_normal((n_windows, PRED_STEPS)) * 6.0, axis=1)
@@ -87,9 +66,7 @@ def _synthetic(n_windows: int = 60, seed: int = 3, half: float = 20.0
     return pred, true, last_bg, patients, _fan(pred, half)
 
 
-# ------------------------------- band_project ------------------------------- #
 def test_band_project_zero_inside_distance_outside():
-    """Zero residual inside the band; the distance to the NEARER edge outside it."""
     true = np.array([[110.0, 50.0, 200.0, 100.0, 120.0]])
     lo = np.full_like(true, 100.0)
     hi = np.full_like(true, 120.0)
@@ -108,7 +85,6 @@ def test_band_project_zero_inside_distance_outside():
 
 
 def test_band_project_degenerate_band_is_the_median():
-    """A collapsed band (``lo == hi``) returns that common value for every truth."""
     rng = np.random.default_rng(11)
     med = 120.0 + rng.standard_normal((7, PRED_STEPS)) * 25.0
     true = med + rng.standard_normal((7, PRED_STEPS)) * 40.0
@@ -128,14 +104,9 @@ def test_band_project_rejects_mismatched_shapes():
         raise AssertionError("band_project accepted a shape mismatch")
 
 
-# ----------------------------- compute_suite -------------------------------- #
 def test_band_scored_never_worse_than_median_line():
-    """Every band-scored level metric ≤ its ``median_line`` twin, strictly so here.
-
-    The projection is the closest point of ``[q₂₅, q₇₅]`` to the truth and the median
-    lies inside that interval, so the per-step error can only shrink — element-wise,
-    hence for RMSE / MAE / MARD / macro-RMSE alike.
-    """
+    """The projection is the closest point of ``[q₂₅, q₇₅]`` to the truth and the median
+    lies inside it, so the per-step error can only shrink, element-wise."""
     pred, true, last_bg, pats, bands = _synthetic()
     res = compute_suite(pred, true, last_bg, pats, bands=bands)
     for h in HORIZONS:
@@ -153,11 +124,10 @@ def test_band_scored_never_worse_than_median_line():
 
 
 def test_band_cov50_and_width_hand_counted():
-    """``band_cov50`` / ``band_width`` are read at the horizon step, hand-countable."""
     n = 4
     pred = np.full((n, PRED_STEPS), 120.0)
-    # Band [90, 150] at every step: width 60. Truth constant per window so the count is
-    # the same at every horizon: in, below, above, exactly on the upper edge.
+    # band [90, 150] at every step, width 60; truth constant per window so the count
+    # is the same at every horizon: in, below, above, exactly on the upper edge
     base = np.array([60.0, 75.0, 90.0, 120.0, 150.0, 165.0, 180.0])
     assert base.shape == (N_QUANTILES,) and base[LO] == 90.0 and base[HI] == 150.0
     bands = np.broadcast_to(base, (n, PRED_STEPS, N_QUANTILES)).copy()
@@ -174,7 +144,7 @@ def test_band_cov50_and_width_hand_counted():
 
 
 def test_band_cov50_tracks_the_horizon_step_only():
-    """Coverage is the realized fraction at step ``HORIZON_IDX[h]``, NOT pooled 0..k."""
+    """Coverage is the fraction at step ``HORIZON_IDX[h]``, never pooled over 0..k."""
     n = 5
     pred = np.full((n, PRED_STEPS), 120.0)
     bands = _fan(pred, half=20.0)                       # band = 120 ± 10
@@ -190,7 +160,6 @@ def test_band_cov50_tracks_the_horizon_step_only():
 
 
 def test_bands_none_emits_the_pre_band_block():
-    """``bands=None`` keeps the pre-band key set AND the banded run's median values."""
     pred, true, last_bg, pats, bands = _synthetic()
     res_b = compute_suite(pred, true, last_bg, pats, bands=bands)
     res_n = compute_suite(pred, true, last_bg, pats, bands=None)
@@ -202,7 +171,7 @@ def test_bands_none_emits_the_pre_band_block():
         med = res_b[h]['median_line']
         for k in POINT_KEYS:
             assert med[k] == res_n[h][k], (h, k, med[k], res_n[h][k])
-        # persistence carries no band, so it is shared verbatim by both bases
+        # persistence carries no band, so both bases share it verbatim
         assert res_b[h]['rmse_persist_point'] == res_n[h]['rmse_persist_point']
         assert res_b[h]['rmse_persist_winmean'] == res_n[h]['rmse_persist_winmean']
         assert res_b[h]['n_windows'] == res_n[h]['n_windows']
@@ -212,7 +181,6 @@ def test_bands_none_emits_the_pre_band_block():
 
 
 def test_degenerate_band_reproduces_the_median_line_exactly():
-    """A collapsed scored band makes the banded run identical to the band-less one."""
     pred, true, last_bg, pats, _ = _synthetic()
     bands = _degenerate_fan(pred)
     res_b = compute_suite(pred, true, last_bg, pats, bands=bands)
@@ -230,12 +198,8 @@ def test_degenerate_band_reproduces_the_median_line_exactly():
 
 
 def test_band_scoring_does_not_disturb_the_alarm_edges():
-    """hypo/hyper stay on the ALARM taus, independent of the metric-band projection.
-
-    The truth side is untouched by the projection, so ``n_true`` must still be the raw
-    threshold crossing count at the horizon step; the alarm side reads the alarm band
-    edges, which are at least as sensitive as the median line.
-    """
+    """The projection never touches the truth side, so ``n_true`` stays the raw crossing
+    count; the alarm edges are at least as sensitive as the median."""
     pred, true, last_bg, pats, bands = _synthetic()
     res = compute_suite(pred, true, last_bg, pats, bands=bands)
     res_n = compute_suite(pred, true, last_bg, pats, bands=None)
@@ -256,18 +220,12 @@ def test_band_scoring_does_not_disturb_the_alarm_edges():
 
 
 def test_cgega_region_totals_depend_only_on_the_truth():
-    """Hold the truth and the window set fixed, vary only the forecast: the three
-    CG-EGA per-region totals must not move.
+    """A point's region is its TRUE glucose's, so ``ap+be+ep`` per region depends on the
+    truth and window set alone; the forecast only redistributes it across AP/BE/EP.
 
-    A point's glycemic region is that of its TRUE glucose, so ``ap+be+ep`` per region is
-    a function of the truth and the window set alone — the forecast may only redistribute
-    each total across AP/BE/EP. Score the forecast as the reference instead and the
-    region follows the forecast, so the denominators shift between two runs over
-    identical truth and the per-region percentages are no longer comparable.
-
-    Both forecasts here sit far outside their own band, so the projected series is
-    displaced ~51 mg/dL below the truth in one run and ~51 above it in the other — well
-    across both the 70 and the 180 mg/dL region boundaries for a large share of points.
+    Score the forecast as reference instead and the denominators move between two runs
+    over identical truth. The two forecasts here sit ~51 mg/dL below and above the truth,
+    well across both the 70 and 180 mg/dL boundaries.
     """
     rng = np.random.default_rng(17)
     n = 40
@@ -293,7 +251,7 @@ def test_cgega_region_totals_depend_only_on_the_truth():
             f"{_tot(res_lo, reg)} vs {_tot(res_hi, reg)} — the region is being binned "
             f"on the forecast, not the truth"
         )
-    # not vacuous: the two forecasts genuinely score differently inside those totals
+    # not vacuous: the two forecasts score differently inside those totals
     assert res_lo['cgega']['counts'] != res_hi['cgega']['counts']
     assert sum(res_lo['cgega']['counts'].values()) == true.size
     print(f"[DUMP] region totals invariant to the forecast: "
@@ -301,14 +259,11 @@ def test_cgega_region_totals_depend_only_on_the_truth():
           f"== {[(r, _tot(res_hi, r)) for r in ('hypo', 'eu', 'hyper')]} ✓")
 
 
-# ----------------------------- conformal basis ------------------------------ #
 def test_conformal_intervals_on_the_projected_basis_is_tighter():
-    """Fed the band-projected arrays, the conformal half-width shrinks.
+    """``conformal_intervals`` takes no basis flag — the caller decides.
 
-    ``conformal_intervals`` takes no basis flag — the caller decides. The residual
-    ``|band_project(true) − true|`` is ≤ ``|median − true|`` element-wise, so its
-    empirical quantile (the half-width) can only shrink; it then reads as the extra
-    width needed ON TOP OF the band to reach 90%.
+    ``|band_project(true) − true|`` is ≤ ``|median − true|`` element-wise, so the
+    half-width can only shrink; it then reads as the width needed ON TOP OF the band.
     """
     n = 400        # enough windows that the 90% split-conformal coverage is tight
     cal_pred, cal_true, _, _, cal_bands = _synthetic(n_windows=n, seed=5)
@@ -326,7 +281,6 @@ def test_conformal_intervals_on_the_projected_basis_is_tighter():
               f"{band[h]['coverage']:.3f} / {point[h]['coverage']:.3f}")
 
 
-# --------------------------------- config ----------------------------------- #
 def test_metric_band_taus_are_quantile_levels_straddling_the_median():
     assert METRIC_BAND_TAU_LO in QUANTILE_LEVELS and METRIC_BAND_TAU_HI in QUANTILE_LEVELS
     assert METRIC_BAND_TAU_LO < 0.5 < METRIC_BAND_TAU_HI

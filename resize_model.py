@@ -1,5 +1,4 @@
-"""
-resize_model.py — rewrite config.py with manual architecture overrides.
+"""Rewrite config.py with manual architecture overrides.
 
 Usage::
 
@@ -11,14 +10,10 @@ Usage::
     python resize_model.py --min-context-patches 32 --max-context-patches 96
     python resize_model.py --d-model 256 --heads 4 --report-only   # preview, don't write
 
-Run with no flags, the script prints the live architecture constants from
-``config.py`` and the resulting parameter count, then exits without touching
-the file.
-
-Given one or more override flags, the script applies exactly those overrides
-on top of the current config, leaves everything else as-is, recomputes the
-parameter count (it is *computed* from the architecture, never targeted),
-rewrites the affected lines of ``config.py``, and prints a before -> after diff.
+With no flags the script prints the live constants and the parameter count, then exits
+without touching the file. Given override flags it applies exactly those on top of the
+current config, leaves everything else as-is, recomputes the parameter count, rewrites the
+affected lines of ``config.py`` and prints a before -> after diff.
 
 Overridable constants::
 
@@ -31,59 +26,29 @@ Overridable constants::
     --min-context-patches   MIN_CONTEXT_PATCHES
     --max-context-patches   MAX_CONTEXT_PATCHES
 
-Constants that are not overridden keep their existing source line.  The
-symbolic relations ``FFN_DIM = k * D_MODEL``, ``BG_HEAD_HIDDEN = k * D_MODEL``
-and ``HEAD_DIM = D_MODEL // N_HEADS`` are preserved, so changing ``D_MODEL``
-alone propagates to the derived widths automatically.
+Constants that are not overridden keep their existing source line. The symbolic relations
+``FFN_DIM = k * D_MODEL``, ``BG_HEAD_HIDDEN = k * D_MODEL`` and
+``HEAD_DIM = D_MODEL // N_HEADS`` are preserved, so a change to ``D_MODEL`` alone
+propagates to the derived widths. ``PATCH_SIZE`` is timesteps per patch
+(``PATCH_SIZE * 5`` minutes) and also rescales the wall-clock span of
+``MIN/MAX_CONTEXT_PATCHES``, which count patches rather than hours — pass those alongside
+it to preserve the context window in hours.
 
-``PATCH_SIZE`` (timesteps per patch; ``PATCH_SIZE * 5`` is the patch span in
-minutes) must divide 12 so that an integer number of patches tiles each hour —
-the script hard-fails otherwise.  Changing it also rescales the wall-clock span
-of ``MIN/MAX_CONTEXT_PATCHES`` (which count *patches*, not hours), so pass those
-alongside it to preserve the context window in hours.
+The rewrite is refused unless ``D_MODEL`` is divisible by ``N_HEADS`` with
+``HEAD_DIM = D_MODEL // N_HEADS`` in {16, 32, 64, 128} (so
+``F.scaled_dot_product_attention`` dispatches the Flash / memory-efficient kernels instead
+of materializing the full T×T attention matrix), ``PATCH_SIZE * 5`` divides 60,
+``MIN_CONTEXT_PATCHES <= MAX_CONTEXT_PATCHES``, and every resulting value is positive. The
+rest of the config — optimizer, loss, day/night windowing — is untouched.
 
-Validation is strict — the script refuses to rewrite ``config.py`` unless:
-
-  * ``D_MODEL`` is divisible by ``N_HEADS`` and
-    ``HEAD_DIM = D_MODEL // N_HEADS`` is in {16, 32, 64, 128} (so
-    ``F.scaled_dot_product_attention`` dispatches the Flash / memory-efficient
-    kernels instead of materializing the full T×T attention matrix),
-  * ``PATCH_SIZE * 5`` divides 60 (an integer number of patches per hour),
-  * ``MIN_CONTEXT_PATCHES`` <= ``MAX_CONTEXT_PATCHES``,
-  * every resulting value is positive.
-
-The rest of the config (optimizer, loss, day/night windowing, etc.) is untouched.
-
-Parameter-count method
------------------------
-The count is *computed*, never targeted: the script mutates the in-process
-``config`` module to the candidate architecture, re-imports ``model`` so it
-binds the new constants, instantiates ``T1DMAI`` on the ``meta`` device (no
-real allocation), and returns ``sum(p.numel() for p in m.parameters())``.  The
-modules that contribute are::
-
-    patch_embed   Linear(PATCH_DIM, D_MODEL) with bias
-    N_LAYERS x TransformerBlock:
-        TemporalSelfAttention  w_q/w_k/w_v/w_o : Linear(D_MODEL, D_MODEL) no bias
-                               q_norm/k_norm   : RMSNorm(HEAD_DIM)
-                               norm1           : RMSNorm(D_MODEL)
-        SwiGLUFFN              w1/w3 : Linear(D_MODEL, FFN_DIM) no bias
-                               w2    : Linear(FFN_DIM, D_MODEL) no bias
-                               norm2 : RMSNorm(D_MODEL)
-    final_norm    RMSNorm(D_MODEL)
-    bg_head       Linear(D_MODEL, BG_HEAD_HIDDEN) -> SiLU
-                  Linear(BG_HEAD_HIDDEN, BG_HEAD_HIDDEN) -> SiLU
-                  Linear(BG_HEAD_HIDDEN, BG_HEAD_STEP_BASIS_DIM * (1 + 2*N_SPREADS))   (all with bias)
-    time_head     Linear(D_MODEL, TIME_PROBE_HIDDEN) -> SiLU
-                  Linear(TIME_PROBE_HIDDEN, TIME_PROBE_N_BINS)   (both with bias;
-                  present only when TIME_PROBE_ENABLED)
-
-Every width ``config.py`` writes as ``k * D_MODEL`` — ``FFN_DIM``,
-``BG_HEAD_HIDDEN``, ``TIME_PROBE_HIDDEN`` — and ``HEAD_DIM = D_MODEL //
-N_HEADS`` are re-derived at the candidate ``D_MODEL`` before the count, so a
-projected rung is counted at that rung throughout.  A width left at the live
-value would size one head for a different architecture than the rest of the
-model and the printed total would belong to neither.
+The parameter count is COMPUTED, never targeted: the in-process ``config`` module is
+mutated to the candidate architecture, ``model`` re-imported so it binds the new
+constants, ``T1DMAI`` instantiated on the ``meta`` device (no real allocation), and
+``sum(p.numel() for p in m.parameters())`` returned. Every width ``config.py`` writes as
+``k * D_MODEL`` — ``FFN_DIM``, ``BG_HEAD_HIDDEN``, ``TIME_PROBE_HIDDEN`` — and
+``HEAD_DIM`` are re-derived at the candidate ``D_MODEL`` first. A width left at the live
+value would size one head for a different architecture than the rest of the model, and the
+printed total would belong to neither.
 """
 import argparse
 import re
@@ -95,9 +60,9 @@ import torch
 
 VALID_HEAD_DIMS: tuple[int, ...] = (16, 32, 64, 128)
 
-# Architecture constants displayed in the before -> after diff, in order.
-# HEAD_DIM is derived (D_MODEL // N_HEADS) and shown for context but never
-# written directly; every other key here is settable via a CLI flag.
+# Architecture constants shown in the before -> after diff, in order. HEAD_DIM is derived
+# (D_MODEL // N_HEADS) and shown for context but never written; every other key is
+# settable via a CLI flag.
 _VIEW_KEYS: tuple[str, ...] = (
     'D_MODEL', 'N_LAYERS', 'N_HEADS', 'HEAD_DIM', 'FFN_DIM',
     'BG_HEAD_HIDDEN', 'MIN_CONTEXT_PATCHES', 'MAX_CONTEXT_PATCHES', 'PATCH_SIZE',
@@ -107,11 +72,11 @@ _VIEW_KEYS: tuple[str, ...] = (
 def _arch_view(d_model: int, n_layers: int, n_heads: int, ffn_dim: int,
                bg_head_hidden: int, min_ctx: int, max_ctx: int,
                patch_size: int) -> dict[str, int]:
-    """Return the ordered architecture-constant dict used for display/diffing.
+    """Ordered architecture-constant dict used for display and diffing.
 
-    ``HEAD_DIM`` is rendered as ``D_MODEL // N_HEADS`` when the division is
-    exact, otherwise as the raw ``d_model/n_heads`` string so an invalid
-    combination is still legible in the diff before validation rejects it.
+    ``HEAD_DIM`` renders as ``D_MODEL // N_HEADS`` when the division is exact, otherwise as
+    the raw ``d_model/n_heads`` string, so an invalid combination is still legible in the
+    diff before validation rejects it.
     """
     head_dim: object = d_model // n_heads if n_heads and d_model % n_heads == 0 else f'{d_model}/{n_heads}'
     return {
@@ -137,13 +102,12 @@ def _view_from_config(config) -> dict[str, int]:
 
 
 def _effective(config, args: argparse.Namespace) -> dict[str, int]:
-    """Resolve the post-override architecture from current config + CLI flags.
+    """Post-override architecture, from current config plus the CLI flags.
 
-    A flag that is ``None`` keeps the current config value.  ``FFN_DIM`` and
-    ``BG_HEAD_HIDDEN`` are kept symbolic: when their multiplier flag is omitted
-    but ``--d-model`` is set, they re-scale with the new ``D_MODEL`` (mirroring
-    the ``k * D_MODEL`` source expression); when neither is set they retain the
-    current numeric value exactly.
+    A ``None`` flag keeps the current config value. ``FFN_DIM`` and ``BG_HEAD_HIDDEN`` stay
+    symbolic: with their multiplier flag omitted but ``--d-model`` set they re-scale with
+    the new ``D_MODEL``, mirroring the ``k * D_MODEL`` source expression; with neither set
+    they keep the current numeric value exactly.
     """
     d_model = args.d_model if args.d_model is not None else config.D_MODEL
     n_layers = args.layers if args.layers is not None else config.N_LAYERS
@@ -212,12 +176,11 @@ def _validate(eff: dict[str, int]) -> list[str]:
 
 
 def _changes(args: argparse.Namespace) -> dict[str, str]:
-    """Map each provided override flag to the source text to write into config.py.
+    """Each provided override flag mapped to the source text to write into config.py.
 
-    Only flags the user actually passed appear here, so untouched lines (and
-    their trailing comments) are preserved.  ``FFN_DIM`` and ``BG_HEAD_HIDDEN``
-    are written as ``<mult> * D_MODEL`` expressions to keep the architectural
-    relation intact.
+    Only flags actually passed appear, so untouched lines and their trailing comments are
+    preserved. ``FFN_DIM`` and ``BG_HEAD_HIDDEN`` are written as ``<mult> * D_MODEL``
+    expressions to keep the architectural relation intact.
     """
     out: dict[str, str] = {}
     if args.d_model is not None:
@@ -242,28 +205,26 @@ def _changes(args: argparse.Namespace) -> dict[str, str]:
 def _count_params(d_model: int, n_heads: int, ffn_dim: int,
                   bg_head_hidden: int, n_layers: int,
                   patch_size: int | None = None) -> int:
-    """Instantiate T1DMAI with overridden dims on the meta device; return numel.
+    """Parameter count of T1DMAI at the overridden dims, built on the meta device.
 
-    Overrides the architecture constants on the already-loaded ``config``
-    module, then evicts ``model`` from ``sys.modules`` so the next
-    ``from model import T1DMAI`` re-runs ``model.py`` and picks up the new
-    constants.  Uses ``torch.device('meta')`` so no real memory is allocated
-    for the parameter tensors — only the ``numel`` count is needed.  Context-patch
-    counts are deliberately not set here: they do not affect the parameter count
-    (RoPE is parameter-free).  ``patch_size`` *does* affect the count
-    (via PATCH_DIM; the ``(S, K)`` step_basis is a non-parameter buffer and the
-    bg_head output width K*(1 + 2*N_SPREADS) is independent of it), so when it
-    is given the derived constants are re-evaluated to match.
+    Overrides the constants on the already-loaded ``config`` module, then evicts ``model``
+    from ``sys.modules`` so the next ``from model import T1DMAI`` re-runs ``model.py``
+    against them. ``torch.device('meta')`` allocates nothing — only ``numel`` is needed.
 
-    Every constant ``config.py`` derives from ``D_MODEL`` is re-derived here, so
-    the model instantiated is the candidate rung throughout.  ``FFN_DIM`` and
-    ``BG_HEAD_HIDDEN`` arrive resolved from the caller (they carry override
-    flags); ``HEAD_DIM`` and ``TIME_PROBE_HIDDEN`` have none and are re-derived
-    from their ``config.py`` relation at the candidate ``D_MODEL``.
+    Context-patch counts are deliberately not set: RoPE is parameter-free, so they do not
+    affect the count. ``patch_size`` DOES affect it (via ``PATCH_DIM``; the ``(S, K)``
+    step_basis is a non-parameter buffer and the bg_head output width
+    ``K*(1 + 2*N_SPREADS)`` is independent of it), so when given, every constant derived
+    from it is re-evaluated.
+
+    Every constant ``config.py`` derives from ``D_MODEL`` is re-derived here, so the model
+    instantiated is the candidate rung throughout: ``FFN_DIM`` and ``BG_HEAD_HIDDEN``
+    arrive resolved from the caller, which carries their override flags; ``HEAD_DIM`` and
+    ``TIME_PROBE_HIDDEN`` have none and are re-derived from their ``config.py`` relation at
+    the candidate ``D_MODEL``.
     """
     import config
-    # Snapshot every config global this helper mutates so it stays side-effect-free
-    # (no global-state pollution of a long-lived `config` module across calls/tests).
+    # Snapshot every config global this helper mutates, so it stays side-effect-free.
     _MUTATED = ('D_MODEL', 'N_HEADS', 'HEAD_DIM', 'FFN_DIM', 'BG_HEAD_HIDDEN',
                 'TIME_PROBE_HIDDEN', 'N_LAYERS', 'PATCH_SIZE', 'PATCH_DIM',
                 '_PATCHES_PER_HOUR', 'PREDICTION_PATCHES', 'MAX_SEQ_LEN',
@@ -275,17 +236,14 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
         config.HEAD_DIM = d_model // n_heads
         config.FFN_DIM = ffn_dim
         config.BG_HEAD_HIDDEN = bg_head_hidden
-        # TIME_PROBE_HIDDEN = k * D_MODEL with no override flag: it follows
-        # D_MODEL at whatever multiplier config.py holds, the same symbolic
-        # relation FFN_DIM and BG_HEAD_HIDDEN keep.
+        # No override flag: TIME_PROBE_HIDDEN follows D_MODEL at whatever multiplier
+        # config.py holds, the same symbolic relation FFN_DIM and BG_HEAD_HIDDEN keep.
         config.TIME_PROBE_HIDDEN = (_saved['TIME_PROBE_HIDDEN'] // _saved['D_MODEL']) * d_model
         config.N_LAYERS = n_layers
         if patch_size is not None:
-            # PATCH_SIZE feeds patch_embed (PATCH_DIM) and the (S, K) step_basis
-            # buffer; the bg_head output width is K*(1 + 2*N_SPREADS), independent
-            # of PATCH_SIZE.  Re-derive every PATCH_SIZE-dependent constant before
-            # re-importing model.  The caller validates that PATCH_SIZE * 5 divides
-            # 60, so the floor division below is exact.
+            # PATCH_SIZE feeds patch_embed through PATCH_DIM; the bg_head output width
+            # K*(1 + 2*N_SPREADS) is independent of it. The caller validates that
+            # PATCH_SIZE * 5 divides 60, so the floor division below is exact.
             pph = 60 // (patch_size * 5)
             config.PATCH_SIZE = patch_size
             config.PATCH_DIM = patch_size * config.N_INPUT_FEATURES
@@ -299,8 +257,7 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
             m = T1DMAI()
         return sum(p.numel() for p in m.parameters())
     finally:
-        # Restore the live config dims and evict the overridden `model` module so
-        # the next `from model import` re-reads the restored constants.
+        # Restore the live dims and evict `model`, so the next import re-reads them.
         for k, v in _saved.items():
             setattr(config, k, v)
         sys.modules.pop('model', None)
@@ -324,10 +281,8 @@ def _replace_rhs(src: str, name: str, new_value: str) -> str:
 def _write_constants(path: Path, changes: dict[str, str]) -> None:
     """Patch each ``NAME = <value>`` line in ``config.py`` from the changes map.
 
-    Every other line of the file (and trailing comments on the rewritten lines)
-    is preserved verbatim — only the architecture constants this script owns are
-    rewritten.  ``config.py`` is a plain file (there are no config variants), so
-    ``write_text`` simply rewrites it in place.
+    Every other line, and the trailing comments on the rewritten lines, is preserved
+    verbatim. ``config.py`` is a plain file with no variants, so this rewrites it in place.
     """
     src = path.read_text()
     for name, value in changes.items():
@@ -378,10 +333,9 @@ def _print_current_arch() -> None:
 
 
 def main() -> None:
-    # Patch geometry for the context-patch help text: the wall-clock span of a
-    # context-patch count depends on the current PATCH_SIZE, so render the help
-    # against whatever PATCH_SIZE is presently in config.py rather than baking in
-    # the 30-min / 16-patch numbers that only held at PATCH_SIZE=6.
+    # The wall-clock span of a context-patch count depends on the current PATCH_SIZE, so
+    # render the help against config.py's PATCH_SIZE rather than baking in the 30-min /
+    # 16-patch numbers that only held at PATCH_SIZE=6.
     import config
     _patch_min = config.PATCH_SIZE * 5
     _floor_patches = round(8 * 60 / _patch_min)  # patches in the ~8 h ACF floor

@@ -1,27 +1,15 @@
-"""
-Window collection + excursion-decision calibration on the model-input bridge.
+"""Window collection and excursion-decision calibration on the model-input bridge.
 
-The risk-space redesign makes the HEADLINE BG forecast the model's quantile
-median, ``median_bg = f_inv(median)`` from ``inference.predict`` — there is no
-trend head, no physics reconstruction, and no per-patient ``icr`` / ``bg_scale``
-to fit (those depended on the deleted ``utils.reconstruct_bg``).  The deployment
-trend-gain machinery (``calibrate_gain`` / ``g_down`` / ``g_up``) is likewise
-gone: the model emits a calibrated quantile forecast directly.
-
-What survives is the per-patient EXCURSION-DECISION calibration, which only ever
-needed plain ``(pred_bg, true_bg)`` arrays:
+The headline forecast is the quantile median ``median_bg = f_inv(median)``; the decision calibration needs
+only plain ``(pred_bg, true_bg)`` arrays.
 
     collect_windows(model, stats, segments)  -> list[Window]  (median_bg + true CGM)
     forecast_windows(windows)                -> (pred (N,T), true (N,T), last_bg (N,), patients)
     calibrate_threshold(pred, true, bands=…) -> per-horizon recall–precision curves
     select_offset(curve, …)                  -> one operating point under a precision floor
 
-The decision sweep runs off the metric BAND EDGES (τ=``METRIC_BAND_TAU_LO`` for hypo,
-τ=``METRIC_BAND_TAU_HI`` for hyper) when the quantile fan is supplied, matching the
-band basis of the level metrics; without a fan it runs off the median line as before.
-
-``forecast_windows`` returns the raw per-window predicted/true BG so the metrics
-harness can compute MARD / Clarke / hypo-hyper without re-running the model.
+The decision sweep reads the metric BAND EDGES (τ=``METRIC_BAND_TAU_LO`` hypo, ``METRIC_BAND_TAU_HI`` hyper)
+when a fan is supplied, matching the level metrics' basis; without one it reads the median line.
 """
 from __future__ import annotations
 
@@ -44,14 +32,10 @@ from .horizons import HORIZONS, HORIZON_IDX as _HORIZON_IDX
 
 CTX_STEPS = MAX_CONTEXT_PATCHES * PATCH_SIZE
 PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
-# Decision-offset sweep for ``calibrate_threshold``: δ ∈ [0, 60] mg/dL, 2.5 steps.
-# A wide, fine grid so the user reads the whole recall–precision curve; no floor
-# is baked in (PLAN §6/§7).
+# δ ∈ [0, 60] mg/dL in 2.5 steps — the whole recall–precision curve, no floor baked in (PLAN §6/§7)
 _OFFSET_GRID = tuple(float(x) for x in np.arange(0.0, 60.0 + 1e-9, 2.5))
 
-# Band the decision sweep reads when a quantile fan is supplied — the same knob the
-# level metrics score against (``metrics.core.suite``), distinct from the clinical
-# alarm taus.
+# the band the sweep reads with a fan supplied: the level metrics' knob, not the clinical alarm taus
 _BAND_LO_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)
 _BAND_HI_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)
 
@@ -60,23 +44,10 @@ def threshold_curve(pred: np.ndarray, true: np.ndarray, thr: float, side: str,
                     offsets=_OFFSET_GRID) -> list[dict]:
     """Recall–precision curve over a decision-offset sweep at ONE horizon point.
 
-    For each δ in ``offsets`` the alarm fires when ``pred < thr + δ`` (hypo) or
-    ``pred > thr − δ`` (hyper) — a positive δ widens the band toward higher recall.
-    Truth and decision are STRICT clinical crossings (no tolerance band); the band
-    is exactly the lever the user sets the operating point with.
-
-    Args:
-        pred: ``(N,)`` forecast BG at the horizon point — the median line or the
-            band edge the caller decides on.
-        true: ``(N,)`` true BG at the horizon point.
-        thr:  clinical threshold (``BG_HYPO_THRESHOLD`` / ``BG_HYPER_THRESHOLD``).
-        side: ``'hypo'`` | ``'hyper'``.
-        offsets: iterable of δ in mg/dL.
-
-    Returns:
-        list of ``{offset, recall, precision, n_true, n_pred}`` (``n_true`` is
-        constant across the sweep; ``n_pred`` grows with δ; recall/precision are
-        ``None`` when their denominator is 0).
+    ``pred`` / ``true`` ``(N,)`` mg/dL at that point; the alarm fires at ``pred < thr + δ`` (hypo) or
+    ``pred > thr − δ`` (hyper), so a positive δ buys recall. Truth and decision are STRICT crossings.
+    -> ``{offset, recall, precision, n_true, n_pred}`` per δ: ``n_true`` constant, ``n_pred`` grows with δ,
+    recall and precision ``None`` on a zero denominator.
     """
     pred = np.asarray(pred, dtype=np.float64)
     true = np.asarray(true, dtype=np.float64)
@@ -96,26 +67,12 @@ def threshold_curve(pred: np.ndarray, true: np.ndarray, thr: float, side: str,
 def calibrate_threshold(pred: np.ndarray, true: np.ndarray,
                         offsets=_OFFSET_GRID,
                         bands: np.ndarray | None = None) -> dict:
-    """Per-horizon hypo & hyper recall–precision curves over a decision-offset sweep.
+    """Per-horizon hypo and hyper recall–precision curves -> ``{'hypo': {h: curve}, 'hyper': {h: curve}}``.
 
-    Fit on the CALIBRATION split. Emits the full curve per horizon so the operating
-    point is chosen from data; bakes in NO precision floor or target recall
-    (PLAN §6/§7).
-
-    With ``bands`` the hypo sweep reads the τ=``METRIC_BAND_TAU_LO`` lower edge and the
-    hyper sweep the τ=``METRIC_BAND_TAU_HI`` upper edge, the same band the level
-    metrics score against. With ``bands=None`` both sweeps read the median line
-    ``pred`` exactly as before.
-
-    Args:
-        pred: ``(N, PRED_STEPS)`` median-line forecast BG, mg/dL.
-        true: ``(N, PRED_STEPS)`` matched true BG, mg/dL.
-        offsets: δ grid in mg/dL.
-        bands: optional ``(N, PRED_STEPS, N_QUANTILES)`` mg/dL quantile fan
-            (ascending τ), as stacked by :func:`forecast_bands`.
-
-    Returns:
-        ``{'hypo': {h: curve}, 'hyper': {h: curve}}`` for ``h`` in ``HORIZONS``.
+    Fit on the CALIBRATION split; no precision floor or target recall baked in (PLAN §6/§7).
+    ``pred`` / ``true`` ``(N, PRED_STEPS)`` mg/dL; ``bands`` optional ``(N, PRED_STEPS, N_QUANTILES)`` mg/dL,
+    ascending τ. With ``bands`` the sweeps read the τ=``METRIC_BAND_TAU_LO`` / ``METRIC_BAND_TAU_HI`` edges,
+    without it the median line.
     """
     pred = np.asarray(pred, dtype=np.float64)
     true = np.asarray(true, dtype=np.float64)
@@ -137,13 +94,10 @@ def calibrate_threshold(pred: np.ndarray, true: np.ndarray,
 
 def select_offset(curve: list[dict], min_precision: float | None = None,
                   target_recall: float | None = None) -> tuple[float, float | None, float | None]:
-    """Pick one operating point from a ``threshold_curve``.
+    """One operating point from a ``threshold_curve`` -> ``(offset, recall, precision)``.
 
-    ``min_precision``: the δ of highest recall whose precision ≥ the floor
-    (recall-first under a precision constraint). ``target_recall``: the smallest δ
-    that reaches that recall (least precision sacrificed). Neither: the strict
-    (δ≈0) point — no operating point is baked in by default. Returns
-    ``(offset, recall, precision)``.
+    ``min_precision``: highest-recall δ whose precision clears the floor. ``target_recall``: smallest δ that
+    reaches it. Neither: the strict δ≈0 point, so nothing is baked in by default.
     """
     pts = [p for p in curve if p['recall'] is not None]
     if not pts:
@@ -162,14 +116,11 @@ def select_offset(curve: list[dict], min_precision: float | None = None,
 
 @dataclass
 class Window:
-    """One prediction window: the headline median BG forecast + the true CGM.
+    """One prediction window: the median BG forecast and the true CGM.
 
-    ``bands`` (optional, default None) carries the model's full per-step mg/dL
-    quantile fan ``(PRED_STEPS, N_QUANTILES)`` (ascending τ, RAW ``f_inv(q_tau)`` —
-    uncalibrated) for the quantile-CQR re-fit in ``run_eval.evaluate_from_windows``.
-    Defaulting to None keeps every pre-redesign cached/sim Window construction
-    (which never set it) valid, and ``forecast_bands`` returns None unless every
-    window carries it.
+    ``bands`` is the per-step mg/dL fan ``(PRED_STEPS, N_QUANTILES)``, ascending τ, RAW ``f_inv(q_tau)`` and
+    uncalibrated, for the CQR re-fit in ``run_eval.evaluate_from_windows``. None is legal — a window built
+    without one — and ``forecast_bands`` then returns None for the whole list.
     """
     patient: str
     pred_bg: np.ndarray          # (PRED_STEPS,) median_bg = f_inv(median), mg/dL
@@ -180,15 +131,10 @@ class Window:
 
 def _future_overrides(feats: np.ndarray, pred_start: int,
                       announce: tuple[int, ...]) -> dict[int, torch.Tensor]:
-    """Slice the prediction-zone future of the announced output channels into
-    ``predict`` overrides.
+    """The announced channels' prediction-zone future -> ``{ch: (PREDICTION_PATCHES, PATCH_SIZE)}``, normalized.
 
-    ``feats`` is the normalized (N, F) input stack; output channel ``ch`` lives at
-    input feature ``CHANNEL_TO_FEAT[ch]`` (carb 0→feat 1, insulin 1→feat 2,
-    exercise 2→feat 3).
-    Returns a ``{ch: (PREDICTION_PATCHES, PATCH_SIZE)}`` dict of the
-    already-normalized future values, ready to hand to
-    ``inference.predict(overrides=…)``.
+    ``feats`` is the normalized ``(N, F)`` stack; output channel ``ch`` sits at input feature
+    ``CHANNEL_TO_FEAT[ch]`` — carb 0→feat 1, insulin 1→feat 2, exercise 2→feat 3.
     """
     fut = feats[pred_start:pred_start + PRED_STEPS]      # (PRED_STEPS, F), normalized
     ov: dict[int, torch.Tensor] = {}
@@ -205,21 +151,11 @@ def collect_windows(model, stats, segments: list[Segment], device,
                     announce: tuple[int, ...] = (0, 1, 2)) -> list[Window]:
     """Slide prediction windows across each segment and capture the BG forecast.
 
-    The model is ALWAYS conditioned: each window's true future ``announce``
-    channels (the logged carbs/insulin/exercise over the prediction zone) are
-    announced to the model, so the captured forecast is conditioned on them — the
-    deployment what-if regime in which the patient declares the meal/dose/session.
-    There is no unconditioned regime; ``conditional`` is retained only for
-    call-compatibility and no longer toggles anything.
-
-    Args:
-        stride_patches: gap (in patches) between successive window starts.
-        max_per_patient: cap on windows per patient (random subsample if exceeded).
-        conditional: deprecated no-op (the forecast is always conditioned).
-        announce: output-channel indices announced — carbs (0), insulin (1) and
-            exercise (2); BG is never conditionable. Exercise is identically zero
-            wherever a source has no activity record, so announcing it declares
-            "no session".
+    ALWAYS conditioned: each window's true future ``announce`` channels reach the model, the deployment
+    regime where the patient declares the meal, dose or session. ``conditional`` is a no-op kept for callers.
+    ``stride_patches`` in patches between window starts; ``max_per_patient`` subsamples at random.
+    ``announce``: carb 0, insulin 1, exercise 2 — BG is never conditionable, and announcing an exercise
+    column of zeros declares "no session".
     """
     by_patient: dict[str, list[Window]] = {}
     for seg in segments:
@@ -227,9 +163,7 @@ def collect_windows(model, stats, segments: list[Segment], device,
         if n < CTX_STEPS + PRED_STEPS:
             continue
         feats = build_feature_stack(seg, stats)
-        # The forecast is scored against the raw (bg-clamped) CGM (the model
-        # consumes raw post-noise signals); both the per-window truth and the
-        # last-context anchor are sliced from it.
+        # truth and last-context anchor both slice the raw bg-clamped CGM
         cgm_smooth = smoothed_cgm(seg.cgm)
         stride = stride_patches * PATCH_SIZE
         for pred_start in range(CTX_STEPS, n - PRED_STEPS + 1, stride):
@@ -238,8 +172,7 @@ def collect_windows(model, stats, segments: list[Segment], device,
             out = predict(model, ctx, normalization_stats=stats, device=device,
                           overrides=overrides)
             pred_bg = out['median_bg'].detach().cpu().numpy().astype(np.float64)
-            # RAW mg/dL band fan (no conformal_delta passed) so the downstream CQR
-            # fit in run_eval is on UNcalibrated bands. (P, S, K) -> (PRED_STEPS, K).
+            # RAW fan, no conformal_delta: run_eval's CQR fit needs uncalibrated bands. (P,S,K) -> (PRED_STEPS,K)
             bands = out['bands'].detach().cpu().numpy().reshape(-1, N_QUANTILES).astype(np.float64)
             w = Window(
                 patient=seg.patient,
@@ -262,8 +195,7 @@ def collect_windows(model, stats, segments: list[Segment], device,
 def forecast_windows(windows: list[Window]):
     """Stack a window list into ``(pred (N,T), true (N,T), last_bg (N,), patients)``.
 
-    The headline ``pred`` is the model's median BG forecast (``median_bg``)
-    captured at collection; no per-patient calibration is applied.
+    ``pred`` is the median forecast as captured; no per-patient calibration is applied.
     """
     if not windows:
         empty = np.zeros((0, PRED_STEPS), dtype=np.float64)
@@ -275,12 +207,9 @@ def forecast_windows(windows: list[Window]):
 
 
 def forecast_bands(windows: list[Window]) -> np.ndarray | None:
-    """Stack the per-window RAW mg/dL quantile fans into ``(N, PRED_STEPS, N_QUANTILES)``.
+    """Per-window RAW fans stacked into ``(N, PRED_STEPS, N_QUANTILES)``: ascending τ, mg/dL, uncalibrated.
 
-    Returns ``None`` if the list is empty or ANY window lacks ``bands`` (legacy caches
-    or any window that did not capture a band fan), so callers can cleanly skip the
-    quantile-CQR path. Ascending τ, mg/dL, uncalibrated — the input to
-    ``conformal.fit_quantile_conformal`` / ``apply_quantile_conformal``.
+    ``None`` when the list is empty or ANY window lacks ``bands``, so a caller skips the CQR path whole.
     """
     if not windows or any(w.bands is None for w in windows):
         return None

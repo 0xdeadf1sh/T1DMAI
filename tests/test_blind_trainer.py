@@ -1,26 +1,15 @@
-"""``train_blind.py`` — the seven ways it must differ from ``train.py``, tested.
+"""``train_blind.py`` is a copy of ``train.py``, so nothing keeps it honest by
+construction. Five divergences that fail silently are pinned here:
 
-The fork is a copy, so nothing keeps it honest by construction. Five of its seven
-divergences can fail silently and are pinned here:
+* both protocol forwards place their own masked sets after the dataset built the
+  sample, so the dataset's blinding never reaches them;
+* the long-horizon roll announces nothing, while its OBSERVED context restores the
+  doses the mask withheld — history, not objective;
+* no ``cf_*`` column survives, in the header or on the page;
+* the run writes to ``checkpoints_blind/`` and ``logs_blind/`` only.
 
-* both PROTOCOL forwards must blind the spans they mask. They place their own
-  masked sets after the dataset has built the sample, so the dataset's blinding
-  does not reach them — and an announced dose surviving there would score the
-  blind model on a conditioned task while every number stayed plausible;
-* the long-horizon roll must announce NOTHING;
-* the same roll's OBSERVED context must un-blind the doses the mask withheld.
-  Blinding is a property of the objective and the roll's context is history, so
-  restoring the withheld bg without the doses beside it does not leave a gap —
-  it asserts that a meal and a bolus did not happen, and the night rows are
-  scored on a patient who did not eat;
-* no ``cf_*`` column may survive, in the CSV header or on the page;
-* the run must write to ``checkpoints_blind/`` and ``logs_blind/`` only. A
-  conditioned run may be live in the same checkout, and its logs are overwritten
-  on the first step of whatever starts next.
-
-Plus the provenance guard in ``calibrate_conformal.py``, which is the only thing
-standing between a blind checkpoint and a conditioned band fit: no parameter shape
-records the policy, so the weights load either way.
+Plus ``calibrate_conformal.py``'s provenance guard: no parameter shape records the
+policy, so a blind checkpoint loads into a conditioned band fit either way.
 """
 
 import ast
@@ -50,7 +39,7 @@ def stats():
 
 @pytest.fixture(scope='module')
 def blind_batch(stats):
-    """A collated batch from a BLIND dataset — what the fork's validation sees."""
+    """What the fork's validation sees."""
     ds = T1DMDataset(master_seed=SEED, total_steps=N_SAMPLES, batch_size=1,
                      normalization_stats=stats, patient_uniform_sample_prob=0.0,
                      blind=True)
@@ -63,14 +52,11 @@ def _dose_cells(patches: torch.Tensor, rows, cols) -> dict[int, torch.Tensor]:
 
 
 def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
-    """Every dose cell of the trailing forecast zone carries the fill.
+    """``_forecast_protocol`` masks ``[T - PREDICTION_PATCHES, T)`` on a window the
+    sampler masked elsewhere, so those patches usually carry their true doses.
 
-    ``_forecast_protocol`` masks ``[T - PREDICTION_PATCHES, T)`` on a window the
-    sampler masked somewhere else. Those trailing patches are usually VISIBLE in
-    the sample and so carry their true announced doses; if the protocol withholds
-    only bg there, the whole horizon-keyed clinical suite — every ``bg_rmse_@h``,
-    every coverage row, the alarm curve — is measured on a conditioned forecast
-    that this model never trains on.
+    Withhold only bg there and the whole horizon-keyed clinical suite is measured on
+    a conditioned forecast this model never trains on.
     """
     fill = zero_dose_fill(stats)
     fc = train_blind._forecast_protocol(
@@ -85,8 +71,8 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
     print(f"\n[DUMP] forecast protocol: {len(rows)}/{N_SAMPLES} rows kept, "
           f"T={T}, zone={zone[0]}..{zone[-1]}")
 
-    # The conditioned protocol on the SAME batch is what gives this a subject: it
-    # is the input the blind model must NOT be validated on.
+    # the conditioned protocol on the SAME batch is the subject: the input the blind
+    # model must NOT be validated on
     fc_announced = train._forecast_protocol(
         blind_batch['patches'], blind_batch['bg_formula_data']['mask_idx'].long(),
         blind_batch['bg_formula_data']['valid'], blind_batch['n_context_patches'])
@@ -105,9 +91,8 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
         "the announced protocol built the same tensor — this batch announces no "
         "dose in its forecast zone, so the assertions above have no subject")
 
-    # "and only there": outside the zone this protocol masks, its window must be
-    # the announced protocol's byte for byte. Blinding the whole window satisfies
-    # every assertion above and destroys the context the forecast reads.
+    # and only there: blinding the whole window satisfies everything above and
+    # destroys the context the forecast reads
     T_all = list(range(T - PREDICTION_PATCHES))
     assert torch.equal(fc['patches'][:, T_all], fc_announced['patches'][:, T_all]), (
         "the forecast protocol changed a patch outside its masked zone")
@@ -115,12 +100,11 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
 
 
 def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
-    """The interior spans this protocol places are blinded, and only they are.
+    """``_infill_protocol`` REPLACES the training mask, restoring every withheld bg and
+    drawing its own spans.
 
-    ``_infill_protocol`` REPLACES the training mask: it restores every withheld bg
-    and then draws its own spans. So the blinding has to follow ITS masked set,
-    not the sample's — a patch it reveals keeps what the sample left there, and a
-    patch it masks is blinded whether or not the sampler had masked it.
+    So the blinding follows ITS masked set: a patch it reveals keeps what the sample
+    left there, a patch it masks is blinded whether the sampler masked it or not.
     """
     fill = zero_dose_fill(stats)
     bf = blind_batch['bg_formula_data']
@@ -145,11 +129,8 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
         assert torch.equal(got, expected), (
             f"feat {feat} on a patch this protocol masks is not the fill")
 
-    # "and ONLY they are" — the half the first draft of this test left out. An
-    # implementation that wiped the dose channels of the whole window satisfies
-    # everything above, and would blind the visible evidence the infill task is
-    # defined against. The revealed patches must still carry what the sample left
-    # there, which is what the untouched input says.
+    # and ONLY they are: wiping the whole window's dose channels satisfies everything
+    # above while blinding the visible evidence the infill task is defined against
     _revealed = ~masked
     for feat in MASKABLE_FEATS:
         got = p[:, :, feat::N_INPUT_FEATURES][_revealed]
@@ -165,13 +146,9 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
 def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatch):
     """``predict_rolling`` is called with no ``overrides_fn``.
 
-    ``train.py`` passes the sample's true future carb / insulin / exercise here to
-    tame a zero-basal OOD runaway. Passing it in the blind fork would condition
-    the long-horizon rows on a plan the model cannot read at any other horizon,
-    so ``night_bg_rmse_*`` would answer a question no other row on the page does.
-
-    Observed at the call, not read off the source: the argument is what matters,
-    and a builder left in place but returning None would look identical in a grep.
+    ``train.py`` passes the true future doses to tame a zero-basal OOD runaway; here
+    that would make ``night_bg_rmse_*`` answer a question no other row does. Observed
+    at the call, not in the source — a builder returning None greps the same.
     """
     import inference
     seen: list[dict] = []
@@ -202,19 +179,10 @@ def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatc
 def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
     """``_observed_patches`` un-blinds feats 1-3, not feat 0 alone.
 
-    The roll's context is the patient's OBSERVED history, which is why the
-    function restores the withheld bg at all. Under the blind policy the same
-    patches had their doses overwritten with the ``zero_dose_fill`` constant, so
-    restoring bg and stopping there does not leave a gap — it leaves an
-    ASSERTION, that a half-hour was seen and carried no carbs and no insulin,
-    over spans that carried a meal or a bolus. The roll conditions on it and the
-    ``night_bg_rmse_*`` rows then answer a question about a patient who did not
-    eat.
-
-    Pinned against the ANNOUNCED sample at the same seed, which is the ground
-    truth for what those cells held: ``tests/test_blind_dataset.py`` establishes
-    that the two policies differ in the masked dose cells and nowhere else, so
-    equality here is the restore being exact rather than merely non-constant.
+    Restoring bg and stopping there leaves no gap but an ASSERTION — that a half-hour
+    was seen and carried no carbs and no insulin — over spans that carried a meal or a
+    bolus. Pinned against the announced sample at the same seed, whose only difference
+    is the masked dose cells, so equality here means exact rather than non-constant.
     """
     kw = dict(master_seed=SEED, total_steps=N_SAMPLES, batch_size=1,
               normalization_stats=stats, patient_uniform_sample_prob=0.0)
@@ -256,7 +224,7 @@ def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
                 f'the restore reached feat {feat} on a VISIBLE patch')
         checked += 1
 
-    # The announced fork has nothing to undo and must not have grown a restore.
+    # the announced fork has nothing to undo and must not have grown a restore
     plain_out = train._observed_patches(plain_s, stats)
     plain_in = torch.as_tensor(np.asarray(plain_s['patches'])).float()
     for feat in MASKABLE_FEATS:
@@ -268,15 +236,12 @@ def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
 
 
 def test_no_counterfactual_column_survives(blind_batch):
-    """No ``cf_*`` column in the header, and no counterfactual row on the page.
+    """The probe perturbs a masked span's announced doses, which a blind model reads as
+    a constant: every row would report the perturbation's own absence as a model
+    property — ``cf_insulin_dir`` at chance, ``train.py``'s signature for a model that
+    stopped responding to insulin.
 
-    The probe perturbs the announced doses of a masked span. A blind model reads
-    a constant there, so every row would report the perturbation's own absence as
-    a model property — ``cf_insulin_dir`` at chance, which in ``train.py`` is the
-    signature of a model that has stopped responding to insulin.
-
-    Both halves are asserted: absent here AND present in ``train.py``, off the
-    same input. A rename would otherwise pass the first half on nothing.
+    Asserted absent here AND present in ``train.py``, or a rename passes on nothing.
     """
     blind_cols = [name for name, _ in train_blind._val_log_columns()]
     plain_cols = [name for name, _ in train._val_log_columns()]
@@ -285,11 +250,9 @@ def test_no_counterfactual_column_survives(blind_batch):
     dropped = [c for c in plain_cols if c.startswith('cf_')]
     assert dropped, "train.py's header has no cf_* column — this test has no subject"
 
-    # SEQUENCE equality, not set equality. A set comparison cannot see a
-    # duplicated column, and a duplicate is exactly what a copy-paste edit to
-    # this list produces: the two logs then differ in width and every column
-    # after the duplication sits at a different index, so a positional reader
-    # silently reports one metric under another's name. That defect was here.
+    # SEQUENCE equality, not set: a set cannot see a duplicated column, and a
+    # duplicate shifts every later index, so a positional reader silently reports one
+    # metric under another's name
     assert len(blind_cols) == len(set(blind_cols)), (
         "the blind header repeats a column: "
         f"{sorted({c for c in blind_cols if blind_cols.count(c) > 1})}")
@@ -303,7 +266,7 @@ def test_no_counterfactual_column_survives(blind_batch):
           f"{len(blind_cols)} of {len(plain_cols)} columns kept, in order, "
           "no duplicates")
 
-    # Feed the values that WOULD render, so the absence is evidence.
+    # feed the values that WOULD render, so the absence is evidence
     synthetic = {'cf_n': 96, 'cf_carb_dir': 0.94, 'cf_insulin_dir': 0.88,
                  'cf_insulin_monotonic': 0.71, 'cf_carb_dbg': 12.4,
                  'cf_insulin_dbg': -9.1, 'cf_hypo_rescue': 0.5,
@@ -322,11 +285,9 @@ def test_no_counterfactual_column_survives(blind_batch):
 def test_the_fork_never_writes_to_the_conditioned_run_s_directories():
     """Not one ``checkpoints/`` or ``logs/`` path literal survives in the fork.
 
-    This is the failure that costs a run rather than a number: ``train.py`` opens
-    its CSVs in ``'w'`` mode on step 0 and writes ``checkpoints/t1dmai_best.pt``
-    on every improvement, so a blind run started beside a live conditioned one
-    would take its logs and its best checkpoint with it. Every path literal is
-    checked, not the four that were edited.
+    ``train.py`` opens its CSVs in ``'w'`` on step 0 and writes
+    ``checkpoints/t1dmai_best.pt`` on every improvement, so a blind run beside a live
+    conditioned one takes its logs and its best checkpoint with it.
     """
     src = open(train_blind.__file__).read()
     bad = sorted({
@@ -335,18 +296,16 @@ def test_the_fork_never_writes_to_the_conditioned_run_s_directories():
         and re.search(r"(^|[^_a-z])(checkpoints|logs)/", node.value)
     })
     assert not bad, f"the blind trainer writes conditioned-run paths: {bad}"
-    # And the blind ones are actually there — an empty file would also pass above.
+    # an empty file would pass the check above
     for expected in ('checkpoints_blind', 'logs_blind'):
         assert expected in src, f"{expected} appears nowhere in the fork"
 
 
 def test_the_conformal_fit_blinds_the_interior_span(stats):
-    """``calibrate_conformal --blind`` withholds the infill span's doses.
+    """The infill span sits INSIDE the context, so its doses arrive with the context and
+    ``inference._build_patches_tensor`` withholds only bg there.
 
-    That span sits INSIDE the context, so its doses arrive with the context
-    rather than through an override and ``inference._build_patches_tensor``
-    withholds only bg there. Its residuals are what the (unshipped) infill delta
-    is fitted on, and a delta fitted on a conditioned span does not describe the
+    A delta fitted on those residuals with the doses announced does not describe the
     blind model's interval.
     """
     import calibrate_conformal as C
@@ -373,10 +332,8 @@ def test_the_conformal_fit_blinds_the_interior_span(stats):
 def test_the_conformal_fit_refuses_a_policy_it_was_not_asked_for():
     """The flag and the checkpoint's stamp must agree, both ways.
 
-    This delta is the one that ships: ``metrics/core/report.py`` lifts it onto the
-    model and every ``inference.predict`` handed it applies it. Fitted under the
-    wrong policy it is not a wrong figure on a page but a wrong interval on the
-    phone, and nothing downstream can tell.
+    This is the delta that SHIPS: fitted under the wrong policy it is a wrong interval
+    on the phone, not a wrong figure on a page, and nothing downstream can tell.
     """
     import calibrate_conformal as C
 
@@ -392,12 +349,8 @@ def test_the_conformal_fit_refuses_a_policy_it_was_not_asked_for():
             C._check_policy(ck, blind=blind)
 
 
-# ---------------------------------------------------------------------------
-# The provenance guard
-# ---------------------------------------------------------------------------
-
 def _guard_module():
-    """``calibrate_conformal.py`` — where the policy guard now lives."""
+    """``calibrate_conformal.py`` holds the policy guard."""
     import calibrate_conformal
     return calibrate_conformal
 
@@ -411,8 +364,8 @@ def _ckpt(policy) -> dict:
 
 
 def test_a_blind_checkpoint_is_refused_by_a_conditioned_fit():
-    """The direction that actually ships: ``train_blind.py`` writes 'blind', and
-    a fit without ``--blind`` announces doses on the span it predicts."""
+    """The shipping direction: ``train_blind.py`` writes 'blind', and a fit without
+    ``--blind`` announces doses on the span it predicts."""
     F = _guard_module()
     with pytest.raises(SystemExit) as exc:
         F._check_policy(_ckpt(masked_channel_policy(blind=True)), blind=False)
@@ -423,12 +376,8 @@ def test_a_blind_checkpoint_is_refused_by_a_conditioned_fit():
 
 
 def test_a_conditioned_checkpoint_is_refused_by_a_blind_fit():
-    """The guard is an equality, not a one-sided blacklist.
-
-    A guard written as "refuse 'blind'" would pass every test above and let the
-    opposite mismatch through — a band fitted blind shipping on a conditioned
-    checkpoint.
-    """
+    """An equality, not a one-sided blacklist: "refuse 'blind'" passes every test above
+    and ships a blind-fitted band on a conditioned checkpoint."""
     F = _guard_module()
     for stored in (masked_channel_policy(blind=False), None):
         with pytest.raises(SystemExit):
@@ -436,13 +385,8 @@ def test_a_conditioned_checkpoint_is_refused_by_a_blind_fit():
 
 
 def test_an_unstamped_checkpoint_reads_as_announced():
-    """Absence is information, not ignorance.
-
-    The key was introduced WITH the blind trainer and a blind run always stamps
-    it, so a checkpoint without it was trained under the announced policy — which
-    is what every checkpoint on disk today is. Reading absence as "unknown" would
-    skip the check on exactly the population it has to accept.
-    """
+    """Absence is information, not ignorance: a blind run always stamps the key, so an
+    unstamped checkpoint was trained announced — as every checkpoint on disk was."""
     F = _guard_module()
     assert F._check_policy(_ckpt(None), blind=False) == masked_channel_policy(blind=False)
     assert F._check_policy({}, blind=False) == masked_channel_policy(blind=False)

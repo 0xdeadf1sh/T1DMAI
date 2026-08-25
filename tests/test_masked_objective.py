@@ -1,24 +1,12 @@
-"""End-to-end tests for the generalized masked-BG objective.
+"""Two silent failures of the masked-BG objective.
 
-Two things are pinned here, both of which fail silently:
+Padded head slots are 41.8% of the head's output on the average sample; drop
+``valid`` on the loss path and they train against patch 0's BG behind a plausible
+anchor, every shape and every loss curve looking ordinary.
 
-* **Padded head slots contribute EXACTLY zero gradient.**  The head emits a fixed
-  ``M = MAX_MASKED_PATCHES`` slots and ``mask_idx`` pads the surplus with patch 0,
-  so a padded slot produces a real fan against a real target behind a plausible
-  neighbouring anchor.  Drop ``valid`` anywhere on the loss path and those slots
-  train against patch 0's BG — with every shape matching and every loss curve
-  looking ordinary.  41.8% of the head's output is padding on the average sample,
-  so this is the common case, not an edge case.
-
-* **Both fixed evaluation protocols produce a finite loss.**  The FORECAST
-  protocol is one right-edge span of ``PREDICTION_PATCHES``, which leaves the
-  DILATE buckets ``L = 1, 2, 3`` empty in EVERY batch; the INFILL protocol draws
-  the sampler's own masked sets at ``B = 8``, where an empty bucket turns up in a
-  few percent of batches.  ``dilate_loss`` reduces over the batch axis with
-  ``.mean()``, so a ``(0, H)`` input returns NaN with no exception and no shape
-  assert — and that NaN flows through the running totals and past
-  ``val_total < best_val_loss`` (False for NaN), ending a run with no best
-  checkpoint.
+``dilate_loss`` reduces with ``.mean()``, so an empty ``(0, H)`` bucket returns NaN
+with no exception, and NaN flows past ``val_total < best_val_loss``, ending the run
+with no best checkpoint.
 """
 
 import numpy as np
@@ -49,14 +37,9 @@ def _fan(B: int, M: int, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     return q_tau, median
 
 
-# ---------------------------------------------------------------------------
-# (3) Padded slots contribute exactly zero gradient.
-# ---------------------------------------------------------------------------
-
 def test_padded_slots_get_exactly_zero_gradient():
-    """With ``valid`` passed, ``q_tau.grad`` is EXACTLY 0.0 on every padded slot —
-    not small, zero — and dropping ``valid`` makes it non-zero, which is what gives
-    the assertion teeth."""
+    """Padded ``q_tau.grad`` is exactly 0.0, not small; dropping ``valid`` must make
+    it non-zero or the assertion has no teeth."""
     B, M = 6, MAX_MASKED_PATCHES
     valid = torch.zeros(B, M, dtype=torch.bool)
     n_valid = [4, 1, 8, 3, 2, 5]
@@ -79,9 +62,8 @@ def test_padded_slots_get_exactly_zero_gradient():
         "was dropped somewhere on the loss path")
     assert float(grad[valid].abs().max()) > 0.0, "valid slots must carry gradient"
 
-    # Teeth: the same call without ``valid`` supervises every slot.  ``mask_idx``
-    # goes with it — a padded row's index column is not ascending, and the loss
-    # asserts on that, which is itself a guard worth having.
+    # ``mask_idx`` goes with ``valid``: a padded row's index column is not ascending
+    # and the loss asserts on that
     q2, m2 = _fan(B, M, seed=2)
     total2, _ = risk_total_loss(q2, m2, true_bg, KendallGalWeighting())
     total2.backward()
@@ -89,8 +71,7 @@ def test_padded_slots_get_exactly_zero_gradient():
         "without ``valid`` the padded slots must be supervised — otherwise this "
         "test proves nothing")
 
-    # The pinball term alone: same statement, and its DENOMINATOR is the valid
-    # slot count, so zeroing the numerator is not enough.
+    # pinball's denominator is the valid slot count, so a zeroed numerator is not enough
     from utils import kovatchev_f_target
     y_risk = kovatchev_f_target(true_bg)
     q3, _ = _fan(B, M, seed=2)
@@ -112,14 +93,11 @@ def test_padded_slots_get_exactly_zero_gradient():
 
 
 def test_dense_defaults_reproduce_the_right_edge_case():
-    """``valid=None`` and ``mask_idx=None`` are the DENSE right-edge case.
+    """``valid=None`` and ``mask_idx=None`` are the dense right-edge case.
 
-    That default is why the eleven pre-existing loss call sites still hold: each
-    hands a ``(B, PREDICTION_PATCHES, S)`` block in which every slot is a real
-    masked patch of one contiguous span.  The default must therefore be exactly
-    equal to passing an all-True ``valid`` with the matching ascending
-    ``mask_idx`` — if it ever stops being, those call sites silently change
-    meaning rather than breaking."""
+    They must equal an all-True ``valid`` with the matching ascending ``mask_idx``,
+    or every default call site changes meaning instead of breaking.
+    """
     B, M = 4, PREDICTION_PATCHES
     true_bg = _targets(B, M, seed=5)
     valid = torch.ones(B, M, dtype=torch.bool)
@@ -149,13 +127,12 @@ def test_dense_defaults_reproduce_the_right_edge_case():
 
 
 def test_padded_slot_contents_do_not_move_the_loss():
-    """End-to-end through the model: perturbing what the PADDED slots carry — their
-    anchor and their target — leaves the loss and every parameter gradient
-    bit-identical.
+    """Moving a padded slot's anchor and target leaves the loss and every parameter
+    gradient bit-identical.
 
-    A padded slot's anchor must still be legal mg/dL (the forward's ``(B, M)``
-    units tripwire reads all ``M``), which is exactly why it looks plausible and
-    why nothing downstream would flag it being supervised."""
+    The forward's units tripwire reads all ``M``, so a padded anchor is legal mg/dL —
+    which is why nothing downstream would flag it being supervised.
+    """
     torch.manual_seed(0)
     model = T1DMAI().train()
     n_ctx = 12
@@ -193,17 +170,13 @@ def test_padded_slot_contents_do_not_move_the_loss():
           f"padded anchor/target ✓")
 
 
-# ---------------------------------------------------------------------------
-# (5) The two fixed protocols, through risk_total_loss.
-# ---------------------------------------------------------------------------
-
 def test_forecast_protocol_is_finite_with_three_empty_buckets():
-    """FORECAST protocol: one right-edge span of exactly ``PREDICTION_PATCHES``.
+    """One right-edge span of ``PREDICTION_PATCHES`` leaves buckets L = 1, 2, 3 empty
+    in every batch, permanently.
 
-    Buckets ``L = 1, 2, 3`` are empty in every batch — permanently, not by
-    chance — so this is the protocol that would return NaN if an empty bucket were
-    dispatched.  ``loss_D`` must equal the ``L = 4`` bucket's own value, and the
-    empty buckets must report zero spans rather than dropping out of the log."""
+    ``loss_D`` must equal the L = 4 bucket and the empty ones must report zero spans
+    rather than dropping out of the log.
+    """
     torch.manual_seed(0)
     model = T1DMAI().eval()
     B, n_ctx = 8, 16
@@ -237,12 +210,11 @@ def test_forecast_protocol_is_finite_with_three_empty_buckets():
 
 
 def test_infill_protocol_is_finite_including_empty_buckets():
-    """INFILL protocol: the sampler's own masked sets at ``B = 8``, over 24 batches.
+    """The sampler's own masked sets at B = 8: with ~2 spans per sample a length is
+    missing from all 8 rows in a few percent of batches.
 
-    Every total must be finite, empty buckets included — and empty buckets DO turn
-    up here: with ~2 spans per sample a length can be missing from all 8 rows in a
-    few percent of batches, which is exactly the case a span-count-weighted mean
-    cannot rescue (``0.0 * nan == nan``)."""
+    A span-count-weighted mean cannot rescue that — ``0.0 * nan == nan``.
+    """
     torch.manual_seed(0)
     model = T1DMAI().eval()
     rng = np.random.default_rng(7)
@@ -273,7 +245,7 @@ def test_infill_protocol_is_finite_including_empty_buckets():
             assert torch.isfinite(comps[f'loss_D_L{L}']), \
                 f"bucket L={L} ({c:.0f} spans) reported a non-finite loss"
         totals.append(float(total.detach()))
-        # Every masked patch of every row is supervised exactly once.
+        # every masked patch of every row is supervised exactly once
         assert float(comps['n_masked_mean']) == pytest.approx(
             sum(sum(L for _s, L in row) for row in spans_per_row) / B)
     print(f"\n[DUMP] infill protocol | {n_batches} batches at B={B}: all totals "

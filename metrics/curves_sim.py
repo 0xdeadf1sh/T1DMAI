@@ -1,17 +1,7 @@
-"""
-The 48 h BG day figures (2 h/8 h BG, conditioned) on fresh T1DMSIM patients
-(2 h/8 h BG, conditioned) on FRESH T1DMSIM patients.
+"""48 h BG day figures (2 h and 8 h forecasts, conditioned) on fresh T1DMSIM patients.
 
-No logged-event markers on the BG panels (the simulator's combined insulin has no
-discrete events).
-
-Risk-space redesign note: the model now outputs only a BG quantile forecast, so
-the former carb/insulin/IS/HGO channel panels (which overlaid the simulator's TRUE
-latents on the predicted dynamics channels) were DROPPED — those are no longer
-model outputs. The figure is BG-only.
-
-Reuses day_curves.plot_day + constants; the sim data bridge is metrics/sim/sim_data.py.
-Runs on the live best checkpoint. Writes metrics/sim/figures/sim_day{k}.png.
+No event markers — the simulator's combined insulin carries no discrete events.
+Reuses ``day_curves.plot_day``; sim bridge is metrics/sim/sim_data.py. Writes metrics/sim/figures/sim_day{k}.png.
 """
 from __future__ import annotations
 import os, sys
@@ -34,26 +24,22 @@ from day_curves import _pick_day_start
 from inference import predict, predict_rolling
 from utils import time_of_day_decode_bins
 
-# Like day_curves.py, every forecast here runs the FORECAST protocol and takes its
-# masked set from ``metrics.protocols`` rather than deriving a trailing zone from
-# position. ``hp // CV.PREDICTION_PATCHES`` below is how many such spans a tile
-# rolls through; past roll 0 the span's evidence is the previous roll's own
-# output. ``protocols`` carries the d rule and the pooling prohibition.
+# Every forecast runs the FORECAST protocol, masked set from ``metrics.protocols``.
+# ``hp // CV.PREDICTION_PATCHES`` is a tile's roll count; past roll 0 the evidence is the previous roll's output.
 N_DAYS = 10
 SEEDS = list(SD.TEST_SEEDS)[:14]          # held-out sim test patients (≥N_DAYS, one day each)
 
 
 def sim_bg_sigma(model, stats, runs, horizon_patches,
                  stride_steps=8 * CV.PATCH_SIZE, max_windows=200, report=None):
-    """Per-horizon-step ±1σ envelope over the sim cohort (curves.bg_sigma_real analogue).
-    Conditioned: each window announces its true future carbs/insulin/exercise."""
+    """Per-horizon-step ±1σ envelope, mg/dL; each window announces its true future carb/insulin/exercise."""
     H = horizon_patches * CV.PATCH_SIZE
     acc = {'se': np.zeros(H), 'n': np.zeros(H), 'count': 0}
     for pid, d in runs:
         if acc['count'] >= max_windows:
             break
         feats = SD.build_sim_feature_stack(d, stats)
-        # Error envelope is scored against the raw (bg-clamped) CGM (one space).
+        # scored against the raw bg-clamped CGM
         CV._sigma_accumulate(model, stats, feats, CV.smooth_bg_truth(d['bg_observed']),
                              horizon_patches, stride_steps, acc, max_windows,
                              report=report)
@@ -61,11 +47,10 @@ def sim_bg_sigma(model, stats, runs, horizon_patches,
 
 
 def sim_day_curves(model, stats, d, ds, pid, sig2=None, sig8=None):
-    """BG 2 h/8 h conditioned forecasts tiled across 48 h (events zeroed → no markers)."""
+    """BG 2 h/8 h conditioned forecasts tiled across 48 h; events zeroed, so no markers."""
     feats = SD.build_sim_feature_stack(d, stats)
     T = CV.DAY_PATCHES * CV.PATCH_SIZE
-    # The plotted "true CGM" the forecast is scored against is the raw (bg-clamped)
-    # CGM (one space).
+    # the plotted truth is the raw bg-clamped CGM
     cgm = CV.smooth_bg_truth(d['bg_observed'])
     hod0 = float(d['hour_of_day'][ds])
     hours = hod0 + np.arange(T) * (5.0 / 60.0)
@@ -108,17 +93,10 @@ def sim_day_curves(model, stats, d, ds, pid, sig2=None, sig8=None):
 
 
 def _attach_tod_probe(model, stats, feats, d, ds, spec):
-    """Populate the model's per-2h-tile time-of-day probe arrays into ``spec``.
+    """Per-2 h-tile time-of-day probe arrays into ``spec``, aligned with ``spec['tile2_h']``.
 
-    Runs a single ``model.forward(..., return_time=True)`` (via ``inference.predict``)
-    at each 2 h forecast origin, storing the per-patch ``(P, TIME_PROBE_N_BINS)``
-    softmax belief (``spec['tile2_time_probs']``, the native small-multiple clocks
-    ``curves.plot_day`` renders) plus the scalar origin hour decoded from the FIRST
-    MASKED patch's row (the forecast origin, under this protocol) vs the true
-    ``d['hour_of_day'][ts]`` and the confidence ``R``, aligned with the
-    ``spec['tile2_h']`` tile origins. Skipped entirely when ``TIME_PROBE_ENABLED`` is
-    off (the head is unbuilt and the forward yields no probe output) so a probe-off
-    checkpoint still renders — the renderer gates the clock overlay on key presence.
+    Per-patch ``(P, TIME_PROBE_N_BINS)`` softmax belief; the origin hour decodes the FIRST MASKED patch's row.
+    Under ``TIME_PROBE_ENABLED = False`` the keys stay absent and the renderer drops the clock overlay.
     """
     if not TIME_PROBE_ENABLED:
         return
@@ -128,10 +106,8 @@ def _attach_tod_probe(model, stats, feats, d, ds, spec):
     for c in range(CV.DAY_PATCHES // CV.PREDICTION_PATCHES):
         ts = ds + c * hsteps
         ctx = context_window(feats, ts, CV.MAX_CONTEXT_PATCHES)
-        # Announced, like every other forward on this page and like curves.py's
-        # own probe read-out: an un-announced maskable slot takes normalize(0),
-        # a legal "no event" value, so an unconditioned probe reads a regime the
-        # rest of the figure never runs.
+        # Announced, like every other forward here: an un-announced maskable slot takes
+        # normalize(0), a legal "no event", so the probe would read a regime the figure never runs.
         ov = _future_overrides(feats, ts, CV.ANNOUNCE)
         out = predict(model, ctx, normalization_stats=stats, overrides=ov,
                       return_time=True, mask_spans=ms.spans)
@@ -170,9 +146,7 @@ def main():
     report = PR.RunReport(label='curves_sim (T1DMSIM cohort)',
                           n_ctx=CV.MAX_CONTEXT_PATCHES)
     print(PR.context_note(CV.MAX_CONTEXT_PATCHES), flush=True)
-    # Kept/dropped "segments" (one per sim patient) and windows at the PINNED
-    # 24 h footprint — the same census every run prints, so a sim run and a
-    # real run are read on one axis.
+    # census at the PINNED 24 h footprint, so a sim run and a real run read on one axis
     print(report.census('t1dmsim', [len(d['bg_observed']) for _pid, d in runs],
                         stride_patches=8).format(), flush=True)
 

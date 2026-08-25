@@ -1,58 +1,42 @@
 #!/usr/bin/env python3
 """model_health.py — capacity / staleness audit of a trained T1DMAI checkpoint.
 
-Purpose
--------
-Inspect the best checkpoint in ``checkpoints/`` and decide, for every
-architecture knob that ``resize_model.py`` exposes, whether that part of the
-network is
+For every architecture knob ``resize_model.py`` exposes — ``D_MODEL``, ``N_LAYERS``,
+``N_HEADS``, ``FFN_DIM`` (``--ffn-mult``), ``BG_HEAD_HIDDEN`` (``--bg-head-hidden-mult``)
+and ``PATCH_SIZE`` — decide whether that part of the network is over-provisioned (low-rank
+weight maps, dead or ignored units, parameters whose optimizer state shows they never
+received gradient) and can be SHRUNK, or saturated (near-full-rank maps, no dead units,
+evenly used heads) and is a candidate to GROW. The report ends with a per-knob verdict
+table and the ``resize_model.py`` command that would enact each suggestion.
 
-  * **over-provisioned** — low-rank weight maps, dead/ignored units, or
-    parameters whose optimizer state shows they never received gradient — and
-    can be **shrunk** with little expected loss of quality, or
-  * **saturated** — near-full-rank maps, no dead units, evenly used heads — and
-    is a candidate to **grow** to lift quality.
+Every architecture dimension is derived from the CHECKPOINT's tensor shapes, not from the
+live ``config.py``, so the script audits whatever architecture produced the weights. The
+frozen input layout (``config.N_INPUT_FEATURES`` — the four normalized signal channels
+plus the ``bg_masked`` announcement bit) is the only structural assumption;
+``PATCH_SIZE`` is recovered from ``PATCH_DIM``.
 
-The knobs audited are ``D_MODEL``, ``N_LAYERS``, ``N_HEADS``, ``FFN_DIM``
-(``--ffn-mult``), ``BG_HEAD_HIDDEN`` (``--bg-head-hidden-mult``) and
-``PATCH_SIZE``, each a ``resize_model.py`` flag.  The report ends with a
-per-knob verdict table and the concrete ``resize_model.py`` command that would
-enact each suggestion.
+Signals, all data-free unless ``--data`` is passed:
 
-How it reads the model
-----------------------
-Every architecture dimension is **derived from the checkpoint's tensor shapes**
-(not from the live ``config.py``), so the script audits whatever architecture
-produced the weights — any configuration ``resize_model.py`` can emit.  The
-frozen input layout (``config.N_INPUT_FEATURES`` — the four normalized signal
-channels plus the ``bg_masked`` announcement bit) is the only structural
-assumption; ``PATCH_SIZE`` is recovered from ``PATCH_DIM``.
+  * Optimizer staleness. AdamW ``exp_avg_sq`` (1-D params) and Muon ``momentum_buffer``
+    (2-D weights) are EMAs of (squared) gradients, so a buffer at ~0 means the parameter
+    has stopped receiving gradient. State is mapped back to parameter names by replaying
+    ``train._build_optimizers``' ndim partition over ``model.named_parameters()`` order.
+  * Drift from init. Each weight's std against the analytic init std of
+    ``model._init_weights`` (width-aware ``base_std``, the residual rescale, the tiny
+    BG-head-final scale); a ratio near 1.0 means the tensor barely moved. Norm weights
+    against their 1.0 init, biases against 0.
+  * Spectral capacity. Per weight matrix: stable rank ``‖W‖_F²/σ_max²`` and entropy
+    effective rank ``exp(H(σ/Σσ))``, each over ``min(in, out)`` as the map's rank
+    utilization. Low ⇒ shrinkable.
+  * Per-unit usage. FFN hidden units, BG-head hidden units and attention heads scored by
+    their in/out weight-norm product; units far below the median are ignored and inflate
+    the corresponding width.
 
-Signals (all data-free unless ``--data`` is passed)
----------------------------------------------------
-  * **Optimizer staleness.**  AdamW ``exp_avg_sq`` (1-D params) and Muon
-    ``momentum_buffer`` (2-D weights) are EMAs of (squared) gradients.  A
-    parameter whose buffer is ~0 has effectively stopped receiving gradient —
-    it is stale/dead.  Optimizer state is mapped back to parameter names by
-    replaying ``train._build_optimizers``' ndim partition over
-    ``model.named_parameters()`` order.
-  * **Drift from init.**  Each weight's std is compared to the analytic init std
-    of ``model._init_weights`` (width-aware ``base_std``, the residual rescale,
-    the tiny BG-head-final scale); a ratio near 1.0 means the tensor barely
-    moved.  Norm weights are compared to their 1.0 init, biases to 0.
-  * **Spectral capacity.**  Per weight matrix: stable rank
-    ``‖W‖_F²/σ_max²`` and entropy effective rank ``exp(H(σ/Σσ))``; their ratio
-    to ``min(in, out)`` is the map's rank utilization.  Low ⇒ shrinkable.
-  * **Per-unit usage.**  FFN hidden units, BG-head hidden units, and attention
-    heads are scored by their in/out weight-norm product; units far below the
-    median are "ignored" and inflate the corresponding width.
-
-With ``--data N`` the script additionally streams ``N`` cached simulator
-samples through the model with forward hooks and measures *activation* dead
-fractions (FFN / BG-head units that fire ~never), residual-stream per-dimension
-variance, and per-head output-activation norm — corroborating the weight-only
-verdicts with the model's actual behaviour.  Those samples are built under the
-checkpoint's own ``masked_channel_policy``, which the report header echoes.
+``--data N`` additionally streams ``N`` cached simulator samples through the model with
+forward hooks and measures ACTIVATION dead fractions (units that fire ~never),
+residual-stream per-dimension variance and per-head output-activation norm, corroborating
+the weight-only verdicts. Those samples are built under the CHECKPOINT's own
+``masked_channel_policy``, which the report header echoes.
 
 Usage::
 
@@ -63,10 +47,9 @@ Usage::
     python model_health.py --json out.json       # also dump machine-readable findings
     python model_health.py --top 40              # list more rows in the per-param table
 
-The verdicts are heuristic capacity signals, not guarantees: a SHRINK means the
-evidence says the width is underused at this checkpoint, not that quality is
-provably invariant to the cut.  Re-run after retraining; treat them as a guide
-for the next ``resize_model.py`` sweep.
+The verdicts are heuristic capacity signals, not guarantees: a SHRINK means the evidence
+says the width is underused at this checkpoint, not that quality is provably invariant to
+the cut.
 """
 from __future__ import annotations
 
@@ -81,24 +64,20 @@ import numpy as np
 import torch
 
 from config import N_INPUT_FEATURES
-# The bg_masked column index, from its single definition.  ``data`` imports torch,
-# config and normalization and nothing heavier — blosc2 and T1DMSIM are pulled in
-# lazily, inside the cache reader — so this stays on the data-free path.
+# The bg_masked column index, from its single definition. ``data`` pulls blosc2 and
+# T1DMSIM in lazily, inside the cache reader, so this stays on the data-free path.
 from data import (
     BG_MASKED_FEAT, MASKED_CHANNEL_POLICY_BLIND, checkpoint_masked_channel_policy,
 )
 
 
-# ---------------------------------------------------------------------------
-# Frozen structural assumptions (see CLAUDE.md "FROZEN index map") and the init
-# scheme of model._init_weights.  These are NOT resize knobs; PATCH_SIZE is the
-# only patch-layout quantity resize_model.py changes, and it multiplies
-# N_INPUT_FEATURES.
-# ---------------------------------------------------------------------------
-# model._init_weights: base_std = 0.02 * sqrt(512 / D_MODEL); residual-branch
-# output projections (attn.w_o, ffn.w2) use base_std / sqrt(2 * N_LAYERS); the
-# BG-head final layer uses BG_HEAD_INIT_SCALE.  Mirror them so the drift metric
-# can reconstruct the init std without re-seeding.
+# Frozen structural assumptions (CLAUDE.md "FROZEN index map") and the init scheme of
+# model._init_weights. NOT resize knobs: PATCH_SIZE is the only patch-layout quantity
+# resize_model.py changes, and it multiplies N_INPUT_FEATURES.
+# model._init_weights: base_std = 0.02 * sqrt(512 / D_MODEL); residual-branch output
+# projections (attn.w_o, ffn.w2) use base_std / sqrt(2 * N_LAYERS); the BG-head final
+# layer uses BG_HEAD_INIT_SCALE. Mirrored here so the drift metric can reconstruct the
+# init std without re-seeding.
 INIT_BASE_STD_ANCHOR = 0.02
 INIT_BASE_STD_ANCHOR_DMODEL = 512.0
 RESIDUAL_WRITES_PER_BLOCK = 2     # attn out + ffn out
@@ -106,9 +85,7 @@ DEFAULT_BG_HEAD_INIT_SCALE = 1e-2
 DEFAULT_N_SPREADS = 3
 VALID_HEAD_DIMS = (16, 32, 64, 128)
 
-# ---------------------------------------------------------------------------
-# Verdict thresholds (heuristic).  Tunable; printed in the report header.
-# ---------------------------------------------------------------------------
+# Verdict thresholds (heuristic). Tunable; printed in the report header.
 RANK_UTIL_SHRINK = 0.50          # mean rank-utilization below this ⇒ width over-provisioned
 RANK_UTIL_GROW = 0.85            # rank-utilization above this (flat spectrum) ⇒ saturated
 ACTIVE_FRAC_SHRINK = 0.65        # fraction of live units below this ⇒ shrink the width
@@ -121,9 +98,6 @@ DRIFT_NEAR_INIT = 0.08           # |std/init_std - 1| below this ⇒ "near-init"
 TAIL_REL = 0.01                  # singular values below 1% of σ_max counted as spectral tail
 
 
-# ===========================================================================
-# Architecture, derived purely from the checkpoint
-# ===========================================================================
 @dataclass
 class Arch:
     """Architecture dimensions recovered from the model state-dict shapes."""
@@ -149,14 +123,7 @@ class Arch:
 
 
 def derive_arch(sd: dict[str, torch.Tensor]) -> Arch:
-    """Recover every architecture dimension from state-dict tensor shapes.
-
-    Args:
-        sd: model state dict (name -> tensor).
-
-    Returns:
-        Arch with all dimensions; cross-checked for internal consistency.
-    """
+    """Every architecture dimension recovered from state-dict shapes, cross-checked."""
     d_model, patch_dim = sd['patch_embed.weight'].shape
     block_ids = sorted({int(k.split('.')[1]) for k in sd if k.startswith('blocks.')})
     n_layers = len(block_ids)
@@ -176,17 +143,17 @@ def derive_arch(sd: dict[str, torch.Tensor]) -> Arch:
     bg_head_hidden = sd[bg_linears[0]].shape[0]
     head_out_width = sd[bg_linears[-1]].shape[0]
 
-    # PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES, step-major.  The last feature is
-    # the per-patch ``bg_masked`` bit, written into all PATCH_SIZE of its columns,
-    # so it occupies a whole feature slot of the layout and this division holds.
+    # PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES, step-major. The last feature is the
+    # per-patch bg_masked bit, written into all PATCH_SIZE of its columns, so it occupies
+    # a whole feature slot of the layout and this division holds.
     assert patch_dim % N_INPUT_FEATURES == 0, (
         f"PATCH_DIM={patch_dim} inconsistent with the frozen "
         f"{N_INPUT_FEATURES}-feature layout"
     )
     patch_size = patch_dim // N_INPUT_FEATURES
-    # The smooth-basis BG head's final Linear emits BG_HEAD_STEP_BASIS_DIM (=K)
-    # coefficients per output channel, expanded across the within-patch steps by a
-    # fixed basis: head_out_width = K * (1 + 2*N_SPREADS) — NOT PATCH_SIZE * (...).
+    # The smooth-basis BG head's final Linear emits K = BG_HEAD_STEP_BASIS_DIM
+    # coefficients per output channel: head_out_width = K * (1 + 2*N_SPREADS), NOT
+    # PATCH_SIZE * (...).
     import config as _cfg
     k_basis = _cfg.BG_HEAD_STEP_BASIS_DIM
     assert head_out_width % k_basis == 0, (
@@ -206,9 +173,6 @@ def derive_arch(sd: dict[str, torch.Tensor]) -> Arch:
     )
 
 
-# ===========================================================================
-# Checkpoint loading & optimizer-state mapping
-# ===========================================================================
 def find_best_checkpoint(ckpt_dir: Path) -> Path:
     """Pick the 'best' checkpoint: prefer t1dmai_best.pt, then latest step."""
     p = ckpt_dir / 't1dmai_best.pt'
@@ -224,21 +188,15 @@ def find_best_checkpoint(ckpt_dir: Path) -> Path:
 def map_optimizer_activity(
     sd: dict[str, torch.Tensor], ckpt: dict[str, Any],
 ) -> dict[str, dict[str, float]]:
-    """Map each parameter name to its optimizer-state gradient-activity scalars.
+    """Each parameter name mapped to its optimizer-state gradient-activity scalars.
 
-    Replays ``train._build_optimizers``' partition (ndim>=2 -> Muon, else AdamW)
-    over ``named_parameters()`` order, which equals the construction order, then
-    zips it against ``param_groups[*]['params']`` (the same order PyTorch used to
-    key the saved ``state`` dict).
+    Replays ``train._build_optimizers``' partition (ndim>=2 → Muon, else AdamW) over
+    ``named_parameters()`` order, which equals construction order, then zips it against
+    ``param_groups[*]['params']`` — the same order PyTorch used to key the saved ``state``.
 
-    Args:
-        sd: model state dict (gives names + ndim, in order).
-        ckpt: full checkpoint dict (gives the two optimizer state dicts).
-
-    Returns:
-        name -> {'opt', 'activity', 'first_moment', 'step'}.  ``activity`` is the
-        RMS of exp_avg_sq (AdamW) or of the momentum buffer (Muon): the historical
-        gradient energy reaching that parameter.  Empty if no optimizer state.
+    Returns name → {'opt', 'activity', 'first_moment', 'step'}. ``activity`` is the RMS of
+    ``exp_avg_sq`` (AdamW) or of the momentum buffer (Muon): the historical gradient energy
+    reaching that parameter. Empty when there is no optimizer state.
     """
     out: dict[str, dict[str, float]] = {}
     names = list(sd.keys())
@@ -277,21 +235,11 @@ def map_optimizer_activity(
     return out
 
 
-# ===========================================================================
-# Init-std reconstruction (for the drift-from-init signal)
-# ===========================================================================
 def init_std_for(name: str, arch: Arch, bg_head_init_scale: float) -> tuple[str, float]:
-    """Return (kind, expected_init_std) for a parameter, mirroring model._init_weights.
+    """``(kind, expected_init_std)`` for a parameter, mirroring ``model._init_weights``.
 
-    Args:
-        name: parameter name.
-        arch: derived architecture.
-        bg_head_init_scale: BG_HEAD_INIT_SCALE (final-layer std).
-
-    Returns:
-        (kind, init_std).  kind in {'linear', 'residual', 'head_final', 'norm',
-        'bias'}; init_std is the std of the init distribution (NaN for
-        kinds with a non-Gaussian reference handled separately).
+    kind is one of 'linear', 'residual', 'head_final', 'norm', 'bias'. ``init_std`` is NaN
+    for kinds whose reference is not Gaussian and is handled separately.
     """
     base_std = INIT_BASE_STD_ANCHOR * math.sqrt(INIT_BASE_STD_ANCHOR_DMODEL / arch.d_model)
     residual_std = base_std / math.sqrt(RESIDUAL_WRITES_PER_BLOCK * arch.n_layers)
@@ -309,18 +257,11 @@ def init_std_for(name: str, arch: Arch, bg_head_init_scale: float) -> tuple[str,
     return 'other', float('nan')
 
 
-# ===========================================================================
-# Spectral analysis
-# ===========================================================================
 def spectral(W: np.ndarray) -> dict[str, float]:
-    """Singular-value capacity metrics for a 2-D weight matrix.
+    """Singular-value capacity metrics for a ``(out, in)`` weight matrix.
 
-    Args:
-        W: (out, in) weight matrix.
-
-    Returns:
-        dict with stable_rank, eff_rank (entropy), util (eff_rank / min(out,in)),
-        tail_frac (fraction of σ below TAIL_REL·σ_max), and sigma_max.
+    stable_rank, eff_rank (entropy), util = eff_rank / min(out, in), tail_frac (fraction of
+    σ below ``TAIL_REL``·σ_max), and sigma_max.
     """
     s = np.linalg.svd(W.astype(np.float64), compute_uv=False)
     s = s[s > 0]
@@ -347,13 +288,9 @@ def row_norms(W: np.ndarray) -> np.ndarray:
 
 
 def active_fraction(strength: np.ndarray) -> tuple[int, float]:
-    """Count units whose strength clears DEAD_UNIT_REL × median(strength).
+    """``(n_active, active_fraction)`` for units clearing ``DEAD_UNIT_REL`` × median.
 
-    Args:
-        strength: per-unit non-negative strength scores.
-
-    Returns:
-        (n_active, active_fraction).
+    ``strength`` is a per-unit non-negative score.
     """
     med = float(np.median(strength))
     if med <= 0:
@@ -366,9 +303,6 @@ def active_fraction(strength: np.ndarray) -> tuple[int, float]:
     return n, n / strength.size
 
 
-# ===========================================================================
-# Per-parameter health table
-# ===========================================================================
 @dataclass
 class ParamRow:
     name: str
@@ -417,9 +351,9 @@ def analyze_params(
             o, act = info['opt'], info['activity']
             rel = act / med[o] if med[o] > 0 else float('inf')
             stale = (act < STALE_OPT_ABS) or (rel < STALE_OPT_REL)
-            # "near-init" only signals *untrained* when the optimizer also shows
-            # little gradient energy; a high-activity tensor whose std merely sits
-            # near init is trained, not stale (e.g. a matrix that rotated in place).
+            # "near-init" signals UNTRAINED only when the optimizer also shows little
+            # gradient energy: a high-activity tensor sitting near init has rotated in
+            # place, not stalled.
             near = near and rel < 0.5
         else:
             o, act, rel, stale = '-', float('nan'), float('nan'), False
@@ -432,9 +366,6 @@ def analyze_params(
     return rows
 
 
-# ===========================================================================
-# Per-knob capacity verdicts
-# ===========================================================================
 @dataclass
 class Verdict:
     knob: str
@@ -459,19 +390,12 @@ def _suggest_heads(arch: Arch, grow: bool) -> tuple[int, str]:
 
 
 def _suggest_dmodel(arch: Arch, new_d: int) -> str:
-    """Build a VALID ``--d-model`` command for a target width.
+    """A VALID ``--d-model`` flag string for a target width, or '' if none exists.
 
     resize_model.py requires ``D_MODEL % N_HEADS == 0`` and
-    ``D_MODEL // N_HEADS ∈ VALID_HEAD_DIMS``.  Keep the current N_HEADS if the
-    resulting head_dim is valid; otherwise keep the current HEAD_DIM by setting
-    N_HEADS = new_d // head_dim.  Returns '' if no valid pairing exists.
-
-    Args:
-        arch: derived architecture.
-        new_d: target D_MODEL.
-
-    Returns:
-        a resize_model.py flag string (e.g. '--d-model 128 --heads 8'), or ''.
+    ``D_MODEL // N_HEADS ∈ VALID_HEAD_DIMS``. Keeps the current N_HEADS when the resulting
+    head_dim is valid, otherwise keeps the current HEAD_DIM by setting
+    ``N_HEADS = new_d // head_dim``.
     """
     if new_d <= 0:
         return ''
@@ -516,12 +440,11 @@ def build_verdicts(
     verdicts: list[Verdict] = []
     spectra: dict[str, dict[str, float]] = {}
 
-    # Global training-progress gate.  Random init is *full rank*, so a barely
-    # trained checkpoint shows high rank-utilization that would masquerade as
-    # "saturated → GROW".  If the main weight matrices have barely moved from
-    # init (median |std/init_std - 1| below the near-init band) the checkpoint
-    # is undertrained and its capacity verdicts are meaningless — flag it and
-    # suppress the resize advice below.
+    # Training-progress gate. Random init is FULL RANK, so a barely trained checkpoint
+    # shows high rank-utilization that would masquerade as "saturated → GROW". When the
+    # main weight matrices have barely moved from init (median |std/init_std - 1| below
+    # DRIFT_NEAR_INIT) the capacity verdicts are meaningless — flag it and suppress the
+    # resize advice below.
     main_drifts = [abs(r.drift - 1.0) for r in rows
                    if r.kind in ('linear', 'residual', 'head_final') and not math.isnan(r.drift)]
     undertrained = bool(main_drifts) and float(np.median(main_drifts)) < DRIFT_NEAR_INIT
@@ -534,7 +457,7 @@ def build_verdicts(
     L = arch.n_layers
     hd = arch.head_dim
 
-    # ---- D_MODEL: mean rank-utilization across every D×D map + the embed/head. ----
+    # D_MODEL: mean rank-utilization across every D×D map plus the embed/head.
     dmodel_maps = ['patch_embed.weight']
     for i in range(L):
         dmodel_maps += [f'blocks.{i}.attn.w_q.weight', f'blocks.{i}.attn.w_k.weight',
@@ -544,9 +467,9 @@ def build_verdicts(
     dmodel_maps.append(arch.bg_head_linears[0])
     utils_dm = [spec(m)['util'] for m in dmodel_maps]
     mean_util_dm = float(np.mean(utils_dm))
-    # Residual-dimension liveness (basis-dependent; corroborating only): a dim is
-    # live if it is both written (rows of out=D_MODEL maps) and read (cols of
-    # in=D_MODEL maps) above the dead floor.
+    # Residual-dimension liveness (basis-dependent, corroborating only): a dim is live if
+    # it is both written (rows of out=D_MODEL maps) and read (cols of in=D_MODEL maps)
+    # above the dead floor.
     write = row_norms(np_sd['patch_embed.weight']).copy()
     read = np.zeros(arch.d_model)
     for i in range(L):
@@ -567,7 +490,7 @@ def build_verdicts(
                 'per_map_util': dict(zip(dmodel_maps, utils_dm))}
     verdicts.append(v)
 
-    # ---- N_LAYERS: depth. Per-block residual write strength relative to init. ----
+    # N_LAYERS: depth. Per-block residual write strength relative to init.
     base_std = INIT_BASE_STD_ANCHOR * math.sqrt(INIT_BASE_STD_ANCHOR_DMODEL / arch.d_model)
     residual_std = base_std / math.sqrt(RESIDUAL_WRITES_PER_BLOCK * L)
     block_writes = []
@@ -602,7 +525,7 @@ def build_verdicts(
         verdicts.append(Verdict('N_LAYERS', str(L), verd, sig, sug,
                                 {'block_write_ratio': block_writes, 'block_util': block_utils}))
 
-    # ---- N_HEADS: per-head value×output pathway strength. ----
+    # N_HEADS: per-head value×output pathway strength.
     head_strength = np.zeros(arch.n_heads)
     head_detail = []
     for i in range(L):
@@ -618,10 +541,10 @@ def build_verdicts(
     _, sug_grow = _suggest_heads(arch, grow=True)
     da = f', data-active {data_heads:.0%}' if data_heads is not None else ''
     sig = f'{len(underused)}/{arch.n_heads} heads underused (<{HEAD_UNDERUSE_REL:.0%} median){da}'
-    # Heads are ~param-neutral, so be conservative: SHRINK only when a real
-    # fraction is underused.  Never GROW on weight evidence alone (full-rank
-    # head subspaces are not evidence that *more* heads would help); only when
-    # the data pass shows every head saturated and head_dim has room to split.
+    # Heads are ~param-neutral, so SHRINK only when a real fraction is underused. Never
+    # GROW on weight evidence alone — a full-rank head subspace is no evidence that MORE
+    # heads would help — only when the data pass shows every head saturated and head_dim
+    # has room to split.
     if len(underused) >= max(1, arch.n_heads // 4) and sug_shrink:
         verd, sug = 'SHRINK', sug_shrink
     elif (data_heads is not None and data_heads >= 0.999 and not underused
@@ -633,7 +556,7 @@ def build_verdicts(
                             {'head_strength': head_strength.tolist(),
                              'underused_heads': underused}))
 
-    # ---- FFN_DIM: hidden-unit usage (in/out weight-norm product) + rank-util. ----
+    # FFN_DIM: hidden-unit usage (in/out weight-norm product) plus rank-util.
     ffn_strength = np.zeros(arch.ffn_dim)
     ffn_util = []
     for i in range(L):
@@ -660,7 +583,7 @@ def build_verdicts(
                 'active_frac': frac_act}
     verdicts.append(v)
 
-    # ---- BG_HEAD_HIDDEN: both hidden layers (final layer is tiny-init by design). ----
+    # BG_HEAD_HIDDEN: both hidden layers (the final layer is tiny-init by design).
     # layer0 hidden = out of bg_head.0, consumed by bg_head.2 columns.
     # layer1 hidden = out of bg_head.2, consumed by bg_head.4 columns.
     bl = arch.bg_head_linears
@@ -692,17 +615,16 @@ def build_verdicts(
     v.detail = {'per_layer_active': [a[0] for a in layer_active], 'mean_util': float(np.mean(bg_util))}
     verdicts.append(v)
 
-    # ---- PATCH_SIZE: structural; report patch-embed input-column usage only. ----
+    # PATCH_SIZE: structural; report patch-embed input-column usage only.
     pe = np_sd['patch_embed.weight']                       # (D, PATCH_DIM)
     in_use = col_norms(pe)
-    # The row is step-major, so feature f occupies columns f::N_INPUT_FEATURES.
-    # The last feature is the ``bg_masked`` announcement bit, held at one value for
-    # the whole patch and therefore written into all PATCH_SIZE of its columns.
-    # Those columns are a repeated indicator, not a normalized signal: the embedding
-    # only ever sees their SUM, so an individual column norm says nothing about
-    # whether the bit is used, and pooling them with the signal columns moves the
-    # median the deadness test is taken against.  Score the signal columns, and
-    # report the bit's summed contribution beside them.
+    # The row is step-major, so feature f occupies columns f::N_INPUT_FEATURES. The last
+    # feature is the bg_masked announcement bit, held at one value for the whole patch and
+    # therefore written into all PATCH_SIZE of its columns. Those columns are a repeated
+    # indicator, not a normalized signal: the embedding only ever sees their SUM, so an
+    # individual column norm says nothing about whether the bit is used, and pooling them
+    # with the signal columns moves the median the deadness test is taken against. Score
+    # the signal columns, and report the bit's summed contribution beside them.
     n_feat_cols = arch.patch_size * N_INPUT_FEATURES
     mask_bit_cols = np.arange(BG_MASKED_FEAT, n_feat_cols, N_INPUT_FEATURES)
     signal_cols = np.setdiff1d(np.arange(n_feat_cols), mask_bit_cols)
@@ -718,9 +640,8 @@ def build_verdicts(
                             {'dead_feature_cols': dead_feat,
                              'bg_masked_rel_weight': bit_rel}))
 
-    # Apply the undertrained guard: a near-init checkpoint yields no trustworthy
-    # capacity advice, so neutralize every SHRINK/GROW to KEEP (the NOTE knobs
-    # stay) and let the report banner explain why.
+    # A near-init checkpoint yields no trustworthy capacity advice, so neutralize every
+    # SHRINK/GROW to KEEP (the NOTE knobs stay) and let the report banner explain why.
     if undertrained:
         for v in verdicts:
             if v.verdict in ('SHRINK', 'GROW'):
@@ -731,30 +652,19 @@ def build_verdicts(
     return verdicts, {'spectra': spectra, 'undertrained': undertrained}
 
 
-# ===========================================================================
-# Optional data-driven activation pass
-# ===========================================================================
 def run_data_pass(
     arch: Arch, ckpt: dict[str, Any], state_dict: dict[str, torch.Tensor],
     n_samples: int, device: torch.device,
 ) -> dict[str, Any] | None:
     """Stream cached samples through the model and measure activation liveness.
 
-    Patches the in-process ``config`` to the checkpoint's dims (so ``model``
-    binds them), builds ``T1DMAI``, loads ``state_dict``, registers forward
-    hooks, and runs ``n_samples`` cached simulator samples.  Returns activation
-    dead-fraction summaries, or ``None`` if the cache/model is unavailable (the
-    caller continues with the data-free report).
+    Patches the in-process ``config`` to the checkpoint's dims (so ``model`` binds them),
+    builds ``T1DMAI``, loads ``state_dict``, registers forward hooks and runs ``n_samples``
+    cached simulator samples. Returns activation dead-fraction summaries, or ``None`` when
+    the cache or model is unavailable — the caller then continues with the data-free
+    report.
 
-    Args:
-        arch: derived architecture.
-        ckpt: full checkpoint (for cache_path, master_seed, normalization_stats).
-        state_dict: weights to load (live or EMA).
-        n_samples: number of cached samples to stream.
-        device: torch device.
-
-    Returns:
-        dict of data-driven summaries, or None on failure.
+    ``ckpt`` supplies cache_path, master_seed and normalization_stats.
     """
     import sys
     try:
@@ -770,18 +680,18 @@ def run_data_pass(
         config.PATCH_DIM = arch.patch_dim
         pph = 60 // (arch.patch_size * 5)
         config._PATCHES_PER_HOUR = pph
-        # PREDICTION_PATCHES no longer names a prediction ZONE — the supervised set
-        # is the sampled masked set.  What it still fixes is the WINDOW length the
-        # sampler places spans in (``collate_fn`` builds T = n_ctx +
-        # PREDICTION_PATCHES), so it stays derived from the checkpoint's patch size.
+        # PREDICTION_PATCHES names no prediction ZONE — the supervised set is the sampled
+        # masked set. What it still fixes is the WINDOW length the sampler places spans in
+        # (``collate_fn`` builds T = n_ctx + PREDICTION_PATCHES), so it stays derived from
+        # the checkpoint's patch size.
         config.PREDICTION_PATCHES = config.PREDICTION_HORIZON_HOURS * pph
         config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
         config.NIGHT_LONG_HORIZON_PATCHES = config.NIGHT_LONG_HORIZON_HOURS * pph
-        # MAX_MASKED_PATCHES (M, the head's slot count) is deliberately NOT rewritten
-        # from the checkpoint: no parameter of the model is shaped by it — the BG head
-        # emits K*(1+2*N_SPREADS) per slot and M is a runtime shape carried by
-        # ``mask_idx`` — so a checkpoint trained at a different M streams here
-        # unchanged, and no tensor shape could reveal the difference.
+        # MAX_MASKED_PATCHES (M, the head's slot count) is deliberately NOT rewritten from
+        # the checkpoint: no parameter of the model is shaped by it — the BG head emits
+        # K*(1+2*N_SPREADS) per slot and M is a runtime shape carried by ``mask_idx`` — so
+        # a checkpoint trained at a different M streams here unchanged, and no tensor shape
+        # could reveal the difference.
         sys.modules.pop('model', None)
         from model import T1DMAI
         from data import T1DMDataset, collate_fn
@@ -794,11 +704,11 @@ def run_data_pass(
         if not Path(cache_path, 'meta.json').exists():
             print(f"[data] cache {cache_path!r} unavailable — skipping data pass")
             return None
-        # The masked-channel policy is the CHECKPOINT's, not this script's: a
-        # blind checkpoint streamed through an announced dataset reads a dose
-        # channel it was trained to see pinned at the no-dose fill, and every
-        # activation figure below is then measured off-distribution.  No
-        # parameter shape records the policy, so nothing else would catch it.
+        # The masked-channel policy is the CHECKPOINT's, not this script's: a blind
+        # checkpoint streamed through an announced dataset reads a dose channel it was
+        # trained to see pinned at the no-dose fill, and every activation figure below is
+        # then measured off-distribution. No parameter shape records the policy, so nothing
+        # else would catch it.
         policy = checkpoint_masked_channel_policy(ckpt)
         ds = T1DMDataset(
             master_seed=int(ckpt.get('master_seed', 0)),
@@ -811,7 +721,7 @@ def run_data_pass(
         print(f"[data] could not initialize data pass: {type(e).__name__}: {e}")
         return None
 
-    # --- accumulators (per-unit mean |activation| over all tokens) ---
+    # Accumulators: per-unit mean |activation| over all tokens.
     acc: dict[str, np.ndarray] = {}
     cnt: dict[str, int] = {}
 
@@ -863,14 +773,11 @@ def run_data_pass(
                 batch = collate_fn([ds[i]])
                 patches = batch['patches'].to(device)
                 attn_mask = batch['attn_mask'].to(device)
-                # The supervised set is the sampled masked set, not a trailing
-                # slice: the head gathers ``mask_idx`` (already rebased onto the
-                # padded patch axis by ``collate_fn``) and anchors each slot on its
-                # own ``anchor_bg``.  Both are (B, M) and both come from
-                # ``bg_formula_data``; the broadcast per-sample ``last_bg`` scalar
-                # is not the anchor any more.  Padded slots gather patch 0 and
-                # carry a legal mg/dL anchor, so the units tripwire over all M
-                # passes — this pass reads activations, so nothing discards them.
+                # The supervised set is the sampled masked set, not a trailing slice: the
+                # head gathers ``mask_idx`` (rebased onto the padded patch axis by
+                # ``collate_fn``) and anchors each slot on its own ``anchor_bg``, both
+                # (B, M) and both from ``bg_formula_data``. Padded slots gather patch 0 and
+                # carry a legal mg/dL anchor, so the units tripwire over all M passes.
                 bgf = batch['bg_formula_data']
                 anchor_bg = bgf['anchor_bg'].float().to(device)     # (B, M) mg/dL
                 mask_idx = bgf['mask_idx'].long().to(device)        # (B, M)
@@ -911,9 +818,6 @@ def run_data_pass(
     return out
 
 
-# ===========================================================================
-# Reporting
-# ===========================================================================
 def hr(c: str = '─', n: int = 88) -> str:
     return c * n
 
@@ -940,7 +844,7 @@ def print_report(
     print("  arch: " + "  ".join(f"{k}={v}" for k, v in av.items())
           + f"  N_SPREADS={arch.n_spreads}")
 
-    # ---- per-param health ----
+    # Per-param health.
     print()
     print(hr())
     print("  PARAMETER HEALTH  (drift = std/init_std; opt-act = √mean optimizer 2nd-moment; "
@@ -971,7 +875,7 @@ def print_report(
     print(f"  → {n_stale} stale parameter tensor(s), {n_near} near-init "
           f"(of {len(rows)} total)")
 
-    # ---- spectral table ----
+    # Spectral table.
     print()
     print(hr())
     print("  SPECTRAL CAPACITY  (util = eff_rank / min(in,out); low ⇒ over-provisioned)")
@@ -984,7 +888,7 @@ def print_report(
         print(f"  {name:32s} {str(sh):>13s} {s['stable_rank']:>10.1f} "
               f"{s['eff_rank']:>9.1f} {s['util']:>6.2f} {s['tail_frac'] * 100:>5.0f}%")
 
-    # ---- data summary ----
+    # Data summary.
     if data:
         print()
         print(hr())
@@ -997,7 +901,7 @@ def print_report(
             if k in data:
                 print(f"  {label:36s} {data[k]:.0%}")
 
-    # ---- verdicts ----
+    # Verdicts.
     print()
     print(hr('═'))
     print("  CAPACITY VERDICTS  (resize_model.py knobs)")
@@ -1024,9 +928,6 @@ def print_report(
     print(hr('═'))
 
 
-# ===========================================================================
-# Main
-# ===========================================================================
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Audit a T1DMAI checkpoint for under-/over-provisioned parts.",

@@ -1,24 +1,14 @@
-"""The DTS Error Grid, pinned against the coordinates its paper publishes.
+"""The DTS Error Grid against the coordinates its own paper publishes.
 
-``dts_grid`` implements the closed-form risk function of Klonoff et al. 2024
-(J Diabetes Sci Technol 18(6):1346-1361). The paper ALSO publishes a table of
-border vertices for drawing the grid, and that table is an independent statement
-of the same geometry — so it is the oracle here. Every one of the 16 edge
-vertices of Table A1 is checked against the function.
+Closed-form risk of Klonoff et al. 2024, J Diabetes Sci Technol 18(6):1346-1361.
+Table A1's 16 border vertices are an independent statement of the same geometry, so
+they are the oracle. They agree to 1.11 mg/dL, not exactly — consistent with the
+paper's rounded coefficients, and largest on the vertical below-clamp segments where
+the border is a chord of nothing, so not a drawing artefact. A wrong coefficient, a
+dropped clamp or a transposed axis moves a vertex by tens of mg/dL.
 
-They agree to 1.11 mg/dL, not exactly. The gap is largest on the VERTICAL
-below-clamp segments, where the border is not a chord of anything, so it is not a
-drawing artefact; it is consistent with the paper's coefficients being rounded
-("after rounding and simplification", Appendix 2) while Table A1 was drawn from
-the unrounded fit. Either way it is a property of the table rather than of the
-implementation. ``VERTEX_TOL_MGDL`` is set just above the worst observed gap and
-is deliberately tight enough that a wrong coefficient, a dropped clamp or a
-transposed axis fails it — each of those moves a vertex by tens of mg/dL.
-
-The 50 mg/dL clamp is the one part of ``dts_grid`` that is a reading of the
-paper's prose rather than of its formula (see that module's docstring). It is
-also the part these vertices constrain hardest: eight of the sixteen are the flat
-and vertical border segments that exist ONLY under the clamp.
+The 50 mg/dL clamp is read off the paper's prose rather than its formula, and eight
+of the sixteen vertices exist only under it.
 """
 
 import numpy as np
@@ -30,18 +20,12 @@ from dts_grid import (
     dts_zones,
 )
 
-# Table A1, "Coordinates (Reference/Monitor) of the Lines Defining the Zones of
-# the DTS Error Grid", Supplemental Appendix 2. Each border is a 3-point
-# polyline; the two ENDPOINTS of each are what pin the geometry, so the middle
-# point (the corner, at the clamp) is implied by the pair.
-#
-# LOWER borders run below the line of identity (monitor under-reads), UPPER above
-# it. The zone each border bounds is the one INSIDE it: the B lines are the A|B
-# border, so zone A is what they enclose.
-#
-# NOTE the published supplement labels the E rows "D Lower"/"D Upper" — a
-# copy-paste slip in the table's sub-headers, not in the coordinates: these sit
-# outside the D lines in Figure A1 and are unambiguously E.
+# Table A1, Supplemental Appendix 2. Each border is a 3-point polyline; the two
+# endpoints pin the geometry and the middle point (the corner, at the clamp) follows.
+# LOWER runs below the line of identity (monitor under-reads), UPPER above it; each
+# border bounds the zone INSIDE it, so the B lines enclose zone A.
+# The published supplement labels the E rows "D Lower"/"D Upper" — a slip in the
+# sub-headers, not the coordinates: Figure A1 puts them outside the D lines.
 TABLE_A1 = {
     # border: (corner at the clamp, far endpoint), in (reference, monitor) mg/dL
     ('b', 'lower'): ((62.5, 0.0), (62.5, 50.0), (600.0, 480.0)),
@@ -57,17 +41,15 @@ TABLE_A1 = {
 # The |Risk| contour each border traces: the upper edge of the zone INSIDE it.
 BORDER_RISK = {'b': 0.5, 'c': 1.5, 'd': 2.5, 'e': 3.5}
 
-# Worst observed table-vs-function gap is 1.11 mg/dL (both D-lower and E-lower at
-# the clamp corner). Anything materially larger is a defect, not rounding.
+# worst observed table-vs-function gap is 1.11 mg/dL, at the D-lower and E-lower
+# clamp corners; materially larger is a defect, not rounding
 VERTEX_TOL_MGDL = 1.2
 
 
 def _solve_monitor(reference: float, risk: float, upper: bool) -> float:
     """The monitor value on a given |Risk| contour at a given reference.
 
-    Inverts the risk function by hand — deliberately NOT by calling ``dts_risk``,
-    so the check is against an independent statement of the algebra rather than
-    against the implementation restated.
+    Inverted by hand, never through ``dts_risk``, so the oracle stays independent.
     """
     r = max(reference, DTS_LOW_CLAMP_MGDL)
     if upper:
@@ -85,13 +67,8 @@ def _solve_reference(monitor: float, risk: float, upper: bool) -> float:
 
 @pytest.mark.parametrize('zone', ['b', 'c', 'd', 'e'])
 def test_published_vertices_lie_on_the_risk_contour(zone):
-    """Both endpoints of both published borders of each zone, solved from the
-    function, land on the tabulated coordinate.
-
-    This is the whole geometry in one check: the two coefficients, the clamp, the
-    four |Risk| edges and the axis convention all have to be right for any of the
-    eight numbers to come out.
-    """
+    """Both coefficients, the clamp, the four |Risk| edges and the axis convention all
+    have to be right for any of the eight numbers to come out."""
     risk = BORDER_RISK[zone]
     worst = 0.0
     for side in ('lower', 'upper'):
@@ -123,17 +100,12 @@ def test_published_vertices_lie_on_the_risk_contour(zone):
 
 
 def test_the_asymmetry_is_in_log_space_not_in_the_ratio():
-    """Overestimates are penalised harder — and that is NOT visible at zone A.
+    """Overestimates are penalised harder — 2.75 against 2.25, since a falsely high
+    reading prompts insulin — but not visibly at zone A.
 
-    This is the grid's whole clinical content (2.75 against 2.25, because a
-    falsely high reading prompts insulin), and it is easy to check in a way that
-    passes on a symmetric implementation. Exponentiating nearly cancels the
-    coefficients at the innermost edge: A runs -19.93% / +19.94%, so zone A reads
-    as a symmetric +/-20% band by coincidence.
-
-    The claim with content is therefore made in LOG space, where the overestimate
-    side of every edge is the tighter one, and again at the OUTER edge, where the
-    cancellation has long since stopped.
+    Exponentiating nearly cancels the coefficients at the innermost edge: A runs
+    -19.93% / +19.94%, a symmetric ±20% band by coincidence. So the claim is made in
+    LOG space, and again at the outer edge where the cancellation has stopped.
     """
     ref = np.full(3, 200.0)
     pred = np.array([200.0 * 0.8, 200.0, 200.0 * 1.2])
@@ -154,29 +126,25 @@ def test_the_asymmetry_is_in_log_space_not_in_the_ratio():
             f"at |Risk|={edge} the overestimate side is not the tighter one — "
             "the 2.75/2.25 asymmetry has been lost or inverted")
 
-    # At the A edge the two linear deviations agree to 1.5e-4, which is why the
-    # log-space form above is the one that can fail.
+    # the A edge's two linear deviations agree to 1.5e-4, so only the log-space form
+    # above can fail
     a_over = _solve_monitor(200.0, DTS_ZONE_EDGES[0], upper=True) / 200.0 - 1.0
     a_under = 1.0 - _solve_monitor(200.0, DTS_ZONE_EDGES[0], upper=False) / 200.0
     assert abs(a_over - a_under) < 2e-4
 
-    # At the outermost edge it is unmistakable in ratio terms too.
+    # at the outermost edge the ratio shows it too
     e_over = _solve_monitor(200.0, DTS_ZONE_EDGES[-1], upper=True) / 200.0
     e_under = _solve_monitor(200.0, DTS_ZONE_EDGES[-1], upper=False) / 200.0
     assert e_over - 1.0 > 2.0 and 1.0 - e_under < 0.8
 
 
 def test_the_zone_transition_happens_at_the_edge_and_the_edge_is_closed():
-    """Each edge is CLOSED: ``0-0.5`` is A, ``>0.5-1.5`` is B, in the paper's own
-    notation, so a point ON a border takes the LOWER-risk zone.
+    """Each edge is closed — ``0-0.5`` A, ``>0.5-1.5`` B — so a point ON a border
+    takes the lower-risk zone.
 
-    A pair sitting EXACTLY on an edge cannot be constructed: the contour is at
-    ``monitor/reference = exp(edge/coeff)``, and the exp/log round trip is not
-    exact in float64 — it lands a few ULP off, in a direction that varies by edge,
-    which is a property of the arithmetic and not of the rule. So the transition
-    is BRACKETED at a relative 1e-12, which is three orders of magnitude above
-    that noise and ten below any glucose difference that could mean anything; and
-    the closed half is asserted where it IS exactly representable, at |Risk| = 0.
+    A pair exactly on an edge is not constructible: the exp/log round trip lands a
+    few ULP off in float64. Hence the relative 1e-12 bracket, three orders above that
+    noise and ten below any meaningful glucose difference.
     """
     nudge = 1e-12
     ref = np.full(len(DTS_ZONE_EDGES), 100.0)
@@ -191,7 +159,7 @@ def test_the_zone_transition_happens_at_the_edge_and_the_edge_is_closed():
     assert list(z_above) == [i + 1 for i in range(len(DTS_ZONE_EDGES))], (
         "just outside an edge did not cross into the higher-risk zone")
 
-    # The exactly-representable case of the closed rule: zero risk is zone A.
+    # the exactly representable case: zero risk is zone A
     assert dts_risk(np.array([137.0]), np.array([137.0]))[0] == 0.0
     assert ZONE_NAMES[int(dts_zones(np.array([137.0]), np.array([137.0]))[0])] == 'a'
 
@@ -199,12 +167,9 @@ def test_the_zone_transition_happens_at_the_edge_and_the_edge_is_closed():
 def test_the_clamp_governs_the_low_glucose_corner():
     """Under 50 mg/dL every glucose is treated as 50, on BOTH axes.
 
-    Without the clamp the low corner is a log singularity and the flat/vertical
-    border segments of Figure A1 cannot exist. This is the reconstructed part of
-    the geometry — see ``dts_grid``'s docstring — so it gets its own check rather
-    than riding on the vertex test.
+    Unclamped, the low corner is a log singularity and Figure A1's flat and vertical
+    segments cannot exist.
     """
-    # Two pairs that differ only below the clamp must score identically.
     a = dts_risk(np.array([30.0, 50.0]), np.array([200.0, 200.0]))
     print(f"\n[DUMP] risk(30 -> 200) {a[0]:.6f} vs risk(50 -> 200) {a[1]:.6f}")
     assert a[0] == pytest.approx(a[1], abs=1e-12), (
@@ -214,19 +179,15 @@ def test_the_clamp_governs_the_low_glucose_corner():
     assert b[0] == pytest.approx(b[1], abs=1e-12), (
         "monitors of 10 and 50 mg/dL scored differently — the clamp is not "
         "applied to the monitor axis")
-    # The paper's printed third branch: both under the clamp is zero risk.
+    # the paper's printed third branch: both under the clamp is zero risk
     assert dts_risk(np.array([20.0]), np.array([45.0]))[0] == 0.0
-    # And a badly-missed hypo is D, not E: 200 -> 10 clamps to 200 -> 50.
+    # a badly missed hypo is D, not E: 200 -> 10 clamps to 200 -> 50
     assert ZONE_NAMES[int(dts_zones(np.array([200.0]), np.array([10.0]))[0])] == 'd'
 
 
 def test_a_risk_space_array_trips_the_units_tripwire():
-    """Feeding normalized or risk-space values raises instead of scoring.
-
-    This is the failure mode the clamp creates: z-scores are all under 50, so
-    every pair would clamp to 50/50, score 0 risk, and report a flawless 100%
-    zone A. Nothing downstream could tell.
-    """
+    """The clamp's own failure mode: z-scores are all under 50, so an unguarded pair
+    clamps to 50/50, scores 0 risk and reports a flawless 100% zone A."""
     z = np.array([-1.2, 0.3, 2.1])
     with pytest.raises(AssertionError, match='units tripwire'):
         dts_zones(z, z)
@@ -253,17 +214,11 @@ def test_counts_and_fractions_round_trip():
 
 
 def test_both_trainers_render_every_zone_and_no_a_plus_b():
-    """The five zones reach the page, in ``train.py`` and ``train_blind.py`` alike,
-    and no A+B convenience row appears anywhere.
+    """No A+B row: the paper calls presenting A+B as acceptable inappropriate and
+    names pZA alone as the measure. Clarke's own A+B row is a different grid and stays.
 
-    The paper states in terms that presenting zone A+B as if both were clinically
-    acceptable is inappropriate and that pZA alone is the measure — so an A+B row
-    would be a claim the source refuses to make. Clarke's own A+B row is a
-    different grid and stays.
-
-    Both trainers are checked because the blind fork is a COPY: the grid is common
-    ground between them, not one of the seven things they differ in, and nothing
-    but a test keeps it that way.
+    ``train_blind.py`` is a copy of ``train.py``; nothing but this test keeps the grid
+    common ground between them.
     """
     import train
     import train_blind
@@ -295,7 +250,7 @@ def test_transposing_the_axes_changes_the_answer():
     """Argument order is load-bearing: (true, pred), never (pred, true).
 
     The grid is asymmetric, so a transposed call returns a well-formed table of a
-    different statistic — the same trap ``cg_ega`` documents for its own inputs.
+    different statistic.
     """
     true = np.array([180.0, 90.0, 250.0])
     pred = np.array([140.0, 130.0, 200.0])

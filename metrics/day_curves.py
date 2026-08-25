@@ -1,15 +1,8 @@
-"""
-48 h day-figure machinery: the tiled 2 h / 8 h forecast curves and the plotting
-that renders them.
+"""48 h day-figure machinery: the tiled 2 h / 8 h forecast curves and ``plot_day``.
 
-This module is the shared half — the model loader, the sigma accumulation, the
-per-day forecast assembly and ``plot_day``. ``curves_sim.py`` is the driver that
-feeds it fresh T1DMSIM patients and writes the figures.
-
-Every forecast here runs the FORECAST protocol and takes its masked set from
-``metrics.protocols`` rather than deriving a trailing zone from position.
-
-Runs on the live best checkpoint (checkpoints/t1dmai_best.pt). GPU if available.
+The shared half — loader, sigma accumulation, per-day assembly, plotting; ``curves_sim.py`` drives it.
+Every forecast runs the FORECAST protocol, masked set from ``metrics.protocols``, never derived from position.
+Runs on checkpoints/t1dmai_best.pt, GPU if available.
 """
 from __future__ import annotations
 import os, sys, json
@@ -46,52 +39,35 @@ import protocols as PR
 
 
 def smooth_bg_truth(bg_raw) -> np.ndarray:
-    """RAW BG, bg-clamped (the ground truth every metric/figure scores against).
+    """RAW BG, bg-clamped — the truth every metric and figure scores against.
 
-    The pipeline consumes raw post-noise signals (``data._build_sample``): the
-    scored ground-truth BG is the raw CGM that produced the model input, physical-
-    range clamped. Name kept for its call-sites; no FIR smoothing is applied.
+    No smoothing despite the name, kept for its call sites: the scored truth is the raw CGM that produced
+    the model input.
     """
     return np.clip(np.asarray(bg_raw, dtype=np.float64),
                    BG_CLAMP_MIN, BG_CLAMP_MAX).astype(float)
 
-# Every forecast on this page runs the FORECAST protocol, and takes its masked
-# set from ``metrics.protocols`` rather than deriving a trailing zone from
-# position: ``PR.forecast_masked_set(n_ctx)`` names the span, the head slots it
-# occupies, its per-slot d and the rows those slots occupy in ``predict``'s
-# output. The INFILL protocol is the other fixed one and is not drawn here.
-# ``protocols`` carries the d rule and the pooling prohibition; nothing on this
-# page restates them.
+# ``PR.forecast_masked_set(n_ctx)`` names the span, its head slots, their per-slot d and their rows in
+# ``predict``'s output. The INFILL protocol is not drawn here. ``protocols`` carries the d rule.
 PRED = PR.SPAN_STEPS                              # steps in one masked forecast span
 DAY_PATCHES = 48 * _PATCHES_PER_HOUR              # 48 h day window (fixed figure span)
 H8_PATCHES = NIGHT_LONG_HORIZON_PATCHES           # NIGHT_LONG_HORIZON_HOURS long-horizon window
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 ANNOUNCE = (0, 1, 2)                              # carb, insulin, exercise
 
-# Every announceable channel is announced, and that is checked here rather than
-# left to read correctly: an announced set short of ``CHANNEL_TO_FEAT`` leaves the
-# dropped slot at ``normalize(0)``, which for exercise_equiv is a legal "no
-# session" value (−0.139 z on the balanced pool), so the eval silently scores a
-# regime training never saw.
+# A set short of ``CHANNEL_TO_FEAT`` leaves the dropped slot at ``normalize(0)`` — for exercise_equiv a
+# legal "no session" (−0.139 z on the balanced pool) — so the eval would score a regime training never saw.
 assert ANNOUNCE == tuple(CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(CHANNEL_TO_FEAT)}")
 
-# Output-channel → input-feature index (carb 0→feat 1, insulin 1→feat 2,
-# exercise 2→feat 3) for the per-roll night-onset conditioning, derived from the
-# shared ``CHANNEL_TO_FEAT`` so it tracks the canonical layout (matching
-# ``calibrate._future_overrides``).
+# output channel → input feature: carb 0→1, insulin 1→2, exercise 2→3, off the shared ``CHANNEL_TO_FEAT``
 _ANNOUNCE_FEAT_IDX = {ch: CHANNEL_TO_FEAT[ch] for ch in ANNOUNCE}
 
 CKPT = os.path.join(ROOT, 'checkpoints', 't1dmai_best.pt')
 
 
 def load_model(device, path: str = CKPT):
-    """Load a checkpoint, building the model to match the WEIGHTS it carries.
-
-    Reimplemented here (rather than imported from the foundation report module,
-    which depends on deleted config symbols) so the deep-dive scripts import
-    cleanly. Returns ``(model, normalization_stats, step)``.
-    """
+    """Load a checkpoint, building the model to match the WEIGHTS it carries -> ``(model, stats, step)``."""
     ckpt = torch.load(path, map_location=device, weights_only=True)
     m = T1DMAI().to(device)
     sd = ckpt['model_state_dict']
@@ -102,11 +78,10 @@ def load_model(device, path: str = CKPT):
 
 
 def _slice_seg(seg, a: int, b: int):
-    """A sub-Segment over steps [a, b), with t0 advanced accordingly.
+    """A sub-Segment over steps ``[a, b)``, ``t0`` advanced to match.
 
-    Must name every length-N array, the optional pre-resolved curves included:
-    ``replace`` copies un-named fields through at full length, which would
-    misalign them against the sliced CGM.
+    Every length-N array must be named, pre-resolved curves included: ``replace`` copies an un-named field
+    through at FULL length, misaligned against the sliced CGM.
     """
     return replace(
         seg, t0=seg.t0 + timedelta(minutes=GRID_MIN * a),
@@ -119,10 +94,10 @@ def _slice_seg(seg, a: int, b: int):
 
 
 def _pick_day_start(seg) -> int | None:
-    """Patch-aligned day-window start nearest midnight with ``DAY_PATCHES`` ahead
-    and ``MAX_CONTEXT_PATCHES`` of context behind. ``None`` if the segment is too
-    short. (Reimplemented locally — the foundation report module dropped its
-    day-figure helpers with the risk-space redesign.)"""
+    """Patch-aligned day start nearest midnight, ``DAY_PATCHES`` ahead and ``MAX_CONTEXT_PATCHES`` behind.
+
+    ``None`` when the segment is too short.
+    """
     Lp = len(seg) // PATCH_SIZE
     lo_p, hi_p = MAX_CONTEXT_PATCHES, Lp - DAY_PATCHES
     if hi_p <= lo_p:
@@ -137,14 +112,11 @@ def _make_night_overrides_fn(feats: np.ndarray, pred_start: int,
                              announce: tuple[int, ...], stats: dict):
     """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for ``predict_rolling``.
 
-    Roll ``r`` masks the same right-edge span, advanced by one horizon; this slices
-    the announced channels (normalized) from ``feats`` over that span. The raw side
-    of the tuple is unused by the risk-space rolling path so a zero placeholder is
-    returned. ``None`` once a roll runs past the segment.
-
-    Past roll 0 the span's left neighbour is the previous roll's own output, so its
-    slots are again d = 1..PREDICTION_PATCHES but measured from a FABRICATED
-    reading, not an observed one.
+    Roll ``r`` masks the same right-edge span advanced by one horizon, sliced normalized from ``feats``.
+    The raw half of the tuple is unused on this path, so it comes back zeroed; ``None`` once a roll runs
+    past the segment.
+    Past roll 0 the left neighbour is the previous roll's own output: slots are d = 1..PREDICTION_PATCHES
+    again, but from a FABRICATED reading.
     """
     n = feats.shape[0]
 
@@ -171,11 +143,9 @@ def _onsets(x: np.ndarray) -> int:
 
 
 def _bg(out) -> np.ndarray:
-    """Headline BG forecast of a ROLLED pass as a flat mg/dL array.
+    """Headline BG of a ROLLED pass, flat mg/dL.
 
-    ``predict_rolling`` concatenates one forecast-protocol span per roll and
-    returns them as ``pred_bg``; the rolls are contiguous by construction, so the
-    flat array is already in step order.
+    ``predict_rolling`` concatenates one span per roll and the rolls are contiguous, so this is step order.
     """
     pb = out['pred_bg'] if 'pred_bg' in out else out['median_bg']
     pb = pb.detach().cpu().numpy() if hasattr(pb, 'detach') else np.asarray(pb)
@@ -185,38 +155,27 @@ def _bg(out) -> np.ndarray:
 def _protocol_bg(out, ms) -> np.ndarray:
     """Headline BG of a SINGLE pass, ordered by the protocol's scored steps.
 
-    ``predict`` returns one row per masked patch in head-slot order, which is a
-    trailing zone only because the FORECAST protocol's masked set happens to be
-    one. Selecting the scored rows through ``ms.scored_rows()`` and sorting by
-    ``ms.scored_steps()`` reads the same array for the forecast protocol and the
-    right array for any other masked set.
+    ``predict`` returns one row per masked patch in head-slot order — a trailing zone only because this
+    protocol's masked set is one. Going through ``ms.scored_rows()`` / ``ms.scored_steps()`` reads the right
+    array for any masked set.
     """
     med = out['median_bg'].detach().cpu().numpy().reshape(-1, PATCH_SIZE)
     vals = med[ms.scored_rows()].ravel()
     return vals[np.argsort(ms.scored_steps())]
 
 
-# --- BG forecast uncertainty. The model emits per-τ risk-space quantile bands,
-# but here we plot a CALIBRATED empirical per-horizon error envelope instead (it
-# is directly comparable across the tiled origins): slide windows over the cohort,
-# and at each horizon step h accumulate the squared error of the headline
-# ``median_bg`` forecast vs true CGM. The per-step RMSE √E[(pred−true)²] is the
-# ±1σ half-width (a predictive-error band that widens with horizon).
-# The horizon axis IS the distance-to-evidence axis: within one masked span, step
-# h sits in patch ceil(h / PATCH_SIZE) and therefore at d = that patch number,
-# one-sided. Past a single pass the forecast is rolled and d restarts at 1 per
-# roll, against the previous roll's own output rather than an observed reading.
+# The plotted band is an EMPIRICAL per-horizon error envelope, not the native fan: comparable across tiled
+# origins. Per-step RMSE √E[(pred−true)²] is the ±1σ half-width.
+# The horizon axis IS the distance-to-evidence axis: step h sits in patch ceil(h / PATCH_SIZE), so d = that
+# patch, one-sided. Past one pass d restarts at 1 per roll, against the previous roll's own output.
 
 def _sigma_accumulate(model, stats, feats, cgm, horizon_patches, stride_steps, acc,
                       max_windows, report=None):
-    """Accumulate per-horizon squared error of the headline forecast for one trajectory.
+    """Per-horizon squared error of the headline forecast, one trajectory, into ``acc``.
 
-    Always conditioned: each window announces its true future carbs/insulin/exercise.
-
-    ``horizon_patches`` is covered by ``nr`` rolls of the FORECAST protocol's
-    masked set, so the envelope is binned on d within each roll — never on span
-    length and never on arm. ``report`` (a ``protocols.RunReport``) records each
-    window's realised d when supplied."""
+    Always conditioned. ``horizon_patches`` is covered by ``nr`` rolls of the forecast masked set, so the
+    envelope bins on d WITHIN each roll, never on span length. ``report`` records each window's realised d.
+    """
     H = horizon_patches * PATCH_SIZE
     nr = horizon_patches // PREDICTION_PATCHES
     n = (len(cgm) // PATCH_SIZE) * PATCH_SIZE
@@ -249,7 +208,7 @@ def _sigma_accumulate(model, stats, feats, cgm, horizon_patches, stride_steps, a
 
 
 def _tile_band(curve: np.ndarray, sig: np.ndarray, horizon_patches: int):
-    """Tile a per-horizon σ across the (tiled) day curve → (lo1, hi1, lo2, hi2)."""
+    """Tile a per-horizon σ across the day curve -> ``(lo1, hi1, lo2, hi2)``."""
     hsteps = horizon_patches * PATCH_SIZE
     T = len(curve)
     sig_t = np.tile(np.asarray(sig)[:hsteps], T // hsteps + 1)[:T]
@@ -257,30 +216,24 @@ def _tile_band(curve: np.ndarray, sig: np.ndarray, horizon_patches: int):
 
 
 def day_curves(model, stats, seg, day_start: int, sig2=None, sig8=None) -> dict:
-    """24 h true CGM + tiled 2 h and 8 h conditioned forecasts.
+    """True CGM plus tiled 2 h and 8 h conditioned forecasts.
 
-    Every forecast origin (each tile start ts >= day_start) is fed the full
-    MAX_CONTEXT_PATCHES = 24 h of REAL history via context_window — far beyond the
-    8 h (MIN_CONTEXT_PATCHES) floor; context_window requires a full window, so a
-    short context would raise rather than silently truncate. Every window
-    announces its true future carbs/insulin/exercise (the model is always
-    conditioned).
+    Every origin is fed the full ``MAX_CONTEXT_PATCHES`` of REAL history, well past the
+    ``MIN_CONTEXT_PATCHES`` floor; ``context_window`` demands a full window, so a short context raises rather
+    than truncating quietly. Always conditioned on the true future doses.
     """
     assert day_start >= CTX, (
         f"origin needs MAX_CONTEXT_PATCHES of context behind it; "
         f"day_start={day_start} < {CTX}")
     feats = build_feature_stack(seg, stats)
     T = DAY_PATCHES * PATCH_SIZE
-    # The plotted "true CGM" the forecast is scored against is the raw (bg-clamped)
-    # CGM (one space; never the future). Logged-event overlays below stay raw.
+    # the plotted truth is the raw bg-clamped CGM; the event overlays below stay raw
     true = smooth_bg_truth(seg.cgm)[day_start:day_start + T]
     hod = seg.hour_of_day()
     hod0 = float(hod[day_start])
     hours = hod0 + np.arange(T) * (GRID_MIN / 60.0)
 
-    # Model time-of-day probe read-out per 2 h tile origin, collected inside the
-    # PREDICTION_PATCHES pass only (the 8 h pass leaves it untouched). Populated
-    # only when the probe is enabled; NaN otherwise, so plot_day can skip cleanly.
+    # probe read-out per 2 h tile origin, collected in the PREDICTION_PATCHES pass only; NaN with the probe off
     tod: dict[str, list] = {'pred_hour': [], 'true_hour': [], 'R': [], 'bin_probs': []}
 
     ms = PR.forecast_masked_set(MAX_CONTEXT_PATCHES)
@@ -294,10 +247,7 @@ def day_curves(model, stats, seg, day_start: int, sig2=None, sig8=None) -> dict:
             ts = day_start + c * hsteps
             ctx = context_window(feats, ts, MAX_CONTEXT_PATCHES)
             if collect_tod:
-                # collect_tod ==> horizon_patches == PREDICTION_PATCHES ==> nr == 1
-                # (single pass): the same forward yields BOTH the forecast bg and the
-                # time-of-day bin logits, so read the probe off THIS forward (no
-                # separate predict_origin_hour pass).
+                # collect_tod ⇒ nr == 1, so this one forward carries both the bg and the bin logits
                 ov = _future_overrides(feats, ts, ANNOUNCE)
                 out = predict(model, ctx, normalization_stats=stats, overrides=ov,
                               return_time=True, mask_spans=ms.spans)
@@ -323,9 +273,8 @@ def day_curves(model, stats, seg, day_start: int, sig2=None, sig8=None) -> dict:
             curve[c * hsteps:c * hsteps + len(bg)] = bg[:hsteps]
         return curve
 
-    # raw logged events inside the day (grams / IU per step — discrete spikes, NOT
-    # the convolved absorption curves the model ingests). basal_day is the
-    # piecewise-constant basal RATE (IU/hour) per step; basal IU = rate × GRID/60.
+    # raw logged events: grams / IU per step, discrete spikes, NOT the curves the model ingests.
+    # basal_day is the piecewise-constant RATE in IU/hour per step; basal IU = rate × GRID/60.
     carb_day = np.asarray(seg.carb_grams[day_start:day_start + T], dtype=float)
     bol_day = np.asarray(seg.bolus_units[day_start:day_start + T], dtype=float)
     basal_day = np.asarray(seg.basal_rate[day_start:day_start + T], dtype=float)
@@ -339,9 +288,8 @@ def day_curves(model, stats, seg, day_start: int, sig2=None, sig8=None) -> dict:
         'carb_total': float(np.sum(carb_day)), 'bolus_total': float(np.sum(bol_day)),
         'basal_total': float(np.sum(basal_day)) * (GRID_MIN / 60.0),
     }
-    # TOD probe read-out, one entry per 2 h tile (aligned with the tile2_h
-    # boundaries). Emitted only when at least one origin returned a finite hour
-    # (the probe is on); plot_day gates its render on this presence + finiteness.
+    # one entry per 2 h tile, aligned with tile2_h; emitted only if some origin returned a finite hour,
+    # and plot_day gates its render on that
     tod_pred = np.asarray(tod['pred_hour'], dtype=float)
     if tod_pred.size and np.isfinite(tod_pred).any():
         spec['tile2_pred_hour'] = tod_pred
@@ -356,7 +304,7 @@ def day_curves(model, stats, seg, day_start: int, sig2=None, sig8=None) -> dict:
 
 
 def _attach_bg_bands(spec: dict, sig2, sig8) -> None:
-    """Add ±1σ/±2σ envelope keys for the conditioned BG curves to ``spec`` (in place)."""
+    """Add ±1σ / ±2σ envelope keys for the conditioned BG curves to ``spec``, in place."""
     for key, sig, hp in (('p2', sig2, PREDICTION_PATCHES),
                          ('p8', sig8, H8_PATCHES)):
         if sig is None:
@@ -367,17 +315,13 @@ def _attach_bg_bands(spec: dict, sig2, sig8) -> None:
 
 
 def _hhmm(x, _):
-    """Format an hour-of-day-continuous x value (hod0 + elapsed) as clock HH:MM."""
+    """A continuous hour-of-day x value (hod0 + elapsed) as HH:MM."""
     c = x % 24.0
     return f"{int(c):02d}:{int(round((c % 1) * 60)) % 60:02d}"
 
 
 def plot_day(spec, pretty, path):
-    """Two-panel 48 h BG figure (2 h and 8 h tiled forecasts).
-
-    The dynamics-channel panels (carbs/insulin/IS/HGO) were removed with the
-    risk-space redesign — those are no longer model outputs.
-    """
+    """Two-panel 48 h BG figure: 2 h and 8 h tiled forecasts."""
     fig, axes = plt.subplots(2, 1, figsize=(22, 8), sharex=True)
     h = spec['hours']
     carb, bol = spec['carb_steps'], spec['bolus_steps']
@@ -385,7 +329,7 @@ def plot_day(spec, pretty, path):
     ci, bi = np.where(carb > 0)[0], np.where(bol > 0)[0]
     ev_max = max(120.0, float(carb.max()) if carb.size else 0.0)
 
-    # --- rows 0,1: BG forecasts (2 h, 8 h) with logged-event overlay ---
+    # rows 0,1: BG forecasts (2 h, 8 h) with the logged-event overlay
     for ax, (tag, ck, tiles, hp) in zip(axes[:2], [
         ('2 h prediction windows (BG)', 'p2', 'tile2_h', PREDICTION_PATCHES),
         ('8 h prediction windows (BG)', 'p8', 'tile8_h', H8_PATCHES)]):
@@ -394,8 +338,7 @@ def plot_day(spec, pretty, path):
         ax.axhline(BG_HYPER_THRESHOLD, color='#e67e22', lw=0.7, ls=':')
         for tb in spec[tiles]:
             ax.axvline(tb, color='#bbbbbb', lw=0.5, zorder=1)
-        # empirical per-horizon error envelope on the conditioned forecast
-        # (derived — the head has no native BG σ; see _sigma_accumulate)
+        # empirical per-horizon error envelope, derived; see _sigma_accumulate
         if f'{ck}_lo1' in spec:
             ax.fill_between(h, spec[f'{ck}_lo2'], spec[f'{ck}_hi2'], color='#d62728',
                             alpha=0.10, zorder=2, label='±2σ (emp.)')
@@ -403,9 +346,8 @@ def plot_day(spec, pretty, path):
                             alpha=0.22, zorder=3, label='±1σ (emp.)')
         ax.plot(h, spec['true'], color='black', lw=2.0, label='true CGM', zorder=5)
         ax.plot(h, spec[ck], color='#d62728', lw=1.4, label='forecast (announced)', zorder=4)
-        # Time-of-day probe read-out (2 h panel only): the model's predicted origin
-        # clock per tile, coloured by confidence R (true clock is the x-axis). Only
-        # present when TIME_PROBE_ENABLED — the spec keys are absent otherwise.
+        # 2 h panel only: predicted origin clock per tile, coloured by confidence R; the x-axis is the
+        # true clock. Keys absent with the probe off.
         if ck == 'p2' and 'tile2_pred_hour' in spec:
             hsteps_tod = hp * PATCH_SIZE
             for c, (ph_c, R_c) in enumerate(zip(spec['tile2_pred_hour'], spec['tile2_R'])):
@@ -416,11 +358,8 @@ def plot_day(spec, pretty, path):
                 ax.text(xc, 350.0, f"{_hhmm(ph_c, None)} (R{R_c:.1f})", ha='center', va='top',
                         fontsize=5, color=col, zorder=6,
                         bbox=dict(boxstyle='round,pad=0.1', fc='white', ec='none', alpha=0.6))
-        # Native per-patch time-of-day clocks (2 h panel only): one clock per MASKED
-        # patch, no rotation, in a micro-strip across each tile's top band (data
-        # coords; ylim is 40-360). Dense (n_tiles*P clocks) so kept tiny. The row
-        # count comes from the probe output, not from a fixed zone length, so a
-        # masked set of another size draws its own clocks rather than 2 h of them.
+        # One clock per MASKED patch, no rotation, in a strip across each tile's top band (data coords,
+        # ylim 40-360). The count comes from the probe output, not a fixed zone length.
         if ck == 'p2' and spec.get('tile2_time_probs') is not None:
             tp_all = spec['tile2_time_probs']       # (n_tiles, P, TIME_PROBE_N_BINS)
             th = spec['tile2_h']
@@ -438,8 +377,7 @@ def plot_day(spec, pretty, path):
         ax.set_title(title, fontsize=10, loc='left', pad=8)
         ax.set_ylabel('BG (mg/dL)'); ax.set_ylim(40, 360)
         ax.legend(loc='upper right', fontsize=8, ncol=2)
-        # per-window basal level (mean IU/h over each prediction window), as small
-        # grey numbers along the bottom of the panel (logged-event sources only).
+        # mean IU/h per prediction window, as grey numbers along the bottom; logged-event sources only
         if basal is not None:
             hsteps = hp * PATCH_SIZE
             for c in range(len(h) // hsteps):
@@ -447,15 +385,12 @@ def plot_day(spec, pretty, path):
                 if seg_b.size:
                     ax.text(h[c * hsteps + hsteps // 2], 43.5, f"{float(np.mean(seg_b)):.1f}",
                             ha='center', va='bottom', fontsize=5.5, color='#777777', zorder=3)
-        # logged-event overlay; skipped when no discrete events are
-        # supplied (e.g. simulator runs, where the full carb/insulin truth is in
-        # the channel panels instead). Each event carries its dose UNDER the marker:
-        # carb grams under the carb point, bolus IU under the bolus point.
+        # skipped when a source supplies no discrete events (the simulator). Each dose is labelled UNDER
+        # its marker: carb grams, bolus IU.
         if ci.size or bi.size:
             ax2 = ax.twinx()
-            # lower bound is pushed negative so short bolus lollipops (U is tiny on
-            # a carb-g scale) lift off the bottom edge, leaving room for the dose
-            # label UNDER each marker without colliding with the clock tick labels.
+            # negative lower bound lifts the short bolus lollipops off the edge, leaving room for the
+            # label under each marker
             ax2.set_ylim(-0.28 * ev_max, ev_max * 1.18)
             ax2.set_ylabel('carb g / bolus U', fontsize=8)
             ax2.axhline(0, color='#cccccc', lw=0.5, zorder=1)
@@ -474,12 +409,8 @@ def plot_day(spec, pretty, path):
                                  ha='center', va='top', fontsize=6, color='#4a148c', zorder=5, bbox=bbox)
             ax2.legend(loc='upper left', fontsize=7)
 
-    # The predicted-dynamics-channel panels (carbs/insulin/IS/HGO μ ± σ vs GT)
-    # were removed: those are no longer model outputs under the risk-space design.
-    # HH:MM clock x-axis, hour-by-hour (major every 1 h, minor every 30 min) +
-    # midnight markers. labelbottom=True on EVERY panel (not just the bottom one)
-    # so each window reads its own clock — `sharex` would otherwise hide all but
-    # the last; the 48 hourly labels are rotated to stay legible.
+    # HH:MM x-axis, major every 1 h, minor every 30 min, midnight marked.
+    # labelbottom=True on EVERY panel, since `sharex` would otherwise hide all but the last.
     first_mid = (int(h[0] // 24) + 1) * 24
     mids = [m for m in (first_mid, first_mid + 24, first_mid + 48) if h[0] <= m <= h[-1]]
     for ax in axes:
@@ -491,8 +422,7 @@ def plot_day(spec, pretty, path):
             ax.axvline(m, color='#777777', lw=0.9, alpha=0.55, zorder=1)
     axes[-1].set_xlabel('time of day (HH:MM)  ·  grey lines = midnight')
 
-    # Title ABOVE all content: reserve top margin, then draw a bold heading + a
-    # smaller caption clear of the first panel (the old suptitle collided with it).
+    # title ABOVE all content: reserve the top margin, then heading and caption clear of the first panel
     bt = spec.get('basal_total')
     dose = (f"logged 48 h: {spec['carb_total']:.0f} g carb · {spec['bolus_total']:.1f} U bolus"
             + (f" · {bt:.1f} U basal" if bt is not None else ""))

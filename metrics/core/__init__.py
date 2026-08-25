@@ -1,10 +1,6 @@
-"""Shared evaluation core: the canonical Segment, the model-input bridge, the
-window collector, the horizon map and the comparison metric suite.
+"""Source-agnostic evaluation core: Segment, feature bridge, window collector, horizons, suite.
 
-Everything here is source-agnostic. ``metrics/sim/`` builds Segments and Windows
-from fresh T1DMSIM patients; ``train.py`` and ``calibrate_conformal.py`` reach in
-for the window and metric definitions so training, calibration and the offline
-report score the same quantities the same way.
+Training, calibration and the offline report score the same quantities through these definitions.
 """
 from __future__ import annotations
 

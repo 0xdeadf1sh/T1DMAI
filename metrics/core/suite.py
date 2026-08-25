@@ -1,35 +1,18 @@
-"""
-Comparison metric suite for the evaluation harness.
+"""Comparison metric suite over ``(n_windows, PRED_STEPS)`` mg/dL arrays; train.py's definitions exactly.
 
-Replicates train.py's exact definitions (Clarke Error Grid zones, MARD, band-edge
-hypo/hyper recall/precision — hypo off the τ-lower band edge, hyper off the τ-upper,
-with strict recall and a precision-only ±EXCURSION_PRECISION_TOLERANCE_MGDL forgiveness
-band) but operates on plain ``(pred_bg, true_cgm)`` arrays of shape
-(n_windows, PRED_STEPS), where ``pred_bg`` is the median line ``median_bg =
-f_inv(median)`` and the band fan is passed alongside.
+Headline level metrics are BAND-SCORED: the effective point forecast is
+``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])`` — zero error where the truth lies
+inside the band, the distance to the nearer edge outside; a degenerate band reproduces the median line.
+The same block on the median line stays under ``out[h]['median_line']``, the basis for peer numbers, which
+are point forecasts. Persistence carries no band, so the skill column is a band-scored model against a
+point baseline.
 
-The headline level metrics are BAND-SCORED. The forecast is a quantile fan, so the
-effective point forecast is the band point nearest the truth,
-``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])`` — zero error
-where the truth lies inside the band, the distance to the nearer edge where it lies
-outside. Every downstream formula (RMSE / MAE / MARD / Clarke / CG-EGA / skill) is
-unchanged; only the array it consumes changes, and a degenerate band reproduces the
-median-line numbers exactly. The same block computed on the median line is kept
-alongside under ``out[h]['median_line']`` — the basis for peer / literature
-comparisons, whose published numbers are point forecasts. Persistence carries no band,
-so the skill column compares a band-scored model against a point baseline.
+``bands=None`` scores every metric off the median ``pred`` and emits no ``median_line`` / ``band_cov50`` /
+``band_width`` keys.
 
-``bands=None`` keeps the pre-band behaviour exactly: every metric off the median
-``pred``, and no ``median_line`` / ``band_cov50`` / ``band_width`` keys.
-
-Also carries the comparison-audit reporting fixes:
-
-  * STRICT point-at-horizon RMSE/MAE  (our original convention)
-  * WINDOW-MEAN RMSE/MAE pooled over steps 0..k  (the Crossformer/PatchTST basis)
-  * naive-PERSISTENCE baseline + skill, per horizon  (last-CGM-value forecast)
-  * per-patient MACRO RMSE  (secondary aggregation)
-  * realized band coverage ``band_cov50`` + mean ``band_width``, per horizon
-  * split-conformal calibrated 90% interval  (needs only point residuals)
+Per horizon: STRICT point RMSE/MAE; WINDOW-MEAN RMSE/MAE pooled over steps 0..k (the Crossformer/PatchTST
+basis); naive persistence (last CGM held flat) and skill against it; per-patient MACRO RMSE; realized
+``band_cov50`` and mean ``band_width``; a split-conformal 90% interval off point residuals.
 """
 from __future__ import annotations
 
@@ -43,12 +26,8 @@ from config import (BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, QUANTILE_LEVELS,
 
 from .horizons import HORIZONS, HORIZON_IDX as _IDX  # step index (0-based) per minute-horizon
 
-# Clinical hypo/hyper recall/precision key off the QUANTILE BAND EDGES (matching
-# train.py's validation table): hypo off the τ=HYPO_ALARM_QUANTILE_TAU lower edge,
-# hyper off the τ=HYPER_ALARM_QUANTILE_TAU upper edge, from the per-window band fan
-# (``Window.bands``) when available, else the median. RECALL is strict; PRECISION
-# forgives a near-boundary false alarm within EXCURSION_PRECISION_TOLERANCE_MGDL of the
-# true value (CGM sensor noise near a threshold does not deflate it) — same as train.py.
+# Excursion detectors key off the BAND EDGES, from ``Window.bands`` when present, else the median:
+# hypo off the τ=HYPO_ALARM_QUANTILE_TAU lower edge, hyper off the τ=HYPER_ALARM_QUANTILE_TAU upper edge.
 _HYPO_BAND_IDX = QUANTILE_LEVELS.index(HYPO_ALARM_QUANTILE_TAU)
 _HYPER_BAND_IDX = QUANTILE_LEVELS.index(HYPER_ALARM_QUANTILE_TAU)
 
@@ -57,8 +36,7 @@ _BAND_LO_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)
 _BAND_HI_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)
 _N_QUANTILES = len(QUANTILE_LEVELS)
 
-# Slack on the ascending-fan assertion: the fan reaches mg/dL through f_inv, so two
-# adjacent quantiles that coincide in risk space can differ by a float rounding step.
+# f_inv can leave two quantiles that coincide in risk space a float rounding step apart
 _FAN_ORDER_TOL_MGDL = 1e-6
 
 
@@ -77,10 +55,11 @@ def _clarke(pred: np.ndarray, true: np.ndarray):
 
 
 def _excursion(pred_edge, true, thr, side):
-    """Band-edge recall/precision for a threshold crossing (matches train.py's band-edge
-    detectors). ``pred_edge`` is the τ-lower edge for hypo / τ-upper edge for hyper.
-    RECALL is strict; PRECISION forgives a false alarm whose edge is within
-    EXCURSION_PRECISION_TOLERANCE_MGDL of the true value."""
+    """Band-edge recall/precision at a threshold; ``pred_edge`` is the τ-lower edge for hypo, τ-upper for hyper.
+
+    RECALL is strict. PRECISION forgives a false alarm within EXCURSION_PRECISION_TOLERANCE_MGDL of the truth,
+    so CGM noise at a threshold cannot deflate it.
+    """
     if side == 'hypo':
         te, pe = true < thr, pred_edge < thr
     else:
@@ -98,13 +77,10 @@ def _rmse(e: np.ndarray) -> float:
 
 
 def band_project(true: np.ndarray, band_lo: np.ndarray, band_hi: np.ndarray) -> np.ndarray:
-    """Project the truth onto the forecast band — the effective point forecast.
+    """Truth projected onto the band — the effective point forecast.
 
-    ``true`` / ``band_lo`` / ``band_hi`` are matching mg/dL arrays, canonically
-    ``(n_windows, PRED_STEPS)``; returns the same shape. ``clip(true, lo, hi)`` is the
-    band point nearest the truth: zero error where the truth lies inside the band, the
-    distance to the nearer edge where it lies outside. A degenerate band (``lo == hi``)
-    returns that common value, so the projection reduces to a point forecast exactly.
+    Matching mg/dL arrays, canonically ``(n_windows, PRED_STEPS)``, same shape out. A degenerate band
+    (``lo == hi``) returns that value, so this reduces to a point forecast exactly.
     """
     assert true.shape == band_lo.shape == band_hi.shape, (
         f"band_project shape mismatch: true {true.shape}, lo {band_lo.shape}, "
@@ -116,15 +92,12 @@ def band_project(true: np.ndarray, band_lo: np.ndarray, band_hi: np.ndarray) -> 
 
 def _point_block(pred_k: np.ndarray, true_k: np.ndarray, err_winmean: np.ndarray,
                  pats: np.ndarray, rmse_persist_point: float) -> dict:
-    """Per-horizon point-error block for ONE forecast basis (band-projected or median).
+    """Per-horizon point-error block for ONE forecast basis, band-projected or median.
 
-    ``pred_k`` / ``true_k`` are ``(n_windows,)`` mg/dL at the horizon step;
-    ``err_winmean`` the ``(n_windows, k+1)`` error over steps 0..k on the same basis;
-    ``pats`` the ``(n_windows,)`` patient ids. ``rmse_persist_point`` is the shared
-    persistence baseline — persistence has no band, so it is computed once by the
-    caller and fed to both bases; ``skill_point`` then differs only through the model
-    side. Returns rmse_point, mae_point, rmse_winmean, mae_winmean, rmse_macro, mard,
-    clarke_A, clarke_AB, clarke_D, clarke_E, skill_point.
+    ``pred_k`` / ``true_k`` ``(n_windows,)`` mg/dL at the horizon step, ``err_winmean`` ``(n_windows, k+1)``
+    over steps 0..k on the same basis, ``pats`` ``(n_windows,)`` patient ids.
+    ``rmse_persist_point`` is fed in because persistence has no band: both bases share it, so ``skill_point``
+    differs only through the model side.
     """
     assert pred_k.ndim == 1 and pred_k.shape == true_k.shape == pats.shape, (
         f"_point_block shape mismatch: pred {pred_k.shape}, true {true_k.shape}, "
@@ -153,24 +126,13 @@ def _point_block(pred_k: np.ndarray, true_k: np.ndarray, err_winmean: np.ndarray
 
 def compute_suite(pred: np.ndarray, true: np.ndarray, last_bg: np.ndarray,
                   patients: list[str], bands: np.ndarray | None = None) -> dict:
-    """Full per-horizon metric suite from (n_windows, PRED_STEPS) BG arrays.
+    """Per-horizon suite from ``(n_windows, PRED_STEPS)`` mg/dL arrays -> ``{h: {...}} | {'cgega': {...}}``.
 
-    ``pred`` is the median line ``median_bg``, ``true`` the CGM truth, ``last_bg``
-    ``(n_windows,)`` the persistence anchor, ``bands`` the optional per-window mg/dL
-    quantile fan ``(n_windows, PRED_STEPS, N_QUANTILES)`` (``forecast_bands``).
-
-    With ``bands``: the headline per-horizon block and CG-EGA score the BAND-PROJECTED
-    forecast ``band_project(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``; the
-    same block on the median line is nested under ``out[h]['median_line']``; each
-    horizon also carries ``band_cov50`` (realized fraction of truth inside the band,
-    target 0.50) and ``band_width`` (mean edge-to-edge width, mg/dL). hypo/hyper
-    recall/precision key off the τ-lower / τ-upper ALARM band edges (matching train.py).
-
-    With ``bands=None``: the pre-band behaviour exactly — every metric off the median
-    ``pred``, no ``median_line`` / ``band_cov50`` / ``band_width`` keys, hypo/hyper off
-    the median.
-
-    Returns ``{h: {...} for h in HORIZONS} | {'cgega': {...}}``.
+    ``pred`` the median line, ``true`` the CGM truth, ``last_bg`` ``(n_windows,)`` the persistence anchor,
+    ``bands`` the optional fan ``(n_windows, PRED_STEPS, N_QUANTILES)``.
+    With ``bands``: headline block and CG-EGA score the band-projected forecast, the median-line block nests
+    under ``out[h]['median_line']``, and each horizon carries ``band_cov50`` (target 0.50) and ``band_width``
+    (mean edge-to-edge, mg/dL). Without: every metric, hypo and hyper included, comes off the median.
     """
     assert pred.ndim == 2 and pred.shape == true.shape, \
         f"compute_suite shape mismatch: pred {pred.shape}, true {true.shape}"
@@ -190,7 +152,7 @@ def compute_suite(pred: np.ndarray, true: np.ndarray, last_bg: np.ndarray,
     for h in HORIZONS:
         k = _IDX[h]
         tk = true[:, k]
-        # persistence (predict last_bg held flat) — no band, computed once per horizon
+        # persistence: last_bg held flat, no band, once per horizon
         rmse_persist_point = _rmse(last_bg - tk)
         row = _point_block(pred_eff[:, k], tk,
                            pred_eff[:, :k + 1] - true[:, :k + 1],   # window-mean basis
@@ -210,11 +172,9 @@ def compute_suite(pred: np.ndarray, true: np.ndarray, last_bg: np.ndarray,
         row['hyper'] = _excursion(pred_hi_k, tk, BG_HYPER_THRESHOLD, 'hyper')
         row['n_windows'] = len(tk)
         out[h] = row
-    # CG-EGA clinical accuracy over the FULL forecast window (all PRED_STEPS, not a
-    # single horizon) — per-region %AP/%BE/%EP, anchored at last_bg for the t=0 rate.
-    # GRID_MIN = 5 min per step. The TRUTH is the reference on every axis (region,
-    # acceptance band, mod widening, R-EGA abscissa); the band-projected forecast is
-    # the scored series, and where the truth lies inside the band the two coincide.
+    # CG-EGA over the FULL window, all PRED_STEPS, not one horizon: per-region %AP/%BE/%EP,
+    # anchored at last_bg for the t=0 rate, 5 min per step. The TRUTH is the reference on every
+    # axis (region, acceptance band, mod widening, R-EGA abscissa); the band-projected forecast is scored.
     cg_counts = cg_ega.cg_ega_counts(true, pred_eff, last_bg, freq_min=5.0)
     cg_fr = cg_ega.cg_ega_fractions(cg_counts)
     out['cgega'] = {
@@ -229,15 +189,11 @@ def compute_suite(pred: np.ndarray, true: np.ndarray, last_bg: np.ndarray,
 def conformal_intervals(cal_pred: np.ndarray, cal_true: np.ndarray,
                         test_pred: np.ndarray, test_true: np.ndarray,
                         alpha: float = 0.1) -> dict:
-    """Split-conformal constant-width 90% intervals: fit ±q on calibration
-    residuals, evaluate coverage + width on test (per horizon).  Point-only —
-    no MC sampling needed.
+    """Split-conformal constant-width 90% intervals: fit ±q on calibration residuals, score coverage on test.
 
-    All four arrays are ``(n_windows, PRED_STEPS)`` mg/dL. The BASIS is whatever the
-    caller passes: hand it ``band_project(true, lo, hi)`` on both splits and the
-    half-width reads as the extra width needed on top of the band to reach 90%; hand it
-    the median line on both and it is the classic point interval. Both splits must use
-    the SAME basis for the residuals to be exchangeable.
+    All four arrays ``(n_windows, PRED_STEPS)`` mg/dL. The basis is the caller's: band-projected on both
+    splits reads as the extra width the band needs to reach 90%, the median line on both is the classic point
+    interval. Both splits MUST share one basis, or the residuals are not exchangeable.
     """
     out = {}
     for h in HORIZONS:
@@ -245,10 +201,7 @@ def conformal_intervals(cal_pred: np.ndarray, cal_true: np.ndarray,
         scores = np.abs(cal_pred[:, k] - cal_true[:, k])
         nq = len(scores)
         if nq == 0 or len(test_pred) == 0:
-            # A window-starved source (a single short segment) yields an
-            # empty calibration or test split: np.quantile on an empty array (and the
-            # nq+1 / nq term) would crash. Degrade gracefully to NaN rather than abort
-            # the whole eval.
+            # empty cal or test split: np.quantile would crash, so NaN rather than abort the eval
             out[h] = {'half_width': float('nan'), 'coverage': float('nan')}
             continue
         q = float(np.quantile(scores, min(1.0, np.ceil((nq + 1) * (1 - alpha)) / nq), method='higher'))

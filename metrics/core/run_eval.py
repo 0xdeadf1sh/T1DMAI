@@ -1,21 +1,13 @@
-"""
-Evaluation driver — the full comparison metric suite over a set of collected
-windows, with the reporting protocol baked in:
+"""Evaluation driver: the comparison metric suite over collected windows, reporting protocol included.
 
-  * headline forecast = the model's quantile BAND projected onto the truth,
-    ``clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``; the median line
-    ``median_bg`` is kept alongside under ``metrics[h]['median_line']`` as the
-    point basis for peer/literature comparison. Without a band fan every metric
-    falls back to the median line
-  * metrics: strict-point + window-mean RMSE/MAE, MARD, Clarke A/A+B, hypo/hyper
-    recall+precision (STRICT crossings), persistence skill (persistence carries no
-    band, so its rows are median-line either way)
-  * split-conformal band recalibration, region-binned, fitted on the calibration
-    windows and reported on the test ones
+  * headline forecast = the band projected onto the truth,
+    ``clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``; the median line stays under
+    ``metrics[h]['median_line']`` as the point basis peers publish. No fan ⇒ every metric is median-line
+  * strict-point and window-mean RMSE/MAE, MARD, Clarke A/A+B, hypo/hyper recall and precision on STRICT
+    crossings, persistence skill (persistence has no band, so its rows are median-line either way)
+  * split-conformal band recalibration, region-binned, fit on cal and reported on test
 
-``evaluate_from_windows`` is the entry point: it takes the calibration and test
-window lists a collector produced and returns the whole suite. ``metrics/sim/``
-is the collector.
+``evaluate_from_windows`` is the entry point; ``metrics/sim/`` is the collector.
 """
 from __future__ import annotations
 
@@ -57,40 +49,19 @@ _BAND_HI_IDX = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)    # metric band τ-upp
 from normalization import CHANNEL_NAMES, SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS
 from utils import kovatchev_f_inv_np
 
-# Medically-useful precision floor for the per-horizon hypo decision-offset
-# selection. The risk-space redesign removed ``config.EXCURSION_DECISION_MIN_PRECISION``
-# (this package was out of scope for that cycle's config), so the deployment knob lives
-# here as a module-level default — the highest-recall offset whose CAL precision
-# clears this floor is selected (else the strict δ=0 crossing).
+# Precision floor for the per-horizon hypo decision offset: the highest-recall offset whose CAL precision
+# clears it wins, else the strict δ=0 crossing.
 EXCURSION_DECISION_MIN_PRECISION = 0.7
 
 _PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 
-# --------------------------------------------------------------------------- #
-# The forecast protocol, as a masked set
-# --------------------------------------------------------------------------- #
-# Every window this module scores runs one fixed protocol: a single masked span of
-# ``PREDICTION_PATCHES`` patches ending at the window's LAST patch, with the whole
-# context visible.  That is the FORECAST case of the masked-BG objective, not a
-# mode of its own — a span starting at patch 0 is a backcast and a span between
-# visible patches is infill, and neither is scored here.
-#
-# The masked set is expanded by ``data._mask_slots``, the single definition of the
-# slot layout and of ``d``; nothing below restates the rule.  ``d`` is the distance
-# in patches from a masked patch to the nearest visible evidence ON EITHER SIDE,
-# and it is the only quantity a masked-BG metric may be binned on — never span
-# length, which confounds one-sided and two-sided cases at equal difficulty, and
-# never arm.  A right-edge span has no right neighbour, so d is ONE-SIDED here and
-# slot j sits at d = j + 1: the reported 30 / 60 / 90 / 120 min horizons ARE
-# d = 1..4 one-sided.
-#
-# The ANCHOR is a different quantity and is deliberately not d.  It is ONE-SIDED
-# and LEFT-PREFERRING: every slot of a span takes the last step of the left
-# neighbour, or the first step of the right neighbour only when the span starts at
-# patch 0, and every slot of one span gets the same value.  It therefore IGNORES
-# the near side for the right-half slots of a two-sided span.  For the right-edge
-# span scored here there is no near side to ignore, but the anchor still sits a
-# fixed 1 patch away while d runs 1..PREDICTION_PATCHES.
+# The forecast protocol as a masked set: one span of ``PREDICTION_PATCHES`` at the window's LAST patch,
+# whole context visible. Backcast and infill are the same objective and are not scored here.
+# ``data._mask_slots`` is the single definition of the slot layout and of ``d``, the distance in patches to
+# the nearest visible evidence ON EITHER SIDE — the only axis a masked-BG metric may bin on, never span
+# length. A right-edge span has no right neighbour, so slot j sits at d = j + 1: 30/60/90/120 min ARE d = 1..4.
+# The ANCHOR is NOT d: one-sided and LEFT-PREFERRING, the left neighbour's last step (the right neighbour's
+# first only at patch 0), one value per span. Here it stays a fixed 1 patch away while d runs 1..PREDICTION_PATCHES.
 from data import _mask_slots as _expand_mask_slots
 
 _FORECAST_SEQ_LEN = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
@@ -106,17 +77,12 @@ assert int(_fc_anchor_step[_fc_valid][0]) == CTX_STEPS - 1, (
 
 
 def horizon_d_patches(h_min: int) -> int:
-    """Distance-to-evidence bin ``d``, in patches, of a horizon of ``h_min`` minutes.
+    """The distance-to-evidence bin ``d``, in patches, for a horizon of ``h_min`` minutes.
 
-    A single forward pass masks ``PREDICTION_PATCHES`` patches at the right edge,
-    so the step at ``h_min`` minutes falls in patch ``ceil(h_min / patch_minutes)``
-    of that span and carries ``d`` = that patch number, one-sided.
-
-    Past a single pass the forecast is ROLLED, and ``d`` does not keep growing: roll
-    ``r`` re-runs the same right-edge span against a context whose tail is the
-    previous roll's own output, so its slots are again ``d`` = 1..PREDICTION_PATCHES
-    — but measured from FABRICATED evidence, not from an observed reading.  This
-    returns the within-roll ``d`` and the roll index, so a table can say which.
+    One pass masks ``PREDICTION_PATCHES`` at the right edge, so the step lands in patch
+    ``ceil(h_min / patch_minutes)`` and carries that ``d``, one-sided.
+    Past one pass ``d`` does NOT keep growing: each roll re-runs the same span against the previous roll's
+    own output, so d = 1..PREDICTION_PATCHES again, measured from FABRICATED evidence.
     """
     patch_min = PATCH_SIZE * GRID_MIN
     patch_no = -(-h_min // patch_min)                     # ceil
@@ -131,12 +97,10 @@ def horizon_roll_index(h_min: int) -> int:
 
 
 def _slice(seg: Segment, a: int, b: int) -> Segment:
-    """A sub-Segment over steps [a, b), with t0 advanced accordingly.
+    """A sub-Segment over steps ``[a, b)``, ``t0`` advanced to match.
 
-    Every length-N array on the Segment must be named here, the optional
-    pre-resolved curves included: ``replace`` passes un-named fields through
-    verbatim, so an omitted channel would leave a full-length array on a
-    sub-Segment and silently misalign it against the sliced CGM.
+    Every length-N array must be named, pre-resolved curves included: ``replace`` passes an un-named field
+    through at FULL length, misaligned against the sliced CGM.
     """
     return replace(
         seg, t0=seg.t0 + timedelta(minutes=GRID_MIN * a),
@@ -149,29 +113,16 @@ def _slice(seg: Segment, a: int, b: int) -> Segment:
 
 
 def _quantile_cqr(cal_w: list[Window], test_w: list[Window]) -> dict | None:
-    """Quantile-CQR band recalibration, REGION-BINNED (Mondrian).
+    """Quantile-CQR band recalibration, REGION-BINNED (Mondrian), fit on the CAL split of this run.
 
-    Captures the model's RAW per-window mg/dL quantile fans (``Window.bands``) and
-    fits the split-conformal correction on the CALIBRATION split ONCE PER REGION
-    BIN (``mondrian.fit_mondrian``), the region being where that window's forecast
-    is HEADING. The fit is per run by construction (this runs inside
-    ``evaluate_from_windows`` on that run's own cal/test windows). Returns
-    ``None`` when either split lacks bands (old caches / a path that did not
-    capture them), so the renderer can skip.
-
-    THREE ARMS, ALL MEASURED IN THIS RUN so no figure is ever compared across
-    runs (or across a clamp change): ``raw`` uncalibrated, ``marg`` the marginal
-    pre-Mondrian fit that ``conformal.py`` alone gives — which is also the stated
-    fallback for a bin under ``mondrian.MIN_N_OWN_FIT`` — and the region-binned
-    arm, carried under the historical ``cal_*`` names since it is the correction
-    in force.
-
-    Every coverage figure carries its ``n``, its DISTINCT PATIENT count and its
-    MEAN BAND WIDTH: coverage is bought with width, and n windows drawn from a
-    handful of patients are not n independent observations.
-
-    Per-horizon rows are per-``d`` rows — the right-edge forecast span puts the
-    30/60/90/120 min horizons at one-sided ``d`` = 1..4 (``horizon_d_patches``).
+    The RAW per-window fans (``Window.bands``) are corrected once per region bin, the region being where
+    that window's forecast is HEADING. ``None`` when either split lacks bands, so the renderer can skip.
+    THREE ARMS, all measured in this run so nothing is compared across runs: ``raw``; ``marg``, the marginal
+    ``conformal.py`` fit, which is also the fallback for a bin under ``mondrian.MIN_N_OWN_FIT``; and the
+    region-binned arm, under the ``cal_*`` names, being the correction in force.
+    Every coverage figure carries its ``n``, its DISTINCT PATIENT count and its MEAN BAND WIDTH: coverage is
+    bought with width, and n windows from a handful of patients are not n independent observations.
+    Per-horizon rows are per-``d`` rows.
     """
     cal_bands = forecast_bands(cal_w)
     test_bands = forecast_bands(test_w)
@@ -180,9 +131,8 @@ def _quantile_cqr(cal_w: list[Window], test_w: list[Window]) -> dict | None:
     _, cal_true, _, cal_pats = forecast_windows(cal_w)
     _, test_true, _, test_pats = forecast_windows(test_w)
 
-    # The region reads the fan's own median line, which conformal holds FIXED — a
-    # window's bin is therefore identical before and after correction and the
-    # assignment is not circular.
+    # the region reads the median line, which conformal holds FIXED, so a window's bin is the same before
+    # and after correction and the assignment is not circular
     cal_bin = mondrian.region_bin(mondrian.forecast_destination(cal_bands, _MED_IDX))
     test_bin = mondrian.region_bin(mondrian.forecast_destination(test_bands, _MED_IDX))
 
@@ -203,8 +153,7 @@ def _quantile_cqr(cal_w: list[Window], test_w: list[Window]) -> dict | None:
         'delta': delta.tolist(),                 # (n_bins, S, K) — region-binned
         'delta_marginal': marginal.tolist(),     # (S, K) — the pre-Mondrian baseline
         'fit': meta,
-        # Per bin AND per d: d is the only axis a masked-BG metric may be binned
-        # on, and the right-edge forecast span puts patch p at one-sided d = p+1.
+        # per bin AND per d, the only axis a masked-BG metric may bin on; a right-edge span puts patch p at d = p+1
         'bins': mondrian.bin_report(
             arms, test_true, test_bin, _LO_IDX, _HI_IDX, patients=test_pats,
             step_groups=mondrian.forecast_d_step_groups(PREDICTION_PATCHES, PATCH_SIZE)),
@@ -229,15 +178,12 @@ def _quantile_cqr(cal_w: list[Window], test_w: list[Window]) -> dict | None:
 
 
 def evaluate_from_windows(cal_w: list[Window], test_w: list[Window]) -> dict:
-    """Score the headline metric suite from pre-collected windows (no model).
+    """Score the headline suite from pre-collected windows; no model needed.
 
-    The headline forecast is the model's quantile BAND projected onto the truth
-    (``metrics.core.suite.band_project`` over the τ=``METRIC_BAND_TAU_LO`` /
-    τ=``METRIC_BAND_TAU_HI`` edges of the fan captured at collection); the median line
-    ``median_bg`` is scored alongside under ``metrics[h]['median_line']``. The suite,
-    the split-conformal intervals and the excursion decision-offset sweep all read the
-    SAME basis: a split whose windows carry no fan demotes every one of them to the
-    median line, so the CAL-fit operating point and its TEST readout stay comparable.
+    The headline forecast is the band projected onto the truth over the τ=``METRIC_BAND_TAU_LO`` /
+    ``METRIC_BAND_TAU_HI`` edges; the median line is scored alongside under ``metrics[h]['median_line']``.
+    Suite, conformal intervals and the decision-offset sweep read ONE basis: a split with no fan demotes all
+    three to the median line, so the CAL-fit operating point and its TEST readout stay comparable.
     """
     test_pred, test_true, test_last, test_pats = forecast_windows(test_w)
     cal_pred, cal_true, _, _ = forecast_windows(cal_w)
@@ -253,29 +199,20 @@ def evaluate_from_windows(cal_w: list[Window], test_w: list[Window]) -> dict:
     else:
         cal_eff, test_eff = cal_pred, test_pred
     conf = conformal_intervals(cal_eff, cal_true, test_eff, test_true)
-    # Quantile-CQR band recalibration reads the RAW fan (not the projected basis):
-    # additive, None when windows lack bands. Per-cohort by construction.
+    # reads the RAW fan, not the projected basis; None when windows lack bands
     conf_cqr = _quantile_cqr(cal_w, test_w)
 
-    # --- Excursion decision-offset sweep ----------------------------------- #
-    # The excursion decision runs on the SAME basis as the suite — the τ-lower band
-    # edge (hypo) / τ-upper edge (hyper), else the median line — with a per-horizon
-    # offset δ (``edge < thr + δ``) as the operating point, chosen from the
-    # recall–precision curve. The curves are fit on the CAL split (STRICT crossings;
-    # the offset δ is itself the band lever) so the operating point is picked from data.
+    # Same basis as the suite — τ-lower edge for hypo, τ-upper for hyper, else the median line — with a
+    # per-horizon offset δ (``edge < thr + δ``) as the operating point, fit on the CAL split.
     curves = calibrate_threshold(cal_pred, cal_true, bands=cal_bands if banded else None)
     threshold_curves = {side: {str(h): curves[side][h] for h in HORIZONS}
                         for side in ('hypo', 'hyper')}
 
-    # Per-horizon hypo decision offset, selected on the CAL split under the
-    # medically-useful precision floor (EXCURSION_DECISION_MIN_PRECISION): the
-    # highest-recall δ whose precision clears the floor, else the strict δ=0
-    # crossing (no low-precision alarm). This is the deployable operating point
-    # the excursion decision should run at; it is fit on cal and reported so the
-    # test-split recall/precision can be read at it.
+    # highest-recall δ whose CAL precision clears EXCURSION_DECISION_MIN_PRECISION, else the strict δ=0
+    # crossing — no low-precision alarm. Reported so the test-split rates can be read at it.
     selected_offsets = {'min_precision': EXCURSION_DECISION_MIN_PRECISION, 'hypo': {}}
     for h in HORIZONS:
-        kk = _HORIZON_IDX[h]   # step index for horizon h (30->5, 60->11, 120->23)
+        kk = _HORIZON_IDX[h]   # step index for horizon h
         off, cal_rec, cal_prec = select_offset(
             curves['hypo'][h], min_precision=EXCURSION_DECISION_MIN_PRECISION)
         test_edge = test_bands[:, kk, _BAND_LO_IDX] if banded else test_pred[:, kk]
@@ -289,10 +226,7 @@ def evaluate_from_windows(cal_w: list[Window], test_w: list[Window]) -> dict:
     return {
         'n_cal_windows': len(cal_w), 'n_test_windows': len(test_w),
         'n_patients': len({w.patient for w in test_w}),
-        # What every per-horizon row above is binned on: d, the distance in patches
-        # to the nearest visible evidence on either side, one-sided for the
-        # right-edge forecast span these windows run.  Recorded so a reader never
-        # has to infer the bin from the horizon label.
+        # what every per-horizon row is binned on, recorded so no reader infers it from the horizon label
         'horizon_d': {str(h): {'d_patches': horizon_d_patches(h),
                                'one_sided': True,
                                'roll': horizon_roll_index(h)}
@@ -306,21 +240,18 @@ def evaluate_from_windows(cal_w: list[Window], test_w: list[Window]) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Night-onset nocturnal excursion prediction. Offline evaluation only — the
-# training loop no longer carries a mirror of it, so this is the definition.
-# --------------------------------------------------------------------------- #
+# Night-onset nocturnal excursion prediction. Offline only, and the definition: the training loop has no mirror.
 def _night_len_hours() -> float:
-    """Length of the nocturnal window (NOCTURNAL_START_HOUR → NOCTURNAL_END_HOUR),
-    wrapping past midnight; a same-hour pair is read as a full 24 h night."""
+    """Nocturnal window length, wrapping past midnight; a same-hour pair reads as a full 24 h night."""
     h = (NOCTURNAL_END_HOUR - NOCTURNAL_START_HOUR) % 24.0
     return 24.0 if h == 0.0 else h
 
 
 def _denorm_channel(col_norm: np.ndarray, name: str, stats: dict) -> np.ndarray:
-    """Inverse-normalize one named channel column (mirrors ``normalization.denormalize``
-    for a single channel): z-score un-scale, then the per-channel inverse — Kovatchev
-    ``f_inv`` for risk-space channels (bg), ``expm1``+clamp for log1p channels."""
+    """One named channel column inverse-normalized: z un-scale, then ``f_inv`` (risk space) or ``expm1``+clamp (log1p).
+
+    Mirrors ``normalization.denormalize`` for a single channel.
+    """
     x = col_norm.astype(np.float64) * (stats[name]['std'] + 1e-8) + stats[name]['mean']
     if name in RISK_SPACE_CHANNELS:
         x = kovatchev_f_inv_np(x)
@@ -331,16 +262,12 @@ def _denorm_channel(col_norm: np.ndarray, name: str, stats: dict) -> np.ndarray:
 
 def _make_night_overrides_fn(feats: np.ndarray, pred_start: int,
                              announce: tuple[int, ...], stats: dict):
-    """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for ``predict_rolling``
-    across a whole night, sliced from the normalized feature stack of the segment.
+    """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for ``predict_rolling``, across one night.
 
-    Roll ``r`` masks the same right-edge span of ``PREDICTION_PATCHES`` patches,
-    advanced by one horizon: the announced window is the feature span
-    ``[pred_start + r·PRED_STEPS, pred_start + (r+1)·PRED_STEPS)``; the announced
-    channels are returned both normalized (sliced straight from ``feats``) and raw
-    (denormalized) as ``{ch: (PREDICTION_PATCHES, PATCH_SIZE)}`` dicts, matching the
-    ``overrides_fn`` contract. Returns ``None`` for a roll whose window runs past the
-    segment, so the rollout falls back to the BG-autoregressive prediction there.
+    Roll ``r`` masks the same right-edge span advanced by one horizon: the feature span
+    ``[pred_start + r·PRED_STEPS, pred_start + (r+1)·PRED_STEPS)``, returned both normalized and raw as
+    ``{ch: (PREDICTION_PATCHES, PATCH_SIZE)}``. ``None`` for a roll past the segment end, which leaves that
+    roll BG-autoregressive.
     """
     n = feats.shape[0]
 
@@ -363,13 +290,11 @@ def _make_night_overrides_fn(feats: np.ndarray, pred_start: int,
 
 def _night_onset_origins(hod: np.ndarray, n_steps: int, night_steps: int,
                          tol_hours: float = 0.75) -> list[int]:
-    """Patch-aligned prediction-start indices whose hour-of-day (``hod``) is within
-    ``tol_hours`` of ``NOCTURNAL_START_HOUR`` and that leave the full night
-    (``night_steps``) ahead, with ``CTX_STEPS`` of context behind.
+    """Patch-aligned origins within ``tol_hours`` of ``NOCTURNAL_START_HOUR``, with the full night ahead.
 
-    ``n_steps`` is the patch-trimmed grid length. At most one origin per calendar
-    night is kept (≥12 h apart), so successive 5-min grid points inside the tolerance
-    band do not each spawn a near-duplicate night.
+    ``n_steps`` is the patch-trimmed grid length; ``CTX_STEPS`` of context must sit behind.
+    One origin per night at most, ≥12 h apart, so neighbouring grid points inside the tolerance band do not
+    each spawn a near-duplicate night.
     """
     if n_steps < CTX_STEPS + night_steps:
         return []
@@ -387,13 +312,10 @@ def _night_onset_origins(hod: np.ndarray, n_steps: int, night_steps: int,
 def _score_night(model, feats: np.ndarray, cgm: np.ndarray, pred_start: int,
                  night_steps: int, n_rolls: int, stats: dict, device,
                  announce: tuple[int, ...]) -> tuple[bool, bool, bool, bool]:
-    """Roll one night from ``pred_start`` to night-end and return the per-night binary
-    excursion calls ``(hypo_true, hypo_pred, hyper_true, hyper_pred)``.
+    """One night rolled to night-end -> ``(hypo_true, hypo_pred, hyper_true, hyper_pred)``.
 
-    ``hypo_true``/``hyper_true``: the TRUE CGM (``cgm``) crosses the threshold anywhere
-    in the clipped night window. ``*_pred``: the rolled forecast crosses it likewise.
-    The night's announced overnight carbs+insulin+exercise are fed to every roll via
-    ``predict_rolling``'s ``overrides_fn`` (the model is always conditioned).
+    A call is True when the series crosses the threshold ANYWHERE in the clipped night: truth off the TRUE
+    CGM, prediction off the rolled forecast. Every roll is fed the night's announced carb, insulin and exercise.
     """
     from inference import predict_rolling
 
@@ -405,8 +327,8 @@ def _score_night(model, feats: np.ndarray, cgm: np.ndarray, pred_start: int,
         overrides_fn=overrides_fn,
     )
     pred_bg = result['pred_bg'].detach().cpu().numpy()
-    # Band-edge detectors, as every other clinical hypo/hyper metric: hypo off the τ-lower edge,
-    # hyper off the τ-upper edge; truth off the TRUE CGM. bands: (rolls*P, S, K) -> (T, K).
+    # band-edge detectors, as everywhere else: hypo off the τ-lower edge, hyper off the τ-upper.
+    # bands: (rolls*P, S, K) -> (T, K)
     bands = result['bands'].detach().cpu().numpy().reshape(-1, N_QUANTILES)
     true_bg = cgm[pred_start:pred_start + night_steps].astype(np.float64)
     usable = min(pred_bg.shape[0], true_bg.shape[0], night_steps)
@@ -425,28 +347,15 @@ def _finalize_night_side(tr: int, pr: int, tp: int) -> dict:
 def night_onset_from_records(model, stats, records, device,
                              announce: tuple[int, ...] = (0, 1, 2),
                              max_nights: int | None = None) -> dict:
-    """Core per-night nocturnal-excursion scorer over generic records.
+    """Per-night nocturnal-excursion scorer over generic records -> ``{'hypo': {...}, 'hyper': {...}, 'n_nights'}``.
 
-    Each record is ``(feats, cgm, hod)``: the normalized (N, F) feature stack, the
-    raw (bg-clamped) comparison-truth CGM (N,) in mg/dL, and the fractional
-    hour-of-day (N,). The window path (``evaluate_night_onset``) and the sim path
-    both adapt their data to this shape (each clamping its truth before passing it).
-
-    At each night-start origin (``hod`` ≈ ``NOCTURNAL_START_HOUR``) the forecast is
-    autoregressively rolled (``inference.predict_rolling``) to night-end
-    (``NIGHT_LONG_HORIZON_HOURS`` ≈ the nocturnal span) and a PER-NIGHT binary
-    hypo/hyper call is emitted from the true CGM and from the rolled forecast (crossing
-    the clinical threshold anywhere in the clipped night window). Recall = fraction of
-    true-excursion nights flagged; precision = fraction of flagged nights that truly had
-    one. The roll is always CONDITIONED (announced overnight carbs+insulin fed per roll
-    via ``predict_rolling``'s ``overrides_fn``); there is no unconditioned regime.
-
-    Returns::
-        {'hypo': {recall, precision, n_true, n_pred},  'hyper': {...},
-         'n_nights': int}
-
-    Empty (``{}``) when the night fits in a single forward pass (n_rolls ≤ 1) or no
-    night-onset window is available.
+    A record is ``(feats, cgm, hod)``: the normalized ``(N, F)`` stack, the raw bg-clamped truth CGM ``(N,)``
+    in mg/dL, and the fractional hour-of-day ``(N,)``. Every path adapts to this shape.
+    From each night-start origin the forecast is rolled to night-end and one binary hypo/hyper call comes off
+    the truth and off the forecast — crossing the threshold anywhere in the clipped night. Recall is the
+    fraction of true-excursion nights flagged, precision the fraction of flagged nights that had one.
+    Always conditioned: the overnight doses are announced per roll.
+    ``{}`` when the night fits one forward pass (n_rolls ≤ 1) or no night-onset window exists.
     """
     n_rolls = math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
     if n_rolls <= 1:
@@ -490,50 +399,33 @@ def evaluate_night_onset(model, stats, test_segs: list[Segment], device,
                          max_nights: int | None = None) -> dict:
     """Per-night nocturnal excursion prediction on a dataset's test segments.
 
-    Adapts each :class:`Segment` to a ``(feats, cgm, hod)`` record and delegates to
-    :func:`night_onset_from_records`; see it for the per-night metric definition and
-    the returned dict shape.
+    Each :class:`Segment` becomes a ``(feats, cgm, hod)`` record for :func:`night_onset_from_records`.
     """
-    # Score against the raw (bg-clamped) CGM (the model lives in raw post-noise space).
+    # scored against the raw bg-clamped CGM
     records = ((build_feature_stack(seg, stats), smoothed_cgm(seg.cgm), seg.hour_of_day())
                for seg in test_segs)
     return night_onset_from_records(model, stats, records, device,
                                     announce=announce, max_nights=max_nights)
 
 
-# --------------------------------------------------------------------------- #
-# Hour-by-hour RMSE-vs-horizon for the figures (rolled past the single forward
-# pass). Figure-only: the reported metric suite keeps the canonical HORIZONS.
-# --------------------------------------------------------------------------- #
+# Hour-by-hour RMSE-vs-horizon, rolled past the single forward pass. Figure-only: the suite keeps HORIZONS.
 def rmse_by_horizon_from_records(model, stats, records, device,
                                  horizons_min: tuple[int, ...] = FIGURE_HORIZONS,
                                  conditional: bool = True,
                                  announce: tuple[int, ...] = (0, 1, 2),
                                  stride_patches: int = 8,
                                  max_windows: int = 200) -> dict:
-    """Per-horizon point and window-mean RMSE — model and naive persistence — from
-    a forecast ROLLED out to the largest requested horizon, for the hour-by-hour
-    ``rmse_vs_horizon`` figure.
+    """Per-horizon point and window-mean RMSE, model and naive persistence, off a forecast ROLLED to ``hmax``.
 
-    Each record is ``(feats, cgm)``: the normalized (N, F) feature stack and the
-    raw (bg-clamped) comparison-truth CGM (N,) in mg/dL (the real path wraps
-    :class:`Segment`s, the sim path its run dicts; each clamps its truth before
-    passing it). Squared errors are accumulated per 5-min step across windows (a window
-    near a segment end contributes only to the steps it reaches); point RMSE reads
-    the step at the horizon, window-mean RMSE pools steps 0..horizon. Persistence is
-    the last context BG held flat. Each window's future carbs/insulin/exercise are
-    announced per roll (the model is always conditioned; ``conditional`` is a deprecated
-    no-op), matching the report regime.
-
-    Two forecast bases are accumulated over the same windows, matching the suite: the
-    BAND-projected forecast ``band_project(true, q[METRIC_BAND_TAU_LO],
-    q[METRIC_BAND_TAU_HI])`` (``rmse_point`` / ``rmse_winmean``) and the median line
-    ``f_inv(median)`` (``rmse_point_median`` / ``rmse_winmean_median``). Persistence
-    carries no band and is accumulated once.
-
-    Returns ``{str(h_min): {rmse_point, rmse_winmean, rmse_point_median,
-    rmse_winmean_median, rmse_persist_point, rmse_persist_winmean, n}}`` for every
-    horizon the data reach.
+    A record is ``(feats, cgm)``: the normalized ``(N, F)`` stack and the raw bg-clamped truth ``(N,)`` mg/dL.
+    Squared errors accumulate per 5-min step across windows — a window near a segment end contributes only
+    the steps it reaches. Point RMSE reads the horizon step, window-mean pools steps 0..horizon; persistence
+    is the last context BG held flat. Always conditioned; ``conditional`` is a no-op.
+    Two bases over the same windows, matching the suite: BAND-projected (``rmse_point`` / ``rmse_winmean``)
+    and the median line (``rmse_point_median`` / ``rmse_winmean_median``). Persistence has no band and is
+    accumulated once.
+    -> ``{str(h_min): {rmse_point, rmse_winmean, rmse_point_median, rmse_winmean_median,
+    rmse_persist_point, rmse_persist_winmean, n}}`` for every horizon the data reach.
     """
     from inference import predict, predict_rolling
 
@@ -600,10 +492,8 @@ def rmse_by_horizon_from_records(model, stats, records, device,
             'rmse_persist_point': math.sqrt(se_p[k] / cnt[k]),
             'rmse_persist_winmean': math.sqrt(se_p[:k + 1][msk].sum() / pooled),
             'n': int(cnt[k]),
-            # The bin, carried beside the number: d is the distance in patches to
-            # the nearest visible evidence, one-sided for a right-edge span.  Past
-            # roll 0 that evidence is the previous roll's own output, so d restarts
-            # at 1 and is measured from a fabricated reading — ``roll`` says which.
+            # the bin beside the number: past roll 0 the evidence is the previous roll's own output,
+            # so d restarts at 1 from a fabricated reading and ``roll`` says which
             'd_patches': horizon_d_patches(h),
             'one_sided': True,
             'roll': horizon_roll_index(h),
@@ -617,9 +507,8 @@ def rmse_by_horizon_rolling(model, stats, test_segs: list[Segment], device,
                             announce: tuple[int, ...] = (0, 1, 2),
                             stride_patches: int = 8,
                             max_windows: int = 200) -> dict:
-    """Hour-by-hour RMSE-vs-horizon over a dataset's test segments; see
-    :func:`rmse_by_horizon_from_records` for the metric definition and dict shape."""
-    # Score against the raw (bg-clamped) CGM (the model lives in raw post-noise space).
+    """Hour-by-hour RMSE-vs-horizon over a dataset's test segments; defined in :func:`rmse_by_horizon_from_records`."""
+    # scored against the raw bg-clamped CGM
     records = ((build_feature_stack(seg, stats), smoothed_cgm(seg.cgm)) for seg in test_segs)
     return rmse_by_horizon_from_records(
         model, stats, records, device, horizons_min, conditional=conditional,
