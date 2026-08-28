@@ -47,8 +47,8 @@ def test_write_constants_round_trip_preserves_neighbors():
         out = tmp.read_text()
         assert any(line.lstrip().startswith('D_MODEL = 320') for line in out.splitlines())
         assert 'D_MODEL = 128' not in out
-        # D_MODEL's trailing comment
-        assert 'Hidden dimension throughout the transformer' in out
+        # a neighbour's trailing comment
+        assert '6 × 5 min = 30 min per patch' in out
         assert len(out.splitlines()) == len(src.splitlines())
         print("[DUMP] write round-trip: D_MODEL rewritten, neighbours + comment intact")
     finally:

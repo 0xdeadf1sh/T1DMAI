@@ -137,8 +137,12 @@ def test_architecture_redesign_constants():
     assert not hasattr(config, 'BG_INPUT_RISK_SPACE'), \
         "config.BG_INPUT_RISK_SPACE must be deleted (risk-space input is unconditional)"
 
-    assert config.ARCH_VERSION == 'risk-v4', \
-        f"ARCH_VERSION must be 'risk-v4', got {config.ARCH_VERSION!r}"
+    assert config.ARCH_VERSION == 'risk-v5', \
+        f"ARCH_VERSION must be 'risk-v5', got {config.ARCH_VERSION!r}"
+    # the head is one MLP over spline step states: width and init scale are the only knobs
+    assert sorted(n for n in dir(config) if n.startswith('BG_HEAD_')) == \
+        ['BG_HEAD_HIDDEN', 'BG_HEAD_INIT_SCALE'], \
+        f"stale BG_HEAD_* constant: {[n for n in dir(config) if n.startswith('BG_HEAD_')]}"
     assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-v3', \
         f"LOSS_SCHEMA must be 'kendall-pinball-dilate-v3', got {config.LOSS_SCHEMA!r}"
     print(f"\n[DUMP] redesign | ROPE_BASE={config.ROPE_BASE} "

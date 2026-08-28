@@ -164,7 +164,8 @@ def test_sim_collect_rows_band_capture(delta_none):
         pytest.skip(f"checkpoint {os.path.basename(ckpts[-1])} was trained at "
                     f"PATCH_DIM {ckpt_patch_dim}; this build is {PATCH_DIM}")
     model, stats, _ = load_model(device, ckpts[-1])
-    runs = make_sim_runs((8000,), 90.0)
+    from metrics.sim.sim_data import CTX_STEPS, PRED_STEPS
+    runs = make_sim_runs((8000,), (CTX_STEPS + PRED_STEPS) / 12.0 + 8.0)
     delta = None if delta_none else getattr(model, 'conformal_delta', None)
     rows = collect_sim_rows(model, stats, runs, device, cap=2, conformal_delta=delta)
     assert rows, "expected at least one sim row"

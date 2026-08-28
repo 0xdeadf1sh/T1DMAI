@@ -558,7 +558,7 @@ def test_spans_never_abut_and_fit_the_budget(T):
     MAX_MASKED_PATCHES masked patches, all inside the window, one visible patch between
     neighbours.
 
-    The separator is what makes the anchor, the per-span median basis and the DILATE
+    The separator is what makes the anchor, the spline's node sequence and the DILATE
     length bucket well defined; two spans with nothing between them are one longer span
     and nothing downstream would say so.
     """

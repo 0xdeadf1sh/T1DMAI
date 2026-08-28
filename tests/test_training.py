@@ -255,9 +255,8 @@ def test_risk_total_loss_lower_when_matched():
     B, P, S = 2, PREDICTION_PATCHES, PATCH_SIZE
     weighting = KendallGalWeighting()
     last_bg = torch.full((B,), 120.0)
-    # ramp the truth continuously, within-patch and cross-patch: the cumulative median
-    # is driven by within-patch SLOPE, not level, so a flat-per-patch truth collapses
-    # both signs onto the flat anchor
+    # ramp the truth: against a flat truth the median delta is zero at every step and the
+    # two signs collapse onto the same anchor
     true_bg = torch.full((B, P, S), 120.0)
     for p in range(P):
         for s in range(S):

@@ -102,3 +102,32 @@ def test_descriptor_kovatchev_block_tracks_the_live_transform():
     f_hi = float(kovatchev_f(torch.tensor([float(BG_CLAMP_MAX)])).item())
     assert abs(kov["RISK_CLAMP_MIN"] - f_lo) < 1e-6
     assert abs(kov["RISK_CLAMP_MAX"] - f_hi) < 1e-6
+
+
+def test_descriptor_drops_the_retired_head_constants_and_names_the_decoder(tmp_path):
+    """The Rust runtime reads the descriptor and nothing else: a constant left behind
+    describes a head that is no longer there, and it would parse."""
+    import config as cfg
+    from exporters.head_weights import write_head_weights
+    from model import T1DMAI
+
+    torch.manual_seed(0)
+    block = write_head_weights(T1DMAI(), str(tmp_path / "m.head.bin"))
+    stats = {c: {"mean": 0.0, "std": 1.0}
+             for c in ("bg_absolute", "carb_intake", "insulin_combined")}
+    desc = build_descriptor(
+        model_id="m", engine="e", executorch_version="1.3.1",
+        artifact_filename="m.pte", normalization_stats=stats, head=block,
+    )
+    stale = sorted(k for k in desc["constants"] if k.startswith("BG_HEAD_"))
+    head = desc["head"]
+    print(f"[DUMP] head decoder={head['decoder']} out_dim={head['out_dim']} "
+          f"tensors={[t['name'] for t in head['tensors']]}")
+
+    assert stale == [], f"retired head constants still in the descriptor: {stale}"
+    assert head["decoder"] == "bspline-centre-nodes"
+    assert head["out_dim"] == 1 + 2 * cfg.N_SPREADS
+    assert [t["name"] for t in head["tensors"]] == [
+        "l0.weight", "l0.bias", "l1.weight", "l1.bias", "l2.weight", "l2.bias"]
+    assert desc["io"]["output_hidden"]["name"] == "hidden"
+    assert desc["arch_version"] == cfg.ARCH_VERSION

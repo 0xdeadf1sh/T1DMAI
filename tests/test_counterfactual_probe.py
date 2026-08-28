@@ -1,7 +1,10 @@
-"""Smoke only: the net is untrained, so response sign is not asserted."""
+"""The injected curves are pinned; the probe itself is a smoke test, since the net is
+untrained and its response sign is not assertable."""
 
 import math
 
+import numpy as np
+import pytest
 import torch
 
 
@@ -72,3 +75,41 @@ def test_counterfactual_probe_smoke():
           f"carb_mono={result['cf_carb_monotonic']:.2f} "
           f"insulin_mono={result['cf_insulin_monotonic']:.2f}")
     print(f"[DUMP] cf_probe | all 11 cf_* keys present and finite/None ✓")
+
+
+def test_cf_bolus_curve_is_the_spec_curve_not_a_rectangle():
+    from train import _cf_bolus_curve
+    from config import (CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
+                        PREDICTION_PATCHES, PATCH_SIZE)
+
+    ps = PREDICTION_PATCHES * PATCH_SIZE
+
+    carb = _cf_bolus_curve('carb', CF_CARB_BOLUS_G, ps)
+    assert carb.shape == (ps,)
+    assert (carb >= 0.0).all()
+    assert abs(float(carb.sum()) - CF_CARB_BOLUS_G) < 1e-3, float(carb.sum())
+    # GI 100 peaks at (k-1)*theta = 15 min, the fourth 5-min step
+    assert int(carb.argmax()) == 3, f"carb peak at step {int(carb.argmax())}"
+    assert abs(float(carb[0]) - 1.7907) < 1e-3, float(carb[0])
+    # the rectangle this replaced was flat across the first PATCH_SIZE steps
+    assert float(carb[0]) < 0.5 * float(carb[3]), (float(carb[0]), float(carb[3]))
+
+    ins = _cf_bolus_curve('insulin', CF_INSULIN_BOLUS_U, ps)
+    assert ins.shape == (ps,)
+    assert (ins >= 0.0).all()
+    assert abs(float(ins.sum()) - CF_INSULIN_BOLUS_U) < 1e-3, float(ins.sum())
+    assert int(ins.argmax()) > int(carb.argmax()), (
+        f"insulin peaks at step {int(ins.argmax())}, carbs at {int(carb.argmax())}")
+
+    # truncation keeps the head of the curve rather than rescaling it back to the total
+    short = _cf_bolus_curve('carb', CF_CARB_BOLUS_G, 10)
+    assert short.shape == (10,)
+    assert np.allclose(short, carb[:10])
+    assert float(short.sum()) < CF_CARB_BOLUS_G
+
+    with pytest.raises(ValueError):
+        _cf_bolus_curve('exercise', 1.0, ps)
+
+    print(f"\n[DUMP] cf_curve | carb sum={carb.sum():.3f} peak_step={int(carb.argmax())} "
+          f"step0={carb[0]:.4f} | insulin sum={ins.sum():.3f} "
+          f"peak_step={int(ins.argmax())}")
