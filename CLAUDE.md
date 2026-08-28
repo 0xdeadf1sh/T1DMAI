@@ -49,8 +49,7 @@ withholds bg (feat 0); carb, insulin and exercise keep their true (training) or 
 (inference) values there. The head emits a quantile fan for every masked patch. A masked span
 ending at patch `T-1` is a FORECAST, one starting at patch 0 a BACKCAST, anything else INFILL —
 three cases of one objective, not three modes. `PREDICTION_PATCHES` is the span of the fixed
-forecast *protocol* and the reference length the per-span median basis scales against; it is not a
-region of a training sample.
+forecast *protocol*; it is not a region of a training sample.
 
 - **The sampler** (`data.sample_mask_spans`), per sample: `n_spans ~ U{1..MASK_MAX_SPANS}` (3);
   each `L_i ~ U(MASK_SPAN_LENGTHS)` independently; `sum(L) > MAX_MASKED_PATCHES` resamples the
@@ -64,7 +63,7 @@ region of a training sample.
   pre-quota one exactly. `d_balance.d_distribution` enumerates both branches, and
   `metrics/protocols.py`'s `SAMPLER_REFERENCE` is produced from it.
 - **Two masked spans never abut.** One mandatory visible separator is charged up front. The
-  separator is what makes the anchor, the per-span median basis and the DILATE length bucket well
+  separator is what makes the anchor, the spline's node sequence and the DILATE length bucket well
   defined per span; two spans with nothing between them are one longer span, and `utils._span_layout`
   identifies spans by adjacency in `mask_idx` precisely because the sampler guarantees this.
 - **Head slots.** `MAX_MASKED_PATCHES` is two things: the sampler's cap on `sum(L)`, and `M`, the
@@ -91,8 +90,8 @@ region of a training sample.
 ## Architecture gotchas
 
 - **Capacity.** `D_MODEL = 128`, `N_LAYERS = 8`, `N_HEADS = 8`, `FFN_DIM = 4×D_MODEL`,
-  `BG_HEAD_HIDDEN = 1×D_MODEL` — 2,160,054 parameters plus one 36-element `step_basis` buffer.
-  `ARCH_VERSION = 'risk-v4'`. Don't bake those numbers into other code or comments: `resize_model.py`
+  `BG_HEAD_HIDDEN = 1×D_MODEL` — 2,155,539 parameters and no buffers.
+  `ARCH_VERSION = 'risk-v5'`. Don't bake those numbers into other code or comments: `resize_model.py`
   rewrites them, preserving `HEAD_DIM = D_MODEL // N_HEADS` and the symbolic `FFN_DIM = k·D_MODEL` /
   `BG_HEAD_HIDDEN = k·D_MODEL` relations.
 - **Patch = 6 timesteps = 30 min.** Patches are the attention/loss unit; the BG head emits
@@ -156,30 +155,27 @@ region of a training sample.
 - **No dynamics output channels.** There is no `N_OUTPUT_CHANNELS`, no per-channel head, no MDN, no IS/HGO/carb/insulin output, no `bg_delta` anywhere. The model emits a single BG quantile head.
 - **Single BG quantile head in Kovatchev risk space.** `model.bg_head` is a 3-layer MLP
   (`Linear(D_MODEL, BG_HEAD_HIDDEN), SiLU, Linear, SiLU, Linear(BG_HEAD_HIDDEN,
-  BG_HEAD_STEP_BASIS_DIM·(1 + 2·N_SPREADS))`, `N_SPREADS = 3`) run on each gathered masked-slot
-  hidden state (post `final_norm`).
-  - **Smooth-basis step expansion (structural anti-oscillation).** The head emits
-    `K = BG_HEAD_STEP_BASIS_DIM` (3) coefficients per (slot, channel) — not `PATCH_SIZE` independent
-    per-step values — expanded across the within-patch timesteps by the fixed orthonormal
-    `step_basis (S, K)` buffer (`BG_HEAD_STEP_BASIS_TYPE = 'dct'`, or `'poly'`) via
-    `einsum('sk,bmkc->bmsc', step_basis, coeff)`. With `K < PATCH_SIZE` the period-2 within-patch
-    mode is unrepresentable, so an intra-patch median zigzag cannot be emitted by construction;
-    `K = PATCH_SIZE` recovers a fully-free per-step head.
+  1 + 2·N_SPREADS)`, `N_SPREADS = 3`) run on every 5-minute STEP state, not on the gathered slot
+  state: `H = utils.step_states(x, mask_idx, attn_mask)` `(B, M, S, D_MODEL)` off the post-`final_norm`
+  `x`, then `head_raw = bg_head(H)`.
+  - **The step state is a B-spline over node tokens** — the span's masked patches and its readable
+    visible neighbours, per `../T1DMCOMMON/SPEC/inference.md` §8.2. `utils.bspline_step_weights(L,
+    has_left, has_right)` is the cached `(L·S, n_nodes)` matrix: no parameters, nothing in the
+    checkpoint, no position input, one code path for forecast, backcast and infill.
   - **Assembly.** `head_raw (B, M, S, 1 + 2·N_SPREADS)` goes to
-    `utils.assemble_quantiles(head_raw, anchor_bg, mask_idx, valid, carry_spread)`: col 0 = median
+    `utils.assemble_quantiles`, pointwise per (slot, step): col 0 = median
     delta; cols 1..3 = the `τ>.5` spreads (nearest→far .75/.9/.95); cols 4..6 = the `τ<.5` spreads
     (.25/.1/.05). `anchor = f(anchor_bg).detach()` **per slot**; `spread = softplus(raw) +
     BG_QUANTILE_SPREAD_MIN` (prevents σ-collapse); `q(τ>.5) = m + hypot(c_up, cumsum(d+))`,
     `q(τ<.5) = m − hypot(c_dn, cumsum(d−))`; the fan is ascending by construction.
-    `BG_HEAD_INIT_SCALE = 1e-2` with zero bias ⇒ small coeffs ⇒ `median ≈ f(anchor_bg)` at init (the
+    `BG_HEAD_INIT_SCALE = 1e-2` with zero bias ⇒ small deltas ⇒ `median ≈ f(anchor_bg)` at init (the
     initial forecast is flat from each slot's own anchor). `QUANTILE_LEVELS = (.05,.1,.25,.5,.75,.9,.95)`,
     `N_QUANTILES = 7`. Output is RISK space; inference owns `f_inv → mg/dL`.
   - **`carry_spread` is DEAD at runtime** (risk space, default 0.0) and **PER LEVEL**: six offsets
     in the spread columns' own layout, `[.75 .9 .95 | .25 .1 .05]`, `c_up`/`c_dn` above; a scalar
     widens all six alike. It seeds the cumulative-spread base on both sides of the median, and
     nothing outside `tests/test_utils.py` passes it: the sole non-test call site is `model.forward`,
-    `assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx)`, which takes the default for
-    `valid` and `carry_spread` alike. The rolling widening that needs this algebra lives in
+    which takes the default for `valid` and `carry_spread` alike. The rolling widening that needs this algebra lives in
     `inference.predict_rolling` (see *Rolling prediction BG fill*), which cannot reach the argument
     at all — the assembly runs inside `model.forward`, so by the time a caller holds a fan the fan
     is already built. The two pieces of algebra are duplicated of necessity: change the combine
@@ -189,24 +185,15 @@ region of a training sample.
     in quadrature is the perfectly-correlated bound — twice too wide by the fourth roll
     (`../T1DMCOMMON/SPEC/inference.md` §8.1, §9).
   - `assemble_quantiles` is the SINGLE chokepoint for the **median and the native fan**: training,
-    `inference.predict` and `predict_rolling` all reach it through `model.forward`, so a median-mode
-    change propagates to all three identically. It is not the chokepoint for the rolling band carry,
+    `inference.predict` and `predict_rolling` all reach it through `model.forward`, so a change to
+    the assembly propagates to all three identically. It is not the chokepoint for the rolling band carry,
     which is applied after the fact on the returned `q_tau`; and the export cuts the graph upstream
     of it, at `head_raw`.
-- **The median basis is PER SPAN, and a fixed `G` is a defect.** `BG_HEAD_MEDIAN_MODE = 'global'`
-  projects each span's median delta onto a low-frequency DCT-II subspace spanning that span's
-  `n = L·PATCH_SIZE` steps, with
-  `G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM · L / PREDICTION_PATCHES))` (`utils.global_median_dim`),
-  clamped to `min(G_L, n)`. A projection is an L2 **contraction**, so the per-patch offset is bounded
-  and non-monotone in `p` and cannot drift or amplify. A FIXED `G` is not an approximation: at
-  `L = 1` the projection would have as many columns as the span has steps — the identity — so the
-  anti-drift contraction is ABSENT rather than weakened, and every fan assert still passes. What
-  `G_L` holds roughly constant is the fraction of the span the basis can bend; the cutoff period
-  `2n/G_L` varies with `L` and is what to report. `utils._span_layout` is what groups the `M` slots
-  into spans (adjacency in `mask_idx`, `valid` respected); passing `mask_idx = None` low-passes the
-  whole `M` axis as one span. The two alternative modes are `'cumulative'` (each patch continues
-  from the previous patch's endpoint, C0 at every seam) and `'independent'` (flat
-  `m = anchor + delta`).
+- **Spans are grouped in the step states, not in the assembly.** `utils._span_layout` groups the
+  `M` slots into spans (adjacency in `mask_idx`, `valid` respected) for `step_states`; the fan is
+  then assembled per (slot, step) with no grouping of its own. The median is
+  `m = f(anchor_bg) + head_raw[..., 0]`, so it cannot accumulate across patches; continuity along a
+  span is the spline's, not the assembly's.
 - **No channel cross-attention.** Each transformer block is `temporal_attn(norm1) → FFN(norm2)` — **2 residual writes**, residual init rescale `base_std / sqrt(2·N_LAYERS)`.
 - **fp32 everywhere.** No bf16 autocast anywhere — forward and loss are both fp32. RMSNorm and SwiGLU run native fp32. No gradient checkpointing — every block runs its forward once and keeps activations.
 
@@ -278,10 +265,11 @@ region of a training sample.
 3. the graph is **cut at `head_raw`** `(B, M, S, 1 + 2·N_SPREADS)` in risk space — no `anchor_bg`, no
    `assemble_quantiles`. Everything downstream is the consumer's.
 
-It emits three outputs in a fixed order: `head_raw`, `time_logits`, and `slot_hidden` — the
-final-normed hidden state per slot. `exporters/head_weights.py` writes `bg_head` beside the artifact
-as a flat fp32 file with a sha256, so a consumer can reproduce `head_raw` from `slot_hidden` and put
-an adapter between them; the export checks that reproduction on every run.
+It emits three outputs in a fixed order: `head_raw`, `time_logits`, and `hidden` — the
+final-normed hidden state of EVERY patch. `exporters/head_weights.py` writes `bg_head` beside the
+artifact as a flat fp32 file with a sha256, so a consumer gathers each span's nodes out of `hidden`,
+rebuilds the step states and reproduces `head_raw`, with an adapter free to act on the node states
+ahead of the spline; the export checks that reproduction on every run.
 
 `--seq-len` exports a shorter window as a cheaper artifact with a shorter memory, and the descriptor
 reports the context THAT artifact accepts. `exporters/descriptor.py` is the SOLE pre/post source for
@@ -314,14 +302,14 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 
 - `config.py` — all hyperparameters as uppercase constants (single source of truth)
 - `d_balance.py` — the exact two-branch `d` histogram of the sampler; `metrics/protocols.py`'s `SAMPLER_REFERENCE` is produced from it
-- `model.py` — T1DMAI model class; `make_step_basis`, `build_rope_cache`, `apply_rope`
+- `model.py` — T1DMAI model class; `build_rope_cache`, `apply_rope`, `attention_weights` (the softmax SDPA forms internally and never returns, tapped by `TemporalSelfAttention.attn_sink`)
 - `data.py` — on-the-fly and cached sample generation; `sample_mask_spans`, `_anchor_step_for_span`, `_mask_slots`, `BG_MASKED_FEAT`, `zero_dose_fill` / `blind_masked_doses`, and `stored_masked_channel_policy` / `checkpoint_masked_channel_policy` — the SINGLE reader of the stamp's absent-key convention, which every consumer goes through
 - `train.py` — training loop entry point
 - `train_blind.py` — the unconditioned fork of `train.py` (all four signals withheld on masked patches via `data`'s `blind` flag, no counterfactual probe, unconditioned rolling validation, own `checkpoints_blind/` + `logs_blind/`); checkpoints stamp `masked_channel_policy`, which `calibrate_conformal.py` refuses to mix
-- `inference.py` — prediction functions (standard, what-if, rolling), each with an opt-in `return_time`; `predict` takes an explicit `mask_spans` masked set (`None` selects the trailing forecast), what-if and rolling are right-edge by construction
+- `inference.py` — prediction functions (standard, what-if, rolling), each with an opt-in `return_time`, and `predict_rolling` with an opt-in `return_rolls` (per-roll `context` / `overrides` / sliding-window `offset`, so an attribution pass re-runs ONE roll instead of restating the slide); `predict` takes an explicit `mask_spans` masked set (`None` selects the trailing forecast), what-if and rolling are right-edge by construction
 - `normalization.py` — channel statistics; `CHANNEL_NAMES`, `SPARSE_LOG1P_CHANNELS`, `RISK_SPACE_CHANNELS`, `load_normalization_stats` (validating)
 - `muon.py` — Muon optimizer implementation
-- `utils.py` — seed hashing, the two attention-mask builders, `kovatchev_f` / `kovatchev_f_target` / `kovatchev_f_inv` (+ numpy siblings, the only b↔c bridges), `assemble_quantiles`, `global_median_dim` / `_span_layout` / `get_global_median_basis`, `last_bg_mgdl_from_context`, the clock-face core (`aggregate_origin_belief`, `clock_wedge_geometry`), `ModelEMA`
+- `utils.py` — seed hashing, the two attention-mask builders, `kovatchev_f` / `kovatchev_f_target` / `kovatchev_f_inv` (+ numpy siblings, the only b↔c bridges), `assemble_quantiles`, `bspline_step_weights` / `step_states` / `_span_layout`, `last_bg_mgdl_from_context`, the clock-face core (`aggregate_origin_belief`, `clock_wedge_geometry`), `ModelEMA`
 - `risk_loss.py` — `risk_total_loss` (pinball + per-span DILATE + Kendall-Gal combine; f-target applied once)
 - `dilate.py` — vectorized batched soft-DTW (`SoftDTWBatch`); TDI is its directional derivative via a finite difference
 - `cg_ega.py` — vectorized CG-EGA (Kovatchev 2004) clinical-accuracy metric
@@ -332,12 +320,13 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 - `metrics/scoring.py` — CRPS, Winkler, coverage-with-sharpness, joint horizon coverage, alarm operating curve with median lead; all binned on `d`, all mg/dL at the boundary
 - `metrics/protocols.py` — the two fixed protocols (forecast vs persistence, infill vs linear interpolation), the `d` axis, column naming, the sampler `d` histogram and the cohort census
 - `exporters/` — `modified_forward.py` (the modified forward + struct mask + slot selection + checkpoint load), `head_weights.py` (the head side file, the adapter seam), `descriptor.py` (the on-device JSON contract), `rust_golden.py` (the consumer's pipeline fixture), and the `executorch_xnnpack` / `executorch_vulkan` / `litert_npu` engine modules
+- `attribution.py` — the read-only diagnostic behind the GUI's strips: `capture_attention` arms `model.TemporalSelfAttention.attn_sink`, `rollout` composes the layers, `channel_saliency` folds the signed `grad ⊙ input` back onto `CHANNEL_NAMES` over the step-major stride, and `explain` runs both off ONE `inference._run_forward(grad=True)` on the caller's own masked set. Attention has no channel axis — `patch_embed` mixes the features into one token — so "which channel" is the gradient's answer, never the attention map's
 - `model_health.py` — capacity / staleness audit of a checkpoint, keyed to `resize_model.py`'s knobs; the `--data` pass builds its samples under the CHECKPOINT's `masked_channel_policy`, echoed in the report header and the `--json` payload
 - `resize_model.py` — rewrites `config.py` from manual architecture overrides; reports the resulting parameter count (computed, not targeted)
 - `T1DMSIM/cache_simulator.py` (external, in the T1DMSIM repo) — pre-generates a compressed simulator pool consumed by `T1DMDataset(cache_path=...)`, and emits the four-channel `normalization_stats.json` alongside `meta.json`
 - `metrics/core/` — the shared evaluation core: `schema.py` (the canonical `Segment`), `features.py` (the model-input bridge), `calibrate.py` (window collection), `horizons.py`, `suite.py` (the metric definitions), `run_eval.py` (the driver) and `report.py` (README/JSON/figure assembly). `report.load_model` builds `T1DMAI()` and loads the state dict, attaching `conformal_delta` without changing its return tuple
 - `metrics/sim/` — the one evaluation report: announced-event forecasts on fresh T1DMSIM patients at fixed seeds
-- `metrics/` (top level) — `day_curves.py` (the shared 48 h figure machinery) with `curves_sim.py` as its driver, writing its panels to `metrics/sim/figures/` and no JSON; and `whatif.py` (the dose-response probe), writing `metrics/whatif.json` and its panels to `metrics/figures/`. The shared chrome — palette, source→hue map, mark and label conventions — lives in `metrics/figstyle.py`, the single copy: never inline a colour or an rcParam in a probe. `metrics/rebuild_all.sh` runs all of them.
+- `metrics/` (top level) — `day_curves.py` (the shared 48 h figure machinery) with `curves_sim.py` as its driver, writing its panels to `metrics/sim/figures/` and no JSON; `whatif.py` (the dose-response probe), writing `metrics/whatif.json` and its panels to `metrics/figures/`; and `attention.py` (the attention-geometry probe: offset profile, side split and channel shares per protocol per `d`, writing `metrics/attention.json`). `attention.py` reports TWO attention series per cell — the Abnar & Zuidema rollout and the raw final layer — because the rollout's `0.5·A + 0.5·I` residual term puts `0.5**N_LAYERS` of the mass on the query by construction, which makes its self-mass figures incomparable across capacities; compare capacities on `final_layer`. The shared chrome — palette, source→hue map, mark and label conventions — lives in `metrics/figstyle.py`, the single copy: never inline a colour or an rcParam in a probe. `metrics/rebuild_all.sh` runs all of them.
 - `make_card.py`, `make_figures.py`, `make_readme_figures.py` — model-card, training-figure and README-figure generation
 - `gui.py`, `gui_renderer.py`, `gui_controls.py`, `gui_state.py`, `clock_face.py` — the pygame GUI and the two clock-face host adapters. The user masks free-form patch-aligned spans and the model fills them; forecast / begin-fill / infill are presets of one masked set, not modes. The constraints live in `gui_state` as pure functions (`merge_mask_spans`, `validate_user_spans`, `emit_mask_spans`, `mask_span_ood`, `span_anchor_cell`, `mask_dose_fill`) so they are testable with no display. **The trailing forecast span is always in the emitted set** — `inference._resolve_mask_spans` requires the whole future zone masked — so the user's budget is `MAX_MASKED_PATCHES - PREDICTION_PATCHES` and a pure interior infill is unreachable. `predict_what_if` takes no `mask_spans` (right-edge by construction), so the masked-set what-if call goes to `predict` directly
 - `models/<capacity>/` — the trained-model tree: `checkpoints/`, `logs/`, `figures/`, `metrics_sim/`, one directory per capacity. the root `compare.py` reads that tree and writes `comparison/`

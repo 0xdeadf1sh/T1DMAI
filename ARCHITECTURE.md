@@ -144,7 +144,7 @@ about 3 % of windows, and the band it emits there loses coverage over training
 while every selection scalar improves. One **mandatory visible separator** sits
 between neighbouring spans,
 so two masked spans never abut; the separator is what makes the anchor, the
-per-span median basis and the DILATE length bucket well defined per span.
+spline's node sequence and the DILATE length bucket well defined per span.
 
 `data._mask_slots` expands the spans into the head's `M = MAX_MASKED_PATCHES`
 fixed slots. A sample with fewer masked patches pads the surplus; a padded slot
@@ -342,36 +342,50 @@ no shape error. The mask reaches `scaled_dot_product_attention` as a **bool**
 and would otherwise put the batch axis onto the head axis. Nothing additive is
 materialised per layer.
 
+The fused kernel returns no weights, so `TemporalSelfAttention` carries a
+diagnostic tap: `attn_sink`, `None` everywhere but on the attribution path.
+Armed, it collects `model.attention_weights(q, k, attn_mask)` — the same softmax
+the kernel forms internally, computed from the same post-QK-norm, post-RoPE `q`
+and `k` — as one `(B, H, T, T)` tensor per layer per forward. The branch is
+static and the forward value is unchanged, so the training step and the exported
+graph see nothing of it.
+
 
 ## Heads
 
-Both heads read the `M` masked-patch hidden states after the final norm, gathered
-by `mask_idx` — one `D_MODEL` vector per slot. The gather is not a trailing
-slice: the masked set may sit anywhere in the sequence.
+Both heads read the final-normed hidden states by `mask_idx`, never as a trailing
+slice: the masked set may sit anywhere in the sequence. The time probe takes the
+`M` slot states as they are, one `D_MODEL` vector per slot; the glucose head takes
+a per-step state interpolated from them and their span's visible neighbours.
 
 ### Blood-glucose quantile head
 
-A 3-layer SiLU MLP emitting `BG_HEAD_STEP_BASIS_DIM` coefficients per channel per
-slot, where a channel is the median offset or one of the `2 · N_SPREADS`
-spreads. A fixed orthonormal basis then expands those coefficients across the
-patch's timesteps:
+A 3-layer SiLU MLP, `Linear(D_MODEL, BG_HEAD_HIDDEN) → SiLU → Linear → SiLU →
+Linear(BG_HEAD_HIDDEN, 1 + 2·N_SPREADS)`, run once per 5-minute step on a state
+interpolated from the trunk's patch states. A channel is the median offset or one
+of the `2 · N_SPREADS` spreads, in a frozen column layout that is also the export's
+graph cut:
 
 ```
-coeff    = bg_head(pred).view(B, M, K, 1 + 2·N_SPREADS)
-head_raw = einsum('sk,bmkc->bmsc', step_basis, coeff)     # (B, M, S, C)
+H        = step_states(x, mask_idx, attn_mask)     # (B, M, S, D_MODEL)
+head_raw = bg_head(H)                              # (B, M, S, C)
 ```
 
-`step_basis` is `(PATCH_SIZE, K)` — the low-frequency DCT-II modes, or orthonormal
-polynomials under `BG_HEAD_STEP_BASIS_TYPE = 'poly'`. Emitting fewer coefficients
-than the patch has steps makes the highest-frequency within-patch mode
-unrepresentable, so the head **cannot** produce an intra-patch zigzag. Setting
-`K = PATCH_SIZE` recovers a fully free per-step head. `step_basis` is a
-registered buffer: it travels with the state dict and with `.to(device)`, and it
-holds no parameters.
+**The step state is a spline over node tokens.** `utils.step_states` groups the `M`
+slots into spans and evaluates, for every step, the uniform cubic B-spline over the
+span's node states — the node rule, the coordinate and the weights are
+`SPEC/inference.md` §8.2. `utils.bspline_step_weights(L, has_left, has_right)`
+returns the `(L·PATCH_SIZE) × n_nodes` matrix that does it: fixed, cached, holding
+no parameters.
 
-The final layer initialises at `std = BG_HEAD_INIT_SCALE`, so at step 0 the
-coefficients are near zero, the median offset is near zero, and every slot's
-forecast is a flat persistence line at its own anchor.
+Forecast, backcast and infill share one code path; only which neighbours exist
+differs. A patch seam is interior to the same spline as the steps around it, so
+the input path carries no jump in value or slope there and the loss needs no seam
+penalty. The head sees no position input.
+
+The final layer initialises at `std = BG_HEAD_INIT_SCALE`, so at step 0 the head
+output is near zero, the median offset is near zero, and every slot's forecast is
+a flat persistence line at its own anchor.
 
 ### Quantile assembly
 
@@ -380,40 +394,22 @@ single chokepoint — training, `predict` and `predict_rolling` all pass through
 it, so a config change propagates identically everywhere. The exact algebra is in
 `SPEC/inference.md` §8.1; what matters here is why it has the shape it does.
 
-**Assembly is per span.** `utils._span_layout` groups the `M` slots into
-contiguous spans from `mask_idx`, exploiting the sampler's mandatory separator:
-adjacency in `mask_idx` identifies a span exactly. Nothing accumulates or
-low-passes across the visible patches between two spans, and a padded slot falls
-out as its own singleton.
+**Assembly is pointwise.** Every `(slot, step)` is assembled from its own seven
+raw values and its slot's anchor; nothing accumulates or low-passes along the
+horizon. The span grouping `utils._span_layout` performs — contiguous runs of
+`mask_idx`, which the sampler's mandatory separator identifies exactly — belongs
+to the step states one stage earlier, where a padded slot falls out as its own
+singleton.
 
-**The median is projected, not integrated.** A span's per-patch median offsets
-are flattened patch-major over that span's own `L · PATCH_SIZE` steps and
-projected onto a fixed low-frequency DCT-II subspace of `G_L` columns, where
-`G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM · L / PREDICTION_PATCHES))`
-(`utils.global_median_dim`). A projection is an L2 contraction, so the offset is
-bounded and cannot accumulate across patches. Column 0 is the constant mode,
-which preserves the persistence level. The low-pass also removes the seam
-sawtooth, so no separate seam penalty is needed, and exact seam continuity is
-deliberately not enforced.
-
-`G_L` scales with the span rather than being fixed. A fixed `G` is a defect
-rather than an approximation: at `L = 1` the projection would carry as many
-columns as the span has steps — the identity — so the contraction would be
-absent, not weakened, while every assertion on the fan still passed. What `G_L`
-holds roughly constant is the fraction of a span the basis can bend, not the
-cutoff period: that is `2·L·PATCH_SIZE / G_L` steps, and it varies with `L`.
-
-`BG_HEAD_MEDIAN_MODE` selects the assembly. `'global'` is the released default and
-the one described above; `'cumulative'` continues each patch from the previous
-patch's endpoint, an unconstrained integrator with no bound on the accumulated
-offset, and `'independent'` applies the raw per-patch offset. Both alternatives
-remain reachable and are kept for ablation.
+**The median is anchored, not integrated.** A step's median is its slot's
+`f(anchor_bg)` plus the head's offset for that step, so it cannot accumulate
+across patches and it starts at persistence. Continuity along a span comes from
+the spline the head reads, not from this assembly.
 
 **The spreads are monotone by construction.** Each passes through a softplus and
 a floor of `BG_QUANTILE_SPREAD_MIN`, then accumulates outward from the median, so
 the fan is strictly ordered with a guaranteed minimum gap and `q_tau[..., i]`
-matches `QUANTILE_LEVELS[i]` index for index. The spread algebra is identical
-under every median mode.
+matches `QUANTILE_LEVELS[i]` index for index.
 
 `carry_spread` seeds the accumulation on both sides, per level — six risk-space
 offsets in the spread columns' own layout, `[.75 .9 .95 | .25 .1 .05]` — but no
@@ -1019,9 +1015,10 @@ with `NEG_FILL = -30000.0`, and cuts the graph at `head_raw` so everything
 downstream of it — the anchor, the assembly, the decode — is the consumer's.
 `NEG_FILL` rather than `-inf` keeps an fp16 NPU softmax finite, and underflows to
 the same zero in fp32. Beside `head_raw` and the time probe's logits the graph
-emits `slot_hidden`, the final-normed hidden state per slot, and the export writes
-`bg_head`'s weights out with it — together they let a consumer re-run the head
-outside the graph and adapt it without re-exporting.
+emits `hidden`, the final-normed hidden state of every patch, and the export writes
+`bg_head`'s weights out with it — together they let a consumer gather each span's
+nodes, rebuild the step states, re-run the head outside the graph, and adapt it on
+the node states without re-exporting.
 
 
 ## Parameter count
@@ -1029,8 +1026,9 @@ outside the graph and adapt it without re-exporting.
 The count is computed from the architecture, never targeted. Per block it is
 dominated by the FFN at `3 · D_MODEL · FFN_DIM` and attention at `4 · D_MODEL²`;
 the norms are negligible. Multiply by `N_LAYERS` and add the patch embedding and
-the two heads. `MAX_MASKED_PATCHES` sizes no weight — the head is applied per slot
-with shared weights — and `step_basis` is a buffer, so neither enters the count.
+the two heads. `MAX_MASKED_PATCHES` sizes no weight — the head is applied per step with shared
+weights — and the spline's weight matrix holds no parameters, so neither enters
+the count.
 
 `resize_model.py` with no flags instantiates the model on the `meta` device and
 prints the current architecture and its exact count.

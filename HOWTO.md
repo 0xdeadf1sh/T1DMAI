@@ -35,19 +35,19 @@ reaches the cache — and runs a different torch than the one the venv pins.
 Three rungs. `resize_model.py` rewrites `config.py`; there is no CLI flag,
 because every module reads its dimensions from `config` at import.
 
-| rung | command | parameters | buffers |
-| --- | --- | ---: | ---: |
-| nano | `--d-model 32 --heads 2 --layers 2` | 38,934 | 36 |
-| small | `--d-model 64 --heads 4 --layers 4` | 280,822 | 36 |
-| medium | `--d-model 128 --heads 8 --layers 8` | 2,160,054 | 36 |
+| rung | command | parameters |
+| --- | --- | ---: |
+| nano | `--d-model 32 --heads 2 --layers 2` | 37,779 |
+| small | `--d-model 64 --heads 4 --layers 4` | 278,547 |
+| medium | `--d-model 128 --heads 8 --layers 8` | 2,155,539 |
 
 ```bash
 venv/bin/python resize_model.py --d-model 32 --heads 2 --layers 2
 ```
 
 `FFN_DIM`, `BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are multiples of `D_MODEL`
-and follow it; `HEAD_DIM = D_MODEL // N_HEADS` is 16 at all three rungs. The
-buffer column is the `step_basis`, which carries no gradient.
+and follow it; `HEAD_DIM = D_MODEL // N_HEADS` is 16 at all three rungs. The model
+carries no buffers.
 
 **`--report-only` prints the projection and writes nothing.** Use it to compare
 rungs without touching the tree:
@@ -234,6 +234,32 @@ Reports whether every logged loss stayed finite, whether `loss_ema` fell, whethe
 the per-`d` columns are populated, and whether a best checkpoint was written. A
 missing checkpoint is the visible symptom of a NaN reaching validation, since
 `nan < best` is False against an initial infinity.
+
+---
+
+## 6. Release
+
+A checkpoint is not shippable until its band has been re-fitted. The bands the
+model emits raw are not calibrated, and `calibrate_conformal.py` is the only thing
+that writes `conformal_delta` — the correction `inference.predict` applies when
+given one and the one the descriptor carries. Fit it on the checkpoint that is about to
+ship, then export:
+
+```bash
+venv/bin/python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt
+
+venv/bin/python -m exporters.executorch_xnnpack \
+    --checkpoint checkpoints/t1dmai_best.pt \
+    --out-dir exported --deploy-dir ../T1DMSERVER/data/models
+```
+
+A delta fitted on a different checkpoint is not transferable: the correction is a
+property of those weights on that partition, and applying one to another set of
+weights gives a band that is finite, plausible and wrong. `--no-write` reports the
+fit without touching the checkpoint.
+
+The exporters need `executorch` and `litert-torch`, which `requirements.txt` does
+not pin; `README.md` has the separate export venv.
 
 ---
 

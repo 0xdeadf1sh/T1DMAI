@@ -17,8 +17,8 @@ What follows is only what is true of **this repository**.
 
 | Concern | Where |
 | --- | --- |
-| Architecture, `forward`, the RoPE cache, the per-patch step basis | `model.py` |
-| Risk transform and its guards, the attention masks, `assemble_quantiles`, the per-span median basis | `utils.py` |
+| Architecture, `forward`, the RoPE cache | `model.py` |
+| Risk transform and its guards, the attention masks, the step-state spline, `assemble_quantiles` | `utils.py` |
 | Per-channel normalize / denormalize | `normalization.py` |
 | Single-window, rolling and what-if inference | `inference.py` |
 | Dimensions and released defaults, including the mask-sampler constants | `config.py` |
@@ -41,9 +41,10 @@ the app decodes against, so an export is the moment a re-anchoring becomes real
 for every consumer.
 
 `head_weights.py` writes the BG head beside the artifact as a flat fp32 file, and
-`slot_hidden` is the graph output it pairs with: together they let a consumer
-reproduce `head_raw` outside the graph, and adapt it without re-exporting. The
-export checks that reproduction on every run.
+`hidden` — the trunk state of every patch — is the graph output it pairs with:
+together they let a consumer rebuild the step states, reproduce `head_raw` outside
+the graph, and adapt it without re-exporting. The export checks that reproduction
+on every run.
 
 An artifact, its descriptor and its head file are one unit. Ship them together,
 from the same export run — nothing downstream can detect a mismatched pair.

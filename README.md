@@ -68,15 +68,15 @@ real. The mask reaches attention as a boolean, per sample, and is not a function
 of position.
 
 Two heads read the masked tokens, gathered by index into a fixed set of slots.
-The glucose head emits a few low-frequency coefficients per patch rather than one
-value per step, so a step-to-step zigzag is unrepresentable; the median is then
-projected onto a low-frequency basis spanning one masked span, which smooths
-across patch seams and — because a projection can only shrink a signal — bounds
-the drift away from the anchor. The basis dimension scales with the span length,
-so the contraction survives at the shortest span, where a fixed dimension would
-have a column per step and do nothing. At initialisation the forecast is a flat
-persistence line. Spreads pass through a softplus and a floor, then accumulate,
-so the seven quantiles are strictly ordered by construction.
+The glucose head runs per 5-minute step rather than per patch. A masked span's
+tokens, plus the visible token on each side of it where the mask lets the span
+read one, are the control points of a uniform cubic B-spline; each step's input is
+that spline read at the step's own position, and one shared MLP maps it to a
+median offset from the patch's anchor and to six spreads. The input path is twice
+differentiable across a patch seam, so a seam is not a place the forecast can
+break. At initialisation the forecast is a flat persistence line. Spreads pass
+through a softplus and a floor, then accumulate, so the seven quantiles are
+strictly ordered by construction.
 
 Every masked patch is anchored on the nearest visible reading — the last step to
 its left, or the first step to its right when the span opens the window — and
@@ -312,13 +312,12 @@ and follow it.
 
 | Model | Architecture | Parameters |
 | --- | --- | ---: |
-| nano | D=32, 2L, 2H, FFN=128 | 38,934 |
-| small | D=64, 4L, 4H, FFN=256 | 280,822 |
-| medium | D=128, 8L, 8H, FFN=512 | 2,160,054 |
+| nano | D=32, 2L, 2H, FFN=128 | 37,779 |
+| small | D=64, 4L, 4H, FFN=256 | 278,547 |
+| medium | D=128, 8L, 8H, FFN=512 | 2,155,539 |
 
 Trainable parameters at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 30`; the
-fixed `step_basis` buffer is excluded and is counted separately in
-`docs/COMPARISON.md`. `resize_model.py` instantiates a capacity and prints its
+model carries no buffers. `resize_model.py` instantiates a capacity and prints its
 exact count, computed from the architecture rather than targeted.
 
 Accuracy, wall-clock and peak-memory figures are not listed: none has been
@@ -491,11 +490,11 @@ infill are the same artifact under different inputs. `--seq-len` exports a
 shorter window as a cheaper artifact with a shorter memory. The contract is in
 [T1DMCOMMON/SPEC/inference.md](https://github.com/0xdeadf1sh/T1DMCOMMON/blob/main/SPEC/inference.md).
 
-The graph is cut at the raw head output and also emits the trunk hidden state at
-each masked slot, which — with the head weights written beside the artifact —
-lets a consumer re-run or adapt the head without re-exporting. The anchor, the
-softplus and floor, the median projection, the inverse transform and the quantile
-assembly all run outside it — and the descriptor is the sole contract for that pre- and
+The graph is cut at the raw head output and also emits the trunk hidden state for
+every patch, which — with the head weights written beside the artifact — lets a
+consumer rebuild the step states, re-run the head, and adapt it without
+re-exporting. The anchor, the softplus and floor, the inverse transform and the
+quantile assembly all run outside it — and the descriptor is the sole contract for that pre- and
 post-processing. **An artifact and its descriptor are one unit**: a graph served
 against a descriptor from a different architecture decodes risk space with the
 wrong constants, and nothing downstream can detect it.
@@ -545,8 +544,9 @@ architecture matches the live `config.py` — the only one that could load anywa
 The simulated patient runs out to `MAX_CONTEXT_PATCHES`, so the model is fed the
 window it was trained on; `--context-hours` shortens it, and anything under
 `MIN_CONTEXT_PATCHES` is refused rather than forecast out of distribution. The
-chart opens on the trailing 24 hours of that window: scroll to zoom, middle- or
-right-drag to pan, `R` to return. The viewport is a view — every patch is fed to
+chart opens on the trailing 24 hours of that window: scroll to zoom, arrow keys
+or a middle/right-drag to pan — `Shift` with an arrow moves a full screen — and
+`R` to return. The viewport is a view — every patch is fed to
 the forward whatever is on screen.
 
 `M` opens the masking tool, which drags patch-aligned spans over the context and
@@ -557,6 +557,34 @@ else. The trailing forecast span is always part of the masked set: the future
 zone carries no observed reading, so it is never left visible, and the head's
 `MAX_MASKED_PATCHES` slots are shared between it and the drawn spans. Masked
 spans clear whenever the context changes.
+
+`T` opens a strip of heat rows under the chart, on the chart's own time axis,
+showing what the selected masked span read. The top row is attention over the
+window's patches, composed across the layers by rollout and drawn on a log scale
+in multiples of an even share — the row spans decades, so a linear ramp renders
+everything below a share identically black, which is most of the window. The
+composition's residual term concentrates mass on the query's own patches, the
+more so the shallower the stack; `[` and `]` step the row through the individual
+layers, which carry no such term, and back to the composed one. `,` and `.` step which forward is explained: a rolling
+forecast records one per roll, and only roll 0 reads a context that is entirely
+observed — every later roll attends to one partly built from the model's own
+output. Attention
+runs over patches alone — the patch embedding mixes the five features into one
+token before the first block — so the rows below it are gradient rather than
+attention: the signed `grad ⊙ input` per channel, red where an input raises the
+span's forecast and blue where it lowers it, on one scale across the four
+channels with each channel's share of the total at the right. A masked span's
+median is its anchor plus a delta, so the BG row carries the anchor's own term
+at the one context cell it was read from. Over a masked patch that row is marked
+withheld rather than drawn as zero: the builder writes a literal 0.0 into feat 0
+there, and a product with a zero input is zero whatever the gradient — the model
+still conditions on the patch, through the bit that announces it. The maps are computed alongside the
+forecast when the strip is open, and off the forecast already on screen when the
+strip is opened after one; selecting another masked span, or stepping to another
+roll, re-aims them without re-forecasting. A new masked set, dose or context
+needs a new prediction. Ink is scaled to the patches on screen rather than to the
+whole window, so panning does not black the rows out; the percentages are over
+the whole window and do not move with the view.
 
 The GUI reads the checkpoint's `masked_channel_policy` and shows it. Under the
 blind policy the masked spans carry the no-dose fill rather than the recorded
@@ -691,6 +719,9 @@ alone.
   arXiv:2506.02285 (2025) — the AdamC schedule-aware weight-decay correction.
 - Loshchilov, I., and Hutter, F. *Decoupled Weight Decay Regularization.* ICLR
   2019. arXiv:1711.05101 — AdamW.
+- Abnar, S., and Zuidema, W. *Quantifying Attention Flow in Transformers.* ACL
+  2020. arXiv:2005.00928 — attention rollout, the layer composition behind the
+  GUI's attention strip.
 
 **Calibration**
 
