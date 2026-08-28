@@ -69,19 +69,7 @@ from config import (                                           # noqa: E402
     TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_CROSS_WINDOW_WEIGHT, TIME_PROBE_CROSS_WINDOW_FRACTION,
 )
 
-# Checkpoint provenance, so a checkpoint is self-describing about the arch / loss schema
-# it was produced under. config.py owns them; the local sentinels are the fallback for a
-# config predating the stamps.
-try:
-    from config import ARCH_VERSION as _CFG_ARCH_VERSION  # type: ignore[attr-defined]
-except ImportError:
-    _CFG_ARCH_VERSION = None
-try:
-    from config import LOSS_SCHEMA as _CFG_LOSS_SCHEMA  # type: ignore[attr-defined]
-except ImportError:
-    _CFG_LOSS_SCHEMA = None
-ARCH_VERSION = _CFG_ARCH_VERSION if _CFG_ARCH_VERSION is not None else 'risk-v4'
-LOSS_SCHEMA = _CFG_LOSS_SCHEMA if _CFG_LOSS_SCHEMA is not None else 'kendall-pinball-dilate-v3'
+from config import ARCH_VERSION, LOSS_SCHEMA
 
 from utils import (
     ModelEMA, kovatchev_f_inv, create_attention_mask_from_visible,
@@ -3430,7 +3418,7 @@ def train(
             # ``valid`` discards the padded slots, which gather patch 0 and would otherwise
             # be supervised against its BG behind a plausible neighbouring anchor;
             # ``mask_idx`` groups the slots into spans for the DILATE buckets and the
-            # median basis.
+            # spline nodes.
             loss_total, parts = risk_total_loss(
                 q_tau, median, targets, weighting,
                 valid=slot_valid, mask_idx=mask_idx,

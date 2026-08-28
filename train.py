@@ -41,17 +41,7 @@ from config import (                                           # noqa: E402
     TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_CROSS_WINDOW_WEIGHT, TIME_PROBE_CROSS_WINDOW_FRACTION,
 )
 
-# config.py is authoritative; these sentinels only cover a config predating the stamps.
-try:
-    from config import ARCH_VERSION as _CFG_ARCH_VERSION  # type: ignore[attr-defined]
-except ImportError:
-    _CFG_ARCH_VERSION = None
-try:
-    from config import LOSS_SCHEMA as _CFG_LOSS_SCHEMA  # type: ignore[attr-defined]
-except ImportError:
-    _CFG_LOSS_SCHEMA = None
-ARCH_VERSION = _CFG_ARCH_VERSION if _CFG_ARCH_VERSION is not None else 'risk-v4'
-LOSS_SCHEMA = _CFG_LOSS_SCHEMA if _CFG_LOSS_SCHEMA is not None else 'kendall-pinball-dilate-v3'
+from config import ARCH_VERSION, LOSS_SCHEMA
 
 from utils import (
     ModelEMA, kovatchev_f_inv, create_attention_mask_from_visible,
@@ -59,7 +49,9 @@ from utils import (
     circular_hour_error, circular_hour_residual, circular_bias_hours, circular_std_hours,
 )
 
-from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
+from T1DMSIM.simulator import (
+    BG_CLAMP_MIN, BG_CLAMP_MAX, bolus_pk_for_dose, gamma_curve,
+)
 
 # Band-edge indices on the ascending QUANTILE_LEVELS axis, never a bare literal.
 _TAU_LO_IDX = QUANTILE_LEVELS.index(0.05)
@@ -1772,6 +1764,25 @@ def _accumulate_long_horizon_bg_metrics(
                     night_agg[f'night_bg_mae_{h_min}_cnt'] = night_agg.get(f'night_bg_mae_{h_min}_cnt', 0.0) + 1.0
 
 
+def _cf_bolus_curve(channel: str, total: float, n_steps: int) -> np.ndarray:
+    """Per-step curve for a counterfactual bolus of ``total``, truncated to ``n_steps``.
+
+    Carbohydrate at GI 100 and insulin under its dose-scaled PK, both as ``SPEC/invariants.md``
+    §5 defines them, so the probe injects the shape the model was pretrained on rather than a
+    flat block no channel ever carries.
+    """
+    if channel == 'carb':
+        curve = gamma_curve(total, 2.0, 15.0, 120.0)
+    elif channel == 'insulin':
+        curve = gamma_curve(total, *bolus_pk_for_dose(total))
+    else:
+        raise ValueError(f"unknown counterfactual channel {channel!r}")
+    out = np.zeros(n_steps, dtype=np.float32)
+    n = min(n_steps, int(curve.shape[0]))
+    out[:n] = curve[:n]
+    return out
+
+
 def _run_counterfactual_probe(
     model: T1DMAI,
     val_dataset: T1DMDataset,
@@ -1784,12 +1795,16 @@ def _run_counterfactual_probe(
     """Counterfactual dose-response probe over up to ``VALIDATION_PROBE_N_PATIENTS`` samples.
 
     Forecast a BASELINE on each sample's TRUE announced pred-zone plan, then perturb a single
-    dose — a RAW bolus added to the FIRST pred-zone patch, spread across its PATCH_SIZE steps
-    and renormalized through that channel's log1p z-transform — and re-forecast. Reports:
+    dose — a RAW bolus added as its curve from the first step of the first masked patch,
+    truncated to the horizon and renormalized through that channel's log1p z-transform — and
+    re-forecast. Carbohydrate is the GI-100 appearance gamma, insulin the dose-scaled
+    rapid-bolus action gamma, both per ``SPEC/invariants.md`` §5; each half-dose rung is the
+    same curve at half its area. Reports:
 
     * ``cf_carb_dbg`` / ``cf_insulin_dbg`` — mean over samples of the mean-over-horizon ΔBG
       (mg/dL) from a ``+CF_CARB_BOLUS_G`` carb / ``+CF_INSULIN_BOLUS_U`` insulin bolus. Carbs
-      should raise BG, insulin lower it.
+      raise BG, insulin lowers it. A curve reaching past the horizon injects only the part
+      inside it.
     * ``cf_carb_dir`` / ``cf_insulin_dir`` — fraction of samples with the clinically correct
       sign; target ~1.
     * ``cf_carb_monotonic`` / ``cf_insulin_monotonic`` — fraction whose horizon peak (carb,
@@ -1814,18 +1829,14 @@ def _run_counterfactual_probe(
     ins_s = float(norm_stats['insulin_combined']['std'])
     carb_B = float(CF_CARB_BOLUS_G)
     ins_B = float(CF_INSULIN_BOLUS_U)
+    carb_curve = _cf_bolus_curve('carb', carb_B, _ps)
+    ins_curve = _cf_bolus_curve('insulin', ins_B, _ps)
 
     def _renorm(raw: np.ndarray, m: float, s: float) -> torch.Tensor:
         """Raw per-step (P*S,) → normalized (P, S) torch tensor via log1p z."""
         norm = (np.log1p(np.maximum(raw, 0.0)) - m) / (s + 1e-8)
         return torch.from_numpy(
             norm.reshape(PREDICTION_PATCHES, PATCH_SIZE).astype(np.float32))
-
-    def _perturb_raw(raw: np.ndarray, bolus: float) -> np.ndarray:
-        """Add ``bolus`` to the first pred-zone patch, spread across its steps."""
-        out = raw.copy()
-        out[:PATCH_SIZE] = out[:PATCH_SIZE] + bolus / float(PATCH_SIZE)
-        return out
 
     def _forecast(carb_t: torch.Tensor, ins_t: torch.Tensor,
                   ex_t: torch.Tensor) -> np.ndarray:
@@ -1902,21 +1913,21 @@ def _run_counterfactual_probe(
             baseline = _forecast(carb_true_t, ins_true_t, ex_true_t)     # (P*S,)
 
             # +full carb bolus, insulin at truth.
-            carb_full = _renorm(_perturb_raw(carb_raw, carb_B), carb_m, carb_s)
+            carb_full = _renorm(carb_raw + carb_curve, carb_m, carb_s)
             carb_pert = _forecast(carb_full, ins_true_t, ex_true_t)
             carb_dbg = float(np.mean(carb_pert - baseline))
             carb_dbg_sum += carb_dbg
             carb_dir_hits += int(carb_dbg > 0.0)
 
             # +full insulin bolus, carb at truth.
-            ins_full = _renorm(_perturb_raw(ins_raw, ins_B), ins_m, ins_s)
+            ins_full = _renorm(ins_raw + ins_curve, ins_m, ins_s)
             ins_pert = _forecast(carb_true_t, ins_full, ex_true_t)
             ins_dbg = float(np.mean(ins_pert - baseline))
             ins_dbg_sum += ins_dbg
             ins_dir_hits += int(ins_dbg < 0.0)
 
             # Monotonicity across [0, B/2, B].
-            carb_half = _renorm(_perturb_raw(carb_raw, carb_B / 2.0), carb_m, carb_s)
+            carb_half = _renorm(carb_raw + 0.5 * carb_curve, carb_m, carb_s)
             carb_peaks = [
                 float(baseline.max()),
                 float(_forecast(carb_half, ins_true_t, ex_true_t).max()),
@@ -1926,7 +1937,7 @@ def _run_counterfactual_probe(
                 carb_peaks[1] >= carb_peaks[0] - 1e-6
                 and carb_peaks[2] >= carb_peaks[1] - 1e-6)
 
-            ins_half = _renorm(_perturb_raw(ins_raw, ins_B / 2.0), ins_m, ins_s)
+            ins_half = _renorm(ins_raw + 0.5 * ins_curve, ins_m, ins_s)
             ins_mins = [
                 float(baseline.min()),
                 float(_forecast(carb_true_t, ins_half, ex_true_t).min()),
@@ -3664,7 +3675,7 @@ def train(
 
             # f applied to the target exactly once inside the loss. ``valid`` discards the padded
             # slots, which gather patch 0; ``mask_idx`` groups the slots into spans for the
-            # per-span DILATE buckets and median basis.
+            # per-span DILATE buckets and spline nodes.
             loss_total, parts = risk_total_loss(
                 q_tau, median, targets, weighting,
                 valid=slot_valid, mask_idx=mask_idx,
