@@ -44,7 +44,7 @@ MIN_CONTEXT_PATCHES = 168
 
 # Span of the fixed FORECAST protocol: a dense right-edge run of PREDICTION_PATCHES masked
 # patches at any patch-aligned position in the day. Also the reference length the per-span
-# median basis and the time probe scale against. Time of day is never an input feature.
+# time probe scales against. Time of day is never an input feature.
 PREDICTION_HORIZON_HOURS = 2
 _PATCHES_PER_HOUR = 60 // (PATCH_SIZE * 5)
 PREDICTION_PATCHES = PREDICTION_HORIZON_HOURS * _PATCHES_PER_HOUR
@@ -55,7 +55,7 @@ MAX_SEQ_LEN = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
 # vector, since per-element redrawing gives a different length law and so a different d
 # histogram. Placement is stars-and-bars over the n_spans + 1 gaps, with one mandatory
 # visible separator: two abutting spans are one longer span, and the separator is what
-# makes the anchor, the per-span median basis and the DILATE bucket well defined.
+# makes the anchor, the spline's node sequence and the DILATE bucket well defined.
 MASK_MAX_SPANS = 3
 MASK_SPAN_LENGTHS = (1, 2, 3, 4, 5, 6, 7, 8)
 # Sampler cap on sum(L), and M, the head's slot count. Surplus slots pad and gather patch
@@ -83,35 +83,6 @@ N_SPREADS = 3                    # spreads per side of the median
 BG_HEAD_HIDDEN = 1 * D_MODEL     # resize_model.py --bg-head-hidden-mult
 BG_HEAD_INIT_SCALE = 1e-2        # small ⇒ median ≈ f(anchor_bg) at init ⇒ starts at persistence
 BG_QUANTILE_SPREAD_MIN = 1e-3    # additive floor per softplus spread; anti σ-collapse
-
-# The head emits K = BG_HEAD_STEP_BASIS_DIM coefficients per (slot, channel), expanded
-# across the PATCH_SIZE within-patch steps by the fixed step_basis buffer. K < PATCH_SIZE
-# makes the period-2 within-patch mode unrepresentable; K = PATCH_SIZE recovers a free
-# per-step head. K also fixes the head's median degrees of freedom per span at L*K, which
-# BG_HEAD_MEDIAN_GLOBAL_DIM is pinned to keep: at K = PATCH_SIZE, 12 of the head's 24
-# outputs per forecast span fell in the projection's null space, took no gradient from any
-# loss and grew ~3 orders of magnitude over training.
-BG_HEAD_STEP_BASIS_DIM = 2
-BG_HEAD_STEP_BASIS_TYPE = 'dct'  # 'dct' low-frequency DCT-II rows, or 'poly' orthonormal polynomials
-
-# Median assembly, applied at the single chokepoint utils.assemble_quantiles.
-#   'global'      — each span's median delta projected onto a low-frequency DCT-II subspace
-#                   of G_L columns spanning that span's n = L*PATCH_SIZE steps. A projection
-#                   is an L2 contraction, so the per-patch offset is bounded and cannot
-#                   drift or amplify. C0 seam continuity is NOT enforced: enforcing it is
-#                   what drifted.
-#   'cumulative'  — each patch continues from the previous patch's endpoint, C0 at every seam.
-#   'independent' — flat m = anchor + delta.
-BG_HEAD_MEDIAN_MODE = 'global'
-# G is PER SPAN: G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * L / PREDICTION_PATCHES))
-# (utils.global_median_dim), so this is its value at L = PREDICTION_PATCHES; the basis kind
-# reuses BG_HEAD_STEP_BASIS_TYPE. A FIXED G is a defect, not an approximation: at L = 1 the
-# projection would have as many columns as the span has steps — the identity — so the
-# anti-drift contraction is absent while every fan assert still passes. What G_L holds
-# roughly constant is the fraction of the span the basis can bend; report the cutoff period
-# 2n/G_L. Pinned to PREDICTION_PATCHES * K ⇒ G_L = K*L, so the projection has no null space
-# to discard the head's L*K median outputs into.
-BG_HEAD_MEDIAN_GLOBAL_DIM = PREDICTION_PATCHES * BG_HEAD_STEP_BASIS_DIM
 
 # Per-slot circular hour-of-day classifier over every gathered masked-slot hidden state (no
 # mean-pool), trained by cross-entropy against a wrapped-Gaussian soft label. With
@@ -192,7 +163,7 @@ KENDALL_LOGVAR_INIT = 0.0        # init for log_sigma_Q / log_sigma_D; clamped [
 
 # Provenance only: stamped into every checkpoint, the summary JSON, the resolved-config
 # dump and the export descriptor, and compared by nothing at load time.
-ARCH_VERSION = 'risk-v4'
+ARCH_VERSION = 'risk-v5'
 LOSS_SCHEMA = 'kendall-pinball-dilate-v3'
 
 # mg/dL cutoffs for a hypo / hyper excursion and for the CG-EGA / Clarke / TIR glycemic

@@ -849,7 +849,7 @@ def sample_mask_spans(
     here not mirrored there moves every ``d``-binned figure's reference.
 
     Two masked spans never abut: the separator is what makes the anchor, the
-    per-span median basis and the DILATE length bucket well defined per span, and
+    spline's node sequence and the DILATE length bucket well defined per span, and
     two spans with nothing between them are one longer span.
     """
     lengths_pool = np.asarray(MASK_SPAN_LENGTHS, dtype=np.int64)

@@ -486,64 +486,45 @@ def circular_std_hours(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> torc
     return torch.sqrt(-2.0 * torch.log(r_bar)) * (24.0 / two_pi) + 0.0
 
 
-_GLOBAL_MEDIAN_BASIS_CACHE: "dict[tuple[int, int, str, torch.device, torch.dtype], torch.Tensor]" = {}
+_BSPLINE_STEP_WEIGHT_CACHE: "dict[tuple[int, bool, bool], torch.Tensor]" = {}
 
 
-def get_global_median_basis(
-    n: int, k: int, kind: str = 'dct',
-    device: "torch.device | None" = None, dtype: "torch.dtype | None" = None,
-) -> torch.Tensor:
-    """``(n, k)`` fixed orthonormal low-frequency basis for the per-span median projection.
+def bspline_step_weights(L: int, has_left: bool, has_right: bool) -> torch.Tensor:
+    """``(L*PATCH_SIZE, L + has_left + has_right)`` fp32 step-state weight matrix.
 
-    Same construction as :func:`model.make_step_basis` (DCT-II cosine modes or
-    orthonormal polynomials, ascending frequency/degree) but over a whole masked span,
-    ``n = L * PATCH_SIZE``. Periods below ~``2n/k`` steps — the per-patch seam sawtooth
-    included — are unrepresentable, and the projection is an L2 contraction
-    (``||proj(x)|| <= ||x||``) so the per-patch offset cannot drift. ``k`` is
-    ``global_median_dim(L)``, which the caller clamps to ``min(G_L, n)``. Col 0 is the
-    constant DC mode.
+    Rows are the span's steps, patch-major: row ``(i-1)*S + j`` is step ``j`` of masked
+    patch ``i`` (``1..L``). Columns are the span's nodes in order, starting at node
+    ``lo``: the left visible neighbour when ``has_left``, then the ``L`` masked patches,
+    then the right visible neighbour when ``has_right``.
 
-    Cached per ``(n, k, kind, device, dtype)``, so the hot path does no host→device copy
-    or dtype cast; each call returns a clone, so an in-place edit cannot poison the cache.
+    Each node sits at its patch centre, so step ``j`` of patch ``i`` sits at
+    ``c = i + (j - (S-1)/2) / S`` in node units, and the row is the uniform cubic
+    B-spline evaluated there over nodes ``k-1..k+2``, ``k = floor(c)``, each index
+    clamped into ``[lo, hi]`` — the end node repeats. Every row sums to 1.
+
+    Cached per ``(L, has_left, has_right)``; each call returns a clone, so an in-place
+    edit cannot poison the cache. :func:`step_states` computes the same states by
+    gathering nodes per slot, which needs no per-span grouping.
     """
-    assert 1 <= k <= n, f"need 1 <= G ({k}) <= P*S ({n})"
-    resolved_device = torch.device('cpu') if device is None else torch.device(device)
-    resolved_dtype = torch.float32 if dtype is None else dtype
-    key = (n, k, kind, resolved_device, resolved_dtype)
-    basis = _GLOBAL_MEDIAN_BASIS_CACHE.get(key)
-    if basis is None:
-        s = torch.arange(n, dtype=torch.float64)
-        if kind == 'dct':
-            ks = torch.arange(k, dtype=torch.float64)
-            basis = torch.cos(math.pi * (s.view(-1, 1) + 0.5) * ks.view(1, -1) / n)
-        elif kind == 'poly':
-            t = 2.0 * s / (n - 1) - 1.0 if n > 1 else s
-            vand = torch.stack([t ** p for p in range(k)], dim=1)  # (n, k)
-            basis, _ = torch.linalg.qr(vand)
-        else:
-            raise ValueError(
-                f"unknown BG_HEAD_STEP_BASIS_TYPE {kind!r} (want 'dct' or 'poly')")
-        basis = basis / basis.norm(dim=0, keepdim=True)
-        basis = basis.to(torch.float32)
-        basis = basis.to(device=resolved_device, dtype=resolved_dtype)
-        _GLOBAL_MEDIAN_BASIS_CACHE[key] = basis
-    return basis.clone()
-
-
-def global_median_dim(span_patches: int) -> int:
-    """``G_L = max(1, ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * L / PREDICTION_PATCHES))``, ``>= 1``.
-
-    Reproduces the configured ``G`` exactly at ``L == PREDICTION_PATCHES`` and scales
-    down with shorter spans. A FIXED ``G`` is a defect, not an approximation: at
-    ``L = 1`` the projection would have as many columns as the span has steps — the
-    identity — so the anti-drift contraction is ABSENT rather than weakened, with every
-    fan assert still green. What ``G_L`` holds roughly constant is the fraction of the
-    span the basis can bend; the cutoff period ``2n/G_L`` varies with ``L`` and is what
-    to report. The caller still clamps to ``min(G_L, n)``.
-    """
-    from config import BG_HEAD_MEDIAN_GLOBAL_DIM, PREDICTION_PATCHES
-    assert span_patches >= 1, f"span_patches must be >= 1, got {span_patches}"
-    return max(1, math.ceil(BG_HEAD_MEDIAN_GLOBAL_DIM * span_patches / PREDICTION_PATCHES))
+    from config import PATCH_SIZE
+    assert L >= 1, f"span length must be >= 1, got {L}"
+    key = (int(L), bool(has_left), bool(has_right))
+    W = _BSPLINE_STEP_WEIGHT_CACHE.get(key)
+    if W is None:
+        S = PATCH_SIZE
+        lo = 0 if has_left else 1
+        hi = L + 1 if has_right else L
+        W = torch.zeros(L * S, hi - lo + 1, dtype=torch.float32)
+        for i in range(1, L + 1):
+            for j in range(S):
+                dc = (j - (S - 1) / 2) / S       # offset from the patch centre
+                k, u = (i - 1, dc + 1.0) if dc < 0 else (i, dc)
+                w = ((1 - u) ** 3 / 6, (3 * u ** 3 - 6 * u ** 2 + 4) / 6,
+                     (-3 * u ** 3 + 3 * u ** 2 + 3 * u + 1) / 6, u ** 3 / 6)
+                for w_o, o in zip(w, (-1, 0, 1, 2)):
+                    W[(i - 1) * S + j, min(max(k + o, lo), hi) - lo] += w_o
+        _BSPLINE_STEP_WEIGHT_CACHE[key] = W
+    return W.clone()
 
 
 def _span_layout(
@@ -582,36 +563,79 @@ def _span_layout(
     return start, length
 
 
-def _median_global_per_span(
-    delta: torch.Tensor, start: torch.Tensor, length: torch.Tensor, kind: str,
+def step_states(
+    x: torch.Tensor, mask_idx: torch.Tensor, attn_mask: torch.Tensor,
+    valid: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    """``(B, M, S)`` median delta projected onto each span's own low-frequency subspace.
+    """``(B, M, PATCH_SIZE, D)`` per-step hidden states for the BG head.
 
-    One matmul per distinct span length in the batch: spans of equal ``L`` share
-    ``n = L * PATCH_SIZE`` and ``G_L``, so they stack into a single ``(n_spans, n)``
-    block. Slots are contiguous within a span, so the gather is ``start + arange(L)``
-    and the scatter back writes each slot exactly once.
+    A masked span's nodes are its ``L`` patches plus the visible patch on each side where
+    one exists — inside the window and readable by the span under ``attn_mask``, so a pad
+    row is never a node. Node states are ``x`` at those patches; the head's step states
+    are the uniform cubic B-spline over them at the step coordinates of
+    :func:`bspline_step_weights`. One code path for forecast, backcast and infill, and
+    the interpolation is C2 across every patch edge inside a span.
 
-    ``delta`` is risk space; ``start``/``length`` come from :func:`_span_layout`;
-    ``kind`` is ``BG_HEAD_STEP_BASIS_TYPE``.
+    Nodes are gathered per slot rather than through the matrix, so spans of different
+    length in one batch need no grouping. A padded or invalid slot is a singleton span
+    and its states are arbitrary but finite; downstream ``valid`` discards them.
+
+    Args:
+        x: ``(B, T, D)`` final-normed patch states.
+        mask_idx: ``(B, M)`` int64 patch index per head slot.
+        attn_mask: ``(T, T)``, ``(B, T, T)`` or ``(B, 1, T, T)`` bool, True = attend.
+        valid: ``(B, M)`` bool, False on padded slots. Optional — see
+            :func:`_span_layout`.
     """
-    B, M, S = delta.shape
-    ar = torch.arange(M, device=delta.device)
-    is_start = start.eq(ar.unsqueeze(0))
-    out = torch.zeros_like(delta)
-    # One host sync for the whole loop: the distinct span lengths present.
-    for L in torch.unique(length[is_start]).tolist():
-        sel = is_start & length.eq(L)
-        rows, cols = sel.nonzero(as_tuple=True)               # (n_L,) each
-        idx = cols.unsqueeze(1) + torch.arange(L, device=delta.device).unsqueeze(0)
-        blk = delta[rows.unsqueeze(1), idx]                   # (n_L, L, S)
-        n = L * S
-        g = min(global_median_dim(L), n)
-        Bg = get_global_median_basis(
-            n, g, kind, device=delta.device, dtype=delta.dtype)
-        proj = (blk.reshape(-1, n) @ Bg) @ Bg.transpose(0, 1)
-        out[rows.unsqueeze(1), idx] = proj.reshape(-1, L, S)
-    return out
+    from config import PATCH_SIZE
+    assert x.ndim == 3, f"x must be (B, T, D), got {tuple(x.shape)}"
+    B, T, D = x.shape
+    assert mask_idx.shape[0] == B and mask_idx.ndim == 2, (
+        f"mask_idx must be (B, M) with B={B}, got {tuple(mask_idx.shape)}"
+    )
+    assert attn_mask.dtype == torch.bool, (
+        f"attn_mask must be bool (True = attend), got {attn_mask.dtype}"
+    )
+    M = mask_idx.shape[1]
+    S = PATCH_SIZE
+    dev = x.device
+    attn = attn_mask
+    if attn.ndim == 2:
+        attn = attn.unsqueeze(0).expand(B, T, T)
+    elif attn.ndim == 4:
+        attn = attn[:, 0]
+
+    node_state = x.gather(1, mask_idx.unsqueeze(-1).expand(B, M, D))   # (B, M, D)
+    start, length = _span_layout(mask_idx, valid, B, M, dev)
+    end = start + length - 1
+    p_first, p_last = mask_idx.gather(1, start), mask_idx.gather(1, end)
+    la_pos, ra_pos = (p_first - 1).clamp(min=0), (p_last + 1).clamp(max=T - 1)
+    rows = torch.arange(B, device=dev).unsqueeze(1)
+    has_l = (p_first > 0) & attn[rows, p_first, la_pos]
+    has_r = (p_last + 1 < T) & attn[rows, p_last, ra_pos]
+    xl = x.gather(1, la_pos.unsqueeze(-1).expand(B, M, D))
+    xr = x.gather(1, ra_pos.unsqueeze(-1).expand(B, M, D))
+    slot = torch.arange(M, device=dev).unsqueeze(0).expand(B, M)
+    i = slot - start + 1                                 # this slot's node index, 1..L
+    L = length
+    lo = torch.where(has_l, torch.zeros_like(L), torch.ones_like(L))
+    hi = torch.where(has_r, L + 1, L)
+
+    def node(n: torch.Tensor) -> torch.Tensor:
+        n = torch.maximum(torch.minimum(n, hi), lo)      # the end node repeats
+        st = node_state.gather(
+            1, (start + n - 1).clamp(0, M - 1).unsqueeze(-1).expand(B, M, D))
+        st = torch.where((n == 0).unsqueeze(-1), xl, st)
+        return torch.where((n == L + 1).unsqueeze(-1), xr, st)
+
+    out = []
+    for j in range(S):
+        dc = (j - (S - 1) / 2) / S                       # offset from the patch centre
+        k, u = (i - 1, dc + 1.0) if dc < 0 else (i, dc)
+        w = ((1 - u) ** 3 / 6, (3 * u ** 3 - 6 * u ** 2 + 4) / 6,
+             (-3 * u ** 3 + 3 * u ** 2 + 3 * u + 1) / 6, u ** 3 / 6)
+        out.append(sum(w_o * node(k + o) for w_o, o in zip(w, (-1, 0, 1, 2))))
+    return torch.stack(out, 2)                           # (B, M, S, D)
 
 
 def _carry_is_zero(carry_spread: "torch.Tensor | float") -> bool:
@@ -639,24 +663,10 @@ def assemble_quantiles(
 
     The ``M`` axis is a gathered set of masked patches, not a trailing horizon: a span may
     end at patch ``T−1`` (forecast), start at patch 0 (backcast) or sit between visible
-    patches (infill). Slots are grouped into spans by :func:`_span_layout`, and every
-    median mode is evaluated PER SPAN — nothing accumulates or low-passes across the
-    visible patches separating two spans.
-
-    ``config.BG_HEAD_MEDIAN_MODE``:
-
-    * ``'global'``: the span's per-patch median delta is reshaped ``(n_spans, L*S)``
-      C-contiguous patch-major (matching ``risk_loss._to_patch_major``, so the basis
-      low-passes the TIME axis) and projected onto a fixed low-frequency DCT-II subspace
-      of dimension ``global_median_dim(L)``. A projection is an L2 CONTRACTION, so the
-      per-patch offset is bounded and non-monotone in ``p`` and cannot drift or amplify.
-      C0 seam-continuity is deliberately NOT pinned. At init ``m ≈ anchor`` everywhere.
-    * ``'cumulative'``: each patch continues from the previous patch's endpoint WITHIN ITS
-      SPAN — C0 at every seam, and each span's first step pinned exactly to its anchor.
-    * ``'independent'``: ``m = anchor + delta``; the median may jump at the seams.
-
-    Under every mode ``median == q_tau[..., 3]`` and the ascending fan hold: only ``m``
-    changes, never the ± band structure.
+    patches (infill). The median is ``m = anchor + head_raw[..., 0]``, per slot and per
+    step, with ``median == q_tau[..., 3]``. Nothing here couples the slots: the median is
+    continuous across a span's patch edges because :func:`step_states` interpolates the
+    head's INPUT, not because this assembly smooths its output.
 
     ``carry_spread`` (risk space, default ``0.0`` → bit-identical to a bare fan) seeds the
     cumulative spread base on BOTH sides: ``q(τ>.5) = m + hypot(c_up, cumsum(d+))``,
@@ -682,12 +692,11 @@ def assemble_quantiles(
             the span's right edge; evaluation bins on the two-sided distance ``d``, never
             on this. ``(B,)`` is the legacy single-span form, and then ``mask_idx`` must be
             None.
-        mask_idx: ``(B, M)`` int64 patch index of each slot. Required whenever
-            ``anchor_bg_mgdl`` is ``(B, M)`` — without it the whole ``M`` axis silently
-            low-passes as one span. None selects the legacy single-span layout.
-        valid: ``(B, M)`` bool, False on padded slots. Optional — padded slots fall out as
-            singleton spans either way; passing ``valid`` additionally pins their median to
-            their anchor, so no gradient reaches ``head_raw[..., 0]`` there.
+        mask_idx: ``(B, M)`` int64 patch index of each slot, shape-checked and required
+            whenever ``anchor_bg_mgdl`` is ``(B, M)``. None selects the legacy
+            single-span form.
+        valid: ``(B, M)`` bool, False on padded slots. Optional — passing it pins a padded
+            slot's median to its anchor, so no gradient reaches ``head_raw[..., 0]`` there.
         carry_spread: risk-space scalar, a tensor broadcastable to ``(B, M, S, 1)`` (every
             level alike), or one broadcastable to ``(B, M, S, 2*N_SPREADS)`` in the spread
             columns' layout ``[.75 .9 .95 | .25 .1 .05]`` (per level).
@@ -697,10 +706,7 @@ def assemble_quantiles(
             ``QUANTILE_LEVELS``.
         median: ``(B, M, S)`` risk space (== ``q_tau[..., 3]``).
     """
-    from config import (
-        N_SPREADS, N_QUANTILES, BG_QUANTILE_SPREAD_MIN,
-        BG_HEAD_MEDIAN_MODE, BG_HEAD_STEP_BASIS_TYPE,
-    )
+    from config import N_SPREADS, N_QUANTILES, BG_QUANTILE_SPREAD_MIN
     import torch.nn.functional as F
     assert head_raw.ndim == 4 and head_raw.shape[-1] == 1 + 2 * N_SPREADS, (
         f"head_raw must be (B, M, S, {1 + 2 * N_SPREADS}), got {tuple(head_raw.shape)}"
@@ -721,7 +727,7 @@ def assemble_quantiles(
             f"{tuple(anchor_bg_mgdl.shape)}"
         )
         assert mask_idx is not None, (
-            "a (B, M) anchor needs mask_idx (B, M) to identify the spans"
+            "a (B, M) anchor is a general masked set and must come with its mask_idx"
         )
         anchor_bm = anchor_bg_mgdl
     if mask_idx is not None:
@@ -741,22 +747,7 @@ def assemble_quantiles(
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     anchor = kovatchev_f(anchor_bm.detach().clamp(BG_CLAMP_MIN, BG_CLAMP_MAX))  # (B,M)
     anchor = anchor.unsqueeze(-1)                        # (B, M, 1)
-    delta = head_raw[..., 0]                             # (B, M, S)
-    start, length = _span_layout(mask_idx, valid, B_, M_, delta.device)
-    assert BG_HEAD_MEDIAN_MODE in ('global', 'cumulative', 'independent'), (
-        f"BG_HEAD_MEDIAN_MODE must be 'global'/'cumulative'/'independent', "
-        f"got {BG_HEAD_MEDIAN_MODE!r}")
-    if BG_HEAD_MEDIAN_MODE == 'global':
-        delta_med = _median_global_per_span(
-            delta, start, length, BG_HEAD_STEP_BASIS_TYPE)
-    elif BG_HEAD_MEDIAN_MODE == 'cumulative':
-        d_rel = delta - delta[..., :1]                   # (B,M,S) zero-based; d_rel[...,0]==0
-        rise = delta[..., -1] - delta[..., 0]            # (B,M) net within-patch rise
-        excl = torch.cumsum(rise, dim=1) - rise          # (B,M) EXCLUSIVE cumsum
-        o = excl - excl.gather(1, start)                 # zero at each span's first slot
-        delta_med = o.unsqueeze(-1) + d_rel              # (B,M,S)
-    else:  # 'independent'
-        delta_med = delta                                # legacy flat — BIT-IDENTICAL
+    delta_med = head_raw[..., 0]                         # (B, M, S)
     if valid is not None:
         # Padded slots are anchor-flat: no median gradient reaches their head_raw.
         delta_med = delta_med * valid.to(delta_med.dtype).unsqueeze(-1)
