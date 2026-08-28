@@ -12,7 +12,9 @@ The MODIFIED forward differs from ``T1DMAI.forward`` in exactly three ways, all 
 3. The graph is cut at ``head_raw`` (B, M, S, 1+2*N_SPREADS), risk space: no ``anchor_bg``, no ``q_tau`` /
    ``median``. Everything downstream is Rust.
 
-``slot_hidden`` — the final-normed hidden state per slot — rides alongside as the LoRA seam: the consumer
+``hidden`` — the final-normed state of EVERY patch — rides alongside as the LoRA seam. The decode reads a
+span's masked patches and its visible neighbours as spline nodes, so the seam carries the whole window
+rather than the slot rows: the consumer gathers the nodes from ``hidden``, builds the step weights and
 re-runs ``bg_head`` from the exported weights, and with no adapter attached the two paths agree.
 """
 
@@ -21,12 +23,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from config import (
-    HEAD_DIM, N_SPREADS, MAX_MASKED_PATCHES,
-    BG_HEAD_STEP_BASIS_DIM, PREDICTION_PATCHES, MAX_SEQ_LEN,
-)
+from config import HEAD_DIM, MAX_MASKED_PATCHES, PREDICTION_PATCHES, MAX_SEQ_LEN
 from model import T1DMAI, build_rope_cache
-from utils import create_attention_mask_from_visible
+from utils import create_attention_mask_from_visible, step_states
 
 # fp16-safe additive block fill; exp(-30000) underflows to 0.0 in fp32/fp64, matching a -inf mask
 NEG_FILL: float = -30000.0
@@ -42,7 +41,7 @@ class HeadRawForward(nn.Module):
       1. ``time_logits`` (B, M, TIME_PROBE_N_BINS) raw hour-of-day bin logits, off the SAME final-normed
          hidden states the BG head reads; no clock input, so it is a circadian belief read off the
          trajectory. Softmax downstream, in Rust.
-      2. ``slot_hidden`` (B, M, D_MODEL) — the LoRA seam; a plain forecast reads ``head_raw`` and ignores it.
+      2. ``hidden`` (B, T, D_MODEL) — the LoRA seam; a plain forecast reads ``head_raw`` and ignores it.
     """
 
     def __init__(self, model: T1DMAI) -> None:
@@ -60,7 +59,7 @@ class HeadRawForward(nn.Module):
         NEG_FILL block; ``slot_sel`` (M, T) one-hot, row j names the patch slot j reads.
 
         -> ``head_raw`` (B, M, PATCH_SIZE, 1 + 2*N_SPREADS) risk space, ``time_logits``
-        (B, M, TIME_PROBE_N_BINS), ``slot_hidden`` (B, M, D_MODEL).
+        (B, M, TIME_PROBE_N_BINS), ``hidden`` (B, T, D_MODEL).
         """
         m = self.model
         B = patches.shape[0]
@@ -75,18 +74,18 @@ class HeadRawForward(nn.Module):
         for block in m.blocks:
             x = block(x, rope_cos, rope_sin, struct)
 
-        x = m.final_norm(x)                                          # (B, T, D_MODEL)
+        hidden = m.final_norm(x)                                     # (B, T, D_MODEL)
         # one-hot rows make this exactly the stock forward's gather
-        slot_hidden = torch.einsum('mt,btd->bmd', slot_sel, x)       # (B, M, D_MODEL)
-        n_slots = slot_sel.shape[0]
-        coeff = m.bg_head(slot_hidden).view(
-            B, n_slots, BG_HEAD_STEP_BASIS_DIM, 1 + 2 * N_SPREADS
-        )
-        head_raw = torch.einsum('sk,bmkc->bmsc', m.step_basis, coeff)
+        slot_states = torch.einsum('mt,btd->bmd', slot_sel, hidden)  # (B, M, D_MODEL)
+
+        # slot_sel's rows are one-hot and struct is the additive form of the bool mask, so both of
+        # the stock forward's arguments are recoverable — which keeps ONE node rule, step_states'.
+        mask_idx = slot_sel.argmax(dim=-1).unsqueeze(0).expand(B, -1)
+        head_raw = m.bg_head(step_states(hidden, mask_idx, struct == 0.0))
 
         # same slot hidden states as the eager return_time=True path
-        time_logits = m.time_head(slot_hidden)                       # (B, M, N_BINS)
-        return head_raw, time_logits, slot_hidden
+        time_logits = m.time_head(slot_states)                       # (B, M, N_BINS)
+        return head_raw, time_logits, hidden
 
 
 def build_slot_selection(
@@ -188,6 +187,9 @@ def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
     # T1DMAI reads its dims from config globals at construction, so config.py drifting from the
     # checkpoint would otherwise surface as an opaque load_state_dict shape error
     tc = ck.get("training_config") or {}
+    assert ck.get("arch_version") in (None, cfg.ARCH_VERSION), (
+        f"checkpoint arch_version {ck.get('arch_version')!r} != config {cfg.ARCH_VERSION!r}"
+    )
     import config as _cfg
     for cfg_name, tc_key in (
         ("D_MODEL", "d_model"), ("N_LAYERS", "n_layers"), ("N_HEADS", "n_heads"),

@@ -1,7 +1,7 @@
 """The pipeline golden `T1DMDROID`'s fp64 Rust pre/post is pinned against; regenerate when the contract moves.
 
-Nothing in that reimplementation — masked-patch fill, attention rule, per-slot anchors, per-span median
-projection, quantile assembly — is exercised by this repository's tests.
+Nothing in that reimplementation — masked-patch fill, attention rule, per-slot anchors, quantile
+assembly — is exercised by this repository's tests.
 Per case: raw four-channel history, masked set, padded patch tensor, per-slot anchors, head output, decoded
 fan. Floats travel as values with a tolerance; the boolean attention pattern travels as a digest, exact.
 Two cases run the real model (forecast, infill); the ladders feed a DETERMINISTIC synthetic ``head_raw``
@@ -23,6 +23,7 @@ from normalization import normalize, CHANNEL_NAMES
 from utils import assemble_quantiles, last_bg_mgdl_from_context
 from inference import _build_patches_tensor, _resolve_mask_spans
 from exporters.modified_forward import load_model
+from exporters.head_weights import head_tensors
 from exporters.executorch_xnnpack import _slot_anchor_cells
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
@@ -130,6 +131,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     from utils import create_attention_mask_from_visible
     attend = create_attention_mask_from_visible(visible[None, :], is_pad[None, :])[0]
 
+    hidden = None
     if synthetic_head:
         # fixed pseudo-random head: the decode runs at every span length with no model in the loop
         g = torch.Generator().manual_seed(20260818)
@@ -146,6 +148,8 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
             return orig(hr, a, mi, vl, carry_spread)
 
         model_module.assemble_quantiles = _cap
+        hook = model.final_norm.register_forward_hook(
+            lambda _m, _i, o: captured.__setitem__('hidden', o.detach().clone()))
         try:
             with torch.no_grad():
                 model(
@@ -154,7 +158,23 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
                 )
         finally:
             model_module.assemble_quantiles = orig
+            hook.remove()
         head_raw = captured['hr']
+        hidden = captured['hidden'][0]                       # (T, D_MODEL)
+    # the consumer's node rule per span, so its head_from_hidden path is pinned as well as its decode
+    spans_out = []
+    j = 0
+    while j < n_masked:
+        k = j
+        while k + 1 < n_masked and idx_abs[k + 1] == idx_abs[k] + 1:
+            k += 1
+        first, last = idx_abs[j], idx_abs[k]
+        spans_out.append({
+            'first_slot': int(j), 'length': int(k - j + 1),
+            'has_left': bool(first > 0 and attend[first, first - 1]),
+            'has_right': bool(last + 1 < T and attend[last, last + 1]),
+        })
+        j = k + 1
 
     q_tau, median = assemble_quantiles(
         head_raw.double(), anchor_t.double(), mask_idx_t, valid,
@@ -179,6 +199,8 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
             attend.numpy().astype(np.uint8).tobytes(order="C")
         ).hexdigest(),
         "head_raw": [float(x) for x in head_raw.double().reshape(-1).tolist()],
+        "spans": spans_out,
+        "hidden_f32": None if hidden is None else [float(np.float32(v)) for v in hidden.reshape(-1).tolist()],
         "median_risk": [float(x) for x in median[0, :n_masked].reshape(-1).tolist()],
         "q_tau_risk": [float(x) for x in q_tau[0, :n_masked].reshape(-1).tolist()],
     }
@@ -199,7 +221,7 @@ def main() -> None:
         build_case("infill", model, stats, n_ctx, [(60, 3), (100, 5)], True),
         # No future zone: a gap repair reads real evidence on BOTH sides of the span.
         build_case("infill_no_forecast", model, stats, n_ctx, [(80, 4)], False),
-        # Span lengths 1..4 at once, pinning the span-scaled basis dimension; the sampler draws up to
+        # Span lengths 1..4 at once, pinning the decode against the span layout; the sampler draws up to
         # MASK_SPAN_LENGTHS[-1], so a second ladder covers the long end.
         build_case("span_ladder", model, stats, n_ctx,
                    [(10, 1), (20, 2), (40, 3), (70, 4)], False, synthetic_head=True),
@@ -215,12 +237,14 @@ def main() -> None:
         "n_input_features": cfg.N_INPUT_FEATURES,
         "max_masked_patches": cfg.MAX_MASKED_PATCHES,
         "prediction_patches": cfg.PREDICTION_PATCHES,
-        "median_global_dim": cfg.BG_HEAD_MEDIAN_GLOBAL_DIM,
-        "step_basis_dim": cfg.BG_HEAD_STEP_BASIS_DIM,
         "normalization_stats": stats,
         # `normalization.normalize` is fp32, the consumer fp64-rounded-once: a few fp32 ulps of
         # `ln(g)^power` apart, about 1e-6 in z. Not bit-identity.
-        "tolerances": {"patches": 5e-6, "anchor": 1e-3, "risk": 1e-8},
+        "tolerances": {"patches": 5e-6, "anchor": 1e-3, "risk": 1e-8, "head_raw_from_hidden": 1e-5},
+        # the head file's tensors, so a consumer can pin hidden -> nodes -> spline -> MLP == head_raw on
+        # the real-model cases; T1DMAI builds the spline weights in fp32, hence the looser tolerance
+        "head": [{"name": n, "shape": list(t.shape), "values": [float(v) for v in t.reshape(-1).tolist()]}
+                 for n, t in head_tensors(model)],
         "attn_digest_note": "sha256 over the boolean attend pattern, row-major, one byte "
                             "per cell (1 attend / 0 block)",
         "cases": cases,

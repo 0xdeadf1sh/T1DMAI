@@ -151,19 +151,11 @@ def derive_arch(sd: dict[str, torch.Tensor]) -> Arch:
         f"{N_INPUT_FEATURES}-feature layout"
     )
     patch_size = patch_dim // N_INPUT_FEATURES
-    # The smooth-basis BG head's final Linear emits K = BG_HEAD_STEP_BASIS_DIM
-    # coefficients per output channel: head_out_width = K * (1 + 2*N_SPREADS), NOT
-    # PATCH_SIZE * (...).
-    import config as _cfg
-    k_basis = _cfg.BG_HEAD_STEP_BASIS_DIM
-    assert head_out_width % k_basis == 0, (
-        f"head out width {head_out_width} not divisible by "
-        f"BG_HEAD_STEP_BASIS_DIM {k_basis}"
-    )
-    per_channel = head_out_width // k_basis                 # == 1 + 2*N_SPREADS
-    assert per_channel % 2 == 1, (
-        f"head per-channel width {per_channel} should be 1 + 2*N_SPREADS (odd)")
-    n_spreads = (per_channel - 1) // 2
+    # The BG head runs on one step state at a time, so its final Linear emits
+    # 1 + 2*N_SPREADS values, independent of PATCH_SIZE.
+    assert head_out_width % 2 == 1, (
+        f"head out width {head_out_width} should be 1 + 2*N_SPREADS (odd)")
+    n_spreads = (head_out_width - 1) // 2
 
     return Arch(
         d_model=d_model, patch_dim=patch_dim, n_layers=n_layers, n_heads=n_heads,
@@ -689,7 +681,7 @@ def run_data_pass(
         config.NIGHT_LONG_HORIZON_PATCHES = config.NIGHT_LONG_HORIZON_HOURS * pph
         # MAX_MASKED_PATCHES (M, the head's slot count) is deliberately NOT rewritten from
         # the checkpoint: no parameter of the model is shaped by it — the BG head emits
-        # K*(1+2*N_SPREADS) per slot and M is a runtime shape carried by ``mask_idx`` — so
+        # 1+2*N_SPREADS per step state and M is a runtime shape carried by ``mask_idx`` — so
         # a checkpoint trained at a different M streams here unchanged, and no tensor shape
         # could reveal the difference.
         sys.modules.pop('model', None)

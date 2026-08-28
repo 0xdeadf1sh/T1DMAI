@@ -237,7 +237,7 @@ def draw_architecture(t: Theme, path: Path) -> None:
 
     _box(ax, t, L, 0.130, 0.640, 0.064, "Quantile assembly",
          "per-slot anchor f(anchor_bg), one-sided and left-preferring "
-         " +  per-span DCT median\n"
+         " +  per-step median delta off the B-spline step states\n"
          " +  softplus cumsum  →  7 ascending quantiles  "
          "τ = .05 .10 .25 .50 .75 .90 .95",
          accent=t.TEAL, sub_size=8.2, mono_sub=False)

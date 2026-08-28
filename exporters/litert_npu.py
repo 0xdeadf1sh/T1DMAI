@@ -1,6 +1,6 @@
 """LiteRT (.tflite) NPU-path exporter, via ``litert-torch`` (formerly ``ai-edge-torch``).
 
-Same modified forward as the XNNPACK exporter: external struct mask, ``slot_sel``, cut at ``head_raw``, dual output.
+Same modified forward as the XNNPACK exporter: external struct mask, ``slot_sel``, cut at ``head_raw``, three outputs.
 fp32 CPU XNNPACK stays the authority; both precisions are checked on host against the eager forward first.
 Emits ``<id>.tflite`` + ``<id>.litert.descriptor.json``, engine ``litert_npu_fp32`` / ``litert_npu_fp16``.
 """
@@ -78,11 +78,11 @@ def main() -> None:
     print(f"[input] patches={tuple(patches.shape)} struct={tuple(struct.shape)} "
           f"slot_sel={tuple(slot_sel.shape)} slots={w.n_masked}")
 
-    hr_shape = (1, cfg.PREDICTION_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
-    tl_shape = (1, cfg.PREDICTION_PATCHES, cfg.TIME_PROBE_N_BINS)
+    hr_shape = (1, cfg.MAX_MASKED_PATCHES, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
+    tl_shape = (1, cfg.MAX_MASKED_PATCHES, cfg.TIME_PROBE_N_BINS)
 
     with torch.no_grad():
-        hr_eager, tl_eager_mod, _sh = wrapper(patches, struct, slot_sel)
+        hr_eager, tl_eager_mod, _hd = wrapper(patches, struct, slot_sel)
     tl_eager = eager_time_logits(model, w)   # stock return_time path
     d_stock = float((hr_eager - stock_head_raw(model, w)).abs().max())
     print(f"[verify] modified(struct) vs stock(bool) head_raw  max|Δ| = {d_stock:.3e}")
@@ -114,8 +114,9 @@ def main() -> None:
             hr_t = torch.from_numpy(np.ascontiguousarray(outs[0])).reshape(hr_shape)
         if tl_t is None and len(outs) >= 2:
             tl_t = torch.from_numpy(np.ascontiguousarray(outs[1])).reshape(tl_shape)
-        d_hr = float((hr_t - hr_eager).abs().max())
-        d_tl = float((tl_t - tl_eager).abs().max()) if tl_t is not None else float("nan")
+        n = w.n_masked   # surplus slots gather patch 0 and are discarded
+        d_hr = float((hr_t[:, :n] - hr_eager[:, :n]).abs().max())
+        d_tl = float((tl_t[:, :n] - tl_eager[:, :n]).abs().max()) if tl_t is not None else float("nan")
         print(f"[verify] {tag} .tflite vs eager head_raw   max|Δ| = {d_hr:.3e} (tol {tol:.1e})")
         print(f"[verify] {tag} .tflite vs eager time_logits max|Δ| = {d_tl:.3e}")
         return tfl_path, d_hr, d_tl, (d_hr < tol)

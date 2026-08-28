@@ -212,9 +212,8 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
     against them. ``torch.device('meta')`` allocates nothing — only ``numel`` is needed.
 
     Context-patch counts are deliberately not set: RoPE is parameter-free, so they do not
-    affect the count. ``patch_size`` DOES affect it (via ``PATCH_DIM``; the ``(S, K)``
-    step_basis is a non-parameter buffer and the bg_head output width
-    ``K*(1 + 2*N_SPREADS)`` is independent of it), so when given, every constant derived
+    affect the count. ``patch_size`` DOES affect it (via ``PATCH_DIM``; the bg_head output
+    width ``1 + 2*N_SPREADS`` is independent of it), so when given, every constant derived
     from it is re-evaluated.
 
     Every constant ``config.py`` derives from ``D_MODEL`` is re-derived here, so the model
@@ -242,7 +241,7 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
         config.N_LAYERS = n_layers
         if patch_size is not None:
             # PATCH_SIZE feeds patch_embed through PATCH_DIM; the bg_head output width
-            # K*(1 + 2*N_SPREADS) is independent of it. The caller validates that
+            # 1 + 2*N_SPREADS is independent of it. The caller validates that
             # PATCH_SIZE * 5 divides 60, so the floor division below is exact.
             pph = 60 // (patch_size * 5)
             config.PATCH_SIZE = patch_size

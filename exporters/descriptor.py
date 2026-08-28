@@ -111,13 +111,16 @@ def build_descriptor(
                         "circle downstream (Rust). Present iff the time section "
                         "below is present.",
             },
-            "output_slot_hidden": {
-                "name": "slot_hidden", "output_index": 2,
-                "shape": [1, M, cfg.D_MODEL],
+            "output_hidden": {
+                "name": "hidden", "output_index": 2,
+                "shape": [1, T, cfg.D_MODEL],
                 "dtype": precision, "space": "trunk-hidden",
-                "note": "(B, M, D_MODEL) final-normed hidden state per slot — the "
-                        "adapter seam. Feed it to the head block's weights to "
-                        "reproduce head_raw, with or without a low-rank adapter.",
+                "note": "(B, T, D_MODEL) final-normed hidden state per PATCH — the "
+                        "adapter seam. A span's spline nodes are its masked patches "
+                        "plus the visible neighbour on each side, so the seam carries "
+                        "the whole window: gather the nodes, build the step weights, "
+                        "and feed the head block's weights to reproduce head_raw, with "
+                        "or without a low-rank adapter.",
             },
         },
 
@@ -200,10 +203,6 @@ def build_descriptor(
             "ROPE_BASE": cfg.ROPE_BASE,
             "RMSNORM_EPS": 1e-6,
             "NORMALIZE_STD_FLOOR": 1e-8,
-            "BG_HEAD_MEDIAN_MODE": cfg.BG_HEAD_MEDIAN_MODE,
-            "BG_HEAD_MEDIAN_GLOBAL_DIM": cfg.BG_HEAD_MEDIAN_GLOBAL_DIM,
-            "BG_HEAD_STEP_BASIS_TYPE": cfg.BG_HEAD_STEP_BASIS_TYPE,
-            "BG_HEAD_STEP_BASIS_DIM": cfg.BG_HEAD_STEP_BASIS_DIM,
             "BG_QUANTILE_SPREAD_MIN": cfg.BG_QUANTILE_SPREAD_MIN,
             "N_SPREADS": cfg.N_SPREADS,
             "N_QUANTILES": cfg.N_QUANTILES,
@@ -235,7 +234,7 @@ def build_descriptor(
         },
     }
     if head is not None:
-        desc["head"] = head
+        desc["head"] = {**head, "decoder": "bspline-centre-nodes"}
     if model_card is not None:
         desc["model_card"] = model_card
     return desc

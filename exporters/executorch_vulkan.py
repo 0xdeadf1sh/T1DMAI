@@ -2,7 +2,7 @@
 
 Answers one question on host, before any custom AAR: how much of this transformer graph the Vulkan backend
 delegates, and which ops it leaves on the portable CPU kernels. The usual rejects are RoPE, SDPA with a float
-additive mask, per-head QK RMSNorm, and the ``einsum('sk,bpkc->bpsc')`` step-basis projection.
+additive mask, per-head QK RMSNorm, and the gathers that read the spline nodes.
 Barely delegating is a STOP: on a ~2.16 M-param model, a graph shredded into tiny GPU subgraphs interleaved
 with CPU fallbacks loses to a clean XNNPACK CPU run, where dispatch overhead already dominates.
 fp32 CPU XNNPACK stays the authority (safety rule E). This module reports, and on request writes a
@@ -168,7 +168,7 @@ def cpu_faithful_deltas(wrapper, patches, struct, slot_sel) -> dict:
     hr_shape = (1, _cfg.MAX_MASKED_PATCHES, _cfg.PATCH_SIZE, 1 + 2 * _cfg.N_SPREADS)
     tl_shape = (1, _cfg.MAX_MASKED_PATCHES, _cfg.TIME_PROBE_N_BINS)
     with torch.no_grad():
-        hr_e, tl_e, _sh_e = wrapper(patches, struct, slot_sel)
+        hr_e, tl_e, _hd_e = wrapper(patches, struct, slot_sel)
         ep = torch.export.export(wrapper, (patches, struct, slot_sel), strict=False)
     lowered_cpu = to_edge_transform_and_lower(ep, partitioner=[])
     et_cpu = lowered_cpu.to_executorch()

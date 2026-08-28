@@ -6,7 +6,7 @@ flat fp32 side file, plus the descriptor. Verified on host:
   (1) modified (struct mask, slot selection) vs STOCK (bool mask, gather) ``head_raw``, for a trailing
       forecast AND for a masked set with an infill span,
   (2) the lowered ``.pte`` vs the eager modified forward, on both masked sets,
-  (3) the head side file reproducing ``head_raw`` from the graph's own ``slot_hidden`` — what the on-device
+  (3) the head side file reproducing ``head_raw`` from the graph's own ``hidden`` — what the on-device
       adapter path rests on.
 """
 
@@ -25,7 +25,7 @@ import config as cfg
 import model as model_module
 from data import BG_MASKED_FEAT
 from normalization import normalize, CHANNEL_NAMES
-from utils import last_bg_mgdl_from_context, time_of_day_decode_bins
+from utils import bspline_step_weights, last_bg_mgdl_from_context, time_of_day_decode_bins
 from inference import _build_patches_tensor, _resolve_mask_spans
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
@@ -223,11 +223,16 @@ def eager_time_logits(model, w: Window) -> torch.Tensor:
     return time_pred
 
 
-def head_from_hidden(head_path: str, block: dict, slot_hidden: torch.Tensor) -> torch.Tensor:
-    """``head_raw`` rebuilt from ``slot_hidden`` and the flat head file — the on-device adapter path in miniature.
+def head_from_hidden(
+    head_path: str, block: dict, hidden: torch.Tensor, w: Window,
+) -> torch.Tensor:
+    """``head_raw`` rebuilt from ``hidden`` and the flat head file — the on-device decode in miniature.
 
-    Tensors in file order, the same two-hidden-layer SiLU MLP, expanded through the within-patch basis.
-    Disagreement with the graph's own ``head_raw`` means the side file and the ``.pte`` are different heads.
+    The consumer's own path: split the slots into spans, take each span's masked patches plus the visible
+    neighbour on each side as nodes, read those states out of ``hidden``, multiply by the B-spline step
+    weights, and run the head file's two-hidden-layer SiLU MLP on every step state. Disagreement with the
+    graph's own ``head_raw`` means the side file and the ``.pte`` are different heads. Surplus slots
+    come back as 0.0 where the graph carries patch 0's values: compare on ``[:, :w.n_masked]``.
     """
     buf = np.fromfile(head_path, dtype="<f4")
     off = 0
@@ -239,15 +244,30 @@ def head_from_hidden(head_path: str, block: dict, slot_hidden: torch.Tensor) -> 
         )
         off += n
     assert off == buf.size, f"head file has {buf.size} floats, tensors account for {off}"
-    h = slot_hidden
-    for name in ("l0", "l1"):
-        h = torch.nn.functional.silu(
-            torch.nn.functional.linear(h, ten[f"{name}.weight"], ten[f"{name}.bias"])
-        )
-    out = torch.nn.functional.linear(h, ten["l2.weight"], ten["l2.bias"])
-    b, m = out.shape[0], out.shape[1]
-    coeff = out.view(b, m, cfg.BG_HEAD_STEP_BASIS_DIM, 1 + 2 * cfg.N_SPREADS)
-    return torch.einsum('sk,bmkc->bmsc', ten["step_basis"], coeff)
+
+    B, T, D = hidden.shape
+    S = cfg.PATCH_SIZE
+    slot_patch = w.slot_sel.argmax(dim=-1).tolist()
+    out = torch.zeros(B, w.slot_sel.shape[0], S, 1 + 2 * cfg.N_SPREADS, dtype=hidden.dtype)
+    j = 0
+    while j < w.n_masked:
+        # a span is a run of consecutive patches in the slot order, as utils._span_layout reads it
+        k = j
+        while k + 1 < w.n_masked and slot_patch[k + 1] == slot_patch[k] + 1:
+            k += 1
+        first, last, L = slot_patch[j], slot_patch[k], k - j + 1
+        has_left = int(first > 0 and bool(w.bool_mask[first, first - 1]))
+        has_right = int(last + 1 < T and bool(w.bool_mask[last, last + 1]))
+        nodes = hidden[:, first - has_left:last + 1 + has_right]        # (B, n_nodes, D)
+        weights = bspline_step_weights(L, bool(has_left), bool(has_right)).to(hidden.dtype)
+        h = torch.einsum('rn,bnd->brd', weights, nodes).view(B, L, S, D)
+        for name in ("l0", "l1"):
+            h = torch.nn.functional.silu(
+                torch.nn.functional.linear(h, ten[f"{name}.weight"], ten[f"{name}.bias"])
+            )
+        out[:, j:k + 1] = torch.nn.functional.linear(h, ten["l2.weight"], ten["l2.bias"])
+        j = k + 1
+    return out
 
 
 def export_pte(wrapper, w: Window, out_path: str) -> dict:
@@ -299,7 +319,7 @@ def export_pte(wrapper, w: Window, out_path: str) -> dict:
 
 
 def run_pte_outputs(pte_path: str, patches, struct, slot_sel) -> list:
-    """Run the ``.pte`` -> outputs in order: ``[head_raw, time_logits, slot_hidden]``."""
+    """Run the ``.pte`` -> outputs in order: ``[head_raw, time_logits, hidden]``."""
     args = [patches.contiguous(), struct.contiguous(), slot_sel.contiguous()]
     try:
         from executorch.runtime import Runtime
@@ -438,16 +458,16 @@ def main() -> None:
 
     hr_shape = (1, m, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
     tl_shape = (1, m, cfg.TIME_PROBE_N_BINS)
-    sh_shape = (1, m, cfg.D_MODEL)
+    hd_shape = (1, T, cfg.D_MODEL)
 
     # (1) modified (struct + slot_sel) vs stock (bool + gather)
     deltas: dict[str, float] = {}
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         with torch.no_grad():
-            hr_mod, tl_mod, sh_mod = wrapper(w.patches, w.struct, w.slot_sel)
+            hr_mod, tl_mod, hd_mod = wrapper(w.patches, w.struct, w.slot_sel)
         assert hr_mod.shape == hr_shape, f"{name}: head_raw {tuple(hr_mod.shape)} != {hr_shape}"
         assert tl_mod.shape == tl_shape, f"{name}: time_logits {tuple(tl_mod.shape)} != {tl_shape}"
-        assert sh_mod.shape == sh_shape, f"{name}: slot_hidden {tuple(sh_mod.shape)} != {sh_shape}"
+        assert hd_mod.shape == hd_shape, f"{name}: hidden {tuple(hd_mod.shape)} != {hd_shape}"
         hr_stock = stock_head_raw(model, w)
         # REAL slots only: a padded slot repeats patch 0 on both paths and nothing downstream reads it
         n = w.n_masked
@@ -476,13 +496,13 @@ def main() -> None:
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         outs = run_pte_outputs(pte_work, w.patches, w.struct, w.slot_sel)
         assert len(outs) == 3, (
-            f"expected 3 .pte outputs (head_raw, time_logits, slot_hidden), got {len(outs)}"
+            f"expected 3 .pte outputs (head_raw, time_logits, hidden), got {len(outs)}"
         )
         hr_pte = outs[0].reshape(hr_shape)
         tl_pte = outs[1].reshape(tl_shape)
-        sh_pte = outs[2].reshape(sh_shape)
+        hd_pte = outs[2].reshape(hd_shape)
         with torch.no_grad():
-            hr_mod, _tl_mod, _sh_mod = wrapper(w.patches, w.struct, w.slot_sel)
+            hr_mod, _tl_mod, _hd_mod = wrapper(w.patches, w.struct, w.slot_sel)
         n = w.n_masked
         deltas[f"pte_{name}"] = float((hr_pte[:, :n] - hr_mod[:, :n]).abs().max())
         print(f"[verify] pte vs eager head_raw     ({name:8s})     max|Δ| = "
@@ -494,7 +514,7 @@ def main() -> None:
               f"{deltas[f'time_{name}']:.3e}")
 
         # (3) the head side file reproduces head_raw from the graph's own hidden
-        hr_head = head_from_hidden(head_path, head_block, sh_pte)
+        hr_head = head_from_hidden(head_path, head_block, hd_pte, w)
         deltas[f"head_{name}"] = float((hr_head[:, :n] - hr_pte[:, :n]).abs().max())
         print(f"[verify] head file vs pte head_raw ({name:8s})     max|Δ| = "
               f"{deltas[f'head_{name}']:.3e}")

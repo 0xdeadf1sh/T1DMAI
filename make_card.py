@@ -212,7 +212,6 @@ def _param_breakdown(sd: dict) -> tuple[dict[str, int], int]:
         "Block RMSNorms":                   r"^blocks\.\d+\.norm\d+\.",
         "Final RMSNorm":                    r"^final_norm\.",
         "BG quantile head":                 r"^bg_head\.",
-        "BG head step-basis (DCT buffer)":  r"^step_basis$",
         "Time-of-day probe (aux)":          r"^time_head\.",
     }
     out: dict[str, int] = {}
@@ -246,15 +245,11 @@ def _derive_arch(sd: dict, cfg: dict) -> dict:
     """
     # bg_head.0: (BG_HEAD_HIDDEN, D_MODEL)
     bg_head_hidden = sd['bg_head.0.weight'].shape[0]
-    # the smooth-basis head's last Linear is K = BG_HEAD_STEP_BASIS_DIM coefficients per
-    # channel: out_last = K × (1 + 2·N_SPREADS), NOT PATCH_SIZE × (...)
-    import config as _cfg
-    k_basis = _cfg.BG_HEAD_STEP_BASIS_DIM
+    # the head runs on one step state at a time: out_last = 1 + 2·N_SPREADS
     out_last = sd['bg_head.4.weight'].shape[0]
-    assert out_last % k_basis == 0, (
-        f"head out width {out_last} not divisible by BG_HEAD_STEP_BASIS_DIM {k_basis}")
-    per_channel = out_last // k_basis              # == 1 + 2·N_SPREADS
-    n_spreads = (per_channel - 1) // 2
+    assert out_last % 2 == 1, (
+        f"head out width {out_last} should be 1 + 2·N_SPREADS (odd)")
+    n_spreads = (out_last - 1) // 2
     # time_head.0 → (HIDDEN, D_MODEL), time_head.2 → (N_BINS, HIDDEN); present iff
     # TIME_PROBE_ENABLED at train time, so read presence and dims off the state dict
     time_probe = 'time_head.0.weight' in sd
@@ -440,11 +435,9 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
     _d = cfg['d_model']
     _ps = cfg['patch_size']
     _nq = arch['n_quantiles']
-    import config as _cfg
-    _k = _cfg.BG_HEAD_STEP_BASIS_DIM
     heads = [
         (TEAL, TEAL_T, "BG quantile head",
-         f"Linear({_d}→{_hh})→SiLU→Linear→SiLU→Linear({_hh}→{_k}×{_nq}) → {_ps} steps",
+         f"Linear({_d}→{_hh})→SiLU→Linear→SiLU→Linear({_hh}→{_nq})  ·  {_ps} steps per patch",
          f"{_nq}-τ risk-space fan → kovatchev_f_inv → mg/dL"),
     ]
     if arch.get('time_probe'):
