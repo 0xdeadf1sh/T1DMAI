@@ -390,8 +390,12 @@ support its own extreme order statistic takes the marginal correction instead an
 is recorded as having done so. Only the forecast protocol's fit ships in the
 band — infill is fitted separately and marked unshipped.
 
-`model_health.py` audits each architecture knob for over-provisioning or
-saturation and prints the `resize_model.py` command each verdict implies.
+`model_health.py` audits each architecture knob and the context window for
+over-provisioning or saturation and prints the `resize_model.py` command each
+verdict implies. With `--data N` it streams cached windows through the model and
+scores every head, sublayer and block by ablation, the context by truncation and
+every width by a keep-top-k ladder, each as the change in pinball loss on the
+same windows.
 
 
 ## Simulator cache
