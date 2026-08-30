@@ -120,7 +120,10 @@ from normalization import (
     load_normalization_stats, compute_normalization_stats,
     save_normalization_stats, CHANNEL_NAMES, normalize, denormalize,
 )
-from data import T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy
+from data import (
+    T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy,
+    checkpoint_masked_channel_policy,
+)
 from risk_loss import risk_total_loss, KendallGalWeighting
 import cg_ega
 import dts_grid
@@ -3172,6 +3175,66 @@ def _build_checkpoint(
     return ckpt
 
 
+# (training_config key, config.py constant, resize_model.py flag); FFN_DIM and BG_HEAD_HIDDEN are
+# multiples of D_MODEL on the resize command line and are handled separately.
+_RESUME_ARCH_KNOBS = (
+    ('d_model', 'D_MODEL', '--d-model'),
+    ('n_layers', 'N_LAYERS', '--layers'),
+    ('n_heads', 'N_HEADS', '--heads'),
+    ('patch_size', 'PATCH_SIZE', '--patch-size'),
+    ('min_context_patches', 'MIN_CONTEXT_PATCHES', '--min-context-patches'),
+    ('max_context_patches', 'MAX_CONTEXT_PATCHES', '--max-context-patches'),
+)
+
+
+def _check_resume_architecture(ckpt: dict, path: str) -> None:
+    """Refuse to resume a checkpoint whose architecture, arch version, masked-channel policy or
+    normalization stats differ from what this process trains under. config.py is the single
+    source, so a dimension mismatch names the ``resize_model.py`` command that aligns it."""
+    import config as _cfg
+    tc = ckpt.get('training_config', {})
+    if ckpt.get('arch_version') != ARCH_VERSION:
+        sys.exit(f"--checkpoint {path}: arch_version {ckpt.get('arch_version')!r} != "
+                 f"config.py {ARCH_VERSION!r}")
+    policy = checkpoint_masked_channel_policy(ckpt)
+    if policy != masked_channel_policy(blind=False):
+        sys.exit(f"--checkpoint {path}: masked_channel_policy {policy!r}; train.py trains "
+                 f"{masked_channel_policy(blind=False)!r} (train_blind.py owns {policy!r})")
+    flags = []
+    for key, const, flag in _RESUME_ARCH_KNOBS:
+        want = tc.get(key)
+        if want is not None and want != getattr(_cfg, const):
+            flags.append(f'{flag} {want}')
+    d_model = tc.get('d_model', _cfg.D_MODEL)
+    ffn = tc.get('ffn_dim')
+    if ffn is not None and ffn != _cfg.FFN_DIM:
+        flags.append(f'--ffn-mult {ffn // d_model}')
+    head0 = ckpt['model_state_dict'].get('bg_head.0.weight')
+    if head0 is not None and head0.shape[0] != _cfg.BG_HEAD_HIDDEN:
+        flags.append(f'--bg-head-hidden-mult {head0.shape[0] // d_model}')
+    if flags:
+        sys.exit(f"--checkpoint {path}: architecture differs from config.py; run\n"
+                 f"  python resize_model.py {' '.join(flags)}\nthen resume again")
+
+
+def _restore_weights(
+    path: str,
+    model: T1DMAI,
+    weighting: KendallGalWeighting,
+    norm_stats: dict,
+) -> dict:
+    """Load a checkpoint's live model weights and Kendall-Gal log-σ. Returns the checkpoint
+    dict so the caller can load the EMA shadow once the EMA exists. Optimizer state, step,
+    histories and best_val_loss are NOT restored: a resumed run starts its own schedule."""
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    _check_resume_architecture(ckpt, path)
+    if ckpt.get('normalization_stats') != norm_stats:
+        sys.exit(f"--checkpoint {path}: normalization_stats differ from {NORM_STATS_FILE}")
+    model.load_state_dict(ckpt['model_state_dict'], strict=True)
+    weighting.load_state_dict(ckpt['weighting_state_dict'])
+    return ckpt
+
+
 # Each log has ONE column list, shared by the header and the row writer. They were two mirrored
 # literals, and a metric added to one alone shifted every column after it with no error and no
 # shape to check. The rounding lives in the spec because it differs per column.
@@ -3396,8 +3459,12 @@ def train(
     bg_hypo_threshold: float = BG_HYPO_THRESHOLD,
     bg_hyper_threshold: float = BG_HYPER_THRESHOLD,
     cache_path: str | None = None,
+    checkpoint: str | None = None,
 ) -> list[float]:
-    """Run the T1DMAI training loop. Returns the per-step total-loss history."""
+    """Run the T1DMAI training loop. Returns the per-step total-loss history.
+
+    ``checkpoint``: restore that file's model weights, Kendall-Gal log-σ and EMA shadow, then
+    train from step 0 with fresh optimizers, schedule, histories and best_val_loss."""
     # Must run before any model / optimizer / dataloader is constructed, so every downstream
     # RNG draw is reproducible.
     if DETERMINISTIC:
@@ -3449,6 +3516,11 @@ def train(
     # weight EMA never touches them; they get their own weight_decay=0 AdamW group.
     weighting = KendallGalWeighting().to(device)
 
+    resume_ckpt: dict | None = None
+    if checkpoint is not None:
+        resume_ckpt = _restore_weights(checkpoint, model, weighting, norm_stats)
+        print(f"Restored weights from {checkpoint} (saved at step {resume_ckpt.get('step')})")
+
     muon_opt, adam_opt = _build_optimizers(
         model, weighting, muon_lr, adam_lr, muon_momentum,
         adam_weight_decay=adam_weight_decay,
@@ -3458,6 +3530,13 @@ def train(
     if ema_decay > 0.0:
         ema = ModelEMA(model, decay=ema_decay).to(device)
         print(f"Weight EMA enabled (decay={ema_decay})")
+        if resume_ckpt is not None and 'model_ema_state_dict' in resume_ckpt:
+            shadow = resume_ckpt['model_ema_state_dict']
+            if set(shadow) != set(ema.shadow):
+                sys.exit(f"--checkpoint {checkpoint}: EMA shadow keys differ from the model")
+            ema.load_state_dict(shadow)
+            ema.to(device)
+    resume_ckpt = None
 
     start_step = 0
     loss_history: list[float] = []
@@ -3538,6 +3617,7 @@ def train(
         'bg_hypo_threshold': bg_hypo_threshold,
         'bg_hyper_threshold': bg_hyper_threshold,
         'cache_path': cache_path,
+        'resumed_from': checkpoint,
     }
     with open('logs/resolved_config.json', 'w') as f:
         json.dump(training_config, f, indent=2)
@@ -4144,6 +4224,10 @@ if __name__ == '__main__':
                         help='Decay factor for the weight-EMA shadow used at validation. 0 disables.')
     parser.add_argument('--cache-path', type=str, default=None,
                         help='Path to a simulator cache directory produced by T1DMSIM/cache_simulator.py.')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Checkpoint whose model weights, Kendall-Gal log-σ and EMA shadow '
+                             'start this run; optimizers, schedule, histories and best_val_loss '
+                             'start fresh. config.py must match its architecture.')
     args = parser.parse_args()
 
     resolved = {
@@ -4170,6 +4254,7 @@ if __name__ == '__main__':
         'bg_hypo_threshold': BG_HYPO_THRESHOLD,
         'bg_hyper_threshold': BG_HYPER_THRESHOLD,
         'cache_path': None,
+        'checkpoint': None,
     }
     sources = {k: 'config.py' for k in resolved}
 
@@ -4195,6 +4280,7 @@ if __name__ == '__main__':
         'bg_hypo_threshold': args.bg_hypo_threshold,
         'bg_hyper_threshold': args.bg_hyper_threshold,
         'cache_path': args.cache_path,
+        'checkpoint': args.checkpoint,
     }
     for key, cli_val in cli_map.items():
         if cli_val is not None:
@@ -4247,4 +4333,5 @@ if __name__ == '__main__':
         bg_hypo_threshold=resolved['bg_hypo_threshold'],
         bg_hyper_threshold=resolved['bg_hyper_threshold'],
         cache_path=resolved['cache_path'],
+        checkpoint=resolved['checkpoint'],
     )
