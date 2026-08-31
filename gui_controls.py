@@ -1,25 +1,10 @@
 # pyright: reportPossiblyUnboundVariable=false
-# All ``pygame`` references are runtime-guarded by ``PYGAME_AVAILABLE`` (see
-# the try/except import below); pyright can't follow that flag.
-"""
-T1DMAI GUI Controls — input widgets.
-=====================================
+# every ``pygame`` reference is runtime-guarded by ``PYGAME_AVAILABLE``; pyright can't follow it
+"""Input widgets for ``gui.py``: sliders, buttons, toggles, modals.
 
-Sliders, buttons, toggles, and the meal / bolus event builders
-used by the main GUI.  Every widget is a self-contained class with two
-public-ish methods:
-
-* ``draw(surface)``   — blits the widget at its current state.
-* ``handle_event(e)`` — consumes a pygame event and updates state.
-                         Returns True if the event was consumed.
-
-The base ``Widget`` class wraps the bounding rectangle and a visible /
-enabled pair of flags.  Concrete widgets subclass it and add their own
-event hooks.
-
-pygame is imported under a try / except so the module loads cleanly when
-pygame is unavailable (e.g. on headless CI).  ``PYGAME_AVAILABLE`` is the
-gate widgets check before touching pygame APIs.
+Each widget draws itself and consumes a pygame event, ``handle_event`` returning True when it
+took one.  pygame is imported in a try/except so the module loads headless; ``PYGAME_AVAILABLE``
+is the gate every widget checks before touching a pygame API.
 """
 
 import math
@@ -35,49 +20,24 @@ except ImportError:
 from gui_renderer import draw_text, draw_color_swatch, ChartTransform, ui_px
 
 
-# ============================================================================
-# Base widget
-# ============================================================================
-
 class Widget:
-    """Base class for all GUI widgets."""
-
     def __init__(self, x: int, y: int, w: int, h: int) -> None:
         self.rect = (x, y, w, h)
         self.visible = True
         self.enabled = True
 
     def contains(self, mx: int, my: int) -> bool:
-        """Return True if (mx, my) is inside this widget."""
         x, y, w, h = self.rect
         return x <= mx < x + w and y <= my < y + h
 
     def draw(self, surface: Any, font: Any) -> None:
-        """Draw the widget. Override in subclasses."""
         pass
 
     def handle_event(self, event: Any) -> bool:
-        """Handle a pygame event. Returns True if consumed."""
         return False
 
 
-# ============================================================================
-# Button
-# ============================================================================
-
 class Button(Widget):
-    """
-    A clickable button with a text label.
-
-    Args:
-        x, y, w, h: Position and size.
-        label: Button text.
-        callback: Function to call on click.
-        color: Button background color.
-        hover_color: Color when hovered.
-        text_color: Label color.
-    """
-
     def __init__(
         self,
         x: int, y: int, w: int, h: int,
@@ -122,22 +82,7 @@ class Button(Widget):
         return False
 
 
-# ============================================================================
-# Toggle (checkbox-style)
-# ============================================================================
-
 class Toggle(Widget):
-    """
-    A toggle button showing a color swatch, label, and current value.
-
-    Args:
-        x, y, w, h: Position and size.
-        label: Channel name.
-        color: Channel color swatch.
-        initial_state: Whether toggle is on (True) or off (False).
-        callback: Called with new state on change.
-    """
-
     def __init__(
         self,
         x: int, y: int, w: int, h: int,
@@ -151,13 +96,12 @@ class Toggle(Widget):
         self.color = color
         self.state = initial_state
         self.callback = callback
-        self.current_value: str = ""  # value at cursor, updated by GUI
+        self.current_value: str = ""  # value at the cursor, written by the host
 
     def draw(self, surface: Any, font: Any) -> None:
         if not self.visible or not PYGAME_AVAILABLE:
             return
         x, y, w, h = self.rect
-        # Checkbox
         checkbox_size = ui_px(14)
         gap = ui_px(6)
         cb_x = x + ui_px(4)
@@ -165,15 +109,12 @@ class Toggle(Widget):
         pygame.draw.rect(surface, (50, 60, 80), (cb_x, cb_y, checkbox_size, checkbox_size))
         pygame.draw.rect(surface, (90, 100, 120), (cb_x, cb_y, checkbox_size, checkbox_size), 1)
         if self.state:
-            # Checkmark
             inset = ui_px(2)
             pygame.draw.rect(surface, self.color,
                              (cb_x + inset, cb_y + inset,
                               checkbox_size - 2 * inset, checkbox_size - 2 * inset))
-        # Color swatch
         swatch_x = cb_x + checkbox_size + gap
         draw_color_swatch(surface, swatch_x, cb_y, self.color, checkbox_size)
-        # Label
         if font is not None:
             label_color = (220, 220, 230) if self.state else (100, 100, 120)
             img = font.render(self.label, True, label_color)
@@ -195,23 +136,8 @@ class Toggle(Widget):
         return False
 
 
-# ============================================================================
-# Slider
-# ============================================================================
-
 class Slider(Widget):
-    """
-    A horizontal slider with a label and numeric display.
-
-    Args:
-        x, y, w, h: Position and size.
-        label: Slider label.
-        min_val, max_val: Range.
-        initial: Initial value.
-        step: Value snap step (0 = continuous).
-        fmt: Format string for display.
-        callback: Called with new value on change.
-    """
+    """Horizontal slider; ``step`` is the value snap, 0 for continuous."""
 
     def __init__(
         self,
@@ -233,17 +159,14 @@ class Slider(Widget):
         self.fmt = fmt
         self.callback = callback
         self._dragging = False
-        # Reserve a label area on the left and a value-readout area on the
-        # right, both scaled so the slider stays readable at any UI_SCALE.
+        # gutters: label left, value readout right; the track is what is left over
         self._label_w = ui_px(80)
         self._value_w = ui_px(40)
         self._track_x = x + self._label_w
         self._track_w = w - self._label_w - self._value_w
 
     def set_position(self, x: int, y: int, w: int) -> None:
-        """Reposition the slider in place. Keeps the existing height and
-        recomputes the internal track geometry so the handle and value
-        readout stay in their reserved gutters."""
+        """Reposition in place, height unchanged; recomputes the track geometry."""
         _, _, _, h = self.rect
         self.rect = (x, y, w, h)
         self._track_x = x + self._label_w
@@ -267,12 +190,10 @@ class Slider(Widget):
         x, y, w, h = self.rect
         cy = y + h // 2
 
-        # Label
         if font is not None:
             img = font.render(self.label, True, (180, 180, 190))
             surface.blit(img, (x + 4, cy - img.get_height() // 2))
 
-        # Track
         track_h = ui_px(6)
         track_radius = ui_px(3)
         handle_r = ui_px(7)
@@ -281,7 +202,6 @@ class Slider(Widget):
                          (self._track_x, track_y, self._track_w, track_h),
                          border_radius=track_radius)
 
-        # Fill
         handle_pos = self._val_to_pos()
         fill_w = handle_pos - self._track_x
         if fill_w > 0:
@@ -289,10 +209,8 @@ class Slider(Widget):
                              (self._track_x, track_y, fill_w, track_h),
                              border_radius=track_radius)
 
-        # Handle
         pygame.draw.circle(surface, (100, 150, 230), (handle_pos, cy), handle_r)
 
-        # Value
         if font is not None:
             val_str = self.fmt.format(self.value)
             val_img = font.render(val_str, True, (220, 220, 230))
@@ -318,19 +236,7 @@ class Slider(Widget):
         return False
 
 
-# ============================================================================
-# Modal sub-windows
-# ============================================================================
-#
-# A ``ModalWindow`` is a centered floating panel with a title bar, a close
-# button, a dimmed backdrop, and exclusive event capture while visible.
-# The Meal Builder, Bolus Builder, and Help panel are all ModalWindows;
-# the host calls ``draw(surface, font, font_large)`` once per frame after
-# all other UI, and routes events through ``handle_event(event)`` before
-# any background widgets so the modal can swallow them.
-
-# Visual constants (kept here rather than in gui.py so this module
-# doesn't reach back into the host for styling).
+# Kept here so the module never reaches back into the host for styling.
 MODAL_BG = (34, 36, 50)
 MODAL_BORDER = (70, 76, 100)
 MODAL_TITLE_BG = (48, 52, 72)
@@ -342,17 +248,11 @@ MODAL_CLOSE_HOVER = (180, 80, 90)
 
 
 class ModalWindow:
-    """Centered floating panel with a title bar and close button.
+    """Centered floating panel with a dimmed backdrop and exclusive event capture.
 
-    Subclasses override ``_draw_body`` and ``_handle_body`` to render and
-    handle events inside the body rect. The body rect is in *screen*
-    coordinates (i.e. shifted by the modal's current top-left), so
-    widgets inside should be repositioned in ``_layout_body`` each frame
-    — the host can resize the window between frames.
-
-    While ``visible`` is True, ``handle_event`` returns True for any
-    mouse/keyboard event the host passes in, so background widgets stop
-    receiving input.
+    The host draws it once per frame AFTER all other UI and routes events through it BEFORE
+    any background widget, so the modal can swallow them.  ``body_rect`` is in SCREEN
+    coordinates and the host may resize between frames, so ``_layout_body`` runs every frame.
     """
 
     TITLE_BAR_H = ui_px(34)
@@ -372,7 +272,6 @@ class ModalWindow:
         self.visible = not self.visible
 
     def _layout(self, screen_w: int, screen_h: int) -> None:
-        """Re-center on the current screen and reflow child widgets."""
         self.x = max(0, (screen_w - self.w) // 2)
         self.y = max(0, (screen_h - self.h) // 2)
         self._close_rect = (
@@ -382,8 +281,7 @@ class ModalWindow:
         self._layout_body()
 
     def _layout_body(self) -> None:
-        """Hook for subclasses to reposition body widgets after a
-        re-layout. Default is no-op."""
+        pass
 
     def body_rect(self) -> tuple[int, int, int, int]:
         return (
@@ -441,15 +339,11 @@ class ModalWindow:
         pass
 
     def handle_event(self, event: Any) -> bool:
-        """Modal-aware event filter.
+        """Swallows mouse buttons, the wheel and Esc while visible; motion and keys pass through.
 
-        While the modal is visible we *swallow* mouse buttons + wheel
-        (so the chart, sidebar and background widgets don't react to
-        clicks/scrolls landing on the dimmed backdrop) and Esc (close).
-        Mouse motion and key presses pass through — motion is needed so
-        the host can keep tracking the cursor, and pass-through keys
-        let M / B / H still toggle the modal off and other shortcuts
-        keep working."""
+        Motion has to reach the host for cursor tracking, and pass-through keys keep M / B / H
+        able to toggle the modal back off.
+        """
         if not self.visible or not PYGAME_AVAILABLE:
             return False
 
@@ -485,12 +379,6 @@ class ModalWindow:
         pass
 
 
-# ============================================================================
-# Help window
-# ============================================================================
-
-# Section title + list of body lines. Bodies are rendered with the small
-# font; titles with the body font. Edit here to update the in-app guide.
 HELP_SECTIONS: list[tuple[str, list[str]]] = [
     ("Overview", [
         "T1DMAI predicts blood-glucose trajectories from recent context.",
@@ -519,6 +407,25 @@ HELP_SECTIONS: list[tuple[str, list[str]]] = [
         "Del — remove the selected curve point.",
         "Ctrl+Z — undo the last curve / pencil edit.",
     ]),
+    ("What the model read", [
+        "T       — toggle the attention / saliency strips under the chart.",
+        "          Top row: which patches the selected masked span attended to,",
+        "          composed across layers. Rows below: how much each input",
+        "          channel moved that span's forecast, red up and blue down,",
+        "          on one shared scale with each channel's share at the right.",
+        "[ / ]   — step the attention row through the layers and back to the",
+        "          across-layer composition (shown as 'all'). The composition",
+        "          credits a patch for its own residual stream, so it reads",
+        "          more local than the layers it is built from.",
+        ", / .   — step which forward is explained. A rolling forecast records",
+        "          one per roll; only roll 0 reads a context that is entirely",
+        "          observed, later rolls read the model's own output.",
+        "A masked patch's BG cell is greyed, not dark: it holds no glucose to",
+        "attribute, which is not the same as contributing nothing.",
+        "Opening the strips after a forecast reads that forecast — no second",
+        "prediction. Clicking another masked span, or stepping to another roll,",
+        "re-aims them. A new masked set, dose or context needs a new prediction.",
+    ]),
     ("Channels", [
         "1–4     — toggle channel visibility (BG/Carbs/Insulin/Exercise).",
         "A       — toggle all channels at once.",
@@ -526,7 +433,8 @@ HELP_SECTIONS: list[tuple[str, list[str]]] = [
     ("View", [
         "Mouse wheel  — zoom around the cursor (or scroll the sidebar).",
         "+ / -        — zoom in / out.",
-        "Middle / Right drag — pan the time axis.",
+        "Left / Right — pan the time axis by a quarter screen; Shift for a",
+        "               full screen. Middle- or right-drag does the same.",
         "R            — reset the view.",
         "S            — screenshot the chart.",
     ]),
@@ -577,7 +485,6 @@ class HelpWindow(ModalWindow):
 
         surface.set_clip(prev_clip)
 
-        # Scrollbar indicator on the right edge of the body.
         if self._content_h > bh:
             track_w = ui_px(5)
             track_x = bx + bw - track_w
@@ -601,14 +508,8 @@ class HelpWindow(ModalWindow):
             )
 
 
-# ============================================================================
-# Event editor modal
-# ============================================================================
-
-# Slider spec for each high-level event kind. The first slider is always
-# the time offset; the remaining sliders are kind-specific. Each tuple
-# has the form (attr_name, label, lo, hi, default, step, fmt) — attr_name
-# is the field on gui_state.Event to write back on Save.
+# Per event kind, in slider order, time offset first:
+# (attr_name, label, lo, hi, default, step, fmt); attr_name is the ``gui_state.Event`` field.
 EVENT_SLIDER_SPECS: dict[str, list[tuple]] = {
     'juice': [
         ('time_offset_min', "Time (min)", -30, 360,  0, 5, "{:+.0f}m"),
@@ -638,9 +539,8 @@ EVENT_KIND_TITLES = {
 
 
 class EventEditorModal(ModalWindow):
-    """Modal for creating or editing a high-level Event (juice, insulin,
-    meal). Sliders match the kind; Save fires ``save_callback(event)``;
-    Delete (only for existing events) fires ``delete_callback()``."""
+    """Create or edit one ``gui_state.Event``: Save fires ``save_callback(values)``, Delete
+    ``delete_callback()`` — Delete only exists while editing an event that is already there."""
 
     BUTTON_H = ui_px(30)
     BUTTON_GAP = ui_px(10)

@@ -1,86 +1,15 @@
-"""
-T1DMAI GUI — Interactive visualization and what-if analysis.
-=============================================================
+"""Pygame front end: a context window from the simulator, a checkpoint forward, the median BG
+forecast with its per-τ band, and the doses and masked spans the user paints into it.
 
-What this app is for
---------------------
-A pygame-based front end for inspecting model predictions on a per-patient
-basis.  It builds a context window from the simulator, runs a forward pass
-through a loaded checkpoint, then renders the model's median BG forecast
-with a per-τ quantile uncertainty envelope and a draggable cursor.  The
-model is risk-space: its head emits ONLY a BG quantile forecast (no carb /
-insulin / IS / HGO dynamics outputs, no trend head, no physics
-reconstruction).  The user can place 3-point curve events (raised-cosine
-bells) for carbs / insulin / exercise into the prediction zone and re-run a
-what-if pass: the announced carb / insulin / exercise INPUT is perturbed and
-``predict`` is re-run, so the median BG forecast moves in response to the plan
-— useful for sanity-checking the model's response to specific meal / bolus /
-session plans.
-
-Architecture
-------------
-* ``gui.py``           — main app, window / event loop, sidebar, all
-                           high-level interactions.  Keeps a ``GUIState``
-                           and a chart transform.
-* ``gui_state.py``     — central mutable state (visibility toggles, active
-                           tool, overrides, prediction results, last BG …).
-* ``gui_controls.py``  — input widgets for the meal / bolus
-                            builders.
-* ``gui_renderer.py``  — chart drawing primitives (gridlines, curves,
-                           confidence bands, hover overlay).
-* ``inference.py``     — model entry points (``predict``,
-                           ``predict_what_if``, ``predict_rolling``).
-
-Threading
----------
-Predictions run on a background thread so the UI stays responsive during a
-forward pass.  ``state.is_computing`` flips to True while inference is in
-flight; the main loop reads it to skip redrawing the prediction layer
-until the worker writes ``median_bg`` / ``bands`` back into
-``state.prediction``.
-
-Channel layout convention
--------------------------
-* Display channels (what the user sees on screen): four entries —
-  ``[BG, Carbs, Insulin, Exercise]``.  BG is the model's median forecast;
-  carbs, insulin and exercise are the announced what-if inputs the user can
-  paint.  Exercise is painted in g/step carbohydrate-equivalent glucose
-  disposal, the scale the model is trained on.
-* The model emits no dynamics channels.  The green BG curve drawn on the
-  chart is ``predict``'s ``median_bg``; the shaded envelope is its ``bands``
-  (per-τ quantile edges in mg/dL).
-
-The mapping table ``DISPLAY_TO_OUTPUT_CH`` translates display → announced
-output-channel index (carbs → 0, insulin → 1, exercise → 2).  BG has no
-announced channel.
-
-Usage::
+Predictions run on a worker thread. ``state.is_computing`` is True while one is in flight and the
+main loop skips the prediction layer until it clears.
+Display channels are ``[BG, Carbs, Insulin, Exercise]``; ``DISPLAY_TO_OUTPUT_CH`` maps them to the
+announced output-channel indices (carbs 0, insulin 1, exercise 2), and BG has none — it is the
+model's forecast. Exercise is painted in g/step carb-equivalent glucose disposal, the scale the
+model trained on. Key bindings are listed once, in ``gui_controls.HELP_SECTIONS``.
 
     python gui.py --checkpoint checkpoints/t1dmai_best.pt --seed 42
     python gui.py --no-model    # UI testing with random weights
-
-Controls::
-
-    SPACE/Enter   Run prediction (respecting curve overrides)
-    W / E         Toggle curve editor (a.k.a. what-if mode) — both keys toggle
-    Tab           Cycle selected edit channel
-    F             Roll prediction forward (one model horizon per press)
-    G             Step the simulator forward (extends real ground-truth)
-    V             Eval vs Sim — score the current prediction against the simulator
-    R             Reset overrides
-    C             Clear all curves (blank canvas)
-    N             New random patient
-    M             Meal builder
-    B             Bolus builder
-    S             Screenshot
-    1-4           Toggle curve visibility
-    A             Toggle all curves
-    +/-           Zoom in/out
-    Scroll        Zoom around cursor
-    Middle/Right-drag  Pan
-    Delete        Remove selected curve event
-    Ctrl+Z        Undo
-    Q/ESC         Quit
 """
 
 import os
@@ -103,6 +32,7 @@ import torch
 from config import BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, PATCH_SIZE
 
 from gui_renderer import ui_px  # used by the constants below
+from normalization import CHANNEL_NAMES as _CHANNEL_NAMES  # the strips' row order
 
 WINDOW_WIDTH = ui_px(1600)
 WINDOW_HEIGHT = ui_px(900)
@@ -116,9 +46,7 @@ FONT_SIZE = ui_px(14)
 FONT_SIZE_SMALL = ui_px(11)
 FONT_SIZE_LARGE = ui_px(18)
 
-# Layout primitives — design-time values scaled at import. Reused by the
-# sidebar layout (`_draw_sidebar`) and by control-panel widgets so the
-# whole interface scales with ``UI_SCALE``.
+# design-time values scaled at import, so the whole interface moves with ``UI_SCALE``
 TOGGLE_HEIGHT = ui_px(32)
 TOGGLE_ROW_PITCH = ui_px(28)
 BUTTON_HEIGHT = ui_px(34)
@@ -137,9 +65,7 @@ TEXT_COLOR = (225, 228, 240)
 TEXT_DIM_COLOR = (140, 145, 165)
 TEXT_FAINT_COLOR = (105, 110, 130)
 CURSOR_COLOR = (255, 255, 255)
-# Clock-face overlay cosmetics (the time-of-day probe's circular histogram,
-# rotated to the cursor's elapsed offset). Model/training knobs live in
-# config.py; these are purely GUI presentation, so they live here.
+# Presentation only, so they live here rather than in config.py.
 CLOCK_FACE_RADIUS_PX = ui_px(52)
 CLOCK_FACE_MARGIN_PX = ui_px(12)
 CLOCK_FACE_BG_COLOR = (32, 34, 48)
@@ -147,13 +73,10 @@ CLOCK_WEDGE_COLOR = (90, 150, 230)
 CLOCK_HAND_COLOR = (245, 245, 250)
 CLOCK_TICK_COLOR = (120, 125, 145)
 CONFIDENCE_ALPHA = 40
-# Subtle blue tint over the model's input patches. Mirrors the darker
-# overlay on the prediction side of NOW so the two halves are visually
-# distinct without overpowering the curves.
+# tint over the model's input patches, against the darker one past NOW
 CONTEXT_SHADE_COLOR = (80, 130, 200)
 CONTEXT_SHADE_ALPHA = 20
 
-# Sidebar palette — soft dark panels with colored section accents.
 SIDEBAR_PANEL_BG = (32, 34, 48)
 SIDEBAR_PANEL_BORDER = (56, 60, 80)
 ACCENT_PATIENT = (110, 170, 245)
@@ -169,10 +92,7 @@ TIR_IN_RANGE_COLOR = (90, 200, 130)
 TIR_HIGH_COLOR = (240, 180, 90)
 TIR_LOW_COLOR = (230, 100, 100)
 
-# Chart background shading for glucose ranges. Thresholds are the clinical
-# hypo/hyper cutoffs ``BG_HYPO_THRESHOLD`` / ``BG_HYPER_THRESHOLD`` (config is
-# the single source of truth). Alpha is kept low so the shading is a subtle
-# visual cue and doesn't fight the curves on top.
+# glucose-range shading; the cutoffs come from config, the single source of truth
 HYPO_BAND_COLOR = TIR_LOW_COLOR
 IN_RANGE_BAND_COLOR = TIR_IN_RANGE_COLOR
 HYPER_BAND_COLOR = TIR_HIGH_COLOR
@@ -191,44 +111,68 @@ OVERRIDE_POINT_RADIUS = ui_px(6)
 CURVE_EVENT_FILL_ALPHA = 60
 CONTROL_POINT_HIT_RADIUS = ui_px(12)
 
-# ---- Free-form masking ----
-# A masked span hides the true BG under it: the model is being asked to fill
-# that stretch, so leaving the curve drawn there invites reading the answer off
-# the chart. The overlay is what marks the span; the context curve is clipped
-# out of it in _draw_chart.
+# A masked span hides the true BG under it: the model is being asked to fill that stretch, so
+# drawing the curve there invites reading the answer off the chart. The overlay marks the span;
+# _draw_chart clips the context curve out of it.
 MASK_SPAN_COLOR = (150, 120, 210)
 MASK_SPAN_ALPHA = 46
 MASK_SPAN_SELECTED_ALPHA = 78
 MASK_DRAG_ALPHA = 30
 MASK_EDGE_COLOR = (185, 160, 240)
 MASK_OOD_COLOR = (240, 175, 70)
+# One attention row plus one per input channel, on the chart's own x-transform so they pan and
+# zoom with the trace. Attention is a distribution over patches and only ever positive, so one
+# hue ramp; saliency is signed and gets a diverging pair — up raises the span's forecast.
+ATTN_ROW_H = ui_px(11)
+ATTN_ROW_GAP = ui_px(2)
+ATTN_BLOCK_PAD = ui_px(4)
+ATTN_STRIP_BG = (24, 24, 32)
+ATTN_ROW_BG = (34, 34, 44)
+ATTN_MASS_COLOR = (120, 190, 250)
+SALIENCY_UP_COLOR = (240, 110, 110)
+SALIENCY_DOWN_COLOR = (90, 150, 240)
+ATTN_SPAN_EDGE_COLOR = MASK_EDGE_COLOR
+# Only the abbreviations are local: the row ORDER comes off ``CHANNEL_NAMES``, the axis
+# ``attribution.Attribution.channels`` is columned by, so a renamed or reordered channel raises
+# here instead of labelling a row with its neighbour's saliency.
+ATTN_CHANNEL_ABBREV = {
+    'bg_absolute': 'BG',
+    'carb_intake': 'carb',
+    'insulin_combined': 'ins',
+    'exercise_equiv': 'exer',
+}
+ATTN_ROW_LABELS = ['attn'] + [
+    ATTN_CHANNEL_ABBREV[name] for name in _CHANNEL_NAMES
+]
+ATTN_ROW_MAX_ALPHA = 235
+# A masked patch carries no BG to attribute — a literal 0.0 — so the cell is marked withheld
+# rather than painted as a zero contribution, which would read as "the model ignores this".
+ATTN_WITHHELD_COLOR = (96, 100, 118)
+ATTN_WITHHELD_ALPHA = 120
+# Ink scales to the visible patches, never below this fraction of the whole window's peak, so a
+# stretch carrying nothing stays dark instead of being amplified to look busy.
+ATTN_VIEW_SCALE_FLOOR = 0.15
+ATTN_BLOCK_HEIGHT = (2 * ATTN_BLOCK_PAD
+                     + len(ATTN_ROW_LABELS) * (ATTN_ROW_H + ATTN_ROW_GAP))
+
 # Buttons that write an announced dose; disabled under a blind checkpoint.
 _DOSE_PAINTING_BUTTONS = frozenset({
     "What-If", "Pencil", "Basal +1 U/h", "Basal -1 U/h",
 })
 
-# Visual smoothing windows applied to the predicted curves, in timesteps
-# (5 min each). Both are purely cosmetic — the underlying prediction is
-# unchanged. The σ envelope gets a wider window because edge wobble is
-# what makes the band look "spiky"; the mean line uses a tighter window
-# so real trend changes still come through. Both can be toggled off via
-# the sidebar checkboxes (state.smooth_band, state.smooth_mu).
+# Timesteps (5 min each), cosmetic only — the prediction itself is untouched. The band gets the
+# wider window because edge wobble is what makes it look spiky; the median keeps a tighter one so
+# real trend changes still come through.
 CONFIDENCE_BAND_SMOOTH_STEPS = 25
 MU_SMOOTH_STEPS = 13
 
-# The four display channels: BG (the model's median forecast) and the three
-# announced what-if inputs (carbs, insulin, exercise). Their stats-names match
-# the input feature stack
-# [bg_absolute, carb_intake, insulin_combined, exercise_equiv].
+# the three announceable channels, in output-channel order
 OUTPUT_CHANNEL_ORDER = ['carb_intake', 'insulin_combined', 'exercise_equiv']
 
-# Number of display channels (BG + carbs + insulin + exercise).
 N_DISPLAY_CHANNELS = 4
 
-# Per-channel y-axis span for the painted / drawn curves, in the channel's own
-# raw unit. Exercise shares carb's span: it is a carbohydrate-EQUIVALENT
-# glucose-disposal rate in the same grams-per-step unit, so the two read on one
-# scale.
+# y-axis span per channel, in its own raw unit; exercise shares carb's, being a
+# carb-EQUIVALENT disposal rate in the same g/step
 DISPLAY_CHANNEL_RAW_RANGES: list[tuple[float, float]] = [
     (0.0,     400.0),
     (0.0,     10.0),
@@ -240,32 +184,23 @@ DISPLAY_TO_STATS_NAME: list[str] = [
     'bg_absolute', 'carb_intake', 'insulin_combined', 'exercise_equiv',
 ]
 
-# Display channel → input feature slot. The 4-feature input stack is
-# [bg_absolute, carb_intake, insulin_combined, exercise_equiv], so
-# BG/carb/insulin/exercise sit at feats 0/1/2/3 (all but BG are announceable).
+# display channel → input feat; BG/carb/insulin/exercise at 0/1/2/3, all but BG announceable
 DISPLAY_TO_FEATURE_IDX: list[int] = [0, 1, 2, 3]
 
-# Display channel → announced output-channel index (carbs → 0, insulin → 1,
-# exercise → 2). BG (display 0) is the model's forecast, never an announced
-# input.
+# display channel → announced output channel; BG (display 0) is a forecast, never an input
 DISPLAY_TO_OUTPUT_CH: dict[int, int] = {1: 0, 2: 1, 3: 2}
 
-# Announced output-channel index → display channel (the inverse of
-# DISPLAY_TO_OUTPUT_CH); used to route a pencil stroke's display channel back
-# through the output-channel override compiler.
+# inverse of DISPLAY_TO_OUTPUT_CH, routing a pencil stroke back through the override compiler
 OUTPUT_TO_DISPLAY_CH: dict[int, int] = {v: k for k, v in DISPLAY_TO_OUTPUT_CH.items()}
 
 DISPLAY_CHANNEL_CLEAR_DEFAULTS: list[float] = [100.0, 0.0, 0.0, 0.0]
 
-# Short display names per announced output channel for status messages.
 OUTPUT_CHANNEL_SHORT_NAMES: list[str] = ['carbs', 'insulin', 'exercise']
 
-# The one announced channel the basal ramp writes into.
 INSULIN_OUTPUT_CH: int = OUTPUT_CHANNEL_ORDER.index('insulin_combined')
 
-# Exercise is announced at the trained g/step scale — a carbohydrate-equivalent
-# glucose disposal rate, not a 0-1 intensity. Any conversion belongs to whoever
-# supplies the session, never to the display.
+# Exercise is announced at the trained g/step scale, a carb-equivalent disposal rate and never a
+# 0-1 intensity; any conversion belongs to whoever supplies the session, not to the display.
 DISPLAY_CHANNEL_UNITS: list[str] = [
     'mg/dL',
     'g/5min',
@@ -275,16 +210,17 @@ DISPLAY_CHANNEL_UNITS: list[str] = [
 
 SCROLL_SPEED = 48
 ZOOM_FACTOR = 1.3
-# Hours of the context window the chart opens on. The window itself is days
-# wide; drawn whole, neither the CGM trace nor the forecast at its right edge is
-# legible, and the curve editor's control points land within a pixel of each
+# a fraction of the VISIBLE span, not a patch count, so one press covers the same screen
+# distance at every zoom level
+PAN_STEP_FRACTION = 0.25
+PAN_STEP_FAST_FRACTION = 1.0
+# Hours the chart opens on. The window is days wide; drawn whole, neither the trace nor the
+# forecast at its right edge is legible and the curve control points land within a pixel of each
 # other. Zoom and pan reach the rest.
 CHART_VIEW_HOURS = 24.0
 HOVER_TOOLTIP_DELAY_MS = 200
 
-# One colour per display channel — indexed by ``disp_ch`` over
-# ``range(N_DISPLAY_CHANNELS)`` on every draw path, so it stays the same length
-# as the table above.
+# indexed by ``disp_ch`` on every draw path, so it stays as long as the tables above
 CHANNEL_COLORS = [
     COLOR_BG_CURVE, COLOR_CARBS, COLOR_INSULIN, COLOR_EXERCISE,
 ]
@@ -304,38 +240,23 @@ def _features_from_raw(
     raw: dict,
     norm_stats: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert a simulator raw-dict chunk into the normalized feature
-    stack and per-step bookkeeping arrays the GUI keeps around.
+    """A simulator raw-dict chunk as the normalized feature stack, plus the GUI's raw arrays.
 
-    The risk-space model takes an ``N_INPUT_FEATURES``-feature input stack
-    ``[bg_absolute, carb_intake, insulin_combined, exercise_equiv, bg_masked]``
-    — four normalized signal channels plus the per-patch ``bg_masked``
-    announcement bit — with no bg_delta / IS / HGO input and no temporal sin/cos
-    columns.  Every step of this stack is an OBSERVED reading, so the bit column
-    is 0.0 throughout; the masked set is written into the patches downstream, by
-    the builder that knows it.  bg (feat 0)
-    is fed through the Kovatchev risk transform ``f`` BEFORE the z-score
-    (``normalize`` applies it via ``RISK_SPACE_CHANNELS``); carb / insulin /
-    exercise keep log1p + z.  ``total_exercise`` is the carbohydrate-EQUIVALENT
-    glucose-disposal curve in g/step (the simulator subtracts it from the
-    appearance term), so it is fed at its trained g/step scale and never
-    rescaled to an intensity, and never through the risk transform — it is not
-    a glucose.
-
-    Returns (features_norm[N, N_INPUT_FEATURES], bg_raw[N], context_raw[N,4])
-    where N is trimmed to a multiple of PATCH_SIZE.  ``context_raw`` stays at the
-    four signal channels — it is the chart's data, not the model's input.
+    Stack is ``[bg_absolute, carb_intake, insulin_combined, exercise_equiv, bg_masked]``: bg
+    through the Kovatchev risk transform BEFORE the z-score, the sparse three log1p + z, and the
+    bit 0.0 throughout — every step here is observed, and the masked set is written downstream.
+    Exercise stays at its trained g/step carb-equivalent scale, never an intensity and never
+    through the risk transform; it is not a glucose.
+    Returns ``(features_norm[N, N_INPUT_FEATURES], bg_raw[N], context_raw[N, 4])``, N trimmed to
+    a multiple of PATCH_SIZE; ``context_raw`` is the chart's data, not the model's input.
     """
     from config import PATCH_SIZE, N_INPUT_FEATURES
     from data import BG_MASKED_FEAT
     from normalization import CHANNEL_NAMES, normalize
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
-    # Use bg_observed (post-CGM-noise) so the GUI matches what the model was
-    # trained on.  The model consumes RAW post-noise signals: bg is only clamped
-    # to the physical BG range, carb/insulin/exercise floored at 0 (mirroring
-    # ``data._build_sample`` — no smoothing).  ``bg_raw`` / ``context_raw`` below
-    # stay unclamped for the chart; only the model-input ``features`` are clamped.
+    # bg_observed, post-CGM-noise, as the model was trained: bg clamped to the physical range,
+    # the sparse three floored at 0, no smoothing (mirrors ``data._build_sample``)
     bg_obs_raw = raw['bg_observed'].astype(np.float32)
     carb_raw = raw['total_carb'].astype(np.float32)
     insulin_raw = raw['total_insulin'].astype(np.float32)
@@ -350,18 +271,14 @@ def _features_from_raw(
     bg_obs_raw = bg_obs_raw[:N]; carb_raw = carb_raw[:N]; insulin_raw = insulin_raw[:N]
     exercise_raw = exercise_raw[:N]
 
-    # The displayed/plotted CGM + carb + insulin + exercise stay RAW (chart
-    # realism); only the model-input ``features`` carry the clamp + normalization.
+    # the plotted channels stay RAW; only ``features`` carries the clamp and normalization
     bg_raw = bg_obs_raw.copy()
     context_raw = np.stack(
         [bg_obs_raw, carb_raw, insulin_raw, exercise_raw], axis=-1,
     ).astype(np.float32)
 
-    # Normalize the four clamped signal channels through the shared transform:
-    # bg (feat 0) via the Kovatchev risk transform BEFORE z (RISK_SPACE_CHANNELS),
-    # the sparse carb/insulin/exercise via log1p + z.  One CHANNEL_NAMES entry per
-    # SIGNAL channel, in stack order; the bg_masked bit above them is not a signal
-    # and carries no statistics, so the stack is one column wider than CHANNEL_NAMES.
+    # One CHANNEL_NAMES entry per SIGNAL channel, in stack order; the bg_masked bit carries no
+    # statistics, so the stack is one column wider than CHANNEL_NAMES.
     assert len(CHANNEL_NAMES) == BG_MASKED_FEAT < N_INPUT_FEATURES, (
         f"CHANNEL_NAMES has {len(CHANNEL_NAMES)} entries against "
         f"BG_MASKED_FEAT={BG_MASKED_FEAT}, N_INPUT_FEATURES={N_INPUT_FEATURES}: "
@@ -375,12 +292,10 @@ def _features_from_raw(
 
 
 def default_context_hours() -> float:
-    """Post-warmup simulator hours that fill the model's context window.
+    """Post-warmup simulator hours that fill the context window to ``MAX_CONTEXT_PATCHES``.
 
-    ``MAX_CONTEXT_PATCHES`` is the ceiling the model was trained to, and the
-    forward accepts anything from ``MIN_CONTEXT_PATCHES`` up to it. Bootstrapping
-    short of the floor is the one failure the GUI cannot show you: nothing
-    raises, the fan is simply drawn from a window the weights never saw.
+    Bootstrapping below ``MIN_CONTEXT_PATCHES`` raises nothing — the fan is simply drawn from a
+    window the weights never saw, which is the one failure the GUI cannot show.
     """
     from config import MAX_CONTEXT_PATCHES, PATCH_SIZE
     return MAX_CONTEXT_PATCHES * PATCH_SIZE * 5.0 / 60.0
@@ -420,14 +335,11 @@ def _advance_sim_hours(
     hours: float,
     norm_stats: dict,
 ) -> int:
-    """Step ``state.sim`` forward by ``hours`` real hours and append the
-    new ground-truth steps to the state buffers (context tensor, bg_raw,
-    context_raw).
+    """Step ``state.sim`` by ``hours`` and append the new truth to the state buffers.
 
-    Returns the NET patch shift: appended minus dropped off the left. Once the
-    buffer is saturated at ``MAX_CONTEXT_PATCHES`` the two cancel and the return
-    is 0 — the window slides rather than grows, and every buffer index, the
-    chart viewport included, stays where it was.
+    Returns the NET patch shift, appended minus dropped off the left. At
+    ``MAX_CONTEXT_PATCHES`` the two cancel and it is 0 — the window slides rather than grows and
+    every buffer index, the chart viewport included, stays put.
     """
     from config import PATCH_SIZE, N_INPUT_FEATURES
 
@@ -461,11 +373,9 @@ def _advance_sim_hours(
         if state.context_raw is not None else context_raw_new
     )
 
-    # Drop from the left so the buffer never outgrows MAX_CONTEXT_PATCHES. The
-    # forward reads whatever it is handed and RoPE extrapolates, so an overrun
-    # does not raise — it silently forecasts from a window longer than any the
-    # model was trained on, and grows by ``hours`` every press. The bootstrap now
-    # starts AT the ceiling, so the very first step would overrun without this.
+    # Drop from the left: the forward reads whatever it is handed and RoPE extrapolates, so an
+    # overrun does not raise — it silently forecasts from a window longer than any the model
+    # trained on, growing by ``hours`` a press. The bootstrap starts AT the ceiling.
     from config import MAX_CONTEXT_PATCHES
     n_drop = max(0, int(state.context.shape[0]) - MAX_CONTEXT_PATCHES)
     if n_drop:
@@ -478,30 +388,18 @@ def _advance_sim_hours(
 
 
 def _hour_at_pred_start(state) -> float:
-    """Cosmetic hour-of-day (0..24) at the prediction-zone start.
-
-    The temporal sin/cos inputs are gone, so the clock label is derived purely
-    from the run's start hour plus the elapsed context: each context patch spans
-    ``PATCH_SIZE`` 5-min steps (30 min = 0.5 h), and the prediction zone begins
-    immediately after the last context patch.
-    """
+    """Cosmetic hour-of-day [0, 24) at the prediction-zone start: run start plus 0.5 h a patch."""
     start_hour = float(getattr(state, 'sim_start_hour', 0.0))
     ctx = getattr(state, 'context', None)
     n_ctx = 0 if ctx is None else int(ctx.shape[0])
     return (start_hour + n_ctx * 0.5) % 24.0
 
 
-# Pharmacokinetic shape templates for high-level events. Times in
-# minutes from the placement (event time_offset_min). Each entry yields
-# one or more raised-cosine bells; amplitudes are back-solved from the
-# event's magnitude so the AUC matches grams/units.
-#
-# Carbs unit is g/5min, insulin is U/5min; a 5-min step's value already
-# equals its contribution in grams (resp. units), so total grams =
-# sum(vals). For a half raised-cosine of half-span L patches, the
-# integral is 0.5 L; total bell integral = 0.5 (L_left + L_right). In
-# steps (× patch_size), sum_of_vals = amplitude × 0.5 × (L_l + L_r) × ps.
-# Hence amplitude = magnitude / (0.5 × (L_l + L_r) × ps).
+# Shape templates per event kind; times in minutes from the event's own time_offset_min. Each
+# yields raised-cosine bells whose amplitude is back-solved so the AUC matches the magnitude.
+# Carbs are g/5min and insulin U/5min, so a step's value IS its contribution and total = sum.
+# A half raised-cosine of half-span L integrates to 0.5·L, so the bell is 0.5·(L_l + L_r), and
+# in steps amplitude = magnitude / (0.5 × (L_l + L_r) × patch_size).
 EVENT_SHAPES = {
     'juice':         {'rise_min': 15.0, 'fall_min': 30.0,   'channel': 1},
     'fast_insulin':  {'rise_min': 75.0, 'fall_min': 165.0,  'channel': 2},
@@ -520,10 +418,8 @@ def _make_curve_event(
     n_ctx: int,
     patch_size: int,
 ):
-    """Build a raised-cosine CurveEvent whose AUC equals ``magnitude``.
-
-    ``placement_min`` is the event's nominal start time in minutes
-    relative to the start of the prediction zone (n_ctx)."""
+    """A raised-cosine CurveEvent whose AUC equals ``magnitude``; ``placement_min`` is minutes
+    from the start of the prediction zone (n_ctx)."""
     from gui_state import CurveEvent
 
     min_per_patch = 30.0
@@ -550,8 +446,7 @@ def _events_to_curve_events(
     n_ctx: int,
     patch_size: int = 6,
 ) -> list:
-    """Expand high-level Events (juice / insulin / meal) into one or
-    more CurveEvents suitable for ``_compile_overrides_from_edits``."""
+    """Expand juice / insulin / meal Events into CurveEvents for ``_compile_overrides_from_edits``."""
     from gui_state import (
         Event, EVENT_KIND_JUICE, EVENT_KIND_FAST_INSULIN,
         EVENT_KIND_BASAL_INSULIN, EVENT_KIND_MEAL,
@@ -636,25 +531,12 @@ def _pencil_strokes_to_raw_values(
     n_pred_patches: int,
     patch_size: int,
 ) -> np.ndarray:
-    """Resample freehand pencil strokes for ``disp_channel`` onto the model's
-    ``(n_pred_patches, patch_size)`` prediction grid, smoothed.
+    """``disp_channel``'s pencil strokes onto the ``(n_pred_patches, patch_size)`` grid, smoothed.
 
-    Each stroke stores ``(absolute-patch, raw-value)`` samples.  It contributes a
-    dose of 0 outside its drawn abs-patch span (``np.interp`` ``left=right=0``);
-    overlapping strokes on the same channel are max-combined (redraw-friendly).
-    The resampled dense curve is Gaussian-smoothed (``GUI_PENCIL_SMOOTH_STEPS``)
-    so the hand-drawn shape reads cleanly, and floored at 0 (this is a cosmetic
-    drawing aid, not a model-input denoiser).
-
-    Args:
-        strokes: list of ``gui_state.PencilStroke``.
-        disp_channel: display channel to gather (1=carbs, 2=insulin).
-        n_ctx: number of context patches (prediction zone starts here).
-        n_pred_patches: number of prediction patches to fill.
-        patch_size: timesteps per patch.
-
-    Returns:
-        ``(n_pred_patches, patch_size)`` raw-unit dose array (g/5min or U/5min).
+    A stroke contributes 0 outside its drawn abs-patch span; overlapping strokes on one channel
+    are max-combined, so a redraw replaces rather than adds. Gaussian-smoothed by
+    ``GUI_PENCIL_SMOOTH_STEPS`` and floored at 0 — a drawing aid, not an input denoiser.
+    Returns raw units, g/5min or U/5min.
     """
     from config import GUI_PENCIL_SMOOTH_STEPS
 
@@ -667,8 +549,8 @@ def _pencil_strokes_to_raw_values(
         ys = np.maximum(np.asarray(stroke.ys, dtype=np.float32), 0.0)
         if xs.size == 0:
             continue
-        # ``np.interp`` needs strictly-increasing sample x, but a stroke drawn with
-        # back-and-forth motion is not monotone — collapse duplicate x to their max.
+        # ``np.interp`` needs strictly-increasing x, and a back-and-forth stroke is not
+        # monotone — collapse duplicate x to their max
         uniq_x, inv = np.unique(xs, return_inverse=True)
         uniq_y = np.zeros(uniq_x.shape, dtype=np.float32)
         np.maximum.at(uniq_y, inv, ys)
@@ -745,28 +627,20 @@ def _compile_overrides_from_edits(
     basal_duration_h: float,
     pencil_strokes: list | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
-    """Compile the user's painted curve / pencil / basal edits into announced
-    carb / insulin / exercise INPUT overrides for the prediction zone.
+    """The painted curve / pencil / basal edits as announced dose overrides for the pred zone.
 
-    The model has no dynamics outputs, so the announced inputs are built from
-    a ZERO baseline (no carb, no insulin, no exercise) plus the user's
-    raised-cosine curves, freehand pencil strokes, and basal ramp — there is
-    nothing to seed from a model prediction.  Curve bells and pencil strokes on
-    the same channel sum together.  Returns ``(overrides_norm, overrides_raw)``
-    over output channels {0: carb, 1: insulin, 2: exercise}; ``predict_what_if``
-    consumes ``overrides_norm``.
-
-    Every announced channel carries only what the user painted.  Exercise is a
-    PLAN channel like the other two: nothing the patient did not announce is
-    ever written into the prediction zone.
+    Built from a ZERO baseline plus what the user painted — bells and pencil strokes on one
+    channel SUM. Exercise is a plan channel like the other two: nothing unannounced is ever
+    written into the prediction zone.
+    Returns ``(overrides_norm, overrides_raw)`` over {0: carb, 1: insulin, 2: exercise};
+    ``predict_what_if`` consumes ``overrides_norm``.
     """
     from config import PATCH_SIZE, CHANNEL_TO_FEAT
 
     pencil_strokes = pencil_strokes or []
 
-    # The announceable set is the display table's, not a literal — a display
-    # channel added without its entry here is silently dropped, taking the
-    # user's stroke with it.
+    # the announceable set is the display table's, not a literal: a channel added without an
+    # entry here is silently dropped, taking the user's stroke with it
     has_edit = {out_ch: False for out_ch in DISPLAY_TO_OUTPUT_CH.values()}
     for event in curve_events:
         out_ch = DISPLAY_TO_OUTPUT_CH.get(event.channel)
@@ -783,16 +657,13 @@ def _compile_overrides_from_edits(
     overrides_raw: dict[int, np.ndarray] = {}
 
     for out_ch in sorted(has_edit):
-        # Announceable channels are the ones the model conditions on — the
-        # input feats CHANNEL_TO_FEAT names.
         if out_ch not in CHANNEL_TO_FEAT:
             continue
         if not has_edit[out_ch]:
             continue
         ch_name = OUTPUT_CHANNEL_ORDER[out_ch]
 
-        # Zero baseline: nothing announced on this channel until the user
-        # paints it.
+        # zero baseline: nothing announced on this channel until the user paints it
         modified_raw = np.zeros((n_pred, PATCH_SIZE), dtype=np.float32)
 
         for event in curve_events:
@@ -802,8 +673,7 @@ def _compile_overrides_from_edits(
             event_vals = _curve_event_to_raw_values(event, n_ctx, n_pred, PATCH_SIZE)
             modified_raw = modified_raw + event_vals
 
-        # Freehand pencil strokes for this channel (max-combined internally,
-        # summed on top of the raised-cosine bells above).
+        # max-combined internally, summed on top of the bells above
         if pencil_strokes:
             disp_ch = OUTPUT_TO_DISPLAY_CH[out_ch]
             pencil_vals = _pencil_strokes_to_raw_values(
@@ -820,11 +690,8 @@ def _compile_overrides_from_edits(
 
         modified_raw = np.maximum(modified_raw, 0.0)
 
-        # The model consumes RAW post-noise doses (carb/insulin/exercise floored
-        # at 0); the announced what-if dose is already floored above, so
-        # normalize it directly — no smoothing.  ``overrides_raw`` (chart
-        # overlay) keeps the RAW announced value, at its own trained scale:
-        # exercise in g/step carbohydrate-equivalent, never an intensity.
+        # already floored above, so normalize directly — no smoothing. ``overrides_raw`` keeps
+        # the RAW announced value at its trained scale: exercise g/step, never an intensity.
         norm_vals = _normalize_channel_array(
             modified_raw.flatten(), ch_name, norm_stats
         ).reshape(n_pred, PATCH_SIZE)
@@ -842,40 +709,15 @@ def _decode_tod(
     device: torch.device,
     overrides: dict[int, torch.Tensor] | None = None,
 ) -> tuple[float | None, float | None, np.ndarray | None]:
-    """Decode the diagnostic time-of-day probe for ``context``.
+    """Decode the diagnostic time-of-day probe for ``context``; all None when the probe is off.
 
-    Runs one cheap ``B=1`` forecast through ``inference.predict`` with
-    ``return_time=True`` (the forecast ``q_tau`` / ``median`` are computed
-    identically and untouched — the probe reads a detached hidden state) and
-    decodes the resultant length R of the per-bin softmax belief (via
-    ``utils.time_of_day_decode_bins``).  ``overrides`` should mirror the
-    announced-dose overrides used for the displayed forecast so the probe's
-    context matches the shown bands on the what-if path.
-
-    The probe is read off the MASKED patches, one row per head slot, and the
-    masked set is no longer implied by position — it is built and passed to the
-    model explicitly.  This goes through ``predict`` rather than assembling the
-    forward's arguments here so that the masked set, the per-slot anchors and the
-    patches' ``bg_masked`` bits are all built in one place: a second builder here
-    would be a second chance for them to disagree.  Slot 0 is the first masked
-    patch, which for the forecast protocol is the forecast origin.
-
-    Args:
-        model: loaded T1DMAI model.
-        context: (n_ctx, PATCH_SIZE, N_INPUT_FEATURES) normalized context.
-        norm_stats: normalization statistics (the ``normalize(0)`` no-dose
-            baseline + the mg/dL anchor).
-        device: torch device to run the forward on.
-        overrides: optional {output-channel: (PREDICTION_PATCHES, PATCH_SIZE)}
-            normalized announced-dose overrides.
-
-    Returns:
-        (pred_hour, confidence, bin_probs): ``pred_hour`` the decoded
-        prediction-origin hour-of-day in [0, 24), ``confidence`` the resultant
-        length R in [0, 1] of the FIRST masked patch's bin distribution (higher =
-        more confident), ``bin_probs`` the ``(masked patches, TIME_PROBE_N_BINS)``
-        per-patch softmax belief. All ``None`` when the probe is disabled
-        (``time_pred is None``).
+    One ``B=1`` forecast through ``inference.predict`` with ``return_time=True``; ``q_tau`` and
+    ``median`` are computed identically either way. Goes through ``predict`` rather than
+    assembling the forward here so the masked set, the per-slot anchors and the ``bg_masked``
+    bits are built in ONE place — a second builder is a second chance for them to disagree.
+    ``overrides`` should mirror the displayed forecast's, or the probe reads a different context.
+    Returns ``(pred_hour [0, 24), confidence R [0, 1] of the FIRST masked patch, bin_probs
+    (masked patches, TIME_PROBE_N_BINS))``.
     """
     from inference import predict
     from utils import time_of_day_decode_bins
@@ -895,17 +737,12 @@ def _decode_tod(
 
 
 def _painted_rolls_for_state(state, min_rolls: int, max_rolls: int) -> int:
-    """Number of rolls needed to cover the furthest painted dose (curve events +
-    high-level events + pencil strokes), clamped to ``[min_rolls, max_rolls]``.
-    Positions are absolute patch units, so the furthest painted point minus
-    ``n_ctx`` is the painted span in patches.
+    """Rolls needed to cover the furthest painted dose, clamped to ``[min_rolls, max_rolls]``.
 
-    One roll masks a span of ``PREDICTION_PATCHES`` patches at the right edge of
-    its window — the forecast case of the masked-BG objective — so that is the
-    span each roll covers.
-
-    This is the *fit-to-drawing* horizon shared by the long-prediction dispatch
-    and the announced-dose preview overlay."""
+    Positions are absolute patches, so the furthest painted point less ``n_ctx`` is the painted
+    span, and one roll covers ``PREDICTION_PATCHES``.
+    The fit-to-drawing horizon, shared by the long-prediction dispatch and the preview overlay.
+    """
     from config import PREDICTION_PATCHES
     n_ctx = state.context.shape[0] if state.context is not None else 0
     furthest = float(n_ctx)
@@ -923,15 +760,12 @@ def _painted_rolls_for_state(state, min_rolls: int, max_rolls: int) -> int:
 
 
 def _preview_horizon_patches_for_state(state) -> int:
-    """Length in patches, past ``n_ctx``, to compile/draw the announced-dose
-    preview over.  At least one forward window, grown to cover the drawing
-    (fit-to-drawing, capped at ``GUI_MAX_PREDICTION_HOURS``) and to match an
-    existing forecast's rolled horizon — so a dose painted past 2 h stays
-    visible rather than clipping to the single-pass window.
+    """Patches past ``n_ctx`` to draw the announced-dose preview over.
 
-    This is a DRAWING extent, not the model's masked set: the announced plan is
-    painted over patches the model may never have masked in one pass.  The masked
-    set the model actually reads is built per forward, one roll at a time."""
+    At least one forward window, grown to the drawing (capped at ``GUI_MAX_PREDICTION_HOURS``)
+    and to any existing forecast's rolled horizon, so a dose painted past 2 h stays visible.
+    A DRAWING extent, not a masked set — the model's is built per forward, one roll at a time.
+    """
     from config import PREDICTION_PATCHES, PREDICTION_HORIZON_HOURS, GUI_MAX_PREDICTION_HOURS
     max_rolls = max(1, round(GUI_MAX_PREDICTION_HOURS / PREDICTION_HORIZON_HOURS))
     n = _painted_rolls_for_state(state, 1, max_rolls) * PREDICTION_PATCHES
@@ -943,19 +777,11 @@ def _preview_horizon_patches_for_state(state) -> int:
 def _masked_context(state, spans: list[tuple[int, int]]):
     """``state.context`` with the masked CONTEXT spans' dose channels withheld.
 
-    Only under the blind policy, and only for spans inside the context: the
-    trailing forecast zone is seeded to ``normalize(0)`` by
-    ``inference._build_patches_tensor`` already, which IS the blind fill.
-    ``inference`` withholds bg alone on a masked context patch — the announced
-    convention — so under ``blind`` this is where the dose channels go with it,
-    the same place ``calibrate_conformal._blind_context`` puts them.
-
-    Args:
-        state: the GUI state.
-        spans: the emitted masked set, trailing span included.
-
-    Returns:
-        A new tensor under ``blind``; ``state.context`` itself otherwise.
+    Blind policy only, context spans only: ``inference._build_patches_tensor`` already seeds the
+    trailing zone at ``normalize(0)``, which IS the blind fill. ``inference`` withholds bg alone
+    on a masked context patch, so under ``blind`` the dose channels go with it here — the same
+    place ``calibrate_conformal._blind_context`` puts them.
+    Returns a new tensor under ``blind``, ``state.context`` itself otherwise.
     """
     from config import N_INPUT_FEATURES, PATCH_SIZE
     from data import blind_masked_doses
@@ -994,21 +820,20 @@ def _run_prediction(
         hour = _hour_at_pred_start(state)
         state.active_band_label = f"{hour:0.1f}h"
         n_ctx = state.context.shape[0]
-        # The masked set: the user's context spans plus the mandatory trailing
-        # forecast span. ``inference.PREDICTION_PATCHES`` (not config's) is the
-        # window ``predict`` builds — ``main`` rewrites it to the checkpoint's
-        # horizon — so the trailing span has to be measured against that one.
+        # ``inference.PREDICTION_PATCHES``, not config's: ``main`` rewrites it to the
+        # checkpoint's horizon, and that is the window ``predict`` builds
         n_pred = int(inference.PREDICTION_PATCHES)
         mask_spans = state.emitted_mask_spans(n_pred)
+        # Snapshotted HERE, beside the masked set it belongs to: the event loop takes mask
+        # edits while this thread runs, and one landing mid-compute would hand ``explain`` a
+        # span that is not in the set that was forwarded.
+        target_span = state.selected_span(n_pred)
         ctx = _masked_context(state, mask_spans)
-        # The context edge, which is the trailing forecast span's own anchor. The
-        # anchor rule is one-sided and LEFT-PREFERRING: every slot of a span takes
-        # the last step of the left neighbour patch (the first step of the right
-        # neighbour only when the span starts at patch 0), and every slot of one
-        # span gets the same value. Per-span anchors are read off
-        # ``gui_state.span_anchor_cell`` for the chart's readout; this scalar
-        # stays what it always was. The anchor is not the distance a metric bins
-        # on: it ignores the near side.
+        # The context edge, which is the trailing span's own anchor. The rule is one-sided and
+        # LEFT-PREFERRING — a span's slots all take its left neighbour's last step, its right
+        # neighbour's first only at patch 0. Per-span anchors come off
+        # ``gui_state.span_anchor_cell``. Not the distance a metric bins on: it ignores the
+        # near side.
         last_bg_idx = n_ctx * PATCH_SIZE - 1
         if state.bg_raw is not None and last_bg_idx >= 0:
             state.last_bg = float(state.bg_raw[last_bg_idx])
@@ -1031,11 +856,9 @@ def _run_prediction(
                 ch: torch.from_numpy(vals.astype(np.float32))
                 for ch, vals in overrides_norm.items()
             }
-            # The model only conditions on the single-pass 2 h window, but the
-            # announced dose the user painted may extend past it (fit-to-drawing).
-            # Recompile the RAW overlay over the full painted horizon so a dose
-            # drawn past 2 h stays visible on the chart (the model override above
-            # stays at PREDICTION_PATCHES).
+            # The model conditions on the single-pass window alone, but the painted dose may
+            # run past it, so recompile the RAW overlay over the full painted horizon; the
+            # model override above stays at PREDICTION_PATCHES.
             disp_n_pred = _preview_horizon_patches_for_state(state)
             if disp_n_pred > PREDICTION_PATCHES:
                 _, overrides_raw = _compile_overrides_from_edits(
@@ -1047,13 +870,10 @@ def _run_prediction(
                     basal_ramp_up_h, basal_ramp_down_h, basal_duration_h,
                     pencil_strokes=state.pencil_strokes,
                 )
-            # Re-run predict with the announced carb/insulin/exercise INPUT perturbed;
-            # the model's median BG forecast shifts in response.
-            # ``predict_what_if`` is right-edge by construction — it takes no
-            # ``mask_spans`` — and it is otherwise a conditioned ``predict``, so
-            # the masked-set call goes straight to ``predict`` with the same
-            # overrides rather than widening the wrapper. Painting still writes
-            # the trailing zone only: the overrides are (n_pred, PATCH_SIZE).
+            # ``predict_what_if`` is right-edge by construction — no ``mask_spans`` — and
+            # otherwise a conditioned ``predict``, so a masked-set call goes straight to
+            # ``predict`` with the same overrides. Painting still writes the trailing zone
+            # alone: the overrides are (n_pred, PATCH_SIZE).
             result = predict(
                 model, ctx, state.patient_seed,
                 overrides=torch_overrides,
@@ -1079,20 +899,16 @@ def _run_prediction(
             state.prediction.overrides_raw = None
             probe_overrides = None
 
-        # Headline forecast: median_bg (mg/dL) + per-τ quantile bands.
         state.prediction.median_bg = result['median_bg'].cpu().numpy()
         state.prediction.bands = result['bands'].cpu().numpy()
-        # WHICH patch each band row predicts. The head reads its slots by gather
-        # over an arbitrary masked set, so slot j is patch mask_idx[j] and the
-        # chart must place the row there — a fixed offset from the context end is
-        # right only for the forecast.
+        # Which patch each band row predicts: the head gathers over an arbitrary masked set, so
+        # slot j is patch mask_idx[j]. A fixed offset from the context end is right only for
+        # the forecast.
         state.prediction.span_patches = result['mask_idx'].cpu().numpy()
         state.prediction.n_rolls = 1
 
-        # Diagnostic time-of-day probe: decode the prediction-origin hour +
-        # confidence R off the SAME (optionally what-if-overridden) context so
-        # the readout stays consistent with the shown bands. Read-only — the
-        # forecast above is untouched. None,None when the probe is disabled.
+        # Decoded off the SAME (optionally overridden) context, so the readout stays consistent
+        # with the shown bands. Read-only; None when the probe is off.
         (state.prediction.tod_pred_hour,
          state.prediction.tod_confidence,
          state.prediction.tod_bin_probs) = _decode_tod(
@@ -1100,11 +916,92 @@ def _run_prediction(
             overrides=probe_overrides,
         )
 
-        state.status_message = f"Prediction complete ({datetime.datetime.now().strftime('%H:%M:%S')})"
+        # Exactly what this forward consumed, so the strips can be filled later without a
+        # second prediction having to reproduce it. One entry: a single pass IS one roll.
+        state.last_forward = {
+            'rolls': [{
+                'context': ctx,
+                'mask_spans': mask_spans,
+                'overrides': probe_overrides,
+                'span': target_span,
+                'offset': 0,
+                'label': '',
+            }],
+            'index': 0,
+        }
+
+        # Same context, overrides and masked set as the bands above. Off by default: one extra
+        # grad-enabled forward per prediction.
+        state.prediction.attribution = None
+        attribution_note = ""
+        if state.attn_overlay_visible:
+            attribution_note = _fill_attribution(state, model, device)
+
+        state.status_message = (
+            f"Prediction complete "
+            f"({datetime.datetime.now().strftime('%H:%M:%S')}){attribution_note}"
+        )
 
     except Exception as e:
         traceback.print_exc()
         state.status_message = f"Error: {e}"
+    finally:
+        state.is_computing = False
+
+
+def _selected_roll(state) -> dict | None:
+    """The recorded forward the strips explain, None when there is none.
+
+    A single pass records one roll, a rolling forecast one per roll, and ``index`` picks which.
+    """
+    forward = state.last_forward
+    if not forward or not forward.get('rolls'):
+        return None
+    rolls = forward['rolls']
+    return rolls[max(0, min(int(forward.get('index', 0)), len(rolls) - 1))]
+
+
+def _fill_attribution(state, model, device) -> str:
+    """Maps for the recorded forward the roll index selects; returns '' or the failure text."""
+    from attribution import explain
+
+    roll = _selected_roll(state)
+    state.prediction.attribution = None
+    if roll is None or state.norm_stats is None:
+        return ""
+    try:
+        state.prediction.attribution = explain(
+            model, roll['context'], state.norm_stats,
+            overrides=roll['overrides'],
+            mask_spans=roll['mask_spans'],
+            span=roll['span'],
+            device=device,
+            window_offset=roll['offset'],
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return f" | attribution failed: {e}"
+    return ""
+
+
+def _run_attribution(state, model, device) -> None:
+    """Fill the strips off the recorded forward, on a worker thread."""
+    state.is_computing = True
+    state.status_message = "Reading attention..."
+    try:
+        note = _fill_attribution(state, model, device)
+        attrib = state.prediction.attribution
+        if note or attrib is None:
+            state.status_message = note.lstrip(" |") or "Attention unavailable"
+        else:
+            roll = _selected_roll(state) or {}
+            n_rolls = len(state.last_forward['rolls']) if state.last_forward else 1
+            start = attrib.span[0] + attrib.window_offset
+            where = f"patches {start}-{start + attrib.span[1] - 1}"
+            state.status_message = (
+                f"Attention: {roll['label']} of {n_rolls}, {where}"
+                if roll.get('label') else f"Attention: {where}"
+            )
     finally:
         state.is_computing = False
 
@@ -1140,14 +1037,9 @@ def _scale_to_chart_y(
 def _adaptive_time_intervals(
     span_patches: float,
 ) -> tuple[float, float, str]:
-    """Pick a (major, minor, label_format) triple appropriate for the
-    visible time span. One patch = 30 minutes.
+    """(major, minor, label_format) for the visible span; one patch = 30 min.
 
-    ``label_format`` is ``'h'`` for whole-hour-only labels (used when
-    zoomed way out so we don't waste pixels on ":00"), ``'hm'`` for
-    ``HH:MM`` (the normal case), and ``'hms'`` for ``HH:MM:SS`` when
-    zoomed in tightly enough that minutes alone start looking coarse.
-    Targets ~6–10 major labels visible at any zoom.
+    ``label_format``: 'h' whole hours, 'hm' HH:MM, 'hms' HH:MM:SS. Targets 6–10 major labels.
     """
     s = float(span_patches)
     if s >= 192:    return 48.0,  12.0,  'h'    # 24h major, 6h minor
@@ -1163,12 +1055,11 @@ def _adaptive_time_intervals(
 
 
 def _smooth_1d(x: np.ndarray, window: int) -> np.ndarray:
-    """Gaussian smoothing with edge-replicated padding so output length
-    matches input. ``window=1`` is a no-op; even windows are bumped to the
-    next odd value so the kernel stays centered. The kernel is a discrete
-    Gaussian with σ = window/3, which puts ±3σ at the kernel edges and
-    gives a noticeably softer envelope than a flat boxcar of the same
-    width."""
+    """Gaussian smoothing, edge-replicated so the length is unchanged; ``window=1`` is a no-op.
+
+    Even windows bump to the next odd so the kernel stays centred; σ = window/3 puts ±3σ at the
+    kernel edges, softer than a boxcar of the same width.
+    """
     if window <= 1 or x.size < 2:
         return x
     w = min(int(window), x.size)
@@ -1184,18 +1075,10 @@ def _smooth_1d(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def _contiguous_runs(patches: np.ndarray) -> list[tuple[int, int]]:
-    """Group ascending patch indices into ``[lo, hi)`` runs of consecutive ones.
+    """``(P,)`` ascending patch indices as ``[(lo, hi), ...]`` half-open ranges INTO ``patches``.
 
-    The head's ``mask_idx`` is one slot per masked patch in span order, and the
-    sampler guarantees a visible separator between spans, so a break in the
-    sequence IS a span boundary — the same adjacency rule ``utils._span_layout``
-    uses to group slots for the per-span median basis.
-
-    Args:
-        patches: ``(P,)`` ascending patch indices.
-
-    Returns:
-        ``[(lo, hi), ...]`` half-open index ranges into ``patches``.
+    A visible separator is guaranteed between spans, so a break in the sequence IS a span
+    boundary — the adjacency rule ``utils._span_layout`` groups slots by.
     """
     if len(patches) == 0:
         return []
@@ -1212,17 +1095,9 @@ def _contiguous_runs(patches: np.ndarray) -> list[tuple[int, int]]:
 def _split_at_masked(
     times: np.ndarray, values: np.ndarray, spans,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Break a context curve into the stretches that are NOT masked.
+    """The stretches of a context curve that are NOT masked, runs of 2+ samples only.
 
-    ``times`` are in patch units, so a sample belongs to patch ``floor(t)``.
-
-    Args:
-        times: ``(N,)`` x values in absolute patch units.
-        values: ``(N,)`` chart-y values.
-        spans: the user's ``MaskSpan`` list.
-
-    Returns:
-        ``[(times, values), ...]`` for each visible run of 2+ samples.
+    ``times`` are absolute patch units, so a sample belongs to patch ``floor(t)``.
     """
     if len(times) == 0:
         return []
@@ -1316,7 +1191,8 @@ class T1DMAIGui:
         chart_y = CHART_PADDING
         chart_w = width - SIDEBAR_WIDTH - right_panel_w - 2 * CHART_PADDING
         chart_h = (height - CONTROL_PANEL_HEIGHT - STATUS_BAR_HEIGHT
-                   - 2 * CHART_PADDING - ui_px(40))
+                   - 2 * CHART_PADDING - ui_px(40)
+                   - self._attn_block_h())
 
         from gui_renderer import ChartTransform
         self.chart_transform = ChartTransform(
@@ -1346,9 +1222,7 @@ class T1DMAIGui:
             )
             self._toggles.append(t)
 
-        # Display-options toggles: cosmetic smoothing on the mean line and
-        # on the σ band edges. Toggling them just queues a redraw — no
-        # re-prediction is needed since smoothing is post-hoc.
+        # smoothing is post-hoc, so toggling only queues a redraw
         self._display_toggles = [
             Toggle(
                 10, 0, SIDEBAR_WIDTH - 20, TOGGLE_HEIGHT,
@@ -1396,22 +1270,19 @@ class T1DMAIGui:
             Button(10 + btn_w + 10, 0, btn_w, bh, "Clear Masks",
                    callback=self._do_clear_masks),
         ]
-        # Dose painting is inert under a blind checkpoint (the masked-patch dose
-        # channels were pinned at the no-dose fill throughout training), so the
-        # controls that write one are disabled rather than left to do nothing
-        # visible. Matched by label, since the list above is positional.
+        # Dose painting is inert under a blind checkpoint, so the controls that write one are
+        # disabled rather than left to do nothing visible. Matched by LABEL — the list above is
+        # positional.
         from gui_state import dose_painting_enabled
         if not dose_painting_enabled(self.state.masked_channel_policy):
             for b in self._buttons:
                 if b.label.split(' [')[0] in _DOSE_PAINTING_BUTTONS:
                     b.enabled = False
 
-        # Modal sub-windows. They auto-center on the screen each frame
-        # via their own _layout, so no rect plumbing is needed here.
+        # they re-centre themselves each frame, so no rect plumbing here
         self._help_window = HelpWindow()
         self._event_editor = EventEditorModal()
 
-        # ---- Events right-panel state ----
         self._events_panel_scroll: int = 0
         self._events_panel_content_h: int = 0
         # (kind, meal_name, rect) for each create-event button.
@@ -1426,23 +1297,18 @@ class T1DMAIGui:
 
         self._undo_stack: list[tuple[list, list, float]] = []
 
-        # ---- Pan-drag state (middle / right mouse button) ----
         self._panning: bool = False
         self._pan_start_screen_x: int = 0
         self._pan_start_cx_min: float = 0.0
         self._pan_start_cx_max: float = 0.0
 
-        # ---- Pencil-draw state (left-drag while the pencil tool is active) ----
-        # The in-progress freehand stroke is accumulated here and appended to
-        # ``state.pencil_strokes`` on release.
+        # the in-flight stroke, appended to ``state.pencil_strokes`` on release
         self._pencil_drawing: bool = False
         self._active_stroke: Any = None  # gui_state.PencilStroke | None
 
-        # ---- Sidebar scroll state ----
-        # Content height is measured at the end of each _draw_sidebar pass;
-        # the wheel handler clamps against the *previous* frame's value,
-        # which is fine because layout only changes in response to user
-        # actions that also trigger a redraw before the next scroll input.
+        # Content height is measured at the end of each _draw_sidebar pass, so the wheel
+        # handler clamps against the PREVIOUS frame's — layout only changes on an action that
+        # redraws first.
         self._sidebar_scroll: int = 0
         self._sidebar_content_h: int = 0
 
@@ -1471,7 +1337,8 @@ class T1DMAIGui:
         chart_y = CHART_PADDING
         chart_w = max(width - SIDEBAR_WIDTH - right_panel_w - 2 * CHART_PADDING, 100)
         chart_h = max(height - CONTROL_PANEL_HEIGHT - STATUS_BAR_HEIGHT
-                      - 2 * CHART_PADDING - ui_px(40), 100)
+                      - 2 * CHART_PADDING - ui_px(40)
+                      - self._attn_block_h(), 100)
 
         self.chart_transform = ChartTransform(
             screen_x=chart_x, screen_y=chart_y,
@@ -1487,8 +1354,95 @@ class T1DMAIGui:
             width - SIDEBAR_WIDTH - right_panel_w, CONTROL_PANEL_HEIGHT,
         )
 
-        # Modal sub-windows reposition themselves on every draw; no
-        # layout fixup needed when the host resizes.
+        # modals re-centre on every draw, so a resize needs no layout fixup here
+
+    def _attn_block_h(self) -> int:
+        """Vertical space the strip block takes out of the chart, 0 when hidden."""
+        return ATTN_BLOCK_HEIGHT if self.state.attn_overlay_visible else 0
+
+    def _toggle_attn_overlay(self) -> None:
+        self.state.attn_overlay_visible = not self.state.attn_overlay_visible
+        self._update_layout(self.width, self.height)
+        if not self.state.attn_overlay_visible:
+            self.state.status_message = "Attention strips off"
+        elif self.state.prediction.attribution is not None:
+            self.state.status_message = "Attention strips on"
+        elif not self._run_attribution_async():
+            self.state.status_message = "Attention strips on — predict to fill them"
+        self._needs_redraw = True
+
+    def _run_attribution_async(self) -> bool:
+        """Fill the strips off the forward already on screen; True when a worker started.
+
+        No re-prediction: the maps have to describe the forward that produced the bands on
+        screen, and only the recorded one is guaranteed to be it.
+        """
+        if (self.model is None or self.state.is_computing
+                or self.state.last_forward is None
+                or self.state.norm_stats is None):
+            return False
+        # Claimed synchronously: the event loop is single-threaded, so this closes the window
+        # where a second T or SPACE in the same frame batch starts a concurrent writer.
+        self.state.is_computing = True
+        threading.Thread(
+            target=_run_attribution,
+            args=(self.state, self.model, self.device),
+            daemon=True,
+        ).start()
+        self._needs_redraw = True
+        return True
+
+    def _cycle_attn_layer(self, delta: int) -> None:
+        """Step through the layers, with the rollout (-1) as one more position."""
+        from config import N_LAYERS
+        attrib = self.state.prediction.attribution
+        n_layers = (int(attrib.per_layer.shape[0]) if attrib is not None
+                    else int(N_LAYERS))
+        self.state.attn_layer = (
+            (self.state.attn_layer + 1 + delta) % (n_layers + 1)
+        ) - 1
+        self.state.status_message = (
+            f"Attention: {self._attn_layer_label()}"
+        )
+        self._needs_redraw = True
+
+    def _attn_layer_label(self) -> str:
+        # 'all', never 'roll': the strips step through rolls too, and one word for both is a trap
+        layer = self.state.attn_layer
+        return f'L{layer}' if layer >= 0 else 'all'
+
+    def _cycle_attn_roll(self, delta: int) -> None:
+        """Step which recorded forward the strips explain.
+
+        Only roll 0 reads evidence that is entirely observed; every later one attends to a
+        context partly built from the model's own output.
+        """
+        forward = self.state.last_forward
+        rolls = forward.get('rolls') if forward else None
+        if not rolls:
+            self.state.status_message = "No forward recorded — predict first"
+        elif len(rolls) == 1:
+            self.state.status_message = "One forward — no rolls to step through"
+        else:
+            forward['index'] = (int(forward.get('index', 0)) + delta) % len(rolls)
+            if self.state.attn_overlay_visible:
+                self.state.prediction.attribution = None
+                if not self._run_attribution_async():
+                    self.state.status_message = "Attention busy — try again"
+            else:
+                self.state.status_message = (
+                    f"Attention set to {rolls[forward['index']]['label']} "
+                    f"of {len(rolls)} — T to show"
+                )
+        self._needs_redraw = True
+
+    def _pan_view(self, fraction: float) -> None:
+        """Slide the time axis by a fraction of the visible span, so one press covers the same
+        screen distance at two hours or four days."""
+        ct = self.chart_transform
+        step = (ct.cx_max - ct.cx_min) * fraction
+        ct.update(chart_x_min=ct.cx_min + step, chart_x_max=ct.cx_max + step)
+        self._needs_redraw = True
 
     def _toggle_channel(self, idx: int) -> None:
         self.state.channel_visible[idx] = not self.state.channel_visible[idx]
@@ -1507,23 +1461,17 @@ class T1DMAIGui:
             self._run_prediction_async()
 
     def _n_pred(self) -> int:
-        """The trailing forecast span's length, in patches.
-
-        Read off ``inference``, not ``config``: ``main`` rewrites
-        ``inference.PREDICTION_PATCHES`` to the loaded checkpoint's horizon and
-        leaves ``config`` alone, and this is the window ``predict`` actually
-        builds — the one the masked set has to fit.
-        """
+        """The trailing forecast span's length in patches, off ``inference``, never ``config``:
+        ``main`` rewrites ``inference.PREDICTION_PATCHES`` to the checkpoint's horizon."""
         import inference
         return int(inference.PREDICTION_PATCHES)
 
     def _dose_painting_blocked(self) -> str:
         """Why a painted dose cannot reach this model, or ``''``.
 
-        The blind policy pinned the masked-patch dose channels at
-        ``data.zero_dose_fill`` for the whole of training, so an override written
-        there is a channel the weights learned carries no information: the
-        forecast would not move and the user would read that as a model result.
+        The blind policy pinned the masked-patch dose channels at ``data.zero_dose_fill`` for
+        all of training, so an override there moves nothing — and an unmoved forecast reads as
+        a model result.
         """
         from gui_state import dose_painting_enabled
         if dose_painting_enabled(self.state.masked_channel_policy):
@@ -1559,9 +1507,8 @@ class T1DMAIGui:
         self.state.apply_mask_preset(preset, self._n_pred())
         self._clear_prediction()
         spans = self.state.emitted_mask_spans(self._n_pred())
-        # Frame the span the user asked for, not the whole emitted set: the
-        # trailing forecast span is always in that set and sits a window away
-        # from a backcast one, so framing both frames neither.
+        # Frame the span the user asked for, not the emitted set: the trailing span is always
+        # in it and sits a window away from a backcast one, so framing both frames neither.
         chosen = [(sp.start, sp.length) for sp in self.state.mask_spans]
         self._scroll_to_patches(chosen or spans)
         self.state.status_message = (
@@ -1570,11 +1517,10 @@ class T1DMAIGui:
         self._needs_redraw = True
 
     def _scroll_to_patches(self, spans) -> None:
-        """Pan (never zoom) so every span in ``spans`` is on the chart.
+        """Pan, never zoom, so every span in ``spans`` is on the chart.
 
-        The view opens on the trailing hours of a multi-day window, so the
-        backcast preset's span at patch 0 and an interior infill both land far
-        off the left edge. Their fan would be drawn correctly and seen by nobody.
+        The view opens on the trailing hours of a multi-day window, so a backcast span at patch
+        0 and an interior infill both land off the left edge — drawn correctly, seen by nobody.
         """
         if not spans:
             return
@@ -1591,16 +1537,14 @@ class T1DMAIGui:
         ct.update(chart_x_min=new_min, chart_x_max=new_min + width)
 
     def _clear_prediction(self) -> None:
-        """Drop the shown forecast.
-
-        Any change to the masked set or the context invalidates it: the rows are
-        keyed to the patches the head was asked about, so keeping them would draw
-        one masked set's fan over another's spans.
-        """
+        """Drop the shown forecast: its rows are keyed to the patches the head was asked about,
+        so any change to the masked set or the context would draw one set's fan over another's."""
         self.state.prediction.median_bg = None
         self.state.prediction.bands = None
         self.state.prediction.span_patches = None
         self.state.prediction.overrides_raw = None
+        self.state.prediction.attribution = None
+        self.state.last_forward = None
         self.state.prediction_rolls = 1
 
     def _do_what_if(self) -> None:
@@ -1642,21 +1586,16 @@ class T1DMAIGui:
             self._run_rolling_async()
 
     def _painted_rolls(self, min_rolls: int, max_rolls: int) -> int:
-        """Fit-to-drawing roll count over ``self.state`` (see
-        ``_painted_rolls_for_state``)."""
+        """Fit-to-drawing roll count over ``self.state``."""
         return _painted_rolls_for_state(self.state, min_rolls, max_rolls)
 
     def _preview_horizon_patches(self) -> int:
-        """Announced-dose preview length in patches over ``self.state`` (see
-        ``_preview_horizon_patches_for_state``)."""
+        """Announced-dose preview length in patches over ``self.state``."""
         return _preview_horizon_patches_for_state(self.state)
 
     def _do_long_predict(self) -> None:
-        """Fit-to-drawing long prediction: roll ``predict_rolling`` out far
-        enough to cover the painted doses (floor ``GUI_LONG_PREDICTION_HOURS``,
-        cap ``GUI_MAX_PREDICTION_HOURS``), conditioning every roll on the
-        announced carb / insulin / exercise.  SPACE stays the single-pass 2 h
-        forecast."""
+        """Roll out far enough to cover the painted doses, floor ``GUI_LONG_PREDICTION_HOURS``
+        and cap ``GUI_MAX_PREDICTION_HOURS``, every roll conditioned on the announced doses."""
         if self.state.is_computing or self.state.context is None or self.model is None:
             return
         from config import (
@@ -1673,11 +1612,11 @@ class T1DMAIGui:
         self._run_rolling_async()
 
     def _do_sim_forward(self, hours: float = 2.0) -> None:
-        """Step the live simulator forward by ``hours`` real hours, append
-        the new ground-truth steps to the context buffers, and re-run a
-        single-horizon prediction from the new context end. Distinct from
-        ``_do_roll_forward``, which extends only the model's predicted
-        horizon without advancing the simulator."""
+        """Advance the simulator ``hours`` and append the new truth to the context buffers.
+
+        Distinct from ``_do_roll_forward``, which extends the predicted horizon and leaves the
+        simulator where it stands.
+        """
         if self.state.is_computing or self.state.sim is None:
             return
         if self.state.norm_stats is None:
@@ -1694,14 +1633,12 @@ class T1DMAIGui:
             self.state.status_message = "Sim advance produced no new patches"
             return
         self.state.clear_overrides()
-        # The context just grew, so every masked span now sits on different data
-        # than the user drew it over and the trailing forecast span has moved.
-        # Reset to the forecast preset rather than re-anchor silently.
+        # The context grew, so every span now sits on different data than the user drew it over
+        # and the trailing span has moved; reset rather than re-anchor silently.
         self.state.clear_mask_spans()
         self._clear_prediction()
-        # Keep the user's zoom, but follow NOW: ``n_added`` is the NET shift, so
-        # it is 0 once the buffer is saturated (the window slides, indices hold)
-        # and positive only while it is still filling. Holding the view fixed
+        # Keep the zoom but follow NOW. ``n_added`` is the NET shift: 0 once the buffer is
+        # saturated (indices hold), positive only while it fills — and holding the view fixed
         # through that phase walks the forecast zone off the right edge.
         if n_added:
             ct = self.chart_transform
@@ -1712,14 +1649,12 @@ class T1DMAIGui:
         )
 
     def _do_eval_against_sim(self) -> None:
-        """Score the current model prediction against the simulator's
-        ground truth. Snapshots ``state.prediction.median_bg``, advances the
-        simulator by the prediction horizon so the same window now has
-        real BG, compares the two, and stores the error stats in
-        ``state.last_eval`` for the sidebar Score card to render. The
-        prediction zone gets consumed (the new ground truth becomes
-        context), so the stale prediction is cleared — press SPACE to
-        predict again from the new tail."""
+        """Score the shown forecast against the simulator, into ``state.last_eval``.
+
+        Snapshots the median, advances the simulator by the horizon so the same window carries
+        real BG, then compares. The prediction zone is consumed — it becomes context — so the
+        forecast is cleared with it.
+        """
         from config import PATCH_SIZE
         from gui_state import EvalResult
         if self.state.is_computing or self.state.sim is None:
@@ -1749,8 +1684,7 @@ class T1DMAIGui:
             self.state.status_message = "Eval: simulator advance failed"
             return
 
-        # Score against the RAW post-noise truth: the model forecast targets raw
-        # clamped BG, so the ground truth uses the same physical-range clamp.
+        # RAW post-noise truth under the same physical clamp the forecast targets
         from T1DMSIM.simulator import BG_CLAMP_MIN as _BMIN, BG_CLAMP_MAX as _BMAX
         truth_bg = np.asarray(
             np.clip(self.state.bg_raw, _BMIN, _BMAX)[
@@ -1777,10 +1711,8 @@ class T1DMAIGui:
             eval_at_patch=eval_start_step // PATCH_SIZE,
         )
 
-        # The just-evaluated window is now context with real data; clear
-        # the stale prediction so the chart doesn't keep drawing a band
-        # built for a different prediction zone, and the masked spans with it —
-        # the simulator advanced, so they no longer cover what they were drawn on.
+        # The evaluated window is context now, so the band belongs to a prediction zone that no
+        # longer exists — and the spans no longer cover what they were drawn on.
         self._clear_prediction()
         self.state.clear_mask_spans()
 
@@ -1791,20 +1723,17 @@ class T1DMAIGui:
         self._needs_redraw = True
 
     def _reset_chart_view(self) -> None:
-        """Open on the trailing ``CHART_VIEW_HOURS`` of the window.
+        """Open on the trailing ``CHART_VIEW_HOURS``.
 
-        The whole context is several days wide, and drawn end to end nothing in
-        it is legible — least of all the forecast, which is the last 2 h of it.
-        The view is a viewport, not the model's input: every patch is still fed
-        to the forward. Scroll-wheel zooms, drag pans, and ``R`` returns here.
+        The context is days wide and illegible drawn end to end, the forecast most of all. A
+        viewport only — every patch is still fed to the forward.
         """
         if self.state.context is None:
             return
         from config import GUI_LONG_PREDICTION_HOURS, PREDICTION_HORIZON_HOURS
         n_ctx = self.state.context.shape[0]
-        # Reserve the LONG fan, not the single-pass one: L rolls the forecast out
-        # to GUI_LONG_PREDICTION_HOURS, and a right edge cut to the 2 h horizon
-        # draws most of that off the chart.
+        # Reserve the LONG fan: L rolls out to GUI_LONG_PREDICTION_HOURS, and a right edge cut
+        # to the single-pass horizon draws most of that off the chart.
         rolls = max(1, round(GUI_LONG_PREDICTION_HOURS / PREDICTION_HORIZON_HOURS))
         end = float(n_ctx + rolls * self._n_pred() + 2)
         history = CHART_VIEW_HOURS * 60.0 / (PATCH_SIZE * 5.0)
@@ -1845,9 +1774,7 @@ class T1DMAIGui:
         self.state.clear_overrides()
         self.state.clear_mask_spans()
         self.state.last_eval = None
-        # Drop the previous patient's prediction so the chart doesn't render a
-        # stale forecast overlay (built for a different context / last_bg)
-        # against the new patient until the async worker finishes.
+        # the previous patient's band was built for a different context and last_bg
         self._clear_prediction()
         if self.state.norm_stats:
             try:
@@ -1885,9 +1812,8 @@ class T1DMAIGui:
                 ct.sy <= my <= ct.sy + ct.sh)
 
     def _zoom_at_cursor(self, mx: int, wheel_y: int) -> None:
-        """Zoom the chart x-axis around the cursor's chart-x position so
-        the value under the cursor stays fixed. ``wheel_y`` is the pygame
-        MOUSEWHEEL y delta (+1 = wheel up = zoom in)."""
+        """Zoom x around the cursor so the value under it stays fixed; ``wheel_y`` is the raw
+        MOUSEWHEEL delta, +1 up = in."""
         if wheel_y == 0:
             return
         ct = self.chart_transform
@@ -2030,17 +1956,13 @@ class T1DMAIGui:
             self.state.dragging_point = None
             self._compile_curve_overrides()
 
-    # ------------------------------------------------------------------
-    # Pencil tool (freehand announced-dose drawing)
-    # ------------------------------------------------------------------
 
     def _pencil_sample(self, mx: int, my: int) -> tuple[float, float] | None:
-        """Map a screen click to a ``(abs_patch, raw_value)`` pencil sample for
-        the selected edit channel, or None if outside the drawable region.
+        """A screen click as an ``(abs_patch, raw_value)`` sample, or None outside the region.
 
-        x is clamped to the prediction zone ``[n_ctx, n_ctx + max horizon]`` so a
-        stroke never lands in the context or absurdly far out; y is mapped from
-        the selected channel's raw range and floored at 0."""
+        x is clamped to ``[n_ctx, n_ctx + max horizon]`` so a stroke never lands in the context;
+        y maps from the selected channel's raw range, floored at 0.
+        """
         if self.state.context is None:
             return None
         disp_ch = self.state.selected_edit_channel
@@ -2089,8 +2011,7 @@ class T1DMAIGui:
         if not self._pencil_drawing:
             return
         self._pencil_drawing = False
-        # Drop a degenerate (single-point / zero-length) stroke so a stray click
-        # doesn't leave an invisible edit that flips the mode to What-If.
+        # a degenerate stroke would be an invisible edit that still flips the mode to What-If
         if self._active_stroke is not None and len(self._active_stroke.xs) < 2:
             try:
                 self.state.pencil_strokes.remove(self._active_stroke)
@@ -2099,26 +2020,15 @@ class T1DMAIGui:
         self._active_stroke = None
         self._compile_curve_overrides()
 
-    # ------------------------------------------------------------------
-    # Free-form masking — drag, select, remove
-    # ------------------------------------------------------------------
 
     def _patch_at(self, mx: int) -> int:
-        """The patch under screen x, floored.
-
-        Masking is PATCH-aligned because a patch is the head's unit: it emits one
-        slot per masked patch, so a half-patch mask has no representation.
-        """
+        """The patch under screen x, floored: the head emits one slot per masked patch, so a
+        half-patch mask has no representation."""
         cx, _cy = self.chart_transform.screen_to_chart(float(mx), float(self.chart_transform.sy))
         return int(math.floor(cx))
 
     def _handle_mask_down(self, mx: int, my: int) -> None:
-        """Begin a drag, or select / remove an existing span.
-
-        A click inside a span selects it (the anchor readout follows the
-        selection); ctrl-click removes it. A click on bare context starts a new
-        span.
-        """
+        """Begin a drag, or select an existing span; ctrl-click removes one."""
         if self.state.context is None or not self._is_in_chart(mx, my):
             return
         patch = self._patch_at(mx)
@@ -2131,6 +2041,16 @@ class T1DMAIGui:
                 else:
                     self.state.selected_mask_idx = idx
                     self.state.status_message = self._anchor_readout()
+                    # The strips explain ONE span and the selection just moved, so the map on
+                    # screen is the previous span's — and both carry the same outline colour.
+                    # The forward is unchanged, so re-aim rather than drop.
+                    if self.state.attn_overlay_visible:
+                        self.state.prediction.attribution = None
+                        roll = _selected_roll(self.state)
+                        if roll is not None:
+                            roll['span'] = self.state.selected_span(self._n_pred())
+                        if not self._run_attribution_async():
+                            self.state.status_message += ' — predict to remap'
                 self._needs_redraw = True
                 return
         self.state.mask_drag_start = patch
@@ -2152,10 +2072,8 @@ class T1DMAIGui:
         self.state.mask_drag_start = -1
         self.state.mask_drag_end = -1
         n_ctx = self.state.n_ctx()
-        # Clamp to the maskable stretch before asking: the trailing forecast span
-        # is already masked and patch n_ctx-1 is its mandatory separator, so a
-        # drag that runs off the right edge should mask what it legally can
-        # rather than be refused whole.
+        # Clamp before asking: the trailing span is already masked and patch n_ctx-1 is its
+        # separator, so a drag off the right edge masks what it legally can.
         lo = max(0, lo)
         hi = min(hi, n_ctx - 2)
         if hi < lo:
@@ -2180,17 +2098,12 @@ class T1DMAIGui:
         self._needs_redraw = True
 
     def _forecast_rows(self) -> tuple[np.ndarray | None, int]:
-        """The prediction's FORECAST steps, and how many other patches it filled.
+        """``(median_bg over the forecast rows, count of other masked patches)``, ``(None, 0)``
+        with no prediction.
 
-        The masked set may hold backcast and infill spans as well, and those rows
-        are not on the forecast's timeline: pooling them would make the sidebar's
-        horizon the total masked patch count and its time-in-range a mixture of
-        two different questions. ``span_patches`` is what separates them — rows
-        at patch ``>= n_ctx`` are the trailing span.
-
-        Returns:
-            ``(median_bg over the forecast rows, count of other masked patches)``,
-            or ``(None, 0)`` when there is no prediction.
+        Backcast and infill rows are not on the forecast's timeline: pooling them would make the
+        horizon the total masked patch count and the TIR a mixture of two questions. Rows at
+        patch ``>= n_ctx`` are the trailing span.
         """
         pred = self.state.prediction
         if pred.median_bg is None or len(pred.median_bg) == 0:
@@ -2208,13 +2121,11 @@ class T1DMAIGui:
         return rows[keep].reshape(-1), int((~keep).sum())
 
     def _anchor_readout(self) -> str:
-        """The SELECTED span's anchor, in mg/dL, or the forecast's when none is.
+        """The SELECTED span's anchor in mg/dL, the forecast's when none is.
 
-        The anchor rule is one-sided and left-preferring, so this is the last
-        step of the span's left neighbour — or the first step of its right
-        neighbour for a span at patch 0. Showing the context edge for every span,
-        as the readout did when the forecast was the only masked set, would name
-        a cell the forward never read.
+        One-sided and left-preferring: the last step of the span's left neighbour, the first of
+        its right for a span at patch 0. The context edge would name a cell the forward never
+        read.
         """
         from config import PATCH_SIZE
         if self.state.bg_raw is None:
@@ -2234,15 +2145,11 @@ class T1DMAIGui:
                 f"({which}, {side} · patch {patch})")
 
     def _compile_curve_overrides(self) -> None:
-        """Recompile the painted carb / insulin / exercise announcement for
-        the canvas preview.
+        """Recompile the painted announcement for the canvas preview.
 
-        The risk-space model has no dynamics outputs and cannot reconstruct
-        BG without a forward pass, so this only refreshes ``state.overrides`` /
-        ``prediction.overrides_raw`` (the painted curves shown on the chart)
-        and the mode label.  The BG forecast itself updates only when the user
-        runs Predict / What-If (which re-runs the model with the announced
-        input perturbed)."""
+        Refreshes ``state.overrides`` / ``prediction.overrides_raw`` and the mode label only;
+        the BG forecast moves only on a Predict / What-If, which re-runs the model.
+        """
         if self.state.context is None or self.state.norm_stats is None:
             return
         from config import PREDICTION_PATCHES
@@ -2252,8 +2159,7 @@ class T1DMAIGui:
             list(self.state.curve_events)
             + _events_to_curve_events(self.state.events, n_ctx)
         )
-        # Preview over the fit-to-drawing horizon so a dose painted past 2 h shows
-        # immediately, not clipped to the single-pass window.
+        # fit-to-drawing horizon, so a dose painted past the single-pass window still shows
         n_pred = self._preview_horizon_patches()
         overrides_norm, overrides_raw = _compile_overrides_from_edits(
             n_pred,
@@ -2315,7 +2221,7 @@ class T1DMAIGui:
         self._compile_curve_overrides()
 
     def _refuse_dose_painting(self) -> bool:
-        """Surface the blind-policy reason and return True when painting is off."""
+        """Surface the blind-policy reason; True when painting is off."""
         blocked = self._dose_painting_blocked()
         if not blocked:
             return False
@@ -2326,10 +2232,8 @@ class T1DMAIGui:
     def _run_prediction_async(self) -> None:
         if self.state.context is None or self.model is None:
             return
-        # Claim the compute slot synchronously (the event loop is single-threaded)
-        # so a second Predict/SPACE in the same frame batch cannot slip past the
-        # _do_predict guard before the worker thread sets the flag and launch a
-        # concurrent prediction writing the same state slots.
+        # Claimed synchronously: the event loop is single-threaded, so a second Predict in the
+        # same frame batch cannot slip past the guard before the worker sets the flag.
         self.state.is_computing = True
         self._undo_stack.clear()
         t = threading.Thread(
@@ -2346,27 +2250,23 @@ class T1DMAIGui:
     def _run_rolling_async(self) -> None:
         if self.state.context is None or self.model is None:
             return
-        # ``predict_rolling`` is right-edge by construction and takes no masked
-        # set, so a user span would be silently ignored while the chart still
-        # shaded it. Drop the spans rather than show a fan that does not answer
-        # what the overlay says was asked.
+        # ``predict_rolling`` is right-edge and takes no masked set, so a user span would be
+        # ignored while the chart still shaded it. Drop the spans rather than draw a fan that
+        # does not answer what the overlay says was asked.
         if self.state.mask_spans:
             self.state.clear_mask_spans()
             self.state.status_message = (
                 "Rolling is right-edge only — masked spans cleared"
             )
-        # Claim the compute slot synchronously (see _run_prediction_async): closes
-        # the double-thread window AND prevents a second _do_roll_forward in the
-        # same batch from over-incrementing prediction_rolls before the flag is set.
+        # Claimed synchronously (see _run_prediction_async); also stops a second
+        # _do_roll_forward in the same batch over-incrementing prediction_rolls.
         self.state.is_computing = True
 
         def _roll():
-            # PREDICTION_PATCHES comes from ``inference`` (not ``config``):
-            # main() patches ``inference.PREDICTION_PATCHES`` to the loaded
-            # checkpoint's horizon, and ``predict_rolling`` consumes that same
-            # value internally. Importing from ``config`` here would use the
-            # stale module default and mis-size the trajectory slices below
-            # whenever the checkpoint's horizon differs from the config default.
+            # From ``inference``, never ``config``: main() rewrites
+            # ``inference.PREDICTION_PATCHES`` to the checkpoint's horizon and
+            # ``predict_rolling`` reads that same value, so config's default would mis-size the
+            # trajectory slices below.
             from inference import predict_rolling, PREDICTION_PATCHES
             from config import PATCH_SIZE
             self.state.is_computing = True
@@ -2377,18 +2277,13 @@ class T1DMAIGui:
                 hour = _hour_at_pred_start(self.state)
                 self.state.active_band_label = f"{hour:0.1f}h"
 
-                # Per-roll override callback so curve events condition the
-                # model on every roll — not just get pasted on after the fact.
-                # Each call receives the absolute patch index at this roll's
-                # prediction-zone start; we hand it to
-                # ``_compile_overrides_from_edits`` (the same compiler used by
-                # the single-shot what-if path) so a curve event spanning
-                # multiple rolls produces the right per-roll slice via
-                # ``_curve_event_to_raw_values``'s absolute-patch math.
-                # ``basal_rate_delta`` is only forwarded on roll 0 because
-                # ``_basal_curve_raw_values`` measures position from the start
-                # of *this* prediction window — applying it again on roll 1+
-                # would re-trigger the basal ramp at the wrong absolute time.
+                # Per-roll, so a curve event conditions every roll rather than being pasted on
+                # after the fact: the callback takes this roll's prediction-zone start patch and
+                # goes through the same compiler as the single-shot path, whose absolute-patch
+                # math slices a multi-roll event correctly.
+                # ``basal_rate_delta`` rides roll 0 alone — ``_basal_curve_raw_values`` measures
+                # from the start of THIS window, so a later roll re-triggers the ramp at the
+                # wrong absolute time.
                 state = self.state
                 ramp_up = self._basal_ramp_up_h
                 ramp_down = self._basal_ramp_down_h
@@ -2419,22 +2314,34 @@ class T1DMAIGui:
                     normalization_stats=self.state.norm_stats,
                     device=self.device,
                     overrides_fn=overrides_fn,
+                    return_rolls=True,
                 )
-                # Headline forecast over the full rolled horizon: pred_bg is the
-                # per-roll median forecast concatenated; bands is its per-τ
-                # quantile envelope.
+                # per-roll medians concatenated, with their per-τ envelope
                 self.state.prediction.median_bg = result['pred_bg'].cpu().numpy()
                 self.state.prediction.bands = result['bands'].cpu().numpy()
-                # Rolling is right-edge by construction: its rows ARE the
-                # trailing zone, roll after roll. Clear any per-span mapping a
-                # previous masked prediction left, or the chart would place these
-                # rows over that set's spans.
+                # Rolling is right-edge: these rows ARE the trailing zone, roll after roll, so
+                # clear any per-span mapping a previous masked prediction left behind.
                 self.state.prediction.span_patches = None
+                # A roll-out is many forwards and the strips explain one, so record every
+                # roll's inputs instead of a map: the strips then read whichever roll the user
+                # steps to. Roll r's window has slid once the context saturates, so its own
+                # offset travels with it.
+                self.state.prediction.attribution = None
+                self.state.last_forward = {
+                    'rolls': [{
+                        'context': ri['context'],
+                        'mask_spans': None,
+                        'span': None,
+                        'overrides': ri['overrides'],
+                        'offset': int(ri['offset']),
+                        'label': f"roll {k}",
+                    } for k, ri in enumerate(result['roll_inputs'])],
+                    'index': 0,
+                }
                 self.state.prediction.n_rolls = self.state.prediction_rolls
 
-                # Time-of-day probe: the prediction origin is fixed across
-                # rolls, so decode once from the initial context (read-only,
-                # None,None when the probe is disabled).
+                # the prediction origin is fixed across rolls, so decode once from the initial
+                # context; None when the probe is off
                 (self.state.prediction.tod_pred_hour,
                  self.state.prediction.tod_confidence,
                  self.state.prediction.tod_bin_probs) = _decode_tod(
@@ -2445,8 +2352,7 @@ class T1DMAIGui:
                 if self.state.has_edits():
                     self.state.prediction.is_what_if = True
                     self.state.mode_label = f"What-If (curves) · {self.state.active_band_label}"
-                    # Capture the painted announcement over the rolled horizon
-                    # for the chart's curve overlay.
+                    # the painted announcement over the rolled horizon, for the chart overlay
                     n_ctx = self.state.context.shape[0]
                     all_curve_events = (
                         list(self.state.curve_events)
@@ -2471,9 +2377,7 @@ class T1DMAIGui:
                     self.state.prediction.is_what_if = False
                     self.state.mode_label = f"Standard · {self.state.active_band_label}"
 
-                # Leave the chart view alone — preserve the user's current
-                # zoom/pan after a roll. Press R to reset, or scroll-wheel /
-                # middle-drag to navigate to the new prediction zone.
+                # the chart view is the user's; a roll does not move it
                 self.state.status_message = f"Roll {self.state.prediction_rolls} complete"
             except Exception as e:
                 traceback.print_exc()
@@ -2484,13 +2388,9 @@ class T1DMAIGui:
         t = threading.Thread(target=_roll, daemon=True)
         t.start()
 
-    # ------------------------------------------------------------------
-    # Sidebar drawing helpers
-    # ------------------------------------------------------------------
 
     def _draw_panel_card(self, surface, x, y, w, h):
-        """Soft rounded card used as the background for a sidebar
-        section. Subtle alpha fill + thin border line."""
+        """Rounded card behind a sidebar section: alpha fill, thin border."""
         pygame = self.pygame
         card = pygame.Surface((w, h), pygame.SRCALPHA)
         card.fill((*SIDEBAR_PANEL_BG, 235))
@@ -2501,7 +2401,7 @@ class T1DMAIGui:
         )
 
     def _draw_section_header(self, surface, x, y, title, accent):
-        """Colored vertical accent + bold-ish title. Returns y after."""
+        """Coloured accent bar and title; returns the y below."""
         pygame = self.pygame
         bar_w = ui_px(3)
         bar_h = self._font_large.get_height() - ui_px(2)
@@ -2515,7 +2415,7 @@ class T1DMAIGui:
 
     def _draw_kv(self, surface, x, y, w, key, value,
                  key_color=None, val_color=None):
-        """Compact key/value row: left-aligned key, right-aligned value."""
+        """Key/value row: key left, value right."""
         kc = key_color if key_color is not None else TEXT_DIM_COLOR
         vc = val_color if val_color is not None else TEXT_COLOR
         key_img = self._font_small.render(str(key), True, kc)
@@ -2546,9 +2446,8 @@ class T1DMAIGui:
                              dot_y - label.get_height() // 2))
 
     def _draw_tir_bar(self, surface, x, y, w, h, bg_arr):
-        """Stacked horizontal bar: low(<BG_HYPO_THRESHOLD) / in-range /
-        high(>BG_HYPER_THRESHOLD).
-        Returns (in_frac, low_frac, high_frac) so the caller can label."""
+        """Stacked bar of the forecast's low / in-range / high fractions, off the config
+        thresholds; returns ``(in_frac, low_frac, high_frac)``."""
         pygame = self.pygame
         n = len(bg_arr)
         low_n = int(np.sum(bg_arr < HYPO_THRESHOLD_MGDL))
@@ -2575,9 +2474,6 @@ class T1DMAIGui:
         surface.blit(bar, (x, y))
         return in_f, low_f, high_f
 
-    # ------------------------------------------------------------------
-    # Sidebar
-    # ------------------------------------------------------------------
 
     def _draw_sidebar(self, surface: 'pygame.Surface') -> None:
         pygame = self.pygame
@@ -2586,10 +2482,8 @@ class T1DMAIGui:
                          (SIDEBAR_WIDTH - 1, 0),
                          (SIDEBAR_WIDTH - 1, self.height))
 
-        # Sidebar is clipped to the area above the status bar; scrolling
-        # shifts the content origin by -_sidebar_scroll, so interactive
-        # widget rects assigned during this pass already land in screen
-        # coords (no extra adjustment in event handlers).
+        # Clipped above the status bar; scrolling shifts the content origin, so widget rects
+        # assigned in this pass are already in screen coords.
         visible_h = max(self.height - STATUS_BAR_HEIGHT, 1)
         max_scroll = max(0, self._sidebar_content_h - visible_h)
         self._sidebar_scroll = max(0, min(self._sidebar_scroll, max_scroll))
@@ -2601,7 +2495,6 @@ class T1DMAIGui:
         inner_w = SIDEBAR_WIDTH - 2 * pad
         y = pad - self._sidebar_scroll
 
-        # ---- App header: title + subtitle ----
         title_img = self._font_large.render("T1DMAI", True, TEXT_COLOR)
         surface.blit(title_img, (inner_x, y))
         y += title_img.get_height()
@@ -2612,12 +2505,10 @@ class T1DMAIGui:
         surface.blit(sub_img, (inner_x, y))
         y += sub_img.get_height() + ui_px(10)
 
-        # ---- Mode pill ----
         pill_h = ui_px(30)
         self._draw_mode_pill(surface, inner_x, y, inner_w, pill_h)
         y += pill_h + ui_px(6)
 
-        # ---- Compact system info (one line, key/value pairs) ----
         n_params = sum(p.numel() for p in self.model.parameters()) if self.model else 0
         sys_rows = [
             ("Model", "loaded" if self.model is not None else "none"),
@@ -2630,7 +2521,6 @@ class T1DMAIGui:
             y += LINE_GAP_SM
         y += ui_px(10)
 
-        # ---- Patient card ----
         n_summary_rows = (
             min(5, len(self.state.patient_summary))
             if self.state.patient_summary else 0
@@ -2662,7 +2552,6 @@ class T1DMAIGui:
                 cy += LINE_GAP_SM
         y += card_h + ui_px(10)
 
-        # ---- Channels card ----
         ch_card_h = (
             ui_px(14)
             + self._font_large.get_height() + ui_px(4)
@@ -2688,9 +2577,7 @@ class T1DMAIGui:
             cy += TOGGLE_ROW_PITCH
         y += ch_card_h + ui_px(10)
 
-        # ---- Mask card ----
-        # The masked set is what the model was asked about, so it belongs beside
-        # the patient rather than buried in the tool's help text.
+        # the masked set is what the model was asked about, so it sits beside the patient
         from config import MAX_MASKED_PATCHES
         from gui_state import MASK_PRESET_LABELS
         n_pred_ui = self._n_pred()
@@ -2731,7 +2618,6 @@ class T1DMAIGui:
             cy += LINE_GAP_SM
         y += mask_card_h + ui_px(10)
 
-        # ---- Display options (smoothing toggles, no card bg) ----
         display_label = self._font_small.render(
             "DISPLAY", True, ACCENT_ACTIONS,
         )
@@ -2744,11 +2630,9 @@ class T1DMAIGui:
         y += ui_px(4)
         y += ui_px(8)
 
-        # ---- Prediction summary card (only when a prediction exists) ----
-        # Scoped to the FORECAST rows. This card is about what comes next —
-        # horizon, TIR, the value at the end — and a backcast or infill row is
-        # not on that timeline: pooling them would make the horizon the total
-        # masked patch count and the TIR a mixture of two different questions.
+        # FORECAST rows only: this card is about what comes next, and a backcast or infill row
+        # is not on that timeline — pooling them makes the horizon a masked patch count and the
+        # TIR a mixture of two questions.
         pred_bg, n_filled = self._forecast_rows()
         if pred_bg is not None and len(pred_bg) > 0:
             from config import PATCH_SIZE
@@ -2817,10 +2701,7 @@ class T1DMAIGui:
                           val_color=_bg_color(pred_end))
             cy += LINE_GAP_SM
 
-            # ---- Clock sub-block: model-decoded prediction-origin hour-of-day
-            # (the diagnostic time-of-day probe) beside the true origin clock,
-            # with the resultant length R of the per-bin softmax belief as a
-            # confidence read-out. ----
+            # the probe's decoded origin hour beside the true one, with R as its confidence
             cy += SECTION_GAP_SM
             true_h = _hour_at_pred_start(self.state)
             self._draw_kv(surface, cx, cy, cw, "Origin (true)",
@@ -2850,7 +2731,6 @@ class T1DMAIGui:
                 cy += LINE_GAP_SM
             y += pred_card_h + ui_px(10)
 
-        # ---- Model Score card (last Eval-vs-Sim result) ----
         ev = self.state.last_eval
         if ev is not None:
             score_card_h = (
@@ -2866,9 +2746,7 @@ class T1DMAIGui:
             cy = self._draw_section_header(
                 surface, cx, cy, "Model Score", ACCENT_EVAL,
             )
-            # Color the MAE by how good it is: <15 mg/dL green,
-            # <30 yellow, otherwise red. Same scale roughly tracks
-            # clinically-meaningful CGM error tiers.
+            # <15 mg/dL green, <30 yellow, else red — roughly the CGM error tiers
             if ev.mae < 15.0:
                 mae_color = TIR_IN_RANGE_COLOR
             elif ev.mae < 30.0:
@@ -2895,7 +2773,6 @@ class T1DMAIGui:
                           f"{ev.max_abs:.1f} mg/dL")
             y += score_card_h + ui_px(10)
 
-        # ---- Action buttons (no panel; sit directly on sidebar bg) ----
         actions_label = self._font_small.render(
             "ACTIONS", True, ACCENT_ACTIONS,
         )
@@ -2910,7 +2787,6 @@ class T1DMAIGui:
             btn.draw(surface, self._font_small)
         y += ((len(self._buttons) + 1) // 2) * BUTTON_ROW_PITCH
 
-        # ---- Active edits footer (basal / curves badges) ----
         y += ui_px(8)
         active_bits = []
         if self.state.basal_rate_delta != 0.0:
@@ -2929,13 +2805,11 @@ class T1DMAIGui:
                               val_color=color)
                 y += LINE_GAP_SM
 
-        # Record content height (in unscrolled coords) for the wheel
-        # handler / scrollbar to use on the next frame, then drop clip.
+        # content height in UNSCROLLED coords, for next frame's wheel handler and scrollbar
         self._sidebar_content_h = y + self._sidebar_scroll + pad
         surface.set_clip(prev_clip)
 
-        # Scrollbar overlay, drawn on top of the sidebar (outside the
-        # content clip so it isn't itself scrolled).
+        # outside the content clip, so the scrollbar is not itself scrolled
         if self._sidebar_content_h > visible_h:
             track_w = ui_px(6)
             track_x = SIDEBAR_WIDTH - track_w - ui_px(3)
@@ -2979,12 +2853,8 @@ class T1DMAIGui:
         return (x0 <= mx < x0 + w
                 and 0 <= my < self.height - STATUS_BAR_HEIGHT)
 
-    # ------------------------------------------------------------------
-    # Events right panel
-    # ------------------------------------------------------------------
 
     _EVENT_CREATE_BUTTONS: list[tuple[str, str, str]] = [
-        # (kind, meal_name, label)
         ('juice',         '',          '+ Juice'),
         ('fast_insulin',  '',          '+ Fast Ins'),
         ('basal_insulin', '',          '+ Basal'),
@@ -2995,7 +2865,7 @@ class T1DMAIGui:
 
     @staticmethod
     def _event_summary(ev) -> tuple[str, tuple]:
-        """Return (label, color) for an event-list row."""
+        """``(label, color)`` for one event-list row."""
         kind = ev.kind
         t = ev.time_offset_min
         sign = '+' if t >= 0 else '−'
@@ -3044,7 +2914,6 @@ class T1DMAIGui:
         surface.blit(sub, (inner_x, y))
         y += sub.get_height() + ui_px(10)
 
-        # 2-column grid of create-event buttons.
         btn_h = ui_px(30)
         btn_gap = ui_px(8)
         col_w = (inner_w - btn_gap) // 2
@@ -3055,7 +2924,6 @@ class T1DMAIGui:
             bx = inner_x + col * (col_w + btn_gap)
             by = y + row * (btn_h + btn_gap)
             color = COLOR_CARBS if kind in ('juice', 'meal') else COLOR_INSULIN
-            # Dim background, colored left border, white-ish label.
             pygame.draw.rect(surface, (44, 48, 64),
                              (bx, by, col_w, btn_h),
                              border_radius=ui_px(4))
@@ -3237,8 +3105,7 @@ class T1DMAIGui:
         cy_min = local_transform.cy_min
         cy_max = local_transform.cy_max
 
-        # Glucose-range shading. The BG channel's raw range maps mg/dL into
-        # chart-y space, so the band edges track any vertical pan/zoom.
+        # the BG channel's raw range maps mg/dL into chart-y, so the band edges track pan/zoom
         bg_raw_min, bg_raw_max = DISPLAY_CHANNEL_RAW_RANGES[0]
         cy_hypo = float(_scale_to_chart_y(
             np.array([HYPO_THRESHOLD_MGDL], dtype=np.float32),
@@ -3256,10 +3123,8 @@ class T1DMAIGui:
                     HYPER_BAND_COLOR, GLUCOSE_BAND_ALPHA)
 
         if n_ctx > 0:
-            # The model only ever sees the trailing MAX_CONTEXT_PATCHES
-            # patches before NOW, even if the chart shows more accumulated
-            # history. As predictions roll forward and n_ctx grows past
-            # the cap, the visible window slides with it.
+            # The model sees the trailing MAX_CONTEXT_PATCHES before NOW however much history
+            # the chart holds; once n_ctx passes the cap, that window slides.
             from config import MAX_CONTEXT_PATCHES
             ctx_start = max(0, n_ctx - MAX_CONTEXT_PATCHES)
             ctx_sx_l = int(max(0.0, local_transform.x_to_screen(ctx_start)))
@@ -3302,7 +3167,6 @@ class T1DMAIGui:
             color = CHANNEL_COLORS[disp_ch]
             raw_min, raw_max = DISPLAY_CHANNEL_RAW_RANGES[disp_ch]
 
-            # --- Context history curve ---
             ctx_vals: np.ndarray | None = None
             if disp_ch == 0 and self.state.bg_raw is not None:
                 ctx_vals = self.state.bg_raw[:n_ctx * PATCH_SIZE]
@@ -3327,13 +3191,10 @@ class T1DMAIGui:
                         raw_min, raw_max, cy_min, cy_max,
                     )
                     if disp_ch == 0 and self.state.mask_spans:
-                        # BG under a masked span is what the model is being asked
-                        # to produce; drawing the truth there turns the fan into
-                        # a comparison the user did not ask for. Break the line
-                        # over each span instead. The other channels ride through
-                        # a masked patch under the announced policy, so they stay
-                        # whole; under 'blind' the model does not see them, but
-                        # what the chart shows is the patient's record either way.
+                        # BG under a masked span is what the model is being asked to produce,
+                        # so drawing the truth there turns the fan into a comparison nobody
+                        # asked for; break the line instead. The dose channels stay whole —
+                        # the chart shows the patient's record under either policy.
                         for seg_t, seg_y in _split_at_masked(
                             ctx_times, y_ctx, self.state.mask_spans,
                         ):
@@ -3343,10 +3204,9 @@ class T1DMAIGui:
                         draw_curve(surf, local_transform, ctx_times, y_ctx,
                                    color, width=2)
 
-            # --- BG forecast: median_bg line + per-τ quantile envelope ---
-            # One fan PER SPAN, placed where the head read it. ``span_patches`` is
-            # ``predict``'s own ``mask_idx``: slot j is patch mask_idx[j], so a
-            # fixed offset from the context end is right only for the forecast.
+            # One fan PER SPAN, placed where the head read it: ``span_patches`` is
+            # ``predict``'s own ``mask_idx``, so slot j is patch mask_idx[j] and a fixed offset
+            # from the context end is right only for the forecast.
             if has_pred and disp_ch == 0:
                 pred_bg = np.asarray(median_bg, dtype=np.float32)
                 P = bands.shape[0]
@@ -3360,8 +3220,7 @@ class T1DMAIGui:
                         _smooth_1d(seg, MU_SMOOTH_STEPS)
                         if self.state.smooth_mu else seg
                     )
-                    # Outermost quantile pair (ascending τ) is the widest band;
-                    # use it as the ~95% uncertainty envelope.
+                    # outermost τ pair, the widest band
                     bflat = bands[lo:hi].reshape(-1, bands.shape[-1])
                     upper_raw = bflat[:, -1].astype(np.float32)
                     lower_raw = bflat[:, 0].astype(np.float32)
@@ -3379,7 +3238,6 @@ class T1DMAIGui:
                     draw_curve(surf, local_transform, pred_times, y_pred, color,
                                width=2, alpha=PREDICTION_LINE_ALPHA)
 
-            # --- Announced carb / insulin / exercise input in the pred zone ---
             out_ch = DISPLAY_TO_OUTPUT_CH.get(disp_ch)
             if (out_ch is not None and overrides_raw is not None
                     and out_ch in overrides_raw):
@@ -3404,11 +3262,10 @@ class T1DMAIGui:
         local_transform,
         n_ctx: int,
     ) -> None:
-        """Shade the user's masked spans, and the drag in flight.
+        """Shade the user's masked spans and the drag in flight.
 
-        The trailing forecast span is not drawn here — the NOW line and the
-        prediction-zone shading already mark it, and it is not something the user
-        can remove.
+        Not the trailing forecast span: the NOW line and the prediction-zone shading mark it
+        already, and the user cannot remove it.
         """
         pygame = self.pygame
         h = int(local_transform.sh)
@@ -3447,8 +3304,8 @@ class T1DMAIGui:
             sx = int(local_transform.x_to_screen(float(span.start))) + 4
             img = self._font_small.render(label, True, MASK_EDGE_COLOR)
             surf.blit(img, (sx, 4))
-            # OOD is a HINT, never a block: the fan is still drawn, it is simply
-            # not calibrated by anything the sampler supervised.
+            # a HINT, never a block: the fan is drawn, it is simply calibrated by nothing the
+            # sampler supervised
             if idx in ood:
                 warn = self._font_small.render("OOD", True, MASK_OOD_COLOR)
                 surf.blit(warn, (sx, 4 + img.get_height() + 2))
@@ -3606,8 +3463,10 @@ class T1DMAIGui:
             lines = [
                 "SPC=Predict 2h  L/Shift+SPC=Long Predict  W=What-If  P=Pencil  M=Mask  F=Roll  G=Sim Fwd  V=Eval  R=Reset",
                 "E=Curve Editor  Tab=Cycle edit channel  C=Clear All curves  N=New Patient  S=Screenshot",
-                "1-4=Toggle channels (BG/Carbs/Insulin/Exercise)  A=Toggle all  Q=Quit",
-                "Scroll=Zoom at cursor  +/-=Zoom  Middle/Right-drag=Pan",
+                "1-4=Toggle channels (BG/Carbs/Insulin/Exercise)  A=Toggle all  "
+                "T=Attention strips  [ / ]=Attention layer  , / .=Attention roll  Q=Quit",
+                "Left/Right=Pan (Shift=a full screen)  Scroll=Zoom at cursor  "
+                "+/-=Zoom  Middle/Right-drag=Pan",
             ]
             line_h = self._font_small.get_height() + ui_px(4)
             for j, line in enumerate(lines):
@@ -3652,11 +3511,11 @@ class T1DMAIGui:
             surface.blit(img, (int(ct.sx) - img.get_width() - ui_px(8),
                                int(ct.sy) - img.get_height() - ui_px(2)))
 
-        sy_bottom = int(ct.sy + ct.sh)
+        sy_bottom = int(ct.sy + ct.sh) + self._attn_block_h()
         span = float(ct.cx_max - ct.cx_min)
         major, _minor, fmt = _adaptive_time_intervals(span)
-        # Snap the first label to a multiple of the major interval that's
-        # at or just before cx_min, so labels land on round times.
+        # snap to a multiple of the major interval at or before cx_min, so labels land on
+        # round times
         start = math.floor(ct.cx_min / major) * major
         end = ct.cx_max + major
         day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -3685,8 +3544,7 @@ class T1DMAIGui:
                 time_label = f'{hh:02d}:{mm:02d}'
             img = self._font_small.render(time_label, True, TEXT_DIM_COLOR)
             surface.blit(img, (sx - img.get_width() // 2, sy_bottom + ui_px(4)))
-            # Show the day label only when the day changes — otherwise it
-            # repeats under every hour tick and adds clutter.
+            # only on a day change; otherwise it repeats under every hour tick
             if abs_day != prev_day_idx:
                 dimg = self._font_small.render(
                     day_names[abs_day], True, (100, 130, 170),
@@ -3725,6 +3583,147 @@ class T1DMAIGui:
         img = self._font_small.render(status_text, True, TEXT_DIM_COLOR)
         surface.blit(img, (10, bar_y + (STATUS_BAR_HEIGHT - img.get_height()) // 2))
 
+    def _attn_mass(self) -> 'np.ndarray | None':
+        """The attention row currently on display — one layer's, or the rollout."""
+        attrib = self.state.prediction.attribution
+        if attrib is None:
+            return None
+        layer = self.state.attn_layer
+        if 0 <= layer < attrib.per_layer.shape[0]:
+            return attrib.per_layer[layer]
+        return attrib.where
+
+    @staticmethod
+    def _display_scale(values: np.ndarray, lo: int, hi: int) -> float:
+        """The magnitude that maps to full ink, over the VISIBLE patches.
+
+        Scaling to the whole window leaves a panned view black whenever its largest value is off
+        screen — and one always is, the anchor cell carrying most of a span's BG saliency. The
+        floor stops the opposite lie: a region holding nothing must not brighten, so the view's
+        peak never drops below a fraction of the window's.
+        """
+        window_peak = float(np.abs(values).max()) if values.size else 0.0
+        visible = values[max(0, lo):max(0, hi)]
+        view_peak = float(np.abs(visible).max()) if visible.size else 0.0
+        return max(view_peak, ATTN_VIEW_SCALE_FLOOR * window_peak)
+
+    def _attn_row_data(self, lo: int, hi: int) -> list[tuple] | None:
+        """``[(values, up_color, down_color, note), ...]``, one per ``ATTN_ROW_LABELS`` row.
+
+        ``[lo, hi)`` are visible patches in the EXPLAINED window's own coordinates; ``values``
+        are in [-1, 1] over that window's patch axis. None when no map has been computed.
+        """
+        from attribution import share_ramp, signed_ramp
+        attrib = self.state.prediction.attribution
+        mass = self._attn_mass()
+        if attrib is None or mass is None:
+            return None
+        # Log of the multiple of an even share: the row spans decades, so a linear ramp on the
+        # mass renders everything below a share identically black — about nine tenths of a
+        # composed row.
+        rows: list[tuple] = [(
+            share_ramp(mass, lo, hi),
+            ATTN_MASS_COLOR, ATTN_MASS_COLOR, self._attn_layer_label(), None,
+        )]
+        # Cells with no input to attribute: BG on every masked patch, and under the blind
+        # policy the dose channels too — their saliency would attribute to a fill the patient
+        # never announced.
+        from gui_state import dose_painting_enabled
+        withheld = np.zeros(attrib.channels.shape[0], dtype=bool)
+        withheld[attrib.masked_patches] = True
+        blind = not dose_painting_enabled(self.state.masked_channel_policy)
+        # ONE scale across all four channels — a per-row scale makes every row look equally
+        # important, the opposite of what the strips answer; the sqrt ramp is what keeps the
+        # sparse rows visible. The percentages are over the whole window and do not move with
+        # the view.
+        scale = self._display_scale(attrib.channels, lo, hi)
+        for ch in range(attrib.channels.shape[1]):
+            rows.append((
+                signed_ramp(attrib.channels[:, ch], scale),
+                SALIENCY_UP_COLOR, SALIENCY_DOWN_COLOR,
+                f'{attrib.channel_share[ch] * 100:.0f}%',
+                withheld if (ch == 0 or blind) else None,
+            ))
+        assert len(rows) == len(ATTN_ROW_LABELS), (
+            f"{len(rows)} rows for {len(ATTN_ROW_LABELS)} labels — the channel "
+            f"axis and the row labels have diverged"
+        )
+        return rows
+
+    def _draw_attention_strips(self, surface: 'pygame.Surface') -> None:
+        """The attention and saliency rows, on the chart's own x-transform so a bright column
+        stays under the stretch of trace it refers to through a pan or zoom."""
+        if not self.state.attn_overlay_visible:
+            return
+        pygame = self.pygame
+        ct = self.chart_transform
+        block_x, block_w = int(ct.sx), int(ct.sw)
+        block_y = int(ct.sy + ct.sh)
+        pygame.draw.rect(surface, ATTN_STRIP_BG,
+                         (block_x, block_y, block_w, ATTN_BLOCK_HEIGHT))
+
+        attrib = self.state.prediction.attribution
+        # Every index the maps carry is in the explained forward's OWN window, and a roll past
+        # the point the context starts sliding begins after chart patch 0.
+        offset = int(attrib.window_offset) if attrib is not None else 0
+        n_patches = int(attrib.where.shape[0]) if attrib is not None else 0
+        p_lo = max(offset, int(math.floor(ct.cx_min)))
+        p_hi = min(offset + n_patches, int(math.ceil(ct.cx_max)) + 1)
+        rows = self._attn_row_data(p_lo - offset, p_hi - offset)
+
+        for i, label in enumerate(ATTN_ROW_LABELS):
+            row_y = block_y + ATTN_BLOCK_PAD + i * (ATTN_ROW_H + ATTN_ROW_GAP)
+            pygame.draw.rect(surface, ATTN_ROW_BG,
+                             (block_x, row_y, block_w, ATTN_ROW_H))
+            img = self._font_small.render(label, True, TEXT_DIM_COLOR)
+            surface.blit(img, (block_x - img.get_width() - ui_px(6),
+                               row_y + (ATTN_ROW_H - img.get_height()) // 2))
+            if rows is None:
+                continue
+            values, up_color, down_color, note, withheld = rows[i]
+            row_surf = pygame.Surface((block_w, ATTN_ROW_H), pygame.SRCALPHA)
+            for patch in range(p_lo, p_hi):
+                idx = patch - offset
+                blank = withheld is not None and bool(withheld[idx])
+                v = float(values[idx])
+                if v == 0.0 and not blank:
+                    continue
+                sx_l = max(0, int(round(ct.x_to_screen(float(patch)))) - block_x)
+                sx_r = min(block_w, int(round(ct.x_to_screen(float(patch + 1)))) - block_x)
+                if sx_r <= sx_l:
+                    sx_r = min(block_w, sx_l + 1)
+                if sx_r <= sx_l:
+                    continue
+                if blank:
+                    color, alpha = ATTN_WITHHELD_COLOR, ATTN_WITHHELD_ALPHA
+                else:
+                    color = up_color if v >= 0 else down_color
+                    alpha = int(min(1.0, abs(v)) * ATTN_ROW_MAX_ALPHA)
+                row_surf.fill((*color, alpha), (sx_l, 0, sx_r - sx_l, ATTN_ROW_H))
+            surface.blit(row_surf, (block_x, row_y))
+            nimg = self._font_small.render(note, True, TEXT_FAINT_COLOR)
+            surface.blit(nimg, (block_x + block_w + ui_px(5),
+                                row_y + (ATTN_ROW_H - nimg.get_height()) // 2))
+
+        # NOW and the explained span: without both, a strip is a heat bar with no referent
+        n_ctx = self.state.context.shape[0] if self.state.context is not None else 0
+        now_x = int(round(ct.x_to_screen(float(n_ctx))))
+        if block_x <= now_x <= block_x + block_w:
+            pygame.draw.line(surface, GRID_COLOR, (now_x, block_y),
+                             (now_x, block_y + ATTN_BLOCK_HEIGHT))
+        if attrib is not None:
+            start, length = attrib.span
+            start += offset
+            sx_l = max(block_x, min(int(round(ct.x_to_screen(float(start)))),
+                                    block_x + block_w))
+            sx_r = max(block_x, min(int(round(ct.x_to_screen(float(start + length)))),
+                                    block_x + block_w))
+            if sx_r > sx_l:
+                pygame.draw.rect(
+                    surface, ATTN_SPAN_EDGE_COLOR,
+                    (sx_l, block_y, sx_r - sx_l, ATTN_BLOCK_HEIGHT), 1,
+                )
+
     def _draw_cursor(self, surface: 'pygame.Surface', mx: int, my: int) -> None:
         pygame = self.pygame
         ct = self.chart_transform
@@ -3732,8 +3731,10 @@ class T1DMAIGui:
 
         if not (ct.sx <= mx <= ct.sx + ct.sw):
             return
-        pygame.draw.line(surface, CURSOR_COLOR,
-                         (mx, int(ct.sy)), (mx, int(ct.sy + ct.sh)), 1)
+        pygame.draw.line(
+            surface, CURSOR_COLOR, (mx, int(ct.sy)),
+            (mx, int(ct.sy + ct.sh) + self._attn_block_h()), 1,
+        )
 
         cx, _ = ct.screen_to_chart(float(mx), float(my))
         ts_idx = int(round(cx * PATCH_SIZE))
@@ -3777,6 +3778,32 @@ class T1DMAIGui:
                 fmt = f'{raw_val:.2f}' if abs(raw_val) < 5 else (f'{raw_val:.1f}' if abs(raw_val) < 50 else f'{raw_val:.0f}')
                 tooltip_lines.append((f'{ch_name}: {fmt} {unit}', color))
 
+        attrib = self.state.prediction.attribution
+        mass = self._attn_mass()
+        if self.state.attn_overlay_visible and attrib is not None and mass is not None:
+            patch_idx = int(math.floor(cx)) - int(attrib.window_offset)
+            if 0 <= patch_idx < mass.shape[0]:
+                share = float(mass[patch_idx]) * float(mass.shape[0])
+                tooltip_lines.append((
+                    f'attn {self._attn_layer_label()}: '
+                    f'{float(mass[patch_idx]):.4f} ({share:.2f}x even)',
+                    ATTN_MASS_COLOR,
+                ))
+                masked_here = patch_idx in set(attrib.masked_patches.tolist())
+                from gui_state import dose_painting_enabled
+                blind = not dose_painting_enabled(self.state.masked_channel_policy)
+                for ch, ch_label in enumerate(ATTN_ROW_LABELS[1:]):
+                    if masked_here and (ch == 0 or blind):
+                        tooltip_lines.append((
+                            f'{ch_label}: withheld here', ATTN_WITHHELD_COLOR,
+                        ))
+                        continue
+                    pull = float(attrib.channels[patch_idx, ch])
+                    tooltip_lines.append((
+                        f'{ch_label} pull: {pull:+.3f}',
+                        SALIENCY_UP_COLOR if pull >= 0 else SALIENCY_DOWN_COLOR,
+                    ))
+
         if not tooltip_lines:
             return
 
@@ -3803,22 +3830,15 @@ class T1DMAIGui:
         surface.blit(tip_surf, (tip_x, tip_y))
 
     def _draw_clock_face_overlay(self, surface: 'pygame.Surface', mx: int, my: int) -> None:
-        """Draw the time-of-day probe's clock-face histogram, rotated to the cursor.
+        """The time-of-day probe's clock face, rotated to the cursor. Diagnostic only.
 
-        The probe emits one row per MASKED patch, and the rows are ticked at the
-        patches they were read off rather than at a fixed trailing zone: the row
-        count is ``probs.shape[0]``, not ``PREDICTION_PATCHES``. For the GUI's
-        forecast the masked set is the contiguous span that starts at ``n_ctx``, so
-        the ticks land there — but the count comes from the probe output, so a
-        shorter or longer masked set ticks correctly instead of silently drawing a
-        2 h zone.
-
-        Those per-patch beliefs are ONE origin-phase belief sampled at deterministic
-        elapsed offsets (row p == origin advanced by ``p * ADV_HOURS``); they are
-        fused once (``utils.aggregate_origin_belief``) into a single origin belief,
-        then rendered at the cursor's continuous elapsed offset ``t`` by rigidly
-        rotating that belief on the dial by ``2*pi*t/24`` (angles only, no re-binning,
-        so cursor motion is smooth and exact). Diagnostic only.
+        One row per MASKED patch, ticked where it was read off: the count is
+        ``probs.shape[0]``, never ``PREDICTION_PATCHES``, so a shorter or longer masked set
+        ticks correctly instead of drawing a fixed trailing zone.
+        The rows are ONE origin-phase belief sampled at deterministic offsets (row p is the
+        origin advanced by ``p * ADV_HOURS``), fused once by ``utils.aggregate_origin_belief``
+        and then rotated on the dial by ``2*pi*t/24`` for the cursor's elapsed ``t`` — angles
+        only, no re-binning, so cursor motion is smooth and exact.
         """
         import utils
         import gui_renderer
@@ -3880,8 +3900,7 @@ class T1DMAIGui:
             return True
 
         elif key == pygame.K_SPACE:
-            # Shift+Space runs the fit-to-drawing long prediction; plain Space
-            # stays the single-pass 2 h forecast.
+            # Shift+Space is the fit-to-drawing long prediction; plain Space the single pass
             if pygame.key.get_mods() & pygame.KMOD_SHIFT:
                 self._do_long_predict()
             else:
@@ -3923,8 +3942,7 @@ class T1DMAIGui:
                 TOOL_MASK,
             )
             idx = key - pygame.K_1
-            # While the mask tool is up, 1/2/3 place the presets; the channel
-            # toggles keep the keys otherwise.
+            # 1/2/3 place the presets while the mask tool is up, else toggle channels
             presets = (MASK_PRESET_FORECAST, MASK_PRESET_BEGIN_FILL,
                        MASK_PRESET_INFILL)
             if self.state.active_tool == TOOL_MASK and idx < len(presets):
@@ -3957,6 +3975,26 @@ class T1DMAIGui:
                 chart_x_max=cx + span / 2,
             )
             self._needs_redraw = True
+
+        elif key == pygame.K_t:
+            self._toggle_attn_overlay()
+
+        elif key == pygame.K_LEFTBRACKET:
+            self._cycle_attn_layer(-1)
+
+        elif key == pygame.K_RIGHTBRACKET:
+            self._cycle_attn_layer(1)
+
+        elif key == pygame.K_COMMA:
+            self._cycle_attn_roll(-1)
+
+        elif key == pygame.K_PERIOD:
+            self._cycle_attn_roll(1)
+
+        elif key in (pygame.K_LEFT, pygame.K_RIGHT):
+            fast = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+            step = PAN_STEP_FAST_FRACTION if fast else PAN_STEP_FRACTION
+            self._pan_view(step if key == pygame.K_RIGHT else -step)
 
         elif key == pygame.K_c:
             self._do_clear_all()
@@ -4039,10 +4077,8 @@ class T1DMAIGui:
 
         while running:
             for event in pygame.event.get():
-                # Modals get first crack so chart zoom / pan and sidebar
-                # scroll don't fire on events landing inside an open
-                # sub-window. The modal swallows mouse buttons + wheel
-                # and Esc; mouse motion and other keys pass through.
+                # Modals first, so chart zoom/pan and sidebar scroll do not fire on events
+                # landing inside an open sub-window.
                 modal_consumed = False
                 for modal in (self._help_window, self._event_editor):
                     if modal.visible and modal.handle_event(event):
@@ -4166,6 +4202,7 @@ class T1DMAIGui:
                     self._screen.blit(msg, (cx - msg.get_width() // 2, int(self.chart_transform.sy + 10)))
 
                 self._draw_axes(self._screen)
+                self._draw_attention_strips(self._screen)
                 self._draw_sidebar(self._screen)
                 self._draw_events_panel(self._screen)
                 self._draw_control_panel(self._screen)
@@ -4173,8 +4210,7 @@ class T1DMAIGui:
                 self._draw_cursor(self._screen, last_mx, last_my)
                 self._draw_clock_face_overlay(self._screen, last_mx, last_my)
 
-                # Modals last so they paint on top of everything else,
-                # including the cursor overlay.
+                # last, so they paint over everything including the cursor overlay
                 for modal in (self._help_window, self._event_editor):
                     modal.draw(self._screen, self._font, self._font_large)
 
@@ -4186,19 +4222,17 @@ class T1DMAIGui:
         pygame.quit()
 
 
-# The trained-checkpoint tree, one capacity per subdirectory. ``compare.py``
-# reads the same root; a second one is how the two start disagreeing about which
-# checkpoint 'medium' names.
+# One capacity per subdirectory. ``compare.py`` reads the same root; a second one is how the two
+# start disagreeing about which checkpoint 'medium' names.
 MODEL_DIR = 'models'
 
 
 def _discover_checkpoint() -> str | None:
     """The best checkpoint of the capacity the live ``config.py`` describes.
 
-    Every builder refuses a checkpoint whose ``training_config`` disagrees with
-    the live config, so there is exactly one capacity under ``MODEL_DIR`` that
-    can be loaded at all — matching on ``D_MODEL`` / ``N_LAYERS`` / ``N_HEADS``
-    picks it without reading a state dict.
+    Every builder refuses a checkpoint whose ``training_config`` disagrees with the live config,
+    so exactly one capacity under ``MODEL_DIR`` is loadable at all; matching ``D_MODEL`` /
+    ``N_LAYERS`` / ``N_HEADS`` picks it without reading a state dict.
     """
     from config import D_MODEL, N_LAYERS, N_HEADS
     for capacity in sorted(os.listdir(MODEL_DIR)) if os.path.isdir(MODEL_DIR) else []:
@@ -4220,16 +4254,12 @@ def _discover_checkpoint() -> str | None:
 def _load_checkpoint_into_model(
     path: str, device: torch.device, use_ema: bool
 ) -> tuple[object, int, dict, str]:
-    """Load a checkpoint's weights, horizon, stats and masked-channel policy.
+    """``(model, prediction_patches, normalization_stats, masked_channel_policy)``.
 
-    The policy is part of the return because no parameter shape records it: the
-    strict state-dict load accepts weights trained under either convention, so a
-    blind checkpoint would otherwise be driven as a conditioned one — painted
-    doses landing on channels its weights were trained to read as constant, and
-    a forecast that plausibly does not move.
-
-    Returns:
-        ``(model, prediction_patches, normalization_stats, masked_channel_policy)``.
+    The policy is returned because no parameter shape records it: the strict load accepts
+    weights trained under either convention, so a blind checkpoint would otherwise be driven as
+    a conditioned one — painted doses on channels its weights read as constant, and a forecast
+    that plausibly does not move.
     """
     from model import T1DMAI
     ckpt = torch.load(path, map_location=device, weights_only=True)
