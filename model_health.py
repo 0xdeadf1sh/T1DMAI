@@ -110,7 +110,98 @@ LEGEND = (
     ('near-init', f'|std/init_std − 1| < {DRIFT_NEAR_INIT}'),
     ('context', f'truncation Δ < {CTX_TRUNC_TOL_PCT}% ⇒ patches beyond it unused'),
     ('width ladder', f'Δ < {LADDER_TOL_PCT}% at half width ⇒ SHRINK; Δ > {LADDER_HURT_PCT}% at 3/4 width ⇒ binding'),
+    ('colours', 'green = in range / load-bearing; yellow = under-used, removable, stale, weak; '
+                f'red = over-used, dominant, binding, or a part whose ablation costs > {50.0:.0f}%'),
 )
+ABLATE_LOAD_BEARING_PCT = 50.0   # ablation Δ above this % ⇒ the part is a single point of failure (red)
+
+
+class _Palette:
+    """ANSI colours; off unless stdout is a TTY (or --color), and always off under NO_COLOR."""
+    on = False
+
+    def paint(self, text: str, code: str) -> str:
+        return f'\033[{code}m{text}\033[0m' if self.on else text
+
+    def green(self, t: str) -> str:
+        return self.paint(t, '32')
+
+    def yellow(self, t: str) -> str:
+        return self.paint(t, '33')
+
+    def red(self, t: str) -> str:
+        return self.paint(t, '31')
+
+    def bold(self, t: str) -> str:
+        return self.paint(t, '1')
+
+    def dim(self, t: str) -> str:
+        return self.paint(t, '2')
+
+
+C = _Palette()
+
+
+def c_verdict(v: str) -> str:
+    return {'KEEP': C.green, 'SHRINK': C.yellow, 'GROW': C.red}.get(v, C.dim)(v)
+
+
+def c_flag(f: str) -> str:
+    if f in ('DEAD', 'DOMINANT', 'hot-units'):
+        return C.red(f)
+    return C.yellow(f)
+
+
+def c_flags(flags: list[str]) -> str:
+    return ' '.join(c_flag(f) for f in flags)
+
+
+def c_delta(text: str, x: float, low: float) -> str:
+    """Ablation / truncation Δ: below ``low`` % unused (yellow), load-bearing (red), else green."""
+    if math.isnan(x):
+        return text
+    if x < low:
+        return C.yellow(text)
+    if x > ABLATE_LOAD_BEARING_PCT:
+        return C.red(text)
+    return C.green(text)
+
+
+def c_ladder(text: str, x: float) -> str:
+    """Width / context ladder rung: free cut (yellow), binding (red), else green."""
+    if math.isnan(x):
+        return text
+    if x < LADDER_TOL_PCT:
+        return C.yellow(text)
+    if x > LADDER_HURT_PCT:
+        return C.red(text)
+    return C.green(text)
+
+
+def c_util(text: str, u: float) -> str:
+    if u < RANK_UTIL_SHRINK:
+        return C.yellow(text)
+    if u > RANK_UTIL_GROW:
+        return C.red(text)
+    return C.green(text)
+
+
+def c_live(text: str, frac: float) -> str:
+    return C.yellow(text) if frac < ACTIVE_FRAC_SHRINK else C.green(text)
+
+
+def c_hot(text: str, n: int) -> str:
+    return C.red(text) if n else text
+
+
+def c_write(r: float) -> str:
+    """Residual write ratio: below 1.2× init the block barely wrote (yellow)."""
+    t = f'{r:>5.1f}'
+    return C.yellow(t) if r < 1.2 else t
+
+
+def c_hi(text: str, x: float, thr: float) -> str:
+    return C.yellow(text) if (not math.isnan(x) and x > thr) else text
 
 
 @dataclass
@@ -490,7 +581,7 @@ def _suggest_dmodel(arch: Arch, new_d: int) -> str:
 
 
 def _ladder_line(rows: list[dict[str, float]], width: int) -> str:
-    return ', '.join(f"{r['k']}/{width} {r['delta_pct']:+.2f}%" for r in rows)
+    return ', '.join(c_ladder(f"{r['k']}/{width} {r['delta_pct']:+.2f}%", r['delta_pct']) for r in rows)
 
 
 def _ladder_verdict(rows: list[dict[str, float]], weight_verdict: str) -> tuple[str, str]:
@@ -1404,7 +1495,7 @@ def hr(c: str = '─', n: int = 100) -> str:
 def section(title: str, how: str = '') -> None:
     print()
     print(hr())
-    print(f"  {title}")
+    print(f"  {C.bold(title)}")
     if how:
         print(f"  {how}")
     print(hr())
@@ -1424,7 +1515,7 @@ def print_report(
     ph = arch.patch_hours
 
     print(hr('═'))
-    print(f"  T1DMAI model health — {path}")
+    print(f"  {C.bold(f'T1DMAI model health — {path}')}")
     print(hr('═'))
     step = ckpt.get('step', '?')
     total = tc.get('total_steps')
@@ -1450,12 +1541,12 @@ def print_report(
     print(f"  cache {tc.get('cache_path', '?')}   batch {tc.get('batch_size', '?')}   "
           f"muon_lr {tc.get('muon_lr', '?')}   adam_lr {tc.get('adam_lr', '?')}")
     for note in opt_notes:
-        print(f"  [opt] {note}")
+        print(C.yellow(f"  [opt] {note}"))
     if res['undertrained']:
-        print("  ⚠ checkpoint appears UNDERTRAINED (main matrices at init std) — capacity verdicts suppressed to KEEP")
+        print(C.red("  ⚠ checkpoint appears UNDERTRAINED (main matrices at init std) — capacity verdicts suppressed to KEEP"))
     elif isinstance(step, int) and total and step < 0.5 * total:
-        print(f"  ⚠ checkpoint is {step / total:.0%} through its schedule — verdicts describe this snapshot; "
-              "late-schedule weight decay and LR decay move them")
+        print(C.yellow(f"  ⚠ checkpoint is {step / total:.0%} through its schedule — verdicts describe this snapshot; "
+                       "late-schedule weight decay and LR decay move them"))
 
     section("LEGEND")
     for k, v in LEGEND:
@@ -1471,7 +1562,7 @@ def print_report(
     for r in rows_sorted[:top]:
         flags = (['STALE'] if r.stale else []) + (['near-init'] if r.near_init else [])
         print(f"  {r.name:32s} {str(r.shape):>13s} {r.numel:>9,} {r.std:>8.4f} {_f(r.drift):>7s} "
-              f"{r.opt:>4s} {_f(r.opt_activity, '.2e'):>9s} {_f(r.opt_rel):>6s} {_f(r.snr):>5s}  {' '.join(flags)}")
+              f"{r.opt:>4s} {_f(r.opt_activity, '.2e'):>9s} {_f(r.opt_rel):>6s} {_f(r.snr):>5s}  {c_flags(flags)}")
     if len(rows) > top:
         print(f"  … {len(rows) - top} more (raise --top to see all)")
     n_stale = sum(1 for r in rows if r.stale)
@@ -1493,14 +1584,21 @@ def print_report(
         hdr += (f" {'live_a':>7s} {'hot_a':>5s} {'‖attn‖':>6s} {'‖ffn‖':>6s} {'cos':>5s} {'cka_p':>5s} {'cka_F':>5s} "
                 f"{'tok×':>5s} {'Δattn':>7s} {'Δffn':>7s} {'Δblock':>7s}")
     print(hdr + "  flags")
+    F = arch.ffn_dim
     for l in layers:
-        line = (f"  {l.layer:>2d} {l.util_attn:>6.2f} {l.util_ffn:>6.2f} {l.write_attn:>5.1f} {l.write_ffn:>5.1f} "
-                f"{l.ffn_live_w:>3d}/{arch.ffn_dim:<3d} {l.ffn_hot_w:>5d} {l.ffn_top8_share_w:>5.0%}")
+        line = (f"  {l.layer:>2d} {c_util(f'{l.util_attn:>6.2f}', l.util_attn)} {c_util(f'{l.util_ffn:>6.2f}', l.util_ffn)} "
+                f"{c_write(l.write_attn)} {c_write(l.write_ffn)} "
+                f"{c_live(f'{l.ffn_live_w:>3d}/{F:<3d}', l.ffn_live_w / F)} {c_hot(f'{l.ffn_hot_w:>5d}', l.ffn_hot_w)} "
+                f"{l.ffn_top8_share_w:>5.0%}")
         if data:
-            line += (f" {l.ffn_live_a:>3d}/{arch.ffn_dim:<3d} {l.ffn_hot_a:>5d} {l.attn_rel:>6.2f} {l.ffn_rel:>6.2f} "
-                     f"{l.cos_io:>5.2f} {l.cka_prev:>5.2f} {l.cka_final:>5.2f} {l.tok_outlier:>5.1f} "
-                     f"{_pct(l.ablate_attn_pct):>7s} {_pct(l.ablate_ffn_pct):>7s} {_pct(l.ablate_block_pct):>7s}")
-        print(line + "  " + ' '.join(l.flags))
+            line += (f" {c_live(f'{l.ffn_live_a:>3d}/{F:<3d}', (l.ffn_live_a or 0) / F)} {c_hot(f'{l.ffn_hot_a:>5d}', l.ffn_hot_a or 0)} "
+                     f"{l.attn_rel:>6.2f} {l.ffn_rel:>6.2f} "
+                     f"{c_hi(f'{l.cos_io:>5.2f}', l.cos_io, BLOCK_COS_IDENTITY)} {c_hi(f'{l.cka_prev:>5.2f}', l.cka_prev, CKA_REDUNDANT)} "
+                     f"{l.cka_final:>5.2f} {l.tok_outlier:>5.1f} "
+                     f"{c_delta(f'{_pct(l.ablate_attn_pct):>7s}', l.ablate_attn_pct, HEAD_ABLATE_WEAK_PCT)} "
+                     f"{c_delta(f'{_pct(l.ablate_ffn_pct):>7s}', l.ablate_ffn_pct, HEAD_ABLATE_WEAK_PCT)} "
+                     f"{c_delta(f'{_pct(l.ablate_block_pct):>7s}', l.ablate_block_pct, BLOCK_ABLATE_REMOVABLE_PCT)}")
+        print(line + "  " + c_flags(l.flags))
     if data:
         print("  ‖attn‖ = ‖attn_out‖/‖x_in‖, ‖ffn‖ = ‖ffn_out‖/‖x_mid‖; cos = cos(x_in, x_out); "
               "cka_p = CKA with the previous layer's output, cka_F with the final; tok× = max/median token norm")
@@ -1519,11 +1617,18 @@ def print_report(
         hdr += f" {'act':>6s} {'a_rel':>5s} {'ent':>5s} {'self':>5s} {'mskd':>5s} {'p50h':>5s} {'p90h':>5s} {'Δ':>7s}"
     print(hdr + "  flags")
     for h in heads:
-        line = f"  {h.layer:>2d}.{h.head:<2d} {h.w_strength:>7.3f} {h.w_rel:>5.2f}"
+        w_rel = f'{h.w_rel:>5.2f}'
+        w_rel = C.red(w_rel) if h.w_rel < DEAD_UNIT_REL else C.yellow(w_rel) if h.w_rel < HEAD_WEAK_REL else w_rel
+        line = f"  {h.layer:>2d}.{h.head:<2d} {h.w_strength:>7.3f} {w_rel}"
         if data:
-            line += (f" {h.act_rms:>6.3f} {h.act_rel:>5.2f} {h.entropy:>5.2f} {h.self_mass:>5.2f} {h.masked_mass:>5.2f} "
-                     f"{h.reach_p50_h:>5.1f} {h.reach_p90_h:>5.1f} {_pct(h.ablate_pct):>7s}")
-        print(line + "  " + ' '.join(h.flags))
+            a_rel = f'{h.act_rel:>5.2f}'
+            a_rel = (C.red(a_rel) if h.act_rel > HEAD_DOMINANT_REL or h.act_rel < DEAD_UNIT_REL
+                     else C.yellow(a_rel) if h.act_rel < HEAD_WEAK_REL else a_rel)
+            line += (f" {h.act_rms:>6.3f} {a_rel} {c_hi(f'{h.entropy:>5.2f}', h.entropy, HEAD_ENTROPY_UNIFORM)} "
+                     f"{c_hi(f'{h.self_mass:>5.2f}', h.self_mass, HEAD_SELF_MASS)} {h.masked_mass:>5.2f} "
+                     f"{h.reach_p50_h:>5.1f} {h.reach_p90_h:>5.1f} "
+                     f"{c_delta(f'{_pct(h.ablate_pct):>7s}', h.ablate_pct, HEAD_ABLATE_WEAK_PCT)}")
+        print(line + "  " + c_flags(h.flags))
 
     # ---- spectral -----------------------------------------------------------------
     section("SPECTRAL CAPACITY", "util = eff_rank / min(in,out); tail% = singular values below 1% of σ_max")
@@ -1532,15 +1637,15 @@ def print_report(
         s = spectra[name]
         sh = tuple(ckpt['_sd_shapes'].get(name, ()))
         print(f"  {name:32s} {str(sh):>13s} {s['stable_rank']:>10.1f} {s['eff_rank']:>9.1f} "
-              f"{s['util']:>6.2f} {s['tail_frac'] * 100:>5.0f}%")
+              f"{c_util(f'{s['util']:>6.2f}', s['util'])} {s['tail_frac'] * 100:>5.0f}%")
 
     # ---- data summary -------------------------------------------------------------
     if data:
         section(f"ACTIVATION PASS  ({data['n_samples']} cached windows, {data['partition']} partition, "
                 f"policy {data['policy']}, baseline pinball {data['baseline_pinball']:.5f})")
         if data['n_samples'] < 64:
-            print(f"  ⚠ {data['n_samples']} windows: ablation, ladder and reach figures are noisy below ~64; "
-                  "the context ladder scores only the ~half of windows with a right-edge span")
+            print(C.yellow(f"  ⚠ {data['n_samples']} windows: ablation, ladder and reach figures are noisy below ~64; "
+                           "the context ladder scores only the ~half of windows with a right-edge span"))
         r = data['resid']
         print(f"  residual dims with variance {r['live']}/{arch.d_model}; top-{RESID_TOP_K} dims carry {r['top_share']:.0%} of the variance")
         b = data['bg_head']
@@ -1566,7 +1671,8 @@ def print_report(
         print("  context truncation ladder — keep only the last k hours of context, Δ pinball on the forecast-zone slots:")
         for rung in c['ladder']:
             if rung['n']:
-                print(f"    {rung['hours']:>4d} h ({rung['patches']:>3d} patches)  Δ {rung['delta_pct']:+7.2f}%   n={rung['n']}")
+                print(f"    {rung['hours']:>4d} h ({rung['patches']:>3d} patches)  Δ "
+                      + c_ladder(f"{rung['delta_pct']:+7.2f}%", rung['delta_pct']) + f"   n={rung['n']}")
         ld = data['ladders']
         print("  width ladders — keep only k of the width everywhere, Δ pinball vs the full model:")
         print(f"    D_MODEL (top-k PCs of the stream at every block): {_ladder_line(ld['d_model'], arch.d_model)}")
@@ -1579,28 +1685,31 @@ def print_report(
         ab = data['ablation']
         print(f"    {'block':>5s} " + ' '.join(f'{("h%d" % h):>7s}' for h in range(H)) + f" {'attn':>8s} {'ffn':>8s} {'skip':>8s}")
         for i in range(L):
-            print(f"    {i:>5d} " + ' '.join(f'{ab["heads"][i][h]:>+7.2f}' for h in range(H))
-                  + f" {ab['attn'][i]:>+8.2f} {ab['ffn'][i]:>+8.2f} {ab['block'][i]:>+8.2f}")
+            print(f"    {i:>5d} "
+                  + ' '.join(c_delta(f'{ab["heads"][i][h]:>+7.2f}', ab['heads'][i][h], HEAD_ABLATE_WEAK_PCT) for h in range(H))
+                  + ' ' + c_delta(f"{ab['attn'][i]:>+8.2f}", ab['attn'][i], HEAD_ABLATE_WEAK_PCT)
+                  + ' ' + c_delta(f"{ab['ffn'][i]:>+8.2f}", ab['ffn'][i], HEAD_ABLATE_WEAK_PCT)
+                  + ' ' + c_delta(f"{ab['block'][i]:>+8.2f}", ab['block'][i], BLOCK_ABLATE_REMOVABLE_PCT))
 
     # ---- verdicts -----------------------------------------------------------------
     print()
     print(hr('═'))
-    print("  CAPACITY VERDICTS  (resize_model.py knobs)")
+    print(f"  {C.bold('CAPACITY VERDICTS  (resize_model.py knobs)')}")
     print(hr('═'))
     for v in verdicts:
-        print(f"  {v.knob:16s} {v.current:32s} {v.verdict}")
+        print(f"  {C.bold(f'{v.knob:16s}')} {v.current:32s} {c_verdict(v.verdict)}")
         for e in v.evidence:
             print(f"      · {e}")
         if v.suggest:
             if v.suggest.lstrip().startswith('--'):
-                print(f"      → python resize_model.py {v.suggest}")
+                print({'SHRINK': C.yellow, 'GROW': C.red}.get(v.verdict, C.green)(f"      → python resize_model.py {v.suggest}"))
             else:
-                print(f"      → {v.suggest}")
+                print(C.dim(f"      → {v.suggest}"))
     print(hr('═'))
     shrink = [v.knob for v in verdicts if v.verdict == 'SHRINK']
     grow = [v.knob for v in verdicts if v.verdict == 'GROW']
-    print(f"  SHRINK: {', '.join(shrink) if shrink else '(none)'}")
-    print(f"  GROW:   {', '.join(grow) if grow else '(none)'}")
+    print(C.yellow(f"  SHRINK: {', '.join(shrink)}") if shrink else "  SHRINK: (none)")
+    print(C.red(f"  GROW:   {', '.join(grow)}") if grow else "  GROW:   (none)")
     if not data:
         print("  (weight-only audit — pass --data N for activation, attention-reach, block and ablation evidence)")
     print(hr('═'))
@@ -1626,7 +1735,12 @@ def main() -> None:
                     help='also write the full findings as JSON to this path.')
     ap.add_argument('--device', type=str, default='cpu',
                     help="device for the --data pass ('cuda' or 'cpu').")
+    ap.add_argument('--color', dest='color', action='store_true', default=None,
+                    help='force ANSI colours (default: only on a TTY, never under NO_COLOR).')
+    ap.add_argument('--no-color', dest='color', action='store_false')
     args = ap.parse_args()
+    import os
+    C.on = (sys.stdout.isatty() and 'NO_COLOR' not in os.environ) if args.color is None else args.color
 
     path = Path(args.checkpoint) if args.checkpoint else find_best_checkpoint(Path(args.ckpt_dir))
     print(f"[load] {path}")
@@ -1645,9 +1759,9 @@ def main() -> None:
     live = (_cfg.D_MODEL, _cfg.N_LAYERS, _cfg.N_HEADS, _cfg.FFN_DIM, _cfg.BG_HEAD_HIDDEN, _cfg.PATCH_SIZE)
     derived = (arch.d_model, arch.n_layers, arch.n_heads, arch.ffn_dim, arch.bg_head_hidden, arch.patch_size)
     if live != derived:
-        print(f"[warn] config.py {live} != checkpoint-derived {derived} (auditing the checkpoint's architecture).")
+        print(C.yellow(f"[warn] config.py {live} != checkpoint-derived {derived} (auditing the checkpoint's architecture)."))
     if ckpt.get('arch_version') != _cfg.ARCH_VERSION:
-        print(f"[warn] checkpoint arch_version {ckpt.get('arch_version')!r} != config {_cfg.ARCH_VERSION!r}")
+        print(C.red(f"[warn] checkpoint arch_version {ckpt.get('arch_version')!r} != config {_cfg.ARCH_VERSION!r}"))
     bg_init = float(getattr(_cfg, 'BG_HEAD_INIT_SCALE', DEFAULT_BG_HEAD_INIT_SCALE))
     time_init = float(getattr(_cfg, 'TIME_PROBE_INIT_SCALE', DEFAULT_TIME_PROBE_INIT_SCALE))
 
