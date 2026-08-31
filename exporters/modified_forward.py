@@ -187,10 +187,10 @@ def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
     # T1DMAI reads its dims from config globals at construction, so config.py drifting from the
     # checkpoint would otherwise surface as an opaque load_state_dict shape error
     tc = ck.get("training_config") or {}
-    assert ck.get("arch_version") in (None, cfg.ARCH_VERSION), (
-        f"checkpoint arch_version {ck.get('arch_version')!r} != config {cfg.ARCH_VERSION!r}"
-    )
     import config as _cfg
+    assert ck.get("arch_version") in (None, _cfg.ARCH_VERSION), (
+        f"checkpoint arch_version {ck.get('arch_version')!r} != config {_cfg.ARCH_VERSION!r}"
+    )
     for cfg_name, tc_key in (
         ("D_MODEL", "d_model"), ("N_LAYERS", "n_layers"), ("N_HEADS", "n_heads"),
         ("PATCH_SIZE", "patch_size"), ("PREDICTION_PATCHES", "prediction_patches"),
