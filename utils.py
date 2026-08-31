@@ -555,8 +555,11 @@ def _span_layout(
             [torch.ones(B, 1, dtype=torch.bool, device=device), ~cont], dim=1)
     ar_b = ar.unsqueeze(0).expand(B, M)
     # Running max of "index if a span starts here else -1" = the current span's start.
-    start = torch.cummax(
-        torch.where(new, ar_b, torch.full_like(ar_b, -1)), dim=1).values
+    # Written as a prefix max under an (M, M) causal mask, not torch.cummax: cummax is outside
+    # the Core ATen opset and refuses to lower to ExecuTorch. M is MAX_MASKED_PATCHES.
+    src = torch.where(new, ar_b, torch.full_like(ar_b, -1)).unsqueeze(1)
+    causal = torch.ones(M, M, dtype=torch.bool, device=device).tril().unsqueeze(0)
+    start = torch.where(causal, src, torch.full_like(src, -1)).amax(dim=2)
     ones = torch.ones(B, M, dtype=torch.long, device=device)
     counts = torch.zeros(B, M, dtype=torch.long, device=device).scatter_add_(1, start, ones)
     length = counts.gather(1, start)
