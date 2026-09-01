@@ -109,3 +109,4 @@ scratch/
 
 # Metabonet datasets
 *.parquet
+metabonet/
