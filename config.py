@@ -12,11 +12,11 @@ from T1DMSIM.simulator import (
 # FFN_DIM / BG_HEAD_HIDDEN = k * D_MODEL and HEAD_DIM in {16, 32, 64, 128} — so don't bake
 # their values into other code. PATCH_SIZE must divide 12, and MIN/MAX_CONTEXT_PATCHES
 # count patches, so changing it rescales their wall-clock span.
-D_MODEL = 128
-N_LAYERS = 8
-N_HEADS = 8
+D_MODEL = 32
+N_LAYERS = 32
+N_HEADS = 1
 HEAD_DIM = D_MODEL // N_HEADS
-FFN_DIM = 4 * D_MODEL
+FFN_DIM = 1 * D_MODEL
 PATCH_SIZE = 6                   # 6 × 5 min = 30 min per patch
 
 # Feature order (FROZEN), step-major within a patch: 0 bg_absolute as z(f(bg)) in risk
@@ -111,7 +111,7 @@ ROPE_BASE = 1000
 
 MASTER_SEED = 42
 DETERMINISTIC = False            # True: TF32 off, cuDNN deterministic; SDPA backward still not bit-exact
-TOTAL_STEPS = 100000
+TOTAL_STEPS = 10000
 BATCH_SIZE = 64
 NUM_WORKERS = 8
 
