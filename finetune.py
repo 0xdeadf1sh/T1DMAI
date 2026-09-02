@@ -114,6 +114,8 @@ def parse_args() -> argparse.Namespace:
                    help='max fraction of gap patches per training window')
     p.add_argument('--max-interp-steps', type=int, default=1,
                    help='linear-fill CGM gaps up to this many 5-min steps')
+    p.add_argument('--no-carbs', action='store_true',
+                   help='blank the carb channel, context and zone, train and eval')
     p.add_argument('--log-interval', type=int, default=100)
     return p.parse_args()
 
@@ -209,7 +211,8 @@ def main() -> None:
         cache, stats, seed=args.seed, total_steps=args.total_steps,
         batch_size=args.batch_size, source_alpha=args.source_alpha,
         diadata_frac=args.diadata_frac, gap_budget=args.gap_budget,
-        max_interp_steps=args.max_interp_steps)
+        max_interp_steps=args.max_interp_steps,
+        no_carbs=args.no_carbs)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=finetune_collate_fn,
@@ -217,7 +220,8 @@ def main() -> None:
 
     windows = build_eval_windows(cache, args.eval_windows, args.eval_seed)
     eval_ds = FinetuneEvalDataset(cache, stats, windows,
-                                  max_interp_steps=args.max_interp_steps)
+                                  max_interp_steps=args.max_interp_steps,
+                                  no_carbs=args.no_carbs)
     # Workerless: eval forks would copy the CUDA-holding parent on a RAM-tight box.
     eval_loader = DataLoader(
         eval_ds, batch_size=args.eval_batch_size, shuffle=False,

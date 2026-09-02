@@ -722,13 +722,15 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
     def __init__(self, cache: FinetuneCache, stats: dict[str, dict[str, float]] | None,
                  seed: int, total_steps: int, batch_size: int,
                  source_alpha: float = 0.5, diadata_frac: float = 0.2,
-                 gap_budget: float = 0.2, max_interp_steps: int = 1) -> None:
+                 gap_budget: float = 0.2, max_interp_steps: int = 1,
+                 no_carbs: bool = False) -> None:
         self.cache = cache
         self.stats = stats
         self.seed = seed
         self.total = total_steps * batch_size
         self.gap_budget = gap_budget
         self.max_interp_steps = max_interp_steps
+        self.no_carbs = no_carbs
 
         min_len = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
         w_patches = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
@@ -819,9 +821,10 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
             return {'bg': bg, 'carb': ch['carb'], 'insulin': ch['insulin'],
                     'exercise': ch['exercise'], 'start': start, 'seq_len': seq_len}
         assert self.stats is not None, 'stats=None dataset is for raw draws only'
+        carb = np.zeros_like(ch['carb']) if self.no_carbs else ch['carb']
         feats = _normalize_features(
             np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
-            ch['carb'], ch['insulin'], ch['exercise'], self.stats)
+            carb, ch['insulin'], ch['exercise'], self.stats)
         sample = _assemble_sample(feats, bg, spans, gap_patches, seq_len, n_ctx)
         # True hour of day per head slot, for the time-probe CE: slot j reads
         # patch mask_idx[j], whose first step sits at start + mask_idx[j]*PATCH_SIZE.
@@ -972,11 +975,13 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
     """Right-edge forecast windows at fixed test origins; truth rides beside."""
 
     def __init__(self, cache: FinetuneCache, stats: dict[str, dict[str, float]],
-                 windows: list[tuple[int, int]], max_interp_steps: int = 1) -> None:
+                 windows: list[tuple[int, int]], max_interp_steps: int = 1,
+                 no_carbs: bool = False) -> None:
         self.cache = cache
         self.stats = stats
         self.windows = windows
         self.max_interp_steps = max_interp_steps
+        self.no_carbs = no_carbs
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -997,9 +1002,10 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
         gap_patches = np.flatnonzero(~visible[:n_ctx]).astype(np.int64)
         spans = [(n_ctx, PREDICTION_PATCHES)]
 
+        carb = np.zeros_like(ch['carb']) if self.no_carbs else ch['carb']
         feats = _normalize_features(
             np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
-            ch['carb'], ch['insulin'], ch['exercise'], self.stats)
+            carb, ch['insulin'], ch['exercise'], self.stats)
         # Zone gaps filled so the (unused) targets stay finite; context keeps its
         # NaNs so the last-visible/anchor reads stay honest. The zone's bg input is
         # withheld by the masked span either way; metrics score ``true_bg_horizon``.
