@@ -27,7 +27,7 @@ from config import (                                           # noqa: E402
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
     VALIDATION_N_PATIENTS, VALIDATION_PROBE_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
     N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
-    MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA,
+    MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
     CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
@@ -2556,7 +2556,7 @@ def _run_validation(
     ``risk_total_loss``, with ``val_loss_D`` surfaced from its components.
     """
     model.eval()
-    totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'pinball': 0.0}
+    totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0, 'pinball': 0.0}
     n_samples = 0
 
     agg: dict[str, float] = {}
@@ -2626,6 +2626,7 @@ def _run_validation(
             totals['loss_total'] += float(loss_total) * B_batch
             totals['loss_Q'] += float(parts.get('loss_Q', float('nan'))) * B_batch
             totals['loss_D'] += float(parts.get('loss_D', float('nan'))) * B_batch
+            totals['loss_M'] += float(parts.get('loss_M', float('nan'))) * B_batch
             totals['pinball'] += float(parts.get('pinball', parts.get('loss_Q', float('nan')))) * B_batch
 
             # Time-of-day probe (diagnostic; never in the loss totals or checkpoint selection),
@@ -2825,6 +2826,7 @@ def _run_validation(
         'val_loss_total': totals['loss_total'] / n,
         'val_loss_Q': totals['loss_Q'] / n,
         'val_loss_D': totals['loss_D'] / n,
+        'val_loss_M': totals['loss_M'] / n,
         'val_pinball': totals['pinball'] / n,
         'log_sigma_Q': float(weighting.log_sigma_Q.detach()),
         'log_sigma_D': float(weighting.log_sigma_D.detach()),
@@ -3188,8 +3190,8 @@ _RESUME_ARCH_KNOBS = (
 
 
 def _check_resume_architecture(ckpt: dict, path: str) -> None:
-    """Refuse to resume a checkpoint whose architecture, arch version, masked-channel policy or
-    normalization stats differ from what this process trains under. config.py is the single
+    """Refuse to resume a checkpoint whose architecture, arch version, masked-channel policy,
+    ``mse_alpha`` or normalization stats differ from what this process trains under. config.py is the single
     source, so a dimension mismatch names the ``resize_model.py`` command that aligns it."""
     import config as _cfg
     tc = ckpt.get('training_config', {})
@@ -3200,6 +3202,10 @@ def _check_resume_architecture(ckpt: dict, path: str) -> None:
     if policy != masked_channel_policy(blind=False):
         sys.exit(f"--checkpoint {path}: masked_channel_policy {policy!r}; train.py trains "
                  f"{masked_channel_policy(blind=False)!r} (train_blind.py owns {policy!r})")
+    # The restored log_sigma_D was fitted to the D slot this value defines.
+    if tc.get('mse_alpha') is not None and float(tc['mse_alpha']) != float(_cfg.MSE_ALPHA):
+        sys.exit(f"--checkpoint {path}: mse_alpha {tc['mse_alpha']} != config.py "
+                 f"{_cfg.MSE_ALPHA}")
     flags = []
     for key, const, flag in _RESUME_ARCH_KNOBS:
         want = tc.get(key)
@@ -3269,7 +3275,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
     """
     return [
         ('step', 0), ('loss_total', 6), ('loss_ema', 6),
-        ('loss_Q', 6), ('loss_D', 6), ('loss_D_shape', 6), ('loss_D_tdi', 6),
+        ('loss_Q', 6), ('loss_D', 6), ('loss_D_shape', 6), ('loss_D_tdi', 6), ('loss_M', 6),
         *[(f'loss_D_L{L}', 6) for L in MASK_SPAN_LENGTHS],
         *[(f'n_spans_L{L}', 3) for L in MASK_SPAN_LENGTHS],
         ('n_masked_mean', 3), ('n_spans_mean', 3),
@@ -3315,7 +3321,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
     inf_d = reachable_d(INFILL)
     return [
         ('step', 0),
-        ('val_loss_total', 6), ('val_loss_Q', 6), ('val_loss_D', 6),
+        ('val_loss_total', 6), ('val_loss_Q', 6), ('val_loss_D', 6), ('val_loss_M', 6),
         ('train_loss_ema', 6), ('overfit_ratio', 6),
         *[(f'coverage90@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
         *[(f'sign_balance@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
@@ -3590,7 +3596,7 @@ def train(
         N_HEADS as _CFG_N_HEADS, FFN_DIM as _CFG_FFN_DIM,
     )
     training_config = {
-        'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA,
+        'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
         # The sampler constants the run trained under — the provenance a loader compares against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
@@ -3876,6 +3882,7 @@ def train(
             loss_d = float(parts.get('loss_D', float('nan')))
             loss_d_shape = float(parts.get('loss_D_shape', float('nan')))
             loss_d_tdi = float(parts.get('loss_D_tdi', float('nan')))
+            loss_m = float(parts.get('loss_M', float('nan')))
             log_sigma_q = float(parts.get('log_sigma_Q', float('nan')))
             log_sigma_d = float(parts.get('log_sigma_D', float('nan')))
             loss_tod = _tod_loss_val
@@ -3885,7 +3892,7 @@ def train(
                 f"Step {step:>6}/{total_steps} | "
                 f"Loss: {loss_val:.4f} (ema={loss_ema:.4f}) | "
                 f"L_Q: {loss_q:.4f}  L_D: {loss_d:.4f} "
-                f"(sh={loss_d_shape:.4f} tdi={loss_d_tdi:.4f}) | "
+                f"(sh={loss_d_shape:.4f} tdi={loss_d_tdi:.4f})  L_M: {loss_m:.4f} | "
                 f"logσ: Q={log_sigma_q:+.4f} D={log_sigma_d:+.4f} | "
                 f"L_tod: {loss_tod:.4f} (xwin {loss_tod_xwin:.4f}) | "
                 f"Grad: {grad_norm_val:.3f} | "
@@ -3897,7 +3904,7 @@ def train(
                 'step': step,
                 'loss_total': loss_val, 'loss_ema': loss_ema,
                 'loss_Q': loss_q, 'loss_D': loss_d,
-                'loss_D_shape': loss_d_shape, 'loss_D_tdi': loss_d_tdi,
+                'loss_D_shape': loss_d_shape, 'loss_D_tdi': loss_d_tdi, 'loss_M': loss_m,
                 # Per-bucket DILATE and the span-length histogram off the loss components: the
                 # effective Q:D balance moves with the span mixture even at pinned log-σ.
                 **{k: float(v) for k, v in parts.items()
@@ -3952,6 +3959,7 @@ def train(
                 'val_loss_total': round(val_total, 6),
                 'val_loss_Q': round(val_metrics['val_loss_Q'], 6),
                 'val_loss_D': round(val_metrics['val_loss_D'], 6),
+                'val_loss_M': round(val_metrics['val_loss_M'], 6),
                 'train_loss_ema': round(train_ema, 6),
                 'overfit_ratio': round(overfit_ratio, 4),
                 **{f'coverage90@{h}': _r(val_metrics.get(f'coverage90@{h}'))
@@ -4291,6 +4299,7 @@ if __name__ == '__main__':
     rows.append(('prediction_patches', str(PREDICTION_PATCHES), 'derived'))
     rows.append(('arch_version', str(ARCH_VERSION), 'config.py'))
     rows.append(('loss_schema', str(LOSS_SCHEMA), 'config.py'))
+    rows.append(('mse_alpha', str(MSE_ALPHA), 'config.py'))
     # Read back off ``config``: what the run trains with is what config published, and what the
     # checkpoint records.
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))

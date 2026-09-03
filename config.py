@@ -151,20 +151,22 @@ WEIGHT_DECAY_SCHEDULE_CORRECTION = True
 GRADIENT_CLIP_NORM = 1.0
 
 # Two terms fused by learned Kendall-Gal homoscedastic weighting (risk_loss.py): L_Q, the
-# pinball loss over the 7 QUANTILE_LEVELS, and L_D, DILATE on the median only. Both log-σ
-# live on a separate module — their own AdamW group, never Muon, EMA-excluded.
+# pinball loss over the 7 QUANTILE_LEVELS, and (1-MSE_ALPHA)·L_D + MSE_ALPHA·L_M — DILATE on
+# the median mixed with the median's risk-space MSE. Both log-σ live on a separate module —
+# their own AdamW group, never Muon, EMA-excluded.
 DILATE_ALPHA = 0.5               # alpha*shape + (1-alpha)*TDI
 # softmin softness, NOT an overflow guard: the max-subtracted softmin is overflow-free down
 # to γ=1e-3 and soft-DTW is 1-homogeneous in (cost, γ), so the single-cell cost peak
 # (f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))² = 99.6416 forces no particular γ.
 DILATE_GAMMA = 1.0
 DILATE_TDI_FD_EPS = 0.05         # FD step for TDI = d/dε sDTW(C+εΩ)|0; median grad exact to O(ε)
+MSE_ALPHA = 0.0                 # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
 KENDALL_LOGVAR_INIT = 0.0        # init for log_sigma_Q / log_sigma_D; clamped [-7, 7]
 
 # Provenance only: stamped into every checkpoint, the summary JSON, the resolved-config
 # dump and the export descriptor, and compared by nothing at load time.
 ARCH_VERSION = 'risk-v5'
-LOSS_SCHEMA = 'kendall-pinball-dilate-v3'
+LOSS_SCHEMA = 'kendall-pinball-dilate-mse-v4'
 
 # mg/dL cutoffs for a hypo / hyper excursion and for the CG-EGA / Clarke / TIR glycemic
 # regions. TIR keeps the fixed clinical 70-180 band (BG_TARGET_LO/HI in train.py) so it

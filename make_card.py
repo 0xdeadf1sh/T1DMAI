@@ -265,6 +265,15 @@ def _derive_arch(sd: dict, cfg: dict) -> dict:
 
 
 
+def _mse_alpha(cfg: dict) -> float:
+    return float(cfg.get('mse_alpha', config.MSE_ALPHA))
+
+
+def _slot_name(cfg: dict) -> str:
+    a = _mse_alpha(cfg)
+    return "DILATE" if a == 0.0 else "MSE" if a == 1.0 else "DILATE/MSE"
+
+
 def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> None:
     fig, ax = _setup_card((13.0, 7.6))
     y = _header(ax, "Model card", f"T1DMAI  ·  {_human_count(total_params)} parameter model",
@@ -281,7 +290,7 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
         ("Parameters",      f"{_human_count(total_params)}",
                             f"{total_params:,} exact",  NAVY),
         ("Best val loss",   _b('val_loss_total', '{:.4f}'),
-                            f"pinball + DILATE  ·  step {_b('val_loss_step', '{:,}')}",  CLAY),
+                            f"pinball + {_slot_name(cfg)}  ·  step {_b('val_loss_step', '{:,}')}",  CLAY),
         ("Best MARD @30m",  _b('mard_30m', '{:.2f}', '%'),
                             "mean absolute relative diff. (@30 min)",  CLAY),
         ("Best Clarke A @30m", _b('clarke_A_30m', '{:.2f}', '%'),
@@ -780,6 +789,7 @@ def card_training_recipe(cfg: dict) -> None:
              ("Quantile pinball",    f"L_Q  ·  {len(config.QUANTILE_LEVELS)}-τ fan in Kovatchev RISK space"),
              ("DILATE (shape/TDI)",  f"L_D  ·  α = {config.DILATE_ALPHA:.2f}·shape + {1-config.DILATE_ALPHA:.2f}·TDI"
                                       f"    soft-DTW γ = {config.DILATE_GAMMA:.1f}"),
+             ("MSE (median)",       f"L_M  ·  slot = {1 - _mse_alpha(cfg):.2f}·L_D + {_mse_alpha(cfg):.2f}·L_M"),
              ("Combination",         f"learned Kendall-Gal log-variances  σ_Q, σ_D  (init {config.KENDALL_LOGVAR_INIT:.1f})"),
              ("Clinical thresholds", f"hypo {cfg['bg_hypo_threshold']:.0f} / hyper "
                                       f"{cfg['bg_hyper_threshold']:.0f} mg/dL"),
@@ -818,6 +828,7 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
                           left=0.04, right=0.97, top=0.66, bottom=0.08)
 
     _a = config.DILATE_ALPHA
+    _ra = _mse_alpha(cfg)
     terms = [
         ("Quantile pinball  (L_Q)",
          f"Σ_τ ρ_τ(f(BG_true) − q_τ)  over the {len(config.QUANTILE_LEVELS)}-τ fan",
@@ -831,8 +842,12 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
          "temporal-distortion index — penalizes timing drift",
          f"mix weight: 1 − α = {1 - _a:.2f}",
          SAGE),
+        ("Median MSE  (L_M)",
+         "mean (median − f(BG_true))²  over valid (slot, step)",
+         f"D slot = {1 - _ra:.2f}·L_D + {_ra:.2f}·L_M    (MSE_ALPHA = {_ra:.2f})",
+         TEAL),
         ("Kendall-Gal combine",
-         "½·e^(−2σ_Q)·L_Q + σ_Q  +  ½·e^(−2σ_D)·L_D + σ_D",
+         "½·e^(−2σ_Q)·L_Q + σ_Q  +  ½·e^(−2σ_D)·L_DR + σ_D",
          f"learned log-variances σ_Q, σ_D  (init {config.KENDALL_LOGVAR_INIT:.1f}, clamped [−7, 7])",
          CLAY),
     ]
@@ -844,7 +859,7 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
     head_ax = fig.add_axes([0.0, 0.64, 1.0, 0.36]); head_ax.axis("off")
     _header(head_ax, "Loss design",
             "Composite training objective",
-            f"{_count_word} terms — a quantile pinball and DILATE shape/TDI, "
+            f"{_count_word} terms — a quantile pinball, DILATE shape/TDI and a median MSE, "
             "combined under learned Kendall-Gal uncertainty weights.",
             y_top=0.92)
 
@@ -868,11 +883,11 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
         ax.text(0.030, y0 + 0.025, weight, fontsize=8.5, color=DIMMED,
                 family=FONT_MONO)
 
-    # the learned Kendall-Gal log-variances per training step — a trace of the L_Q / L_D
+    # the learned Kendall-Gal log-variances per training step — a trace of the L_Q / L_DR
     # balance as it moves, not a static split
     ax = fig.add_subplot(gs[0, 1]); ax.set_facecolor(PAPER)
     sig_series = [("log_sigma_Q", "σ_Q  (pinball)", NAVY),
-                  ("log_sigma_D", "σ_D  (DILATE)", TEAL)]
+                  ("log_sigma_D", "σ_D  (DILATE/MSE)", TEAL)]
     steps = train.get("step")
     drew = False
     if steps is not None:

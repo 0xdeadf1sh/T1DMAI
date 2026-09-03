@@ -128,7 +128,7 @@ def main() -> None:
         _apply_checkpoint_dims(ckpt)
 
     from config import (
-        ARCH_VERSION, LOSS_SCHEMA, PREDICTION_PATCHES, EMA_DECAY,
+        ARCH_VERSION, LOSS_SCHEMA, PREDICTION_PATCHES, EMA_DECAY, MSE_ALPHA,
         GRADIENT_CLIP_NORM, MUON_LR, ADAM_LR, MUON_MOMENTUM, ADAM_WEIGHT_DECAY,
         MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA,
         TIME_PROBE_N_BINS, TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_LOSS_WEIGHT,
@@ -374,6 +374,7 @@ def main() -> None:
             'training_config': dict(
                 ckpt.get('training_config', {}) if ckpt is not None else {},
                 finetune=vars(args) | {'init_from': init_from},
+                mse_alpha=MSE_ALPHA,
             ),
             'finetune_step': step,
             'finetune_metrics': {
@@ -454,6 +455,7 @@ def main() -> None:
             t_last = time.time()
             print(f'step {step}/{args.total_steps}  loss {loss.item():.4f}  '
                   f"Q {comps['loss_Q'].item():.4f}  D {comps['loss_D'].item():.4f}  "
+                  f"R {comps['loss_M'].item():.4f}  "
                   f'{dt / args.log_interval:.2f}s/step', flush=True)
 
         if step % args.validation_interval == 0 or step == args.total_steps:

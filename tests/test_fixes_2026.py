@@ -521,9 +521,9 @@ def test_loss_components_have_no_retired_keys():
     true_bg = torch.full((B, PREDICTION_PATCHES, PATCH_SIZE), 120.0)
     _, parts = risk_total_loss(q, median, true_bg, KendallGalWeighting())
 
-    for key in ('loss_Q', 'loss_D', 'loss_D_shape', 'loss_D_tdi',
+    for key in ('loss_Q', 'loss_D', 'loss_D_shape', 'loss_D_tdi', 'loss_M',
                 'log_sigma_Q', 'log_sigma_D'):
-        assert key in parts, f"components dict missing DILATE/Kendall-Gal key {key!r}"
+        assert key in parts, f"components dict missing DILATE/MSE/Kendall-Gal key {key!r}"
     for gone in ('loss_T', 'loss_T_ashift', 'loss_T_phase', 'loss_T_amp',
                  'loss_seam', 'log_sigma_T', 'loss_smooth'):
         assert gone not in parts, f"retired key {gone!r} must be gone from components"

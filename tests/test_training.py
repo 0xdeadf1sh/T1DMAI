@@ -3,7 +3,8 @@ Kendall-Gal weighting, ``risk_total_loss``, and the loop plumbing — offset sam
 resume alignment, checkpoint, optimizer step.
 
 The BG forecast is a single quantile head in Kovatchev risk space, trained by
-pinball + DILATE (soft-DTW divergence shape plus TDI on the median).
+pinball + DILATE (soft-DTW divergence shape plus TDI on the median) mixed with MSE
+by ``MSE_ALPHA``.
 """
 
 import math
@@ -168,13 +169,14 @@ def test_to_patch_major_rejects_transpose():
 
 def test_kendall_gal_weighting_combine():
     """``risk_total_loss`` combines the two terms as
-    ``0.5·exp(−2·σ_Q)·L_Q + σ_Q + 0.5·exp(−2·σ_D)·L_D + σ_D``.
+    ``0.5·exp(−2·σ_Q)·L_Q + σ_Q + 0.5·exp(−2·σ_D)·L_DR + σ_D``,
+    ``L_DR = (1 − MSE_ALPHA)·L_D + MSE_ALPHA·L_M``.
 
-    At ``KENDALL_LOGVAR_INIT == 0`` that reduces to ``0.5·L_Q + 0.5·L_D``, and the
+    At ``KENDALL_LOGVAR_INIT == 0`` that reduces to ``0.5·L_Q + 0.5·L_DR``, and the
     ``log_sigma_*`` components echo the clamped params.
     """
     from risk_loss import risk_total_loss, KendallGalWeighting
-    from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES
+    from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES, MSE_ALPHA
     from utils import assemble_quantiles
 
     B, P, S = 2, PREDICTION_PATCHES, PATCH_SIZE
@@ -188,8 +190,9 @@ def test_kendall_gal_weighting_combine():
     weighting = KendallGalWeighting()  # inits at KENDALL_LOGVAR_INIT == 0.0
     total, comp = risk_total_loss(q_tau, median, true_bg, weighting)
 
-    # at log-σ == 0: 0.5·exp(0)·L_Q + 0 + 0.5·exp(0)·L_D + 0 == 0.5(L_Q + L_D)
-    expected = 0.5 * comp['loss_Q'] + 0.5 * comp['loss_D']
+    # at log-σ == 0: 0.5·exp(0)·L_Q + 0 + 0.5·exp(0)·L_DR + 0 == 0.5(L_Q + L_DR)
+    slot = (1.0 - MSE_ALPHA) * comp['loss_D'] + MSE_ALPHA * comp['loss_M']
+    expected = 0.5 * comp['loss_Q'] + 0.5 * slot
     assert torch.allclose(total, expected, atol=1e-6), (
         f"Kendall-Gal combine broken at σ=0: {float(total)} != {float(expected)}")
     assert 'loss_smooth' not in comp, "L_smooth penalty must be gone from components"
@@ -202,12 +205,57 @@ def test_kendall_gal_weighting_combine():
     with torch.no_grad():
         weighting.log_sigma_Q.add_(1.0)
     total2, comp2 = risk_total_loss(q_tau, median, true_bg, weighting)
+    slot2 = (1.0 - MSE_ALPHA) * comp2['loss_D'] + MSE_ALPHA * comp2['loss_M']
     exp2 = (0.5 * math.exp(-2.0) * comp2['loss_Q'] + 1.0
-            + 0.5 * comp2['loss_D'])
+            + 0.5 * slot2)
     assert torch.allclose(total2, exp2, atol=1e-6), (
         f"Kendall-Gal combine broken at σ_Q=1: {float(total2)} != {float(exp2)}")
-    print(f"\n[DUMP] kendall-gal | total@σ0={float(total):.4f} == 0.5(L_Q+L_D), "
+    print(f"\n[DUMP] kendall-gal | total@σ0={float(total):.4f} == 0.5(L_Q+L_DR), "
           f"σ_Q bump tracked ✓")
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_mse_alpha_mixes_dilate_and_mse(monkeypatch, alpha):
+    """``MSE_ALPHA`` weights the Kendall-Gal D slot ``(1−α)·L_D + α·L_M``: 0 skips the
+    MSE (``loss_M == 0``), 1 skips the soft-DTW (``loss_D`` and every ``loss_D_L{L}`` == 0),
+    and ``loss_M`` is the hand-computed risk-space MSE of the median."""
+    import config
+    from risk_loss import risk_total_loss, KendallGalWeighting
+    from utils import assemble_quantiles, kovatchev_f_target
+
+    monkeypatch.setattr(config, 'MSE_ALPHA', alpha)
+    B, P, S = 2, config.PREDICTION_PATCHES, config.PATCH_SIZE
+    torch.manual_seed(1)
+    head_raw = torch.randn(B, P, S, 1 + 2 * ((config.N_QUANTILES - 1) // 2))
+    q_tau, median = assemble_quantiles(head_raw, torch.full((B,), 120.0))
+    true_bg = 90.0 + 80.0 * torch.rand(B, P, S)
+
+    total, comp = risk_total_loss(q_tau, median, true_bg, KendallGalWeighting())
+    y_risk = kovatchev_f_target(true_bg)
+    mse_hand = ((median - y_risk) ** 2).mean()
+
+    if alpha == 0.0:
+        assert float(comp['loss_M']) == 0.0
+        assert float(comp['loss_D']) > 0.0
+    elif alpha == 1.0:
+        assert float(comp['loss_D']) == 0.0
+        assert all(float(comp[f'loss_D_L{L}']) == 0.0 for L in config.MASK_SPAN_LENGTHS)
+        assert torch.allclose(comp['loss_M'], mse_hand, atol=1e-6)
+    else:
+        assert float(comp['loss_D']) > 0.0
+        assert torch.allclose(comp['loss_M'], mse_hand, atol=1e-6)
+    slot = (1.0 - alpha) * comp['loss_D'] + alpha * comp['loss_M']
+    expected = 0.5 * comp['loss_Q'] + 0.5 * slot
+    assert torch.allclose(total, expected, atol=1e-6), (
+        f"α={alpha}: total {float(total)} != 0.5·L_Q + 0.5·((1−α)·L_D + α·L_M) {float(expected)}")
+    assert torch.isfinite(total)
+    # the span counters are logged from the bucket table, not from the soft-DTW loop
+    assert float(comp['n_spans_mean']) == 1.0 and float(comp['n_masked_mean']) == float(P), (
+        f"α={alpha}: n_spans_mean {float(comp['n_spans_mean'])} n_masked_mean "
+        f"{float(comp['n_masked_mean'])} — the α=1 skip dropped the counters")
+    print(f"\n[DUMP] mse_alpha={alpha} | L_Q={float(comp['loss_Q']):.4f} "
+          f"L_D={float(comp['loss_D']):.4f} L_M={float(comp['loss_M']):.4f} "
+          f"total={float(total):.4f} ✓")
 
 
 def test_risk_total_loss_f_applied_once_and_finite():

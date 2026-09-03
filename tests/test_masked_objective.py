@@ -92,6 +92,66 @@ def test_padded_slots_get_exactly_zero_gradient():
           f"slots only ✓")
 
 
+def test_mse_ignores_padded_slots(monkeypatch):
+    """At ``MSE_ALPHA == 1`` a padded slot's ``q_tau.grad`` is exactly 0.0, and ``loss_M``
+    equals the dense MSE over the valid slots alone — the denominator is the valid mass."""
+    import config
+    from utils import kovatchev_f_target
+    monkeypatch.setattr(config, 'MSE_ALPHA', 1.0)
+    B, M = 6, MAX_MASKED_PATCHES
+    valid = torch.zeros(B, M, dtype=torch.bool)
+    n_valid = [4, 1, 8, 3, 2, 5]
+    for b, k in enumerate(n_valid):
+        valid[b, :k] = True
+    mask_idx = torch.zeros(B, M, dtype=torch.int64)
+    for b, k in enumerate(n_valid):
+        mask_idx[b, :k] = torch.arange(2, 2 + k)
+    true_bg = _targets(B, M, seed=1)
+
+    q_tau, median = _fan(B, M, seed=2)
+    total, comps = risk_total_loss(q_tau, median, true_bg, KendallGalWeighting(),
+                                   valid=valid, mask_idx=mask_idx)
+    total.backward()
+    assert float(q_tau.grad[~valid].abs().max()) == 0.0
+    assert float(q_tau.grad[valid].abs().max()) > 0.0
+
+    y_risk = kovatchev_f_target(true_bg)
+    dense = ((median.detach()[valid] - y_risk[valid]) ** 2).mean()
+    assert torch.allclose(comps['loss_M'], dense, atol=1e-6), (
+        f"loss_M {float(comps['loss_M']):.6f} != dense MSE over valid slots {float(dense):.6f}")
+    assert float(comps['loss_D']) == 0.0
+    print(f"\n[DUMP] mse padded | valid counts {n_valid}; pad grad exactly 0; "
+          f"loss_M={float(comps['loss_M']):.4f} == dense over valid ✓")
+
+
+def test_mse_all_padded_and_exact_fit_are_exact_zero(monkeypatch):
+    """At ``MSE_ALPHA == 1`` an all-padded batch and an exact fit both give ``loss_M``
+    exactly 0.0 with a finite gradient — the clamped denominator, not a 0/0."""
+    import config
+    from utils import kovatchev_f_target
+    monkeypatch.setattr(config, 'MSE_ALPHA', 1.0)
+    B, M = 3, MAX_MASKED_PATCHES
+    true_bg = _targets(B, M, seed=3)
+
+    q_tau, median = _fan(B, M, seed=4)
+    total, comps = risk_total_loss(q_tau, median, true_bg, KendallGalWeighting(),
+                                   valid=torch.zeros(B, M, dtype=torch.bool))
+    assert float(comps['loss_M']) == 0.0
+    assert torch.isfinite(total)
+
+    offs = torch.tensor(QUANTILE_LEVELS) - 0.5
+    y_risk = kovatchev_f_target(true_bg)
+    q_fit = (y_risk.unsqueeze(-1) + offs).requires_grad_(True)
+    m_fit = q_fit[..., QUANTILE_LEVELS.index(0.5)]
+    assert torch.equal(m_fit, y_risk)
+    total_fit, comps_fit = risk_total_loss(q_fit, m_fit, true_bg, KendallGalWeighting())
+    assert float(comps_fit['loss_M']) == 0.0
+    total_fit.backward()
+    assert torch.isfinite(q_fit.grad).all(), "exact fit leaked a non-finite gradient"
+    print(f"\n[DUMP] mse exact zero | all-padded loss_M={float(comps['loss_M'])}, "
+          f"exact-fit loss_M={float(comps_fit['loss_M'])}, grad finite ✓")
+
+
 def test_dense_defaults_reproduce_the_right_edge_case():
     """``valid=None`` and ``mask_idx=None`` are the dense right-edge case.
 

@@ -204,7 +204,7 @@ between 84 and 168 hours, the window may start at any patch-aligned position in 
 day, so day and night are learned by one model without a band restriction, and
 the masked spans are drawn per sample.
 
-The loss combines two terms, both in risk space:
+The loss has three terms, all in risk space:
 
 - **Pinball loss** over all seven quantile levels, which calibrates each level to
   its coverage and pins the median pointwise.
@@ -213,9 +213,12 @@ The loss combines two terms, both in risk space:
   right excursion a step early is not punished as though it predicted the wrong
   excursion. The temporal term is evaluated as a directional derivative of the
   soft-DTW value, which avoids materialising the alignment matrix.
+- **MSE** on the median, in risk space, sharing DILATE's slot as
+  `(1 − MSE_ALPHA)·DILATE + MSE_ALPHA·MSE`. `MSE_ALPHA` in `config.py`:
+  0 is DILATE only, 1 is MSE only.
 
-The two are fused by learned Kendall-Gal homoscedastic uncertainty weights: two
-log-variance scalars, trained alongside the model, so the trade-off is learned
+Pinball and the DILATE/MSE slot are fused by learned Kendall-Gal homoscedastic
+uncertainty weights: two log-variance scalars, trained alongside the model, so the trade-off is learned
 rather than fixed.
 
 Other details worth knowing:

@@ -1,8 +1,8 @@
-"""Risk-space BG loss: pinball + per-span DILATE, Kendall-Gal weighted.
+"""Risk-space BG loss: pinball + (per-span DILATE mixed with MSE), Kendall-Gal weighted.
 
 The supervised set is a window's MASKED patches, gathered into the head's ``M``
-slots; a padded slot gathers patch 0, so neither term may reduce over the slot
-axis by shape alone — both take the ``(B, M)`` ``valid`` flag. ``kovatchev_f_target``
+slots; a padded slot gathers patch 0, so no term may reduce over the slot
+axis by shape alone — every term takes the ``(B, M)`` ``valid`` flag. ``kovatchev_f_target``
 is the only (b)->(c) bridge on the target path and runs once, at the top of
 :func:`risk_total_loss`. fp32 throughout — no autocast, no bf16.
 """
@@ -91,6 +91,33 @@ def pinball_loss(
     return (rho * w[:, :, None, None]).sum() / denom
 
 
+def mse_loss(
+    median: torch.Tensor,
+    y_risk: torch.Tensor,
+    valid: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``mean (median − y_risk)²`` over every valid (slot, step), risk space.
+
+    median / y_risk ``(B, M, PATCH_SIZE)``; valid ``(B, M)``, ``None`` = every slot real.
+    Same denominator rule as :func:`pinball_loss`: weight mass · S, clamped at 1, so an
+    all-padded batch returns an exact 0.0.
+    """
+    assert median.dim() == 3, f"median must be (B,M,S), got {tuple(median.shape)}"
+    assert median.shape == y_risk.shape, (
+        f"median {tuple(median.shape)} and y_risk {tuple(y_risk.shape)} must match"
+    )
+    assert valid is None or tuple(valid.shape) == tuple(median.shape[:2]), (
+        f"valid {None if valid is None else tuple(valid.shape)} must be "
+        f"(B,M) = {tuple(median.shape[:2])}"
+    )
+    sq = (median - y_risk) ** 2  # (B,M,S)
+    if valid is None:
+        return sq.mean()
+    w = valid.to(sq.dtype)  # (B,M)
+    denom = (w.sum() * float(sq.shape[2])).clamp_min(1.0)
+    return (sq * w[:, :, None]).sum() / denom
+
+
 # ``(p, s, device)`` keys whose monotonicity sentinel has run: sort + equal force a
 # host sync, and the probe depends on nothing else.
 _PATCH_MAJOR_PROBE_VERIFIED: set = set()
@@ -175,9 +202,11 @@ def risk_total_loss(
     valid: Optional[torch.Tensor] = None,
     mask_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Pinball + per-span DILATE, Kendall-Gal weighted. The target is f-transformed once, here.
+    """Pinball + (per-span DILATE mixed with MSE), Kendall-Gal weighted. The target is f-transformed once, here.
 
-    ``L = ½·exp(−2·log_σ_Q)·L_Q + log_σ_Q + ½·exp(−2·log_σ_D)·L_D + log_σ_D``, log-σ clamped [-7, 7].
+    ``L = ½·exp(−2·log_σ_Q)·L_Q + log_σ_Q + ½·exp(−2·log_σ_D)·L_DR + log_σ_D``, log-σ clamped [-7, 7],
+    ``L_DR = (1 − MSE_ALPHA)·L_D + MSE_ALPHA·L_M``. ``MSE_ALPHA == 0`` skips the MSE;
+    ``== 1`` skips the soft-DTW, and ``loss_D`` / every ``loss_D_L{L}`` log as 0.
 
     DILATE runs on the MEDIAN only, once per masked SPAN: spans bucketed by length ``L``,
     each stacked ``(n_b, L*S)`` patch-major for one :func:`dilate.dilate_loss` call.
@@ -216,19 +245,21 @@ def risk_total_loss(
     )
 
     b_size, n_slots, n_steps = median.shape
+    alpha = float(config.MSE_ALPHA)
+    assert 0.0 <= alpha <= 1.0, f"MSE_ALPHA must be in [0, 1], got {alpha}"
 
-    # (b)->(c) target bridge, EXACTLY ONCE, shared by both terms.
+    # (b)->(c) target bridge, EXACTLY ONCE, shared by every term.
     y_risk = kovatchev_f_target(true_bg_mgdl)  # (B,M,S) risk space
 
     loss_Q = pinball_loss(q_tau, y_risk, config.QUANTILE_LEVELS, valid=valid)
 
     buckets = _span_buckets(mask_idx, valid, b_size, n_slots)
+    n_spans_total = sum(len(rows_l) for rows_l, _ in buckets.values())
+    n_masked_total = sum(len(rows_l) * length for length, (rows_l, _) in buckets.items())
     dev = median.device
     per_bucket: Dict[int, torch.Tensor] = {}
     num_loss = num_shape = num_tdi = None
-    n_spans_total = 0
-    n_masked_total = 0
-    for length in sorted(buckets):
+    for length in (sorted(buckets) if alpha < 1.0 else ()):
         rows_l, starts_l = buckets[length]
         n_b = len(rows_l)
         if n_b == 0:
@@ -252,11 +283,9 @@ def risk_total_loss(
         num_shape = s_b * w if num_shape is None else num_shape + s_b * w
         num_tdi = t_b * w if num_tdi is None else num_tdi + t_b * w
         per_bucket[length] = l_b.detach()
-        n_spans_total += n_b
-        n_masked_total += n_b * length
 
     if num_loss is None:
-        # Every slot padded: an exact zero on the loss dtype/device, not a 0/0 NaN.
+        # Every slot padded, or MSE only: an exact zero on the loss dtype/device, not a 0/0 NaN.
         loss_D = median.new_zeros(())
         loss_D_shape = median.new_zeros(())
         loss_D_tdi = median.new_zeros(())
@@ -266,13 +295,18 @@ def risk_total_loss(
         loss_D_shape = num_shape / denom
         loss_D_tdi = num_tdi / denom
 
+    loss_M = (mse_loss(median, y_risk, valid=valid) if alpha > 0.0
+              else median.new_zeros(()))
+    loss_DR = (1.0 - alpha) * loss_D + alpha * loss_M
+
     log_sigma_Q, log_sigma_D = weighting.clamped()
     total = (0.5 * torch.exp(-2.0 * log_sigma_Q) * loss_Q + log_sigma_Q
-             + 0.5 * torch.exp(-2.0 * log_sigma_D) * loss_D + log_sigma_D)
+             + 0.5 * torch.exp(-2.0 * log_sigma_D) * loss_DR + log_sigma_D)
 
     components: Dict[str, torch.Tensor] = {
         "loss_Q": loss_Q.detach(),
         "loss_D": loss_D.detach(),
+        "loss_M": loss_M.detach(),
         "loss_D_shape": loss_D_shape.detach(),
         "loss_D_tdi": loss_D_tdi.detach(),
         "log_sigma_Q": log_sigma_Q.detach(),

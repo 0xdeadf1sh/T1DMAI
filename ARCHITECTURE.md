@@ -465,7 +465,7 @@ bit-identical to a model without it.
 
 `risk_loss.risk_total_loss(q_tau, median, true_bg_mgdl, weighting, valid,
 mask_idx, d)`. The mg/dL target crosses into risk space exactly once, at the top,
-and both terms share the result. `valid` and `mask_idx` are what make the
+and every term shares the result. `valid` and `mask_idx` are what make the
 supervised set the masked patches rather than the head's slot axis; their
 defaults describe a single dense right-edge span.
 
@@ -529,6 +529,24 @@ overflow guard: a single cell peaks at
 overflow-free in fp32 down to `γ = 1e-3`, and soft-DTW is 1-homogeneous in
 `(cost, γ)`. Smaller γ approaches a hard minimum with a peakier gradient.
 
+### MSE
+
+The median's mean squared error in risk space over every valid `(slot, step)`
+in the batch, under the pinball term's denominator rule:
+
+```
+L_M = mean over (valid slot, step) of (median − y_risk)²
+```
+
+It shares DILATE's Kendall-Gal slot:
+
+```
+L_DR = (1 − MSE_ALPHA) · L_D + MSE_ALPHA · L_M
+```
+
+`MSE_ALPHA = 0` skips the MSE. `MSE_ALPHA = 1` skips the soft-DTW, and
+`loss_D` and every `loss_D_L{L}` log as zero.
+
 ### Kendall-Gal weighting
 
 The two terms are fused by learned homoscedastic-uncertainty weights rather than
@@ -536,7 +554,7 @@ a fixed ratio:
 
 ```
 total = ½·exp(−2·log_σ_Q)·L_Q + log_σ_Q
-      + ½·exp(−2·log_σ_D)·L_D + log_σ_D
+      + ½·exp(−2·log_σ_D)·L_DR + log_σ_D
 ```
 
 Each precision-weighted term is paired with its `+ log_σ` regulariser, which is

@@ -99,6 +99,9 @@ def test_architecture_redesign_constants():
     assert hasattr(config, 'DILATE_TDI_FD_EPS'), "DILATE_TDI_FD_EPS must exist"
     assert 0.0 <= config.DILATE_ALPHA <= 1.0, \
         f"DILATE_ALPHA must be in [0, 1], got {config.DILATE_ALPHA}"
+    assert hasattr(config, 'MSE_ALPHA'), "MSE_ALPHA must exist"
+    assert 0.0 <= config.MSE_ALPHA <= 1.0, \
+        f"MSE_ALPHA must be in [0, 1], got {config.MSE_ALPHA}"
     assert config.DILATE_GAMMA > 0.0, \
         f"DILATE_GAMMA must be > 0, got {config.DILATE_GAMMA}"
     assert config.DILATE_TDI_FD_EPS > 0.0, \
@@ -143,8 +146,8 @@ def test_architecture_redesign_constants():
     assert sorted(n for n in dir(config) if n.startswith('BG_HEAD_')) == \
         ['BG_HEAD_HIDDEN', 'BG_HEAD_INIT_SCALE'], \
         f"stale BG_HEAD_* constant: {[n for n in dir(config) if n.startswith('BG_HEAD_')]}"
-    assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-v3', \
-        f"LOSS_SCHEMA must be 'kendall-pinball-dilate-v3', got {config.LOSS_SCHEMA!r}"
+    assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-mse-v4', \
+        f"LOSS_SCHEMA must be 'kendall-pinball-dilate-mse-v4', got {config.LOSS_SCHEMA!r}"
     print(f"\n[DUMP] redesign | ROPE_BASE={config.ROPE_BASE} "
           f"DILATE_ALPHA={config.DILATE_ALPHA} DILATE_GAMMA={config.DILATE_GAMMA} "
           f"ARCH={config.ARCH_VERSION} LOSS={config.LOSS_SCHEMA} ✓")

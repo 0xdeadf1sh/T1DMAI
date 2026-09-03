@@ -127,14 +127,15 @@ def fig_loss(train, val, outdir: Path) -> None:
 
 
 def fig_loss_components(train, outdir: Path) -> None:
-    """Risk-space loss components: pinball L_Q, DILATE L_D (+ shape / TDI split) and the learned Kendall-Gal log-σ weights."""
+    """Risk-space loss components: pinball L_Q, DILATE L_D (+ shape / TDI split), MSE L_M and the learned Kendall-Gal log-σ weights."""
     comps = [("L_Q  (quantile pinball)", "loss_Q"),
              ("L_D  (DILATE total)", "loss_D"),
              ("L_D shape  (soft-DTW)", "loss_D_shape"),
              ("L_D TDI  (temporal)", "loss_D_tdi"),
+             ("L_M  (median MSE, risk)", "loss_M"),
              ("log σ_Q  (pinball uncertainty)", "log_sigma_Q"),
-             ("log σ_D  (DILATE uncertainty)", "log_sigma_D")]
-    fig, axes = plt.subplots(2, 3, figsize=(12.6, 5.6), sharex=True)
+             ("log σ_D  (DILATE/MSE uncertainty)", "log_sigma_D")]
+    fig, axes = plt.subplots(2, 4, figsize=(16.8, 5.6), sharex=True)
     s = train["step"]
     flat = list(axes.flat)
     for ax, (name, col) in zip(flat, comps):
