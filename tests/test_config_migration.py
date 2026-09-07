@@ -21,7 +21,7 @@ def test_migrated_values_in_sane_ranges():
 
 def test_redesign_provenance_and_knobs_migrated():
     import config
-    assert config.ARCH_VERSION == 'risk-v5'
+    assert config.ARCH_VERSION == 'risk-v6'
     assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-mse-v4'
     assert config.ROPE_BASE == 1000
     assert (hasattr(config, 'DILATE_ALPHA') and hasattr(config, 'DILATE_GAMMA')

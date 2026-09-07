@@ -78,10 +78,11 @@ def _exercise_kernel() -> np.ndarray:
     """Unit-area shape of one mean-length session: ``T1DMSIM.simulator.exercise_curve`` (SPEC §5).
 
     Ramp, plateau over ``EXERCISE_DURATION_MEAN_MIN``, 90-min tail; padded or cut to
-    ``_EXERCISE_KERNEL_MIN`` steps and renormalized. Shape only — the caller supplies the grams.
+    ``_EXERCISE_KERNEL_MIN`` MINUTES and renormalized. Shape only — the caller supplies the grams.
     """
+    _n = _EXERCISE_KERNEL_MIN // DT_MINUTES
     k = np.asarray(exercise_curve(1.0, float(EXERCISE_DURATION_MEAN_MIN)), dtype=np.float64)
-    k = np.concatenate([k, np.zeros(max(0, _EXERCISE_KERNEL_MIN - len(k)))])[:_EXERCISE_KERNEL_MIN]
+    k = np.concatenate([k, np.zeros(max(0, _n - len(k)))])[:_n]
     return k / k.sum()
 
 

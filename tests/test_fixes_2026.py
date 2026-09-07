@@ -529,3 +529,37 @@ def test_loss_components_have_no_retired_keys():
         assert gone not in parts, f"retired key {gone!r} must be gone from components"
     print(f"\n[DUMP] loss components | DILATE/Kendall-Gal keys present, "
           f"TILDE-Q/seam/L_smooth keys absent: {sorted(parts.keys())} ✓")
+
+
+def test_crossing_alarm_auc_gives_tied_probabilities_average_ranks():
+    """A saturated head ties every probability; ordinal ranks made the AUC 0 or 1 by row order."""
+    from train import _crossing_alarm_metrics
+
+    def _auc(pos_at: int) -> float:
+        t = torch.zeros(4, 2, dtype=torch.bool)
+        t[pos_at, 0] = True
+        p = torch.ones(4, 2)                       # sigmoid saturated: every row identical
+        return _crossing_alarm_metrics('xh', [p], [t], 0, 0.5)['xh_auc']
+
+    aucs = [_auc(i) for i in range(4)]
+    print(f"\n[DUMP] all-tied AUC by positive-row position: {aucs} (want 0.5 each)")
+    assert aucs == [0.5, 0.5, 0.5, 0.5], "tied probabilities must score the midpoint"
+
+    # untied ranking is unchanged: a perfect separator is still 1.0
+    t = torch.zeros(4, 2, dtype=torch.bool)
+    t[3, 0] = True
+    p = torch.tensor([[0.1, 0.], [0.2, 0.], [0.3, 0.], [0.9, 0.]])
+    assert _crossing_alarm_metrics('xh', [p], [t], 0, 0.5)['xh_auc'] == 1.0
+
+
+def test_exercise_kernel_horizon_is_minutes_like_its_siblings():
+    """``_*_KERNEL_MIN`` is a minutes horizon; the exercise kernel padded by raw step count."""
+    from metrics.core.features import CARB_KERNEL, BOLUS_KERNEL, EXERCISE_KERNEL
+    from T1DMSIM.simulator import DT_MINUTES
+
+    n = 240 // DT_MINUTES
+    print(f"\n[DUMP] kernel lengths carb/bolus/exercise: "
+          f"{len(CARB_KERNEL)}/{len(BOLUS_KERNEL)}/{len(EXERCISE_KERNEL)} (want {n} each)")
+
+    assert len(CARB_KERNEL) == len(BOLUS_KERNEL) == len(EXERCISE_KERNEL) == n
+    assert abs(float(EXERCISE_KERNEL.sum()) - 1.0) < 1e-12

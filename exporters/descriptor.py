@@ -25,6 +25,13 @@ from utils import _KOVATCHEV_SCALE, _KOVATCHEV_POWER, _KOVATCHEV_OFFSET
 from T1DMSIM.simulator import BG_CLAMP_MIN as _BG_CLAMP_MIN, BG_CLAMP_MAX as _BG_CLAMP_MAX
 
 
+def checkpoint_crossing_thresholds(ck: dict[str, Any]) -> tuple[float, float]:
+    """The hypo/hyper cutoffs the crossing head was TRAINED on; cfg only if the run stored none."""
+    tc = ck.get("training_config") or {}
+    return (float(tc.get("bg_hypo_threshold", cfg.BG_HYPO_THRESHOLD)),
+            float(tc.get("bg_hyper_threshold", cfg.BG_HYPER_THRESHOLD)))
+
+
 def build_descriptor(
     *,
     model_id: str,
@@ -36,6 +43,7 @@ def build_descriptor(
     model_card: dict[str, Any] | None = None,
     head: dict[str, Any] | None = None,
     seq_len: int | None = None,
+    crossing_thresholds: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Assemble the descriptor dict. Pure data, no I/O.
 
@@ -48,6 +56,9 @@ def build_descriptor(
     """
     risk_lo = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     risk_hi = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
+
+    # The head learned the CHECKPOINT's cutoffs; cfg is only a fallback for a caller with none.
+    xh_hypo, xh_hyper = crossing_thresholds or (cfg.BG_HYPO_THRESHOLD, cfg.BG_HYPER_THRESHOLD)
 
     T = int(seq_len or cfg.MAX_SEQ_LEN)
     P = cfg.PREDICTION_PATCHES
@@ -138,8 +149,8 @@ def build_descriptor(
             "output_name": "crossing_logits",
             "shape": [1, M, cfg.PATCH_SIZE, cfg.N_CROSSING],
             "columns": ["hypo", "hyper"],
-            "hypo_mgdl": float(cfg.BG_HYPO_THRESHOLD),
-            "hyper_mgdl": float(cfg.BG_HYPER_THRESHOLD),
+            "hypo_mgdl": float(xh_hypo),
+            "hyper_mgdl": float(xh_hyper),
             "cumulative": True,
             "value_kind": "raw logits; sigmoid gives the probability",
             "detach": cfg.CROSSING_HEAD_DETACH,

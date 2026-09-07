@@ -82,7 +82,7 @@ def main() -> None:
     tl_shape = (1, cfg.MAX_MASKED_PATCHES, cfg.TIME_PROBE_N_BINS)
 
     with torch.no_grad():
-        hr_eager, tl_eager_mod, _hd = wrapper(patches, struct, slot_sel)
+        hr_eager, tl_eager_mod, _hd, _xh = wrapper(patches, struct, slot_sel)
     tl_eager = eager_time_logits(model, w)   # stock return_time path
     d_stock = float((hr_eager - stock_head_raw(model, w)).abs().max())
     print(f"[verify] modified(struct) vs stock(bool) head_raw  max|Δ| = {d_stock:.3e}")

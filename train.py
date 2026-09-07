@@ -247,8 +247,10 @@ def _crossing_alarm_metrics(
         f'{name}_brier': float(((p - t.double()) ** 2).mean()),
     }
     if n_pos and n_neg:
-        # Mann-Whitney AUC: mean rank of the positives, ties at half.
-        ranks = torch.argsort(torch.argsort(p)).double() + 1.0
+        # Mann-Whitney AUC on AVERAGE ranks, so a tie group scores the midpoint (0.5 each).
+        _ps = torch.sort(p).values.contiguous()
+        ranks = (torch.searchsorted(_ps, p, right=False).double()
+                 + torch.searchsorted(_ps, p, right=True).double() + 1.0) / 2.0
         auc = (ranks[t].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
         out[f'{name}_auc'] = float(auc)
     else:
@@ -2878,7 +2880,8 @@ def _run_validation(
         'val_loss_D': totals['loss_D'] / n,
         'val_loss_M': totals['loss_M'] / n,
         'val_pinball': totals['pinball'] / n,
-        'val_loss_xh': totals['loss_xh'] / n,
+        'val_loss_xh': (totals['loss_xh'] / n
+                        if model.crossing_head is not None else float('nan')),
         'log_sigma_Q': float(weighting.log_sigma_Q.detach()),
         'log_sigma_D': float(weighting.log_sigma_D.detach()),
     }
@@ -3887,7 +3890,7 @@ def train(
             _xh_loss_val = float('nan')     # logged as loss_xh
             if crossing is not None:
                 _xh_tgt = crossing_targets(
-                    targets, mask_idx, slot_valid, BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD)
+                    targets, mask_idx, slot_valid, bg_hypo_threshold, bg_hyper_threshold)
                 _xh_bce = F.binary_cross_entropy_with_logits(
                     crossing[slot_valid].float(), _xh_tgt[slot_valid])
                 if torch.isfinite(_xh_bce):

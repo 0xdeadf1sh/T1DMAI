@@ -356,8 +356,8 @@ class T1DMAI(nn.Module):
         nn.init.normal_(final.weight, mean=0.0, std=BG_HEAD_INIT_SCALE)
         nn.init.zeros_(final.bias)
 
-        # LAST, so every forecast-weight RNG draw above is byte-identical to a model
-        # built without the probe.
+        # LAST and under a saved RNG state: the probe consumes none of the init stream.
+        _probe_state = torch.random.get_rng_state()
         if self.time_head is not None:
             for module in self.time_head.modules():
                 if isinstance(module, nn.Linear):
@@ -366,6 +366,7 @@ class T1DMAI(nn.Module):
             tfinal = self.time_head[-1]
             nn.init.normal_(tfinal.weight, mean=0.0, std=TIME_PROBE_INIT_SCALE)
             nn.init.zeros_(tfinal.bias)
+        torch.random.set_rng_state(_probe_state)
         # After the probe, so a model built with either head alone is byte-identical elsewhere.
         if self.crossing_head is not None:
             for module in self.crossing_head.modules():

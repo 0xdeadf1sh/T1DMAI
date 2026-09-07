@@ -34,7 +34,8 @@ from exporters.modified_forward import (
     build_struct_mask_from_visible, load_model, window_labels, NEG_FILL,
 )
 from exporters.descriptor import (
-    build_descriptor, build_model_card, deploy_to_server, write_descriptor,
+    build_descriptor, build_model_card, checkpoint_crossing_thresholds, deploy_to_server,
+    write_descriptor,
 )
 from exporters.head_weights import write_head_weights
 
@@ -553,6 +554,7 @@ def main() -> None:
         model_id=args.model_id, engine=ENGINE, executorch_version=et_ver,
         artifact_filename=pte_name, normalization_stats=stats, precision="fp32",
         model_card=build_model_card(model, ck), head=head_block, seq_len=T,
+        crossing_thresholds=checkpoint_crossing_thresholds(ck),
     )
     # named after the artifact, since several models share one out-dir; ModelStore globs `*.descriptor.json`
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.xnnpack.descriptor.json")
