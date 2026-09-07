@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 
 from config import (                                           # noqa: E402
@@ -38,6 +39,7 @@ from config import (                                           # noqa: E402
     PREDICTION_HORIZON_HOURS, NIGHT_LONG_HORIZON_HOURS, NIGHT_LONG_HORIZON_PATCHES,
     QUANTILE_LEVELS, N_QUANTILES,
     TIME_PROBE_LOSS_WEIGHT, TIME_PROBE_N_BINS,
+    CROSSING_LOSS_WEIGHT, HYPO_ALARM_PROB, HYPER_ALARM_PROB,
     TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_CROSS_WINDOW_WEIGHT, TIME_PROBE_CROSS_WINDOW_FRACTION,
 )
 
@@ -47,6 +49,7 @@ from utils import (
     ModelEMA, kovatchev_f_inv, create_attention_mask_from_visible,
     time_of_day_bin_ce, time_of_day_decode_bins, time_of_day_resultant,
     circular_hour_error, circular_hour_residual, circular_bias_hours, circular_std_hours,
+    crossing_targets,
 )
 
 from T1DMSIM.simulator import (
@@ -223,6 +226,34 @@ def _median_to_mgdl(median_risk: torch.Tensor) -> torch.Tensor:
         f"[{BG_CLAMP_MIN}, {BG_CLAMP_MAX}]"
     )
     return pred_bg
+
+
+def _crossing_alarm_metrics(
+    name: str, prob: list[torch.Tensor], true: list[torch.Tensor], col: int, threshold: float,
+) -> dict[str, Any]:
+    """Window-level alarm figures of one crossing column: recall, precision, AUC, Brier, counts."""
+    keys = ('recall', 'precision', 'auc', 'brier', 'n_events', 'n_windows')
+    if not prob:
+        return {f'{name}_{k}': None for k in keys}
+    p = torch.cat(prob)[:, col].double()
+    t = torch.cat(true)[:, col].bool()
+    n_pos, n_neg = int(t.sum()), int((~t).sum())
+    fired = p > threshold
+    tp = int((fired & t).sum())
+    out: dict[str, Any] = {
+        f'{name}_n_events': float(n_pos), f'{name}_n_windows': float(t.numel()),
+        f'{name}_recall': tp / n_pos if n_pos else None,
+        f'{name}_precision': tp / int(fired.sum()) if int(fired.sum()) else None,
+        f'{name}_brier': float(((p - t.double()) ** 2).mean()),
+    }
+    if n_pos and n_neg:
+        # Mann-Whitney AUC: mean rank of the positives, ties at half.
+        ranks = torch.argsort(torch.argsort(p)).double() + 1.0
+        auc = (ranks[t].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+        out[f'{name}_auc'] = float(auc)
+    else:
+        out[f'{name}_auc'] = None
+    return out
 
 
 def compute_learning_metrics(
@@ -1372,6 +1403,8 @@ def _build_optimizers(
     output_weight_ids = {id(model.bg_head[-1].weight)}
     if getattr(model, "time_head", None) is not None:
         output_weight_ids.add(id(model.time_head[-1].weight))
+    if getattr(model, "crossing_head", None) is not None:
+        output_weight_ids.add(id(model.crossing_head[-1].weight))
 
     muon_normalized = []   # normalized matrices — get the gamma_t/gamma_max decay correction
     muon_output = []       # output projections — plain (uncorrected) decay
@@ -2556,8 +2589,12 @@ def _run_validation(
     ``risk_total_loss``, with ``val_loss_D`` surfaced from its components.
     """
     model.eval()
-    totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0, 'pinball': 0.0}
+    totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0,
+                                'pinball': 0.0, 'loss_xh': 0.0}
     n_samples = 0
+    # Crossing-head alarm on the forecast protocol: window-end probability vs true crossing.
+    xh_prob: list[torch.Tensor] = []
+    xh_true: list[torch.Tensor] = []
 
     agg: dict[str, float] = {}
     night_agg: dict[str, float] = {}
@@ -2611,9 +2648,14 @@ def _run_validation(
             slot_hour = bg_formula['slot_hour'].float()                   # (B, M) hours
 
             # --- Objective forward: the sample's own masked set ---
-            q_tau_obj, median_obj, time_pred = model(
-                patches, attn_mask, anchor_bg, mask_idx, return_time=True)
+            q_tau_obj, median_obj, time_pred, crossing_obj = model(
+                patches, attn_mask, anchor_bg, mask_idx, return_time=True, return_crossing=True)
             B_batch = median_obj.shape[0]
+            if crossing_obj is not None:
+                _xh_tgt = crossing_targets(
+                    targets, mask_idx, slot_valid, bg_hypo_threshold, bg_hyper_threshold)
+                totals['loss_xh'] += float(F.binary_cross_entropy_with_logits(
+                    crossing_obj[slot_valid].float(), _xh_tgt[slot_valid])) * B_batch
 
             # f is applied to the target exactly once inside risk_total_loss. ``valid`` is what
             # keeps the padded slots — 41.8% of head output on the average sample — from being
@@ -2685,10 +2727,10 @@ def _run_validation(
             if fc is None:
                 continue
             fc_rows = fc['rows']
-            q_tau, median = model(
+            q_tau, median, _tp_fc, crossing_fc = model(
                 fc['patches'], fc['attn_mask'], bg_formula['last_bg'].float()[fc_rows]
                 .unsqueeze(1).expand(-1, PREDICTION_PATCHES),
-                fc['mask_idx'],
+                fc['mask_idx'], return_crossing=True,
             )
             q_tau = q_tau.float()
             median = median.float()
@@ -2708,6 +2750,14 @@ def _run_validation(
                 bg_formula['true_bg_trajectory'][:, :PREDICTION_PATCHES * PATCH_SIZE]
                 .float().reshape(-1, PREDICTION_PATCHES, PATCH_SIZE)
             )
+            if crossing_fc is not None:
+                # Window-end probability of the trailing span: the last step of its last slot.
+                _p_end = torch.sigmoid(crossing_fc[:, PREDICTION_PATCHES - 1, -1, :].float())
+                _t_flat = true_bg_full.reshape(B_fc, -1)
+                _t_end = torch.stack([(_t_flat < bg_hypo_threshold).any(dim=1),
+                                      (_t_flat > bg_hyper_threshold).any(dim=1)], dim=-1)
+                xh_prob.append(_p_end.detach().cpu())
+                xh_true.append(_t_end.detach().cpu())
 
             # pred_bg: the SOLE headline forecast.
             pred_bg = _median_to_mgdl(median)                            # (B_fc, P*S)
@@ -2828,9 +2878,15 @@ def _run_validation(
         'val_loss_D': totals['loss_D'] / n,
         'val_loss_M': totals['loss_M'] / n,
         'val_pinball': totals['pinball'] / n,
+        'val_loss_xh': totals['loss_xh'] / n,
         'log_sigma_Q': float(weighting.log_sigma_Q.detach()),
         'log_sigma_D': float(weighting.log_sigma_D.detach()),
     }
+
+    # ---- Crossing-head alarm (diagnostic; NOT in any loss total) ----
+    for _side, _col, _thr in (('hypo', 0, HYPO_ALARM_PROB), ('hyper', 1, HYPER_ALARM_PROB)):
+        result.update(_crossing_alarm_metrics(
+            f'xh_{_side}', xh_prob, xh_true, _col, _thr))
 
     # ---- Time-of-day probe (diagnostic; NOT in any loss total) ----
     # Point accuracy plus clock reliability over the full val distribution: the bias/precision
@@ -3279,7 +3335,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
         *[(f'loss_D_L{L}', 6) for L in MASK_SPAN_LENGTHS],
         *[(f'n_spans_L{L}', 3) for L in MASK_SPAN_LENGTHS],
         ('n_masked_mean', 3), ('n_spans_mean', 3),
-        ('loss_tod', 6), ('loss_tod_xwin', 6),
+        ('loss_tod', 6), ('loss_tod_xwin', 6), ('loss_xh', 6),
         ('log_sigma_Q', 6), ('log_sigma_D', 6),
         ('grad_norm', 6), ('lr_muon', 8), ('lr_adam', 8),
         ('step_time_seconds', 4), ('gpu_memory_mb', 1),
@@ -3369,6 +3425,10 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),
         ('tod_mae_hiconf', 4),
         ('tod_jump_h', 4), ('tod_xwin_jump_h', 4),
+        # Crossing head: objective-forward BCE, and the window-end alarm at HYPO/HYPER_ALARM_PROB.
+        ('val_loss_xh', 6),
+        *[(f'xh_{s}_{k}', 4) for s in ('hypo', 'hyper')
+          for k in ('recall', 'precision', 'auc', 'brier', 'n_events', 'n_windows')],
         # Protocol coverage: how much of the val set each protocol saw. fc_n counts the forecast
         # windows (a row whose context-edge patch is masked has no visible anchor and is
         # dropped); roll_ctx_patches is the mean VISIBLE context the rolling passes ran on.
@@ -3754,8 +3814,8 @@ def train(
         # path instead of aborting the run.
         try:
             # Forward (fp32-native — no autocast).
-            q_tau, median, time_pred = model(
-                patches, attn_mask, anchor_bg, mask_idx, return_time=True)
+            q_tau, median, time_pred, crossing = model(
+                patches, attn_mask, anchor_bg, mask_idx, return_time=True, return_crossing=True)
             q_tau = q_tau.float()
             median = median.float()
 
@@ -3822,7 +3882,18 @@ def train(
                             _tod_xwin_val = float(_tod_xwin.detach())
                 if torch.isfinite(_tod_loss):
                     _tod_extra = TIME_PROBE_LOSS_WEIGHT * _tod_loss
-            loss_backward = loss_total + _tod_extra
+            # Crossing head: BCE against the cumulative crossing indicator, backward only.
+            _xh_extra = loss_total.new_zeros(())
+            _xh_loss_val = float('nan')     # logged as loss_xh
+            if crossing is not None:
+                _xh_tgt = crossing_targets(
+                    targets, mask_idx, slot_valid, BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD)
+                _xh_bce = F.binary_cross_entropy_with_logits(
+                    crossing[slot_valid].float(), _xh_tgt[slot_valid])
+                if torch.isfinite(_xh_bce):
+                    _xh_loss_val = float(_xh_bce.detach())
+                    _xh_extra = CROSSING_LOSS_WEIGHT * _xh_bce
+            loss_backward = loss_total + _tod_extra + _xh_extra
 
             if not torch.isfinite(loss_backward):
                 _skip_nonfinite_step("NaN/Inf total loss")
@@ -3887,6 +3958,7 @@ def train(
             log_sigma_d = float(parts.get('log_sigma_D', float('nan')))
             loss_tod = _tod_loss_val
             loss_tod_xwin = _tod_xwin_val
+            loss_xh = _xh_loss_val
 
             print(
                 f"Step {step:>6}/{total_steps} | "
@@ -3894,7 +3966,7 @@ def train(
                 f"L_Q: {loss_q:.4f}  L_D: {loss_d:.4f} "
                 f"(sh={loss_d_shape:.4f} tdi={loss_d_tdi:.4f})  L_M: {loss_m:.4f} | "
                 f"logσ: Q={log_sigma_q:+.4f} D={log_sigma_d:+.4f} | "
-                f"L_tod: {loss_tod:.4f} (xwin {loss_tod_xwin:.4f}) | "
+                f"L_tod: {loss_tod:.4f} (xwin {loss_tod_xwin:.4f}) | L_xh: {loss_xh:.4f} | "
                 f"Grad: {grad_norm_val:.3f} | "
                 f"LR_muon: {cur_lr_muon:.6f} | LR_adam: {cur_lr_adam:.6f} | "
                 f"Time: {step_time:.2f}s"
@@ -3911,7 +3983,7 @@ def train(
                    if k.startswith('loss_D_L') or k.startswith('n_spans_L')},
                 'n_masked_mean': float(parts.get('n_masked_mean', float('nan'))),
                 'n_spans_mean': float(parts.get('n_spans_mean', float('nan'))),
-                'loss_tod': loss_tod, 'loss_tod_xwin': loss_tod_xwin,
+                'loss_tod': loss_tod, 'loss_tod_xwin': loss_tod_xwin, 'loss_xh': loss_xh,
                 'log_sigma_Q': log_sigma_q, 'log_sigma_D': log_sigma_d,
                 'grad_norm': grad_norm_val,
                 'lr_muon': cur_lr_muon, 'lr_adam': cur_lr_adam,
@@ -4030,6 +4102,10 @@ def train(
                 'tod_mae_hiconf': _r(val_metrics.get('tod_mae_hiconf')),
                 'tod_jump_h': _r(val_metrics.get('tod_jump_h')),
                 'tod_xwin_jump_h': _r(val_metrics.get('tod_xwin_jump_h')),
+                'val_loss_xh': _r(val_metrics.get('val_loss_xh'), 6),
+                **{f'xh_{s}_{k}': _r(val_metrics.get(f'xh_{s}_{k}'))
+                   for s in ('hypo', 'hyper')
+                   for k in ('recall', 'precision', 'auc', 'brier', 'n_events', 'n_windows')},
                 # How much of the val set each protocol saw.
                 'fc_n': val_metrics.get('fc_n'),
                 'roll_ctx_patches': _r(val_metrics.get('roll_ctx_patches'), 3),

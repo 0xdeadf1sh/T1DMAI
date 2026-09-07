@@ -223,6 +223,16 @@ def eager_time_logits(model, w: Window) -> torch.Tensor:
     return time_pred
 
 
+def eager_crossing_logits(model, w: Window) -> torch.Tensor:
+    """Stock forward's crossing logits, the reference for the exported ``crossing_logits``."""
+    with torch.no_grad():
+        _q, _m, _t, crossing = model(
+            w.patches, w.bool_mask, w.anchors, w.mask_idx, return_crossing=True,
+        )
+    assert crossing is not None, "eager forward returned crossing=None (head absent)"
+    return crossing
+
+
 def head_from_hidden(
     head_path: str, block: dict, hidden: torch.Tensor, w: Window,
 ) -> torch.Tensor:
@@ -459,15 +469,17 @@ def main() -> None:
     hr_shape = (1, m, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
     tl_shape = (1, m, cfg.TIME_PROBE_N_BINS)
     hd_shape = (1, T, cfg.D_MODEL)
+    xl_shape = (1, m, cfg.PATCH_SIZE, cfg.N_CROSSING)
 
     # (1) modified (struct + slot_sel) vs stock (bool + gather)
     deltas: dict[str, float] = {}
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         with torch.no_grad():
-            hr_mod, tl_mod, hd_mod = wrapper(w.patches, w.struct, w.slot_sel)
+            hr_mod, tl_mod, hd_mod, xl_mod = wrapper(w.patches, w.struct, w.slot_sel)
         assert hr_mod.shape == hr_shape, f"{name}: head_raw {tuple(hr_mod.shape)} != {hr_shape}"
         assert tl_mod.shape == tl_shape, f"{name}: time_logits {tuple(tl_mod.shape)} != {tl_shape}"
         assert hd_mod.shape == hd_shape, f"{name}: hidden {tuple(hd_mod.shape)} != {hd_shape}"
+        assert xl_mod.shape == xl_shape, f"{name}: crossing_logits {tuple(xl_mod.shape)} != {xl_shape}"
         hr_stock = stock_head_raw(model, w)
         # REAL slots only: a padded slot repeats patch 0 on both paths and nothing downstream reads it
         n = w.n_masked
@@ -495,15 +507,20 @@ def main() -> None:
     # (2) .pte vs eager modified, on BOTH masked sets
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         outs = run_pte_outputs(pte_work, w.patches, w.struct, w.slot_sel)
-        assert len(outs) == 3, (
-            f"expected 3 .pte outputs (head_raw, time_logits, hidden), got {len(outs)}"
+        assert len(outs) == 4, (
+            f"expected 4 .pte outputs (head_raw, time_logits, hidden, crossing_logits), got {len(outs)}"
         )
         hr_pte = outs[0].reshape(hr_shape)
         tl_pte = outs[1].reshape(tl_shape)
         hd_pte = outs[2].reshape(hd_shape)
+        xl_pte = outs[3].reshape(xl_shape)
         with torch.no_grad():
-            hr_mod, _tl_mod, _hd_mod = wrapper(w.patches, w.struct, w.slot_sel)
+            hr_mod, _tl_mod, _hd_mod, _xl_mod = wrapper(w.patches, w.struct, w.slot_sel)
         n = w.n_masked
+        xl_eager = eager_crossing_logits(model, w)
+        deltas[f"crossing_{name}"] = float((xl_pte[:, :n] - xl_eager[:, :n]).abs().max())
+        print(f"[verify] pte vs eager crossing     ({name:8s})     max|Δ| = "
+              f"{deltas[f'crossing_{name}']:.3e}")
         deltas[f"pte_{name}"] = float((hr_pte[:, :n] - hr_mod[:, :n]).abs().max())
         print(f"[verify] pte vs eager head_raw     ({name:8s})     max|Δ| = "
               f"{deltas[f'pte_{name}']:.3e}")

@@ -256,6 +256,31 @@ def test_predict_return_time_contract():
         print("\n[DUMP] predict return_time | probe disabled, time_pred is None")
 
 
+def test_predict_return_crossing_contract():
+    """``crossing`` is (P, S, 2) probabilities in [0, 1], absent by default, fan untouched."""
+    from inference import predict
+    from model import T1DMAI
+    from config import PREDICTION_PATCHES, PATCH_SIZE, N_CROSSING, CROSSING_HEAD_ENABLED
+
+    model = T1DMAI().eval()
+    stats = _get_stats()
+    context = _make_context()
+    base = predict(model, context, normalization_stats=stats)
+    crossed = predict(model, context, normalization_stats=stats, return_crossing=True)
+
+    assert 'crossing' not in base
+    assert 'crossing' in crossed
+    assert torch.equal(base['q_tau'], crossed['q_tau'])
+    c = crossed['crossing']
+    if CROSSING_HEAD_ENABLED:
+        assert c.shape == (PREDICTION_PATCHES, PATCH_SIZE, N_CROSSING)
+        assert bool(((c >= 0.0) & (c <= 1.0)).all())
+        print(f"\n[DUMP] predict crossing | shape {tuple(c.shape)} "
+              f"p range [{c.min():.3f}, {c.max():.3f}]")
+    else:
+        assert c is None
+
+
 def test_predict_what_if_return_time_forwarded():
     from inference import predict_what_if
     from model import T1DMAI

@@ -122,6 +122,28 @@ def build_descriptor(
                         "and feed the head block's weights to reproduce head_raw, with "
                         "or without a low-rank adapter.",
             },
+            "output_crossing_logits": {
+                "name": "crossing_logits", "output_index": 3,
+                "shape": [1, M, cfg.PATCH_SIZE, cfg.N_CROSSING],
+                "dtype": precision, "space": "raw-logits",
+                "note": "(B, M, S, 2): per-step cumulative crossing logits off the same "
+                        "step states as head_raw; sigmoid downstream. Thresholds and "
+                        "column order in the crossing section below (SPEC/inference.md §8.5).",
+            },
+        },
+
+        # Crossing head (SPEC/inference.md §8.5): the thresholds are the checkpoint's own.
+        "crossing": {
+            "output_index": 3,
+            "output_name": "crossing_logits",
+            "shape": [1, M, cfg.PATCH_SIZE, cfg.N_CROSSING],
+            "columns": ["hypo", "hyper"],
+            "hypo_mgdl": float(cfg.BG_HYPO_THRESHOLD),
+            "hyper_mgdl": float(cfg.BG_HYPER_THRESHOLD),
+            "cumulative": True,
+            "value_kind": "raw logits; sigmoid gives the probability",
+            "detach": cfg.CROSSING_HEAD_DETACH,
+            "co_trains_trunk": not cfg.CROSSING_HEAD_DETACH,
         },
 
         # Time-of-day probe (PLAN §7): each prediction patch's ABSOLUTE hour-of-day over N_BINS circular

@@ -131,3 +131,9 @@ def test_descriptor_drops_the_retired_head_constants_and_names_the_decoder(tmp_p
         "l0.weight", "l0.bias", "l1.weight", "l1.bias", "l2.weight", "l2.bias"]
     assert desc["io"]["output_hidden"]["name"] == "hidden"
     assert desc["arch_version"] == cfg.ARCH_VERSION
+    xo = desc["io"]["output_crossing_logits"]
+    xs = desc["crossing"]
+    assert xo["output_index"] == 3 and xs["output_index"] == 3
+    assert xo["shape"] == [1, cfg.MAX_MASKED_PATCHES, cfg.PATCH_SIZE, cfg.N_CROSSING]
+    assert xs["columns"] == ["hypo", "hyper"] and xs["cumulative"] is True
+    assert xs["hypo_mgdl"] == cfg.BG_HYPO_THRESHOLD and xs["hyper_mgdl"] == cfg.BG_HYPER_THRESHOLD

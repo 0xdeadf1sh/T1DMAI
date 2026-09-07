@@ -32,16 +32,10 @@ NEG_FILL: float = -30000.0
 
 
 class HeadRawForward(nn.Module):
-    """``forward(patches, struct, slot_sel)`` over a loaded ``T1DMAI``: only the plumbing changes.
+    """``forward(patches, struct, slot_sel)`` over a loaded ``T1DMAI``; the tail is dropped.
 
-    The model's own submodules are reused; the tail (``assemble_quantiles``) is dropped.
-    THREE outputs, in this fixed order:
-
-      0. ``head_raw``    (B, M, PATCH_SIZE, 1 + 2*N_SPREADS) risk space
-      1. ``time_logits`` (B, M, TIME_PROBE_N_BINS) raw hour-of-day bin logits, off the SAME final-normed
-         hidden states the BG head reads; no clock input, so it is a circadian belief read off the
-         trajectory. Softmax downstream, in Rust.
-      2. ``hidden`` (B, T, D_MODEL) — the LoRA seam; a plain forecast reads ``head_raw`` and ignores it.
+    FOUR outputs, fixed order: 0 ``head_raw`` (B, M, S, 1+2*N_SPREADS) risk; 1 ``time_logits``
+    (B, M, N_BINS); 2 ``hidden`` (B, T, D_MODEL), the LoRA seam; 3 ``crossing_logits`` (B, M, S, 2).
     """
 
     def __init__(self, model: T1DMAI) -> None:
@@ -49,6 +43,10 @@ class HeadRawForward(nn.Module):
         assert model.time_head is not None, (
             "checkpoint has no time_head (TIME_PROBE_ENABLED was False at train time); "
             "cannot export the time-probe output"
+        )
+        assert model.crossing_head is not None, (
+            "checkpoint has no crossing_head (CROSSING_HEAD_ENABLED was False at train time); "
+            "cannot export the crossing output"
         )
         self.model = model
 
@@ -81,11 +79,13 @@ class HeadRawForward(nn.Module):
         # slot_sel's rows are one-hot and struct is the additive form of the bool mask, so both of
         # the stock forward's arguments are recoverable — which keeps ONE node rule, step_states'.
         mask_idx = slot_sel.argmax(dim=-1).unsqueeze(0).expand(B, -1)
-        head_raw = m.bg_head(step_states(hidden, mask_idx, struct == 0.0))
+        h_steps = step_states(hidden, mask_idx, struct == 0.0)
+        head_raw = m.bg_head(h_steps)
 
         # same slot hidden states as the eager return_time=True path
         time_logits = m.time_head(slot_states)                       # (B, M, N_BINS)
-        return head_raw, time_logits, hidden
+        crossing_logits = m.crossing_head(h_steps)                   # (B, M, S, N_CROSSING)
+        return head_raw, time_logits, hidden, crossing_logits
 
 
 def build_slot_selection(

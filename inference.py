@@ -347,6 +347,7 @@ def _run_forward(
     device: torch.device | None = None,
     return_time: bool = False,
     grad: bool = False,
+    return_crossing: bool = False,
 ) -> dict[str, Any]:
     """Build one sample, announce its masked set, check the announcement, forward.
 
@@ -407,20 +408,24 @@ def _run_forward(
     if grad:
         patches.requires_grad_(True)
         out = model(
-            patches, attn_mask, anchor_bg, mask_idx_t, return_time=return_time,
+            patches, attn_mask, anchor_bg, mask_idx_t,
+            return_time=return_time, return_crossing=return_crossing,
         )
     else:
         with torch.no_grad():
             out = model(
-                patches, attn_mask, anchor_bg, mask_idx_t, return_time=return_time,
+                patches, attn_mask, anchor_bg, mask_idx_t,
+                return_time=return_time, return_crossing=return_crossing,
             )
     q_tau, median = out[0], out[1]
     time_pred = out[2] if return_time else None
+    crossing = out[3] if return_crossing else None
 
     return {
         'q_tau': q_tau.squeeze(0),                          # (M, PATCH_SIZE, N_QUANTILES)
         'median': median.squeeze(0),                        # (M, PATCH_SIZE)
         'time_pred': None if time_pred is None else time_pred.squeeze(0),
+        'crossing': None if crossing is None else crossing.squeeze(0),  # (M, S, 2) logits
         'mask_idx': mask_idx_t.squeeze(0),                  # (M,) patch index per slot
         'valid': valid_t.squeeze(0),                        # (M,) bool
         'anchor_bg': anchor_bg.squeeze(0),                  # (M,) mg/dL
@@ -441,6 +446,7 @@ def predict(
     conformal_delta: np.ndarray | None = None,
     return_time: bool = False,
     mask_spans: MaskSpans | None = None,
+    return_crossing: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Standard prediction: one forward pass over one masked set.
 
@@ -521,6 +527,7 @@ def predict(
     out = _run_forward(
         model, context, anchor_stats, overrides=overrides,
         mask_spans=mask_spans, device=device, return_time=return_time,
+        return_crossing=return_crossing,
     )
 
     # Keep the VALID slots only. The head always emits MAX_MASKED_PATCHES slots and the
@@ -548,6 +555,11 @@ def predict(
         # Decode/softmax stays in utils (single chokepoint) — emit raw here.
         time_pred = out['time_pred']
         result['time_pred'] = None if time_pred is None else time_pred[valid]
+
+    if return_crossing:
+        # (P, PATCH_SIZE, 2) cumulative crossing PROBABILITIES: col 0 hypo, col 1 hyper; None off.
+        crossing = out['crossing']
+        result['crossing'] = None if crossing is None else torch.sigmoid(crossing[valid].float())
 
     if normalization_stats is not None:
         # (c)->(b): invert the risk-space head outputs to mg/dL.  ``f_inv`` is
@@ -630,6 +642,7 @@ def predict_what_if(
     normalization_stats: dict[str, dict[str, float]] | None = None,
     device: torch.device | None = None,
     return_time: bool = False,
+    return_crossing: bool = False,
 ) -> dict[str, torch.Tensor]:
     """What-if prediction: announce carb / insulin / exercise in the prediction zone.
 
@@ -658,6 +671,7 @@ def predict_what_if(
         device=device,
         overrides=overrides,
         return_time=return_time,
+        return_crossing=return_crossing,
     )
 
 

@@ -42,6 +42,8 @@ from config import (
     ROPE_BASE, BG_HEAD_HIDDEN, N_SPREADS, BG_HEAD_INIT_SCALE,
     TIME_PROBE_ENABLED, TIME_PROBE_HIDDEN, TIME_PROBE_DETACH, TIME_PROBE_INIT_SCALE,
     TIME_PROBE_N_BINS,
+    CROSSING_HEAD_ENABLED, CROSSING_HEAD_HIDDEN, CROSSING_HEAD_DETACH,
+    CROSSING_HEAD_INIT_SCALE, N_CROSSING,
 )
 from utils import assemble_quantiles, step_states
 
@@ -305,6 +307,17 @@ class T1DMAI(nn.Module):
         else:
             self.time_head = None
 
+        # Same RNG discipline as the probe; two cumulative-crossing logits per step (§8.5).
+        if CROSSING_HEAD_ENABLED:
+            _rng_state = torch.random.get_rng_state()
+            self.crossing_head = nn.Sequential(
+                nn.Linear(D_MODEL, CROSSING_HEAD_HIDDEN), nn.SiLU(),
+                nn.Linear(CROSSING_HEAD_HIDDEN, N_CROSSING),
+            )
+            torch.random.set_rng_state(_rng_state)
+        else:
+            self.crossing_head = None
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -318,9 +331,11 @@ class T1DMAI(nn.Module):
         # sqrt(1.0) is exactly 1.0 in IEEE 754, so this is bit-identical to the literal
         # 0.02 at d_model = 512.
         base_std = 0.02 * math.sqrt(512.0 / D_MODEL)
-        time_modules = set(self.time_head.modules()) if self.time_head is not None else set()
+        aux_modules = set(self.time_head.modules()) if self.time_head is not None else set()
+        if self.crossing_head is not None:
+            aux_modules |= set(self.crossing_head.modules())
         for module in self.modules():
-            if module in time_modules:
+            if module in aux_modules:
                 continue
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=base_std)
@@ -351,6 +366,15 @@ class T1DMAI(nn.Module):
             tfinal = self.time_head[-1]
             nn.init.normal_(tfinal.weight, mean=0.0, std=TIME_PROBE_INIT_SCALE)
             nn.init.zeros_(tfinal.bias)
+        # After the probe, so a model built with either head alone is byte-identical elsewhere.
+        if self.crossing_head is not None:
+            for module in self.crossing_head.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=base_std)
+                    nn.init.zeros_(module.bias)
+            cfinal = self.crossing_head[-1]
+            nn.init.normal_(cfinal.weight, mean=0.0, std=CROSSING_HEAD_INIT_SCALE)
+            nn.init.zeros_(cfinal.bias)
 
     def forward(
         self,
@@ -359,7 +383,8 @@ class T1DMAI(nn.Module):
         anchor_bg: torch.Tensor,
         mask_idx: torch.Tensor,
         return_time: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        return_crossing: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """
         Args:
             patches: ``(B, T, PATCH_DIM)`` step-major. ``T <= MAX_SEQ_LEN``: the collate
@@ -438,10 +463,10 @@ class T1DMAI(nn.Module):
         ), f"head_raw shape {tuple(head_raw.shape)} unexpected"
 
         q_tau, median = assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx)
-        if not return_time:
+        if not return_time and not return_crossing:
             return q_tau, median
         time_pred = None
-        if self.time_head is not None:
+        if return_time and self.time_head is not None:
             # Every gathered masked-patch hidden state, no mean-pool, so each per-patch
             # representation the BG head's nodes are drawn from is forced to encode the
             # absolute clock. With TIME_PROBE_DETACH=False the probe gradient back-props
@@ -451,4 +476,10 @@ class T1DMAI(nn.Module):
             pred = x.gather(1, mask_idx.unsqueeze(-1).expand(B, M, D_MODEL))
             h = pred if not TIME_PROBE_DETACH else pred.detach()  # (B, M, D_MODEL)
             time_pred = self.time_head(h)                         # (B, M, TIME_PROBE_N_BINS)
-        return q_tau, median, time_pred
+        if not return_crossing:
+            return q_tau, median, time_pred
+        crossing = None
+        if self.crossing_head is not None:
+            h_c = h_steps if not CROSSING_HEAD_DETACH else h_steps.detach()
+            crossing = self.crossing_head(h_c)                    # (B, M, PATCH_SIZE, N_CROSSING)
+        return q_tau, median, time_pred, crossing

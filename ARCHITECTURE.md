@@ -353,10 +353,11 @@ graph see nothing of it.
 
 ## Heads
 
-Both heads read the final-normed hidden states by `mask_idx`, never as a trailing
-slice: the masked set may sit anywhere in the sequence. The time probe takes the
-`M` slot states as they are, one `D_MODEL` vector per slot; the glucose head takes
-a per-step state interpolated from them and their span's visible neighbours.
+All three heads read the final-normed hidden states by `mask_idx`, never as a
+trailing slice: the masked set may sit anywhere in the sequence. The time probe
+takes the `M` slot states as they are, one `D_MODEL` vector per slot; the glucose
+head and the crossing head take a per-step state interpolated from them and their
+span's visible neighbours.
 
 ### Blood-glucose quantile head
 
@@ -460,6 +461,20 @@ pygame and matplotlib renderers share one implementation.
 `TIME_PROBE_ENABLED = False` leaves the head unbuilt and the forward
 bit-identical to a model without it.
 
+
+### Crossing head
+
+A 2-layer SiLU MLP over the same per-step states the glucose head reads, emitting
+two logits per step: the probability that true BG has been below
+`BG_HYPO_THRESHOLD` at some step of the span so far, and above
+`BG_HYPER_THRESHOLD`. The target is the cumulative indicator of the true
+trajectory (`utils.crossing_targets`), restarting at every span start; the loss is
+binary cross-entropy on the valid slots, weighted by `CROSSING_LOSS_WEIGHT` and
+added to the training backward only. `val_loss_total` and checkpoint selection do
+not see it. Validation scores the window-end probability of the forecast span as
+an alarm at `HYPO_ALARM_PROB` / `HYPER_ALARM_PROB` (`xh_*` columns) beside the
+τ-edge alarm. The head is built under a saved RNG state and initialised last, so
+the forecast weights are byte-identical with or without it.
 
 ## Loss
 
@@ -598,8 +613,8 @@ bit-identical to plain decoupled decay, so the tuned regime is untouched; the
 correction only softens decay as the LR decays.
 
 Muon runs as two groups. The corrected one holds the trunk matrices and the head
-*hidden* layers. The uncorrected one holds the two output projections
-(`bg_head[-1]`, `time_head[-1]`), following the paper's exclusion of the output
+*hidden* layers. The uncorrected one holds the three output projections
+(`bg_head[-1]`, `time_head[-1]`, `crossing_head[-1]`), following the paper's exclusion of the output
 layer; the AdamW group is uncorrected for the same reason. `--no-wd-correction`
 restores constant decay throughout.
 
@@ -1032,7 +1047,8 @@ by `mask_idx`, takes its mask as an external additive float struct at a fixed `T
 with `NEG_FILL = -30000.0`, and cuts the graph at `head_raw` so everything
 downstream of it — the anchor, the assembly, the decode — is the consumer's.
 `NEG_FILL` rather than `-inf` keeps an fp16 NPU softmax finite, and underflows to
-the same zero in fp32. Beside `head_raw` and the time probe's logits the graph
+the same zero in fp32. Beside `head_raw`, the time probe's logits and the crossing
+head's logits the graph
 emits `hidden`, the final-normed hidden state of every patch, and the export writes
 `bg_head`'s weights out with it — together they let a consumer gather each span's
 nodes, rebuild the step states, re-run the head outside the graph, and adapt it on

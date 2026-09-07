@@ -107,6 +107,17 @@ TIME_PROBE_LABEL_SMOOTH_BINS = 0.75                                  # soft-labe
 TIME_PROBE_CROSS_WINDOW_WEIGHT = 1.0
 TIME_PROBE_CROSS_WINDOW_FRACTION = 1.0  # 2nd forward on the first ceil(frac*B) rows; validation always uses all
 
+# Crossing head over the BG head's step states; BCE on the backward only. SPEC/inference.md §8.5.
+CROSSING_HEAD_ENABLED = True
+CROSSING_HEAD_HIDDEN = 1 * D_MODEL
+CROSSING_HEAD_DETACH = False     # True ⇒ read-only diagnostic, no trunk gradient
+CROSSING_LOSS_WEIGHT = 1.0
+CROSSING_HEAD_INIT_SCALE = 1e-2  # final-layer weight init std; zero bias ⇒ p = 0.5 at init
+N_CROSSING = 2                   # col 0 hypo (< BG_HYPO_THRESHOLD), col 1 hyper (> BG_HYPER)
+# Window-end crossing probability the scored alarm fires above; evaluation constant, SPEC §6.1.
+HYPO_ALARM_PROB = 0.25
+HYPER_ALARM_PROB = 0.25
+
 ROPE_BASE = 1000
 
 MASTER_SEED = 42
@@ -165,7 +176,7 @@ KENDALL_LOGVAR_INIT = 0.0        # init for log_sigma_Q / log_sigma_D; clamped [
 
 # Provenance only: stamped into every checkpoint, the summary JSON, the resolved-config
 # dump and the export descriptor, and compared by nothing at load time.
-ARCH_VERSION = 'risk-v5'
+ARCH_VERSION = 'risk-v6'         # risk-v5 plus the crossing output; no constant changed
 LOSS_SCHEMA = 'kendall-pinball-dilate-mse-v4'
 
 # mg/dL cutoffs for a hypo / hyper excursion and for the CG-EGA / Clarke / TIR glycemic

@@ -566,6 +566,31 @@ def _span_layout(
     return start, length
 
 
+def crossing_targets(
+    true_bg: torch.Tensor, mask_idx: torch.Tensor, valid: torch.Tensor,
+    hypo_threshold: float, hyper_threshold: float,
+) -> torch.Tensor:
+    """Cumulative crossing indicators per masked step -> ``(B, M, S, 2)`` float.
+
+    Col 0: true BG below ``hypo_threshold`` at some step of the span so far; col 1: above
+    ``hyper_threshold``. Restarts at every span start; padded slots read 0. ``true_bg`` mg/dL.
+    """
+    B, M, S = true_bg.shape
+    start, _ = _span_layout(mask_idx, valid, B, M, true_bg.device)
+    below = (true_bg < hypo_threshold).float()
+    above = (true_bg > hyper_threshold).float()
+    out = torch.zeros(B, M, S, 2, dtype=torch.float32, device=true_bg.device)
+    carry = torch.zeros(B, 2, dtype=torch.float32, device=true_bg.device)
+    for j in range(M):
+        new_span = (start[:, j] == j).float().unsqueeze(1)          # (B, 1)
+        carry = carry * (1.0 - new_span)
+        steps = torch.stack([below[:, j], above[:, j]], dim=-1)       # (B, S, 2)
+        run = torch.cummax(torch.cat([carry.unsqueeze(1), steps], dim=1), dim=1).values[:, 1:]
+        out[:, j] = run
+        carry = run[:, -1]
+    return out * valid.float()[:, :, None, None]
+
+
 def step_states(
     x: torch.Tensor, mask_idx: torch.Tensor, attn_mask: torch.Tensor,
     valid: "torch.Tensor | None" = None,
