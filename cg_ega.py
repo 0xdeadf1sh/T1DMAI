@@ -1,39 +1,7 @@
 """Continuous Glucose-Error Grid Analysis (CG-EGA), vectorized numpy, mg/dL.
-
-Port of the dotXem/CG-EGA reference (https://github.com/dotXem/CG-EGA), which adapts
-the Continuous Glucose-EGA of Kovatchev et al. 2004 (Diabetes Care 27(8):1922) to
-glucose PREDICTION. The zone boundaries and the AP/BE/EP filter matrices below are that
-reimplementation's, NOT the published paper's, and the two differ on three points: the
-rate widening ``mod`` is applied to both bounds rather than only to the one the
-published grid widens; the hyperglycemia benign filter marks its ``lD`` cell benign
-where the published grid marks it erroneous; and the upper-C boundary carries the
-``22/17`` slope below rather than the published ``1.03``. Two of the three under-report
-danger. Transcribing dotXem is deliberate — it is what makes this table and T1DMDROID's
-Rust port one statistic — but no figure produced here may be quoted against a published
-CG-EGA value without stating the departures. ``../T1DMCOMMON/SPEC/invariants.md`` §6.3
-enumerates them with their safety direction and counts four: its fourth is the shared
-``last_bg`` anchoring used below, a considered choice rather than a transcription error.
-
-Two axes per point, combined into one clinical verdict:
-
-  * P-EGA (point) — 5 zones A,B,C,D,E — is the predicted BG VALUE close enough, with
-    the acceptance band widened when BG is moving fast (the ``mod`` rate term)?
-  * R-EGA (rate) — 8 zones A,B,uC,lC,uD,lD,uE,lE — does the predicted RATE of change
-    (mg/dL/min) agree with the true rate?
-
-The (R-mark, P-mark) pair is looked up per glycemic region in the AP/BE/EP filter
-matrices and reduced to AP (accurate), BE (benign error, clinically harmless) or EP
-(erroneous, clinically dangerous).
-
-Region comes from the TRUE BG of each point: hypo ``y_true <= 70``, eu
-``70 < y_true <= 180``, hyper ``y_true > 180`` (mg/dL). ``y_true`` is the reference on
-EVERY axis — that region binning, the ±20% acceptance band, the zone-D excursion gates,
-the ``mod`` widening and the R-EGA abscissa all read it. Argument order is therefore
-load-bearing: transposing the two trajectories re-buckets points between the regions,
-so every denominator moves and the result is a well-formed table of a different
-statistic.
-
-All public functions take and return mg/dL; rates are mg/dL/min.
+Port of dotXem/CG-EGA (Kovatchev et al. 2004), not the published paper: deviates on three
+points, under-reporting danger, enumerated in ../T1DMCOMMON/SPEC/invariants.md §6.3.
+Region and every axis key off y_true — argument order is load-bearing, do not transpose.
 """
 from __future__ import annotations
 
@@ -46,9 +14,7 @@ __all__ = [
     "cg_ega_fractions",
 ]
 
-# AP/BE/EP filter matrices (8 R-marks × region P-cols), VERBATIM from the reference.
-# Rows are the 8 R-marks [A, B, uC, lC, uD, lD, uE, lE]; columns are the region's
-# selected P-marks (see _REGION_P_COLS below).
+# AP/BE/EP filter matrices (8 R-marks x region P-cols), VERBATIM; rows [A,B,uC,lC,uD,lD,uE,lE].
 _FILTER_AP_HYPO = np.array(
     [[1, 0, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0],
      [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]], dtype=bool)
@@ -72,10 +38,7 @@ _FILTER_BE_HYPER = np.array(
      [1, 1, 0, 0, 0], [1, 1, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
     dtype=bool)
 
-# Which P-mark columns (indices into [A,B,C,D,E]) each region's filters use.
-#   hypo : [A, D, E]  -> 0, 3, 4
-#   eu   : [A, B, C]  -> 0, 1, 2
-#   hyper: [A, B, C, D, E] -> all 5
+# P-mark columns each region's filters use: hypo[A,D,E]->0,3,4; eu[A,B,C]->0,1,2; hyper->all 5.
 _REGION_P_COLS: dict[str, list[int]] = {
     "hypo": [0, 3, 4],
     "eu": [0, 1, 2],
@@ -87,9 +50,7 @@ _REGION_FILTERS: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "hyper": (_FILTER_AP_HYPER, _FILTER_BE_HYPER),
 }
 
-# Per-region AP/BE/EP label table over the FULL (8 R-marks × 5 P-marks) grid, so
-# classification is a pure fancy-index gather. 0 = AP, 1 = BE, 2 = EP. A (R,P) cell
-# whose P-mark is not among the region's filter columns is EP — neither AP nor BE.
+# Per-region AP/BE/EP over the full (8x5) grid: 0=AP, 1=BE, 2=EP (P-mark outside filters = EP).
 _LABEL_AP, _LABEL_BE, _LABEL_EP = 0, 1, 2
 
 
@@ -114,19 +75,10 @@ _NAMES = np.array(["hypo", "eu", "hyper"])
 
 def cg_ega_rates(y: np.ndarray, last_bg: np.ndarray,
                  freq_min: float = 5.0) -> np.ndarray:
-    """Per-step rate of change ``dy`` (mg/dL/min), anchored at ``last_bg``.
+    """Per-step rate of change dy (mg/dL/min), anchored at last_bg.
 
-    The forecast (and its true companion) are anchored at the BG one step before
-    t=0, so ``dy[:, t] = (y[:, t] - y[:, t-1]) / freq_min`` with
-    ``y[:, -1] := last_bg`` — every step ``t ∈ [0, T)`` gets a rate.
-
-    Args:
-        y:        ``(N, T)`` BG trajectory (mg/dL).
-        last_bg:  ``(N,)`` anchor BG (mg/dL) at the step before t=0.
-        freq_min: sampling period in minutes (default 5.0).
-
-    Returns:
-        dy: ``(N, T)`` per-step rate of change (mg/dL/min).
+    dy[:, t] = (y[:, t] - y[:, t-1]) / freq_min, with y[:, -1] := last_bg.
+    y (N,T) mg/dL; last_bg (N,) mg/dL; returns dy (N,T) mg/dL/min.
     """
     y = np.asarray(y, dtype=np.float64)
     last_bg = np.asarray(last_bg, dtype=np.float64)
@@ -140,14 +92,9 @@ def cg_ega_rates(y: np.ndarray, last_bg: np.ndarray,
 
 def _p_ega_marks(y_true: np.ndarray, y_pred: np.ndarray,
                  dy_true: np.ndarray) -> np.ndarray:
-    """P-EGA single mark per point, ``argmax`` over [A,B,C,D,E] (first max wins).
+    """P-EGA single mark per point, argmax over [A,B,C,D,E] (first max wins).
 
-    Args:
-        y_true, y_pred: ``(M,)`` BG values (mg/dL).
-        dy_true:        ``(M,)`` true rate of change (mg/dL/min); drives ``mod``.
-
-    Returns:
-        marks: ``(M,)`` int in {0..4} = index into [A,B,C,D,E].
+    y_true/y_pred (M,) mg/dL; dy_true (M,) mg/dL/min drives mod. Returns (M,) int in {0..4}.
     """
     # rate-of-change widening of the acceptance bands (mg/dL/min):
     mod = np.zeros_like(y_true)
@@ -174,15 +121,9 @@ def _p_ega_marks(y_true: np.ndarray, y_pred: np.ndarray,
 
 
 def _r_ega_marks(dy_true: np.ndarray, dy_pred: np.ndarray) -> np.ndarray:
-    """R-EGA single mark per point, ``argmax`` over the 8 marks (first max wins).
+    """R-EGA single mark per point, argmax over 8 marks (first max wins).
 
-    Mark order: [A, B, uC, lC, uD, lD, uE, lE].
-
-    Args:
-        dy_true, dy_pred: ``(M,)`` rates of change (mg/dL/min).
-
-    Returns:
-        marks: ``(M,)`` int in {0..7} = index into [A,B,uC,lC,uD,lD,uE,lE].
+    Mark order [A,B,uC,lC,uD,lD,uE,lE]. dy_true/dy_pred (M,) mg/dL/min; returns (M,) int {0..7}.
     """
     A = (((dy_pred >= dy_true - 1) & (dy_pred <= dy_true + 1))
          | ((dy_pred <= dy_true / 2) & (dy_pred >= dy_true * 2))
@@ -207,20 +148,10 @@ def _r_ega_marks(dy_true: np.ndarray, dy_pred: np.ndarray) -> np.ndarray:
 
 def cg_ega_marks(y_true: np.ndarray, y_pred: np.ndarray, last_bg: np.ndarray,
                  freq_min: float = 5.0) -> dict:
-    """P-EGA and R-EGA marks + region for every (N×T) point, flattened.
+    """P-EGA and R-EGA marks + region for every (N,T) point, flattened to (N*T,).
 
-    Args:
-        y_true, y_pred: ``(N, T)`` true & forecast BG (mg/dL).
-        last_bg:        ``(N,)`` anchor BG at the step before t=0.
-        freq_min:       sampling period in minutes (default 5.0).
-
-    Returns:
-        dict with flattened ``(N*T,)`` arrays:
-            'p_mark'  int in {0..4}  index into [A,B,C,D,E]
-            'r_mark'  int in {0..7}  index into [A,B,uC,lC,uD,lD,uE,lE]
-            'region'  str array in {'hypo','eu','hyper'}
-            'region_code'  int8 array in {0,1,2} (hypo/eu/hyper)
-            'dy_true','dy_pred' rates (mg/dL/min)
+    Returns dict: p_mark int{0..4}->[A,B,C,D,E], r_mark int{0..7}->[A,B,uC,lC,uD,lD,uE,lE],
+    region str{hypo,eu,hyper}, region_code int8{0,1,2}, dy_true/dy_pred mg/dL/min.
     """
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
@@ -251,18 +182,8 @@ def cg_ega_counts(y_true: np.ndarray, y_pred: np.ndarray, last_bg: np.ndarray,
                   freq_min: float = 5.0) -> dict:
     """CG-EGA Accurate/Benign/Erroneous counts per glycemic region.
 
-    Args:
-        y_true: ``(N, T)`` true BG trajectories (mg/dL).
-        y_pred: ``(N, T)`` forecast BG trajectories (mg/dL).
-        last_bg: ``(N,)`` anchor — BG at the step before t=0 — used for the
-            t=0 rate (both ``dy_true`` and ``dy_pred`` are anchored here).
-        freq_min: sampling period in minutes (default 5.0).
-
-    Returns:
-        dict of 9 ints:
-            'ap_hypo','be_hypo','ep_hypo',
-            'ap_eu','be_eu','ep_eu',
-            'ap_hyper','be_hyper','ep_hyper'.
+    last_bg anchors dy_true/dy_pred at the step before t=0. Returns 9 ints:
+    {ap,be,ep}_{hypo,eu,hyper}.
     """
     marks = cg_ega_marks(y_true, y_pred, last_bg, freq_min)
     p_mark = marks["p_mark"]
@@ -282,13 +203,8 @@ def cg_ega_counts(y_true: np.ndarray, y_pred: np.ndarray, last_bg: np.ndarray,
 def cg_ega_fractions(counts: dict) -> dict:
     """Per-region %AP/%BE/%EP from the 9 integer counts.
 
-    Args:
-        counts: dict from :func:`cg_ega_counts` (or accumulated equivalents).
-
-    Returns:
-        dict with keys ``{ap,be,ep}_{hypo,eu,hyper}`` mapped to fractions in
-        [0, 1] (NOT percent). A region with zero total points yields ``None`` for
-        all three of its keys.
+    Fractions in [0, 1], NOT percent. A region with zero total points yields None for all
+    three of its keys.
     """
     out: dict[str, float | None] = {}
     for reg in ("hypo", "eu", "hyper"):

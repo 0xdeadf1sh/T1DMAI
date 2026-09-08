@@ -1,9 +1,7 @@
 """Band-scored metric basis (``metrics.core.suite``).
 
-The headline level metrics score
-``pred_eff = clip(true, q[METRIC_BAND_TAU_LO], q[METRIC_BAND_TAU_HI])``, not the
-median line.
-"""
+Headline metrics score ``pred_eff = clip(true, q[TAU_LO], q[TAU_HI])``, not the
+median line."""
 from __future__ import annotations
 
 import numpy as np
@@ -41,10 +39,8 @@ def _fan(center: np.ndarray, half: float) -> np.ndarray:
 def _degenerate_fan(center: np.ndarray, spread: float = 20.0) -> np.ndarray:
     """``(N, S, N_QUANTILES)`` fan whose scored band has collapsed onto the median.
 
-    Every level in ``[METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI]`` — the alarm taus are
-    the same pair — sits on ``center``; the outer levels still spread, so the fan
-    stays ascending.
-    """
+    Every level in ``[METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI]`` sits on ``center``;
+    outer levels still spread, so the fan stays ascending."""
     off = np.array([0.0 if METRIC_BAND_TAU_LO <= t <= METRIC_BAND_TAU_HI
                     else (t - 0.5) * 2.0 * spread for t in QUANTILE_LEVELS])
     return center[:, :, None] + off[None, None, :]
@@ -126,8 +122,7 @@ def test_band_scored_never_worse_than_median_line():
 def test_band_cov50_and_width_hand_counted():
     n = 4
     pred = np.full((n, PRED_STEPS), 120.0)
-    # band [90, 150] at every step, width 60; truth constant per window so the count
-    # is the same at every horizon: in, below, above, exactly on the upper edge
+    # band [90,150] width 60; truth constant per window, so count is same at every horizon.
     base = np.array([60.0, 75.0, 90.0, 120.0, 150.0, 165.0, 180.0])
     assert base.shape == (N_QUANTILES,) and base[LO] == 90.0 and base[HI] == 150.0
     bands = np.broadcast_to(base, (n, PRED_STEPS, N_QUANTILES)).copy()
@@ -220,13 +215,11 @@ def test_band_scoring_does_not_disturb_the_alarm_edges():
 
 
 def test_cgega_region_totals_depend_only_on_the_truth():
-    """A point's region is its TRUE glucose's, so ``ap+be+ep`` per region depends on the
-    truth and window set alone; the forecast only redistributes it across AP/BE/EP.
+    """A point's region is its TRUE glucose's; ``ap+be+ep`` per region depends only on
+    truth and window set, never the forecast.
 
-    Score the forecast as reference instead and the denominators move between two runs
-    over identical truth. The two forecasts here sit ~51 mg/dL below and above the truth,
-    well across both the 70 and 180 mg/dL boundaries.
-    """
+    Score as reference instead and the denominators move; these two forecasts sit
+    ~51 mg/dL below/above truth, across the 70/180 boundaries."""
     rng = np.random.default_rng(17)
     n = 40
     true = np.clip(

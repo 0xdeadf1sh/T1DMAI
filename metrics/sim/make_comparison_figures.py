@@ -1,4 +1,4 @@
-"""In-domain T1DMSIM figures: simulated CGM vs predicted BG, conditioned on the announced future doses.
+"""In-domain T1DMSIM figures: simulated CGM vs predicted BG, given announced doses.
 
 Writes metrics/sim/figures/{sim_trajectories,parity,clarke}.png off the current checkpoint.
 Run:  CUDA_VISIBLE_DEVICES="" python metrics/sim/make_comparison_figures.py

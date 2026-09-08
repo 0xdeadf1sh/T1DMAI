@@ -1,12 +1,7 @@
 """Two silent failures of the masked-BG objective.
 
-Padded head slots are 41.8% of the head's output on the average sample; drop
-``valid`` on the loss path and they train against patch 0's BG behind a plausible
-anchor, every shape and every loss curve looking ordinary.
-
-``dilate_loss`` reduces with ``.mean()``, so an empty ``(0, H)`` bucket returns NaN
-with no exception, and NaN flows past ``val_total < best_val_loss``, ending the run
-with no best checkpoint.
+Padded head slots are 41.8% of output; dropping ``valid`` trains them against
+patch 0's BG unnoticed, and an empty DILATE bucket's NaN silently loses the checkpoint.
 """
 
 import numpy as np
@@ -62,8 +57,7 @@ def test_padded_slots_get_exactly_zero_gradient():
         "was dropped somewhere on the loss path")
     assert float(grad[valid].abs().max()) > 0.0, "valid slots must carry gradient"
 
-    # ``mask_idx`` goes with ``valid``: a padded row's index column is not ascending
-    # and the loss asserts on that
+    # mask_idx goes with valid; a padded row's index isn't ascending and the loss asserts on that.
     q2, m2 = _fan(B, M, seed=2)
     total2, _ = risk_total_loss(q2, m2, true_bg, KendallGalWeighting())
     total2.backward()
@@ -187,12 +181,11 @@ def test_dense_defaults_reproduce_the_right_edge_case():
 
 
 def test_padded_slot_contents_do_not_move_the_loss():
-    """Moving a padded slot's anchor and target leaves the loss and every parameter
-    gradient bit-identical.
+    """Moving a padded slot's anchor and target leaves the loss and every gradient
+    bit-identical.
 
-    The forward's units tripwire reads all ``M``, so a padded anchor is legal mg/dL —
-    which is why nothing downstream would flag it being supervised.
-    """
+    The forward's units tripwire reads all ``M``, so a padded anchor is legal
+    mg/dL — nothing downstream would flag it being supervised."""
     torch.manual_seed(0)
     model = T1DMAI().train()
     n_ctx = 12
@@ -231,12 +224,11 @@ def test_padded_slot_contents_do_not_move_the_loss():
 
 
 def test_forecast_protocol_is_finite_with_three_empty_buckets():
-    """One right-edge span of ``PREDICTION_PATCHES`` leaves buckets L = 1, 2, 3 empty
-    in every batch, permanently.
+    """One right-edge span of ``PREDICTION_PATCHES`` leaves buckets L=1,2,3 empty in
+    every batch, permanently.
 
-    ``loss_D`` must equal the L = 4 bucket and the empty ones must report zero spans
-    rather than dropping out of the log.
-    """
+    ``loss_D`` must equal the L=4 bucket; empty buckets report zero spans, never
+    drop out of the log."""
     torch.manual_seed(0)
     model = T1DMAI().eval()
     B, n_ctx = 8, 16

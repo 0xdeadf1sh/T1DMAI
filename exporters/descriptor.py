@@ -1,8 +1,7 @@
-"""Shared descriptor emitter, engine-agnostic — each engine passes its own tag, version and filename.
-
-The descriptor JSON is the SOLE pre/post source for the on-device Rust core (PLAN §2.4): the app reads the
-artifact plus this and NEVER parses the ``.pt``. It must carry ``normalization_stats`` and every
-decode-critical constant the checkpoint lacks.
+"""Shared descriptor emitter, engine-agnostic; each engine passes its own tag, version, filename.
+The descriptor JSON is the SOLE pre/post source for the on-device Rust core (PLAN §2.4): the
+app reads the artifact plus this and NEVER parses the .pt. Must carry normalization_stats and
+every decode-critical constant the checkpoint lacks.
 """
 
 from __future__ import annotations
@@ -19,8 +18,7 @@ from exporters.modified_forward import NEG_FILL
 # normalization owns this order, and it names the keys of the ``normalization_stats`` block below
 from normalization import CHANNEL_NAMES
 
-# Kovatchev constants and the physical clamp, imported not hardcoded, so what the Rust f/f_inv reproduce
-# cannot drift from the model's transform. The checkpoint stores none of them.
+# Kovatchev constants imported, not hardcoded, so Rust f/f_inv can't drift; checkpoint stores none.
 from utils import _KOVATCHEV_SCALE, _KOVATCHEV_POWER, _KOVATCHEV_OFFSET
 from T1DMSIM.simulator import BG_CLAMP_MIN as _BG_CLAMP_MIN, BG_CLAMP_MAX as _BG_CLAMP_MAX
 
@@ -46,13 +44,9 @@ def build_descriptor(
     crossing_thresholds: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Assemble the descriptor dict. Pure data, no I/O.
-
-    ``seq_len`` is the graph's fixed ``T``, default ``cfg.MAX_SEQ_LEN``, and bounds the context the artifact
-    accepts (``MAX_CONTEXT_PATCHES = T - PREDICTION_PATCHES``): a shorter export is a shorter memory, not a
-    different contract.
-    ``head`` is :func:`exporters.head_weights.write_head_weights`'s block; absent, the consumer has the frozen
-    graph and no adapter seam. ``model_card`` is display-only and OUTSIDE the Rust contract — the on-device
-    ``parse_descriptor`` ignores it, so it can never perturb decode.
+    seq_len is the graph's fixed T (default cfg.MAX_SEQ_LEN); MAX_CONTEXT_PATCHES = T - P.
+    head is write_head_weights's block; absent, no adapter seam. model_card is display-only,
+    outside the Rust contract — parse_descriptor ignores it.
     """
     risk_lo = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     risk_hi = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
@@ -68,8 +62,7 @@ def build_descriptor(
         f"seq_len {T} leaves {max_ctx} context patches, below MIN_CONTEXT_PATCHES "
         f"{cfg.MIN_CONTEXT_PATCHES}"
     )
-    # a longer graph would advertise more context than the architecture was trained on, and every
-    # consumer takes the descriptor at its word
+    # a longer graph would advertise more context than trained on; every consumer trusts it.
     assert T <= cfg.MAX_SEQ_LEN, (
         f"seq_len {T} exceeds MAX_SEQ_LEN {cfg.MAX_SEQ_LEN}; the model was never trained on a "
         f"window that long"
@@ -157,9 +150,7 @@ def build_descriptor(
             "co_trains_trunk": not cfg.CROSSING_HEAD_DETACH,
         },
 
-        # Time-of-day probe (PLAN §7): each prediction patch's ABSOLUTE hour-of-day over N_BINS circular
-        # bins, inferred from the trajectory — there is NO clock input — not a per-step timestamp.
-        # head_raw is byte-identical with or without this head.
+        # Time-of-day probe (PLAN §7): hour-of-day per patch, no clock input, head_raw unchanged.
         "time": {
             "output_index": 1,
             "output_name": "time_logits",
@@ -175,8 +166,7 @@ def build_descriptor(
             ],
             "circle": "bin k center angle th_k = 2*pi*center_hour_k/24; hour 0 at "
                       "angle 0, increasing with hour",
-            # The P per-patch rows reduced to ONE current-hour belief, as T1DMAI does it
-            # (inference.estimate_current_hour / gui._decode_tod).
+            # The P per-patch rows reduced to ONE current-hour belief (estimate_current_hour).
             "reduction": "origin_slot",
             "reduction_detail": {
                 "slot_index": "the slot holding the FIRST forecast patch — with an "
@@ -190,8 +180,7 @@ def build_descriptor(
                 "note": "R in [0,1]: R->1 a concentrated (confident) phase belief, "
                         "R->0 diffuse/ambiguous.",
             },
-            # The clock-face's fusion (utils.aggregate_origin_belief): de-rotate patch p by -p*advance_hours,
-            # average, renormalize, same resultant read-out. The app's declared reducer stays patch 0.
+            # Clock-face fusion (aggregate_origin_belief): de-rotate, average, renormalize.
             "alt_reduction": {
                 "name": "aggregate_origin_belief",
                 "advance_hours_per_patch":
@@ -212,7 +201,7 @@ def build_descriptor(
             # what THIS artifact accepts, not what the architecture allows
             "MAX_CONTEXT_PATCHES": max_ctx,
             "ARCH_MAX_CONTEXT_PATCHES": cfg.MAX_CONTEXT_PATCHES,
-            # head slot count and the cap on a caller's masked set; it sizes no weight, so no shape recovers it
+            # head slot count / cap on masked set; sizes no weight, so no shape recovers it.
             "MAX_MASKED_PATCHES": M,
             "MASK_MAX_SPANS": cfg.MASK_MAX_SPANS,
             "MASK_SPAN_LENGTHS": list(cfg.MASK_SPAN_LENGTHS),
@@ -220,8 +209,7 @@ def build_descriptor(
             "N_LAYERS": cfg.N_LAYERS,
             "N_HEADS": cfg.N_HEADS,
             "HEAD_DIM": cfg.HEAD_DIM,
-            # The normalized SIGNAL channels in input-feature order, and the keys of `normalization_stats`.
-            # Fewer than N_INPUT_FEATURES: the trailing `bg_masked` bit carries no statistics and no name.
+            # CHANNEL_NAMES: signal channels in feat order, keys of normalization_stats, no mask bit
             "CHANNEL_NAMES": list(CHANNEL_NAMES),
             "CHANNEL_TO_FEAT": {str(k): v for k, v in cfg.CHANNEL_TO_FEAT.items()},
             "NON_MASKABLE_FEATS": list(cfg.NON_MASKABLE_FEATS),
@@ -256,8 +244,7 @@ def build_descriptor(
             "RISK_CLAMP_MAX": risk_hi,
         },
 
-        # No smoother block by design: the model consumes raw post-noise signals, so the Rust runtime
-        # must apply NO input FIR.
+        # No smoother block by design: raw post-noise signals; Rust must apply no input FIR.
 
         # conformal OFF for this real-data deployment (PLAN §2.4)
         "conformal": {
@@ -306,9 +293,9 @@ def _sim_reference_metrics(checkpoint: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_model_card(model, checkpoint: dict[str, Any]) -> dict[str, Any]:
-    """The display-only ``model_card``: param count plus held-out reference metrics.
+    """The display-only model_card: param count plus held-out reference metrics.
 
-    The metrics come from the checkpoint's ``val_history``, the simulator validation the run selected on —
+    From checkpoint's val_history, the simulator validation the run selected on —
     a reference, never on-device realized accuracy.
     """
     return {
@@ -328,19 +315,16 @@ def write_descriptor(descriptor: dict[str, Any], path: str) -> None:
 
 
 def deploy_to_server(pte_path: str, descriptor: dict[str, Any], deploy_dir: str) -> "tuple[str, str]":
-    """Copy ``pte_path`` and its ``descriptor`` into a T1DMSERVER models directory -> (artifact, sidecar).
+    """Copy pte_path and descriptor into a T1DMSERVER models dir -> (artifact, sidecar).
 
-    ``t1dm-store::refresh_models`` hashes every non-``.json`` file and pairs it with a SIBLING ``<stem>.json``,
-    so the sidecar is the artifact's name with the extension swapped: ``large-sim.xnnpack.pte`` ->
-    ``large-sim.xnnpack.json``. The phone strips the engine infix for the logical id (``large-sim``).
+    t1dm-store::refresh_models pairs each non-.json artifact with a SIBLING <stem>.json;
+    large-sim.xnnpack.pte -> large-sim.xnnpack.json. Phone strips engine infix for the id.
     """
     os.makedirs(deploy_dir, exist_ok=True)
     artifact = os.path.join(deploy_dir, os.path.basename(pte_path))
     sidecar = os.path.splitext(artifact)[0] + ".json"
     shutil.copy2(pte_path, artifact)
-    # The head side file does NOT travel this way, so the deployed descriptor must not claim it does:
-    # the registry pairs ONE artifact with ONE sidecar and would offer a stray `<id>.head.bin` as a
-    # model of its own. A synced phone gets a model it can run and cannot adapt.
+    # head side file doesn't travel; registry pairs ONE artifact with ONE sidecar, not head.bin.
     deployed = {k: v for k, v in descriptor.items() if k != "head"}
     write_descriptor(deployed, sidecar)
     return artifact, sidecar

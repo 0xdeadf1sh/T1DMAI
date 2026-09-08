@@ -1,31 +1,7 @@
 """T1DMAI — encoder-only transformer for risk-space BG forecasting.
 
-The input is a window of ``T`` patches, each visible or masked. A masked patch withholds
-feat 0 (CGM blood glucose in Kovatchev RISK space) while carb intake, combined insulin
-action and exercise keep their true or announced values; feat 4 (``bg_masked``) announces
-which patches are masked. The model emits a quantile fan in RISK space for every masked
-patch. A masked span ending at patch ``T−1`` is a forecast, one starting at patch 0 a
-backcast, anything else infill. A single model covers windows starting at any time of
-day. Inference owns the risk→mg/dL inverse (``kovatchev_f_inv``).
-
-* Patch embedding: six consecutive 5-minute simulator timesteps make one 30-minute
-  patch, so ``PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES`` values step-major, projected by
-  ``patch_embed = Linear(PATCH_DIM, D_MODEL)``. No patient-conditioning embedding —
-  patient identity is implicit in the context window.
-* ``N_LAYERS`` pre-norm blocks, each ``TemporalSelfAttention`` (QK-norm then RoPE on Q/K,
-  ``F.scaled_dot_product_attention`` under the caller's bool mask) then a SwiGLU FFN of
-  width ``FFN_DIM``.
-* BG head: after a final RMSNorm ``utils.step_states`` interpolates the patch states of
-  each masked span and its visible neighbours into one state per within-patch timestep,
-  and a 3-layer SiLU MLP maps every step state to ``1 + 2·N_SPREADS`` raw values.
-  ``utils.assemble_quantiles`` anchors the median at ``f(anchor_bg)`` per slot and
-  assembles the ascending fan.
-
-``forward`` returns ``(q_tau, median)`` in risk space:
-``(B, M, PATCH_SIZE, N_QUANTILES)`` and ``(B, M, PATCH_SIZE)``.
-
-fp32-native throughout — no bf16 autocast anywhere, so ``RMSNorm`` is a plain module and
-the SwiGLU gate × value product a native fp32 multiply.
+A masked patch withholds feat 0 (CGM in Kovatchev RISK space); feat 4 announces which
+patches are masked. forward returns (q_tau, median) risk space; fp32-native, no bf16 autocast.
 """
 
 import math
@@ -75,9 +51,8 @@ def build_rope_cache(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RoPE cosine and sine tables, both ``(seq_len, head_dim)``.
 
-    Built once per forward at the model level and shared across layers: the tables depend
-    only on ``T`` and ``head_dim``. ``head_dim`` must be even; ``base`` defaults to
-    ``ROPE_BASE``.
+    Built once per forward at the model level, shared across layers; ``head_dim`` must be
+    even. ``base`` defaults to ``ROPE_BASE``.
     """
     half = head_dim // 2
     # Geometric series of inverse frequencies — RoPE's signature.
@@ -96,10 +71,8 @@ def apply_rope(
 ) -> torch.Tensor:
     """Rotary position embedding on Q or K; same shape in and out.
 
-    Splits the head dim in half, treats each pair as a 2-D vector and rotates by an angle
-    growing geometrically with the dim index and linearly with the position.
-
-    x: ``(B, n_heads, T, head_dim)``. cos, sin: ``(T, head_dim)`` caches.
+    Splits the head dim in half, rotates each pair by an angle growing geometrically with
+    dim index, linearly with position. x: (B, n_heads, T, head_dim); cos/sin: (T, head_dim).
     """
     B, H, T, D = x.shape
     half = D // 2
@@ -117,15 +90,8 @@ def attention_weights(
 ) -> torch.Tensor:
     """Softmax attention weights ``(B, H, T, T)``, each row a distribution over T keys.
 
-    The distribution ``F.scaled_dot_product_attention`` forms internally and never
-    returns. Recomputing it outside this module would pin the QK-norm and RoPE order down
-    in a second place, so this is the single copy and ``TemporalSelfAttention.forward``
-    calls it on the very tensors it hands to SDPA.
-
-    q, k: ``(B, H, T, HEAD_DIM)`` after QK-norm and RoPE.
-    attn_mask: ``(T, T)`` or ``(B, 1, T, T)`` bool, True = attend.
-    ``create_attention_mask_from_visible`` keeps every row's diagonal open, so no row is
-    all-blocked and no row is NaN.
+    SDPA forms this distribution internally, never returns it; this is the single copy,
+    called by TemporalSelfAttention.forward on the tensors it hands to SDPA.
     """
     logits = (q @ k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
     return torch.softmax(logits.masked_fill(~attn_mask, float('-inf')), dim=-1)
@@ -134,9 +100,8 @@ def attention_weights(
 class TemporalSelfAttention(nn.Module):
     """Multi-head self-attention over the temporal (patch) axis.
 
-    QK-norm — per-head RMSNorm on Q and K — bounds the attention logits through the
-    ``N_LAYERS``-deep stack; RoPE on Q and K supplies relative position with no learned
-    positional embedding. ``(B, T, D_MODEL)`` in and out.
+    QK-norm bounds attention logits through the N_LAYERS-deep stack; RoPE supplies relative
+    position with no learned embedding. (B, T, D_MODEL) in and out.
     """
 
     def __init__(self) -> None:
@@ -147,8 +112,7 @@ class TemporalSelfAttention(nn.Module):
         self.w_o = nn.Linear(D_MODEL, D_MODEL, bias=False)
         self.q_norm = RMSNorm(HEAD_DIM)
         self.k_norm = RMSNorm(HEAD_DIM)
-        # Diagnostic tap, off by default: collects one (B, H, T, T) tensor per forward.
-        # ``None`` is a static branch, so export trace and training step are unaffected.
+        # Diagnostic tap, off by default; None is a static branch so export/training are unaffected.
         self.attn_sink: list[torch.Tensor] | None = None
 
     def forward(
@@ -160,9 +124,8 @@ class TemporalSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """``(B, T, D_MODEL)`` → ``(B, T, D_MODEL)``.
 
-        rope_cos, rope_sin: ``(T, HEAD_DIM)`` tables, or None to build them here.
-        attn_mask: bool, True = attend — ``(T, T)`` shared or ``(B, 1, T, T)`` per
-            sample, shaped once in ``T1DMAI.forward``.
+        rope_cos/sin: ``(T, HEAD_DIM)`` tables, or None to build here. attn_mask: bool, True =
+        attend — ``(T, T)`` shared or ``(B, 1, T, T)`` per sample, shaped once in T1DMAI.forward.
         """
         B, T, D = x.shape
         assert D == D_MODEL, f"Expected D_MODEL={D_MODEL}, got {D}"
@@ -184,10 +147,7 @@ class TemporalSelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # A bare 3-D (B, T, T) mask must never arrive here: broadcasting aligns from the
-        # right, so B would land on the head axis — raising when B != N_HEADS, silently
-        # masking head b with row b's mask when B == N_HEADS. T1DMAI.forward adds the
-        # head axis; this asserts it did.
+        # A bare (B,T,T) mask must never arrive: broadcasting would land B on the head axis.
         assert attn_mask.dim() in (2, 4), (
             f"attn_mask must be (T, T) or (B, 1, T, T), got "
             f"{tuple(attn_mask.shape)}"
@@ -248,55 +208,30 @@ class TransformerBlock(nn.Module):
 class T1DMAI(nn.Module):
     """Transformer for type-1 diabetes BG forecasting in Kovatchev RISK space.
 
-    ``bg_head`` emits, per masked-patch timestep, a median risk delta plus ``2·N_SPREADS``
-    quantile spreads off that timestep's interpolated state; ``utils.assemble_quantiles``
-    anchors the median at ``f(anchor_bg)`` and assembles the ascending fan. mg/dL is recovered by inference through
-    ``kovatchev_f_inv`` — the model never leaves risk space.
-
-    Forward inputs:
-        patches: ``(B, T, PATCH_DIM)`` step-major
-            (``PATCH_SIZE × N_INPUT_FEATURES = PATCH_DIM``); ``T <= MAX_SEQ_LEN``, the
-            collate pads to the batch maximum, not to ``MAX_SEQ_LEN``.
-        attn_mask: ``(T, T)`` or ``(B, T, T)`` bool, True = attend.
-        anchor_bg: ``(B, M)`` mg/dL — per masked patch, the nearest visible reading; the
-            risk anchor ``f(anchor_bg)`` for that slot's median.
-        mask_idx: ``(B, M)`` int64 — the patch index each head slot reads.
-
-    Forward outputs:
-        q_tau: ``(B, M, PATCH_SIZE, N_QUANTILES)`` risk space.
-        median: ``(B, M, PATCH_SIZE)`` risk space, the ``QUANTILE_LEVELS.index(0.5)``
-            column of ``q_tau``.
-
-    ``return_time=True`` additionally returns ``(B, M, TIME_PROBE_N_BINS)`` per-slot
-    hour-of-day bin logits, or ``None`` when the probe is disabled, read off every
-    gathered masked-patch hidden state. The head never feeds the forecast in the forward.
+    bg_head emits a median risk delta plus spreads per masked-patch timestep; assemble_quantiles
+    anchors at f(anchor_bg). mg/dL is recovered by inference; the model never leaves risk space.
     """
 
     def __init__(self) -> None:
         super().__init__()
 
-        # A masked patch carries z = 0 in its bg slots — a legal reading (~142 mg/dL),
-        # not a sentinel — so feat 4 announces the mask instead; the bias lets the
-        # projection use that bit as an offset.
+        # Masked bg z=0 is a legal reading (~142 mg/dL), not a sentinel; feat 4 announces the mask.
         self.patch_embed = nn.Linear(PATCH_DIM, D_MODEL)
 
         self.blocks = nn.ModuleList([TransformerBlock() for _ in range(N_LAYERS)])
 
         self.final_norm = RMSNorm(D_MODEL)
 
-        # One MLP shared by every within-patch step, run on that step's interpolated
-        # state. FROZEN column layout, and the graph cut point downstream: col 0 = median
-        # risk delta (added to that slot's f(anchor_bg)); cols 1..N = τ>.5 ascending
-        # spreads (softplus → positive gaps); cols N+1.. = τ<.5 ascending spreads.
+        # One MLP per step; FROZEN column layout, the graph cut point downstream.
+
+        # col 0 = median delta; cols 1..N = tau>.5 spreads; cols N+1.. = tau<.5 spreads.
         self.bg_head = nn.Sequential(
             nn.Linear(D_MODEL, BG_HEAD_HIDDEN), nn.SiLU(),
             nn.Linear(BG_HEAD_HIDDEN, BG_HEAD_HIDDEN), nn.SiLU(),
             nn.Linear(BG_HEAD_HIDDEN, 1 + 2 * N_SPREADS),
         )
 
-        # Built under a saved/restored RNG state, so its nn.Linear draws consume ZERO of
-        # the main init stream — otherwise they land BEFORE _init_weights and shift every
-        # forecast weight. _init_weights re-inits time_head LAST for the same reason.
+        # Built under saved/restored RNG state so its draws consume ZERO of the init stream.
         if TIME_PROBE_ENABLED:
             _rng_state = torch.random.get_rng_state()
             self.time_head = nn.Sequential(
@@ -323,13 +258,10 @@ class T1DMAI(nn.Module):
     def _init_weights(self) -> None:
         """Width-aware init std with a residual-aware rescale.
 
-        ``base_std`` scales as ``1/sqrt(d_model)``, anchored at the GPT-2 ``0.02`` for
-        ``d_model = 512``, so a resize by ``resize_model.py`` does not land in a too-hot
-        regime where SwiGLU saturates and Muon over-corrects in the first few hundred
-        steps.
+        ``base_std`` scales as ``1/sqrt(d_model)``, anchored at GPT-2's ``0.02`` for
+        ``d_model=512``, so resize_model.py doesn't land in a too-hot SwiGLU regime.
         """
-        # sqrt(1.0) is exactly 1.0 in IEEE 754, so this is bit-identical to the literal
-        # 0.02 at d_model = 512.
+        # sqrt(1.0) is exactly 1.0 in IEEE 754: bit-identical to the literal 0.02 at d_model=512.
         base_std = 0.02 * math.sqrt(512.0 / D_MODEL)
         aux_modules = set(self.time_head.modules()) if self.time_head is not None else set()
         if self.crossing_head is not None:
@@ -342,16 +274,13 @@ class T1DMAI(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Each block writes to the residual stream TWICE (attn out, FFN out), so the
-        # rescale is 1/sqrt(2*N_LAYERS) — one /sqrt(N) per independent write across the
-        # depth. Without it Muon drives these layers to huge norms and the stream explodes.
+        # Residual write TWICE per block, so rescale is 1/sqrt(2*N_LAYERS); else Muon explodes it.
         residual_init_std = base_std / math.sqrt(2 * N_LAYERS)
         for block in self.blocks:
             nn.init.normal_(block.attn.w_o.weight, mean=0.0, std=residual_init_std)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
             nn.init.normal_(block.ffn.w2.weight, mean=0.0, std=residual_init_std)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
 
-        # Tiny final weight and zero bias ⇒ median risk delta ≈ 0 at step 0, so the
-        # initial median is f(persistence), flat from each slot's anchor_bg.
+        # Tiny final weight, zero bias -> median delta ~0 at step 0; init median is f(persistence).
         final = self.bg_head[-1]  # pyright: ignore[reportIndexIssue]
         nn.init.normal_(final.weight, mean=0.0, std=BG_HEAD_INIT_SCALE)
         nn.init.zeros_(final.bias)
@@ -387,29 +316,9 @@ class T1DMAI(nn.Module):
         return_crossing: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """
-        Args:
-            patches: ``(B, T, PATCH_DIM)`` step-major. ``T <= MAX_SEQ_LEN``: the collate
-                left-pads to the batch maximum, so ``T`` varies batch to batch and is
-                never asserted equal to ``MAX_SEQ_LEN``.
-            attn_mask: ``(T, T)`` or ``(B, T, T)`` bool, True = attend.
-            anchor_bg: ``(B, M)`` mg/dL — the last step of the span's left neighbour, or
-                the first step of the right neighbour for a span at patch 0. Every slot
-                of one span carries the same value. ``.detach()``'d before ``f``, so no
-                gradient flows into it. Padded slots must still carry a legal mg/dL
-                value — the units tripwire below reads all ``M`` — and their outputs are
-                discarded downstream by ``valid``.
-            mask_idx: ``(B, M)`` int64 — the patch index each head slot reads; padded
-                slots gather position 0.
-            return_time: ``False`` (default) returns the 2-tuple bit-identically.
-
-        Returns:
-            q_tau: ``(B, M, PATCH_SIZE, N_QUANTILES)`` ascending quantile fan, RISK space.
-            median: ``(B, M, PATCH_SIZE)`` risk space, the ``QUANTILE_LEVELS.index(0.5)``
-                column of ``q_tau``.
-            time_pred: only with ``return_time=True`` — ``(B, M, TIME_PROBE_N_BINS)``
-                per-slot hour-of-day bin logits, or ``None`` when ``TIME_PROBE_ENABLED``
-                is False. Read off every gathered masked-patch hidden state, no
-                mean-pool; with ``TIME_PROBE_DETACH=False`` its loss co-trains the trunk.
+        anchor_bg: (B, M) mg/dL, detached before f; padded slots need a legal value (units
+        tripwire reads all M) and are discarded via valid. mask_idx: padded slots gather patch 0.
+        return_time=False returns the 2-tuple bit-identically.
         """
         B, T, _ = patches.shape
         assert mask_idx.dim() == 2 and mask_idx.shape[0] == B, (
@@ -422,9 +331,7 @@ class T1DMAI(nn.Module):
         assert anchor_bg.shape == (B, M), (
             f"anchor_bg must be (B, M)=({B}, {M}), got {tuple(anchor_bg.shape)}"
         )
-        # Units tripwire: every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3, the floor
-        # this assert reads, so a normalized-space BG routed into the anchor trips loudly.
-        # Pool-independent, and it covers all M slots.
+        # Units tripwire: legal z < BG_CLAMP_MIN-1e-3; a normalized value here trips loudly, all M.
         assert bool((anchor_bg >= BG_CLAMP_MIN - 1e-3).all()), (
             "anchor_bg below BG_CLAMP_MIN — non-mg/dL value routed into the anchor"
         )
@@ -434,12 +341,9 @@ class T1DMAI(nn.Module):
         # RoPE depends only on (T, head_dim), so build once and pass to every block.
         rope_cos, rope_sin = build_rope_cache(T, HEAD_DIM, device=x.device, dtype=x.dtype)
 
-        # SDPA consumes the bool mask directly (True = attend), so nothing additive is
-        # materialized and no (B, H, T, T) float is saved for backward. A shared (T, T)
-        # mask broadcasts over batch and head unchanged; a per-sample (B, T, T) must gain
-        # the head axis here, since broadcasting aligns from the right and would otherwise
-        # put B on the head axis — raising when B != N_HEADS, and silently masking head b
-        # with row b's mask when B == N_HEADS.
+        # SDPA consumes the bool mask directly; nothing additive materialized for backward.
+
+        # A per-sample (B,T,T) mask gains the head axis here, else B lands on the head axis.
         assert attn_mask.dtype == torch.bool, (
             f"attn_mask must be bool (True = attend), got {attn_mask.dtype}"
         )
@@ -454,9 +358,7 @@ class T1DMAI(nn.Module):
 
         x = self.final_norm(x)                           # (B, T, D_MODEL)
 
-        # The masked set is arbitrary (forecast, backcast, infill), so the head reads its
-        # slots by index, never by a trailing slice. Padded slots gather position 0 and
-        # are discarded downstream by ``valid``.
+        # Masked set is arbitrary; head reads slots by index, never a slice; padded gather 0.
         h_steps = step_states(x, mask_idx, attn_mask)     # (B, M, PATCH_SIZE, D_MODEL)
         head_raw = self.bg_head(h_steps)
         assert head_raw.shape == (
@@ -468,12 +370,9 @@ class T1DMAI(nn.Module):
             return q_tau, median
         time_pred = None
         if return_time and self.time_head is not None:
-            # Every gathered masked-patch hidden state, no mean-pool, so each per-patch
-            # representation the BG head's nodes are drawn from is forced to encode the
-            # absolute clock. With TIME_PROBE_DETACH=False the probe gradient back-props
-            # into the trunk; either way the forward VALUE of q_tau/median is unchanged.
-            # Slot j is patch mask_idx[:, j], so the caller's per-slot hour target must
-            # follow mask_idx, not a fixed offset from the context end.
+            # Every gathered hidden state, no mean-pool, forces it to encode the absolute clock.
+
+            # Slot j is patch mask_idx[:, j]; hour target follows mask_idx, not a fixed offset.
             pred = x.gather(1, mask_idx.unsqueeze(-1).expand(B, M, D_MODEL))
             h = pred if not TIME_PROBE_DETACH else pred.detach()  # (B, M, D_MODEL)
             time_pred = self.time_head(h)                         # (B, M, TIME_PROBE_N_BINS)

@@ -1,17 +1,7 @@
 """Finetune a pretrained checkpoint on the merged MetaboNet + DiaData cache.
 
-Selection: highest mean DTS zone-A share over the 30/60/90/120 min horizons, scored
-on the MetaboNet test-period windows (the live-leaderboard pooling). Each validation
-prints DTS-A / RMSE / MARD per horizon on two bases, mg/dL: the median line, which
-selection reads, and the METRIC_BAND_TAU_LO/HI band projection, reported with its
-realized coverage and mean width. The best snapshot
-(EMA weights) goes to ``<out-dir>/finetune_best.pt`` with the checkpoint keys
-``train.py`` writes, so calibrate/export/eval tooling loads it unchanged.
-
-The model is built at the CHECKPOINT's architecture, not ``config.py``'s: dims are
-derived from state-dict shapes (the ``model_health.run_data_pass`` pattern), the
-in-process ``config`` is patched, and every module binding config constants at
-import is re-imported against them.
+Selection: highest mean DTS zone-A share over 30/60/90/120 min. Built at the
+CHECKPOINT's architecture, not ``config.py``'s — dims come from state-dict shapes.
 """
 
 import argparse
@@ -58,14 +48,11 @@ def _apply_checkpoint_dims(ckpt: dict) -> None:
     config.PREDICTION_PATCHES = config.PREDICTION_HORIZON_HOURS * pph
     config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
     config.NIGHT_LONG_HORIZON_PATCHES = config.NIGHT_LONG_HORIZON_HOURS * pph
-    # model.py binds these at import; stale after a horizon override they build
-    # time_head at the wrong bin count and the load fails naming the probe.
+    # model.py binds these at import; stale, time_head builds at the wrong bin count.
     config.TIME_PROBE_N_BINS = max(1, round(24.0 / config.PREDICTION_HORIZON_HOURS))
     config.TIME_PROBE_BIN_HOURS = 24.0 / config.TIME_PROBE_N_BINS
 
-    # DataLoader workers (forkserver) import the modules fresh, so the patch
-    # above never reaches them in-process — serialize it into the environment,
-    # which finetune_data replays at the top of its own import.
+    # DataLoader workers import modules fresh, so serialize the patch for finetune_data to replay.
     keys = (
         'D_MODEL', 'N_HEADS', 'HEAD_DIM', 'N_LAYERS', 'FFN_DIM', 'BG_HEAD_HIDDEN',
         'TIME_PROBE_ENABLED', 'TIME_PROBE_HIDDEN', 'PATCH_SIZE', 'PATCH_DIM',
@@ -157,8 +144,7 @@ def main() -> None:
             sys.exit(f"--checkpoint {args.checkpoint}: blind masked-channel policy "
                      "— this pipeline conditions on announced doses")
         stats = ckpt['normalization_stats']
-        # The same guarantees load_normalization_stats gives a file: a missing
-        # channel or a degenerate std trains silently behind plausible numbers.
+        # Same guarantees load_normalization_stats gives a file: a bad channel trains silently.
         for name in CHANNEL_NAMES:
             s = stats.get(name)
             if (s is None or not np.isfinite(s.get('mean', np.nan))
@@ -166,9 +152,7 @@ def main() -> None:
                 sys.exit(f"--checkpoint {args.checkpoint}: bad normalization "
                          f"stats for channel {name!r}: {s}")
     else:
-        # Scratch init has no pretrained z-space to honour, so the stats are the
-        # cache's own — fit over its train-period steps by the build (or
-        # ``finetune_data.py fit-stats``) — validated on the way in.
+        # Scratch init has no pretrained z-space to honour, so stats are the cache's own.
         stats_path = os.path.join(args.cache, 'normalization_stats.json')
         if not os.path.exists(stats_path):
             sys.exit(f'{stats_path} missing — run: python finetune_data.py '
@@ -191,8 +175,7 @@ def main() -> None:
     if ckpt is None:
         init_from = 'random'
     elif ckpt.get('model_ema_state_dict') is not None:
-        # strict=False only for the EMA shadow's structural exclusions; anything
-        # actually missing or unexpected is still a wrong checkpoint.
+        # strict=False only for the EMA shadow's exclusions; anything else is a wrong checkpoint.
         missing, unexpected = model.load_state_dict(
             ckpt['model_ema_state_dict'], strict=False)
         assert not missing and not unexpected, (
@@ -246,8 +229,7 @@ def main() -> None:
                 batch['patches'].to(device), batch['attn_mask'].to(device),
                 batch['anchor_bg'].to(device), batch['mask_idx'].to(device),
             )
-            # The eval span is [(n_ctx, PREDICTION_PATCHES)], so slots 0..P-1 are
-            # the forecast zone in order and (P, S) row-major is the 24-step horizon.
+            # Eval span is [(n_ctx, PREDICTION_PATCHES)], so slots 0..P-1 are the forecast in order.
             B = median.shape[0]
             pred_mgdl = kovatchev_f_inv(
                 median[:, :PREDICTION_PATCHES, :]).reshape(B, -1).cpu().numpy()
@@ -282,21 +264,18 @@ def main() -> None:
                 continue
             rmse = float(np.sqrt(np.mean((p_ - t_) ** 2)))
             mard = float(100.0 * np.mean(np.abs(p_ - t_) / t_))
-            # Floor-only: the ceiling half would collapse every truth above the
-            # 400 rail onto the rail-pinned prediction and score it zone A.
+            # Floor-only: the ceiling half would collapse truth above 400 and score it zone A.
             t_c = np.clip(t_, BG_CLAMP_MIN, None)
             frac = dts_grid.dts_zone_fractions(dts_grid.dts_zone_counts(t_c, p_))
             dts_a = float(frac['a'] * 100.0) if frac['a'] is not None else None
-            # Projected twice: each basis onto the truth vector its own metric
-            # scores, so the band keeps zero error inside it under the floor too.
+            # Projected twice: each basis onto the truth vector its own metric scores.
             eff = band_project(t_, lo_, hi_)
             eff_c = band_project(t_c, lo_, hi_)
             rmse_b = float(np.sqrt(np.mean((eff - t_) ** 2)))
             mard_b = float(100.0 * np.mean(np.abs(eff - t_) / t_))
             frac_b = dts_grid.dts_zone_fractions(dts_grid.dts_zone_counts(t_c, eff_c))
             dts_a_b = float(frac_b['a'] * 100.0) if frac_b['a'] is not None else None
-            # A band figure means nothing without these two: widen the band until it
-            # swallows every truth and the errors go to zero while only they move.
+            # A band figure means nothing without these two: widen enough and its errors go to zero.
             cov = float(100.0 * np.mean((t_ >= lo_) & (t_ <= hi_)))
             width = float(np.mean(hi_ - lo_))
             out[m] = {'n': int(len(t_)), 'dts_a': dts_a, 'rmse': rmse, 'mard': mard,
@@ -312,8 +291,7 @@ def main() -> None:
         return out
 
     def print_table(metrics: dict, best: float, best_step: int) -> None:
-        # Plain columns are the median line, `b` columns the band projection: two
-        # quantities on one forecast, and a figure quoted without its basis is wrong.
+        # Plain columns are the median line, `b` columns the band projection.
         print('  min    DTS-A%  DTS-A%b     RMSE    RMSEb   MARD%   MARD%b'
               '    cov%   width       n')
         for m in HORIZON_MINUTES:
@@ -356,8 +334,7 @@ def main() -> None:
 
     def save(path: str, step: int, metrics: dict) -> None:
         with ema.apply_to(model):
-            # clone: on CPU ``.cpu()`` returns self, and apply_to's exit restores
-            # the live weights IN PLACE — an aliased dict would save those.
+            # clone: on CPU .cpu() returns self, and apply_to's exit restores weights IN PLACE.
             sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         torch.save({
             'arch_version': ARCH_VERSION,
@@ -388,8 +365,7 @@ def main() -> None:
     with ema.apply_to(model):
         metrics = evaluate()
     best, best_step = metrics['mean_dts_a'], 0
-    # The baseline is a legal best: finetune_best.pt always exists at exit —
-    # but never clobber a previous run's best with an untrained snapshot.
+    # Legal best: finetune_best.pt always exists at exit, but never clobber a trained run's best.
     best_path = os.path.join(args.out_dir, 'finetune_best.pt')
     if not os.path.exists(best_path):
         save(best_path, 0, metrics)
@@ -414,9 +390,7 @@ def main() -> None:
             q_tau, median, batch['targets'].to(device), weighting,
             valid=valid_b, mask_idx=mask_idx_b,
         )
-        # The probe co-trains the trunk in pretraining; without its CE here the
-        # head freezes while the trunk it reads moves, and the exported
-        # time_logits go stale. Backward only, exactly as in train.py.
+        # Without the probe's CE here, exported time_logits go stale as the trunk moves.
         loss_bw = loss
         if time_pred is not None and 'slot_hour' in batch:
             tod_ce = time_of_day_bin_ce(
@@ -424,10 +398,7 @@ def main() -> None:
                 TIME_PROBE_N_BINS, TIME_PROBE_LABEL_SMOOTH_BINS)
             loss_bw = loss + TIME_PROBE_LOSS_WEIGHT * tod_ce
 
-        # Guard the loss AND the grad norm: soft-DTW's fp32 backward can NaN
-        # while the forward value stays finite, and a NaN clip coefficient
-        # multiplies every gradient — one unguarded step poisons all parameters
-        # and the EMA update then skips every tensor forever.
+        # Guard loss AND grad norm: soft-DTW's fp32 backward can NaN, poisoning every parameter.
         skipped_reason = None
         if torch.isfinite(loss_bw):
             muon_opt.zero_grad(set_to_none=True)

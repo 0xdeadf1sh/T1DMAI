@@ -1,16 +1,8 @@
-"""The blosc2-backed simulator cache (T1DMSIM/cache_simulator.py + data.py).
-
-The builder lives in the EXTERNAL T1DMSIM repo, reachable as
-``T1DMSIM.cache_simulator`` through the ``T1DMAI/T1DMSIM`` symlink. There is no
-causal smoothing anywhere, so stats are fit on the RAW transformed channels.
-
-FOUR is the count of NORMALIZED channels; the input stack is five features wide,
-the fifth being the ``bg_masked`` bit, which carries no statistics.
-
-``pool_size=4``, ``n_jobs=1`` and the real ``ON_THE_FLY_SIM_HOURS`` /
-``SIMULATOR_WARMUP_HOURS``, so ``T1DMDataset`` accepts the cache without
-monkey-patching its trajectory-length validation; a full build is ~0.4 s.
-"""
+"""The blosc2-backed simulator cache (T1DMSIM/cache_simulator.py + data.py). Builder lives in the
+EXTERNAL T1DMSIM repo (``T1DMSIM.cache_simulator``), reached via the T1DMAI/T1DMSIM symlink; no
+causal smoothing, stats fit on RAW transformed channels. FOUR normalized channels; input stack is
+five wide, feat 4 = ``bg_masked`` bit, no statistics. ``pool_size=4``, ``n_jobs=1``, real
+``ON_THE_FLY_SIM_HOURS``/``SIMULATOR_WARMUP_HOURS`` so ``T1DMDataset`` needs no monkey-patch."""
 
 from __future__ import annotations
 
@@ -44,9 +36,7 @@ from T1DMSIM.cache_simulator import (
 from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
 
 
-# match the on-the-fly window and warmup, which T1DMDataset compares against config
-# alongside dt and uniform_prob. One full-length patient is ~90 ms, so pool_size=4
-# keeps every build under a second.
+# Matches what T1DMDataset checks against config; one patient ~90 ms, pool_size=4 stays under 1s.
 _TINY_SIM_HOURS = _data.ON_THE_FLY_SIM_HOURS
 _TINY_WARMUP_HOURS = _cfg.SIMULATOR_WARMUP_HOURS
 _TINY_POOL = 4
@@ -57,9 +47,7 @@ _REQUIRED_META_KEYS = (
     'pool_size', 'n_timesteps', 'sim_hours', 'simulator_warmup_hours',
     'patient_uniform_sample_prob', 'dt_minutes', 'channels', 'cache_format',
 )
-# the {mean, std} contract in the builder-emitted normalization_stats.json: all four
-# of ``normalization.CHANNEL_NAMES``, pinned so a builder that starts or stops
-# emitting one is visible here rather than in a training run
+# {mean, std} keys the builder emits: all four of ``normalization.CHANNEL_NAMES``, pinned here.
 _BUILDER_NORM_STATS_KEYS = frozenset({
     'bg_absolute', 'carb_intake', 'insulin_combined', 'exercise_equiv',
 })
@@ -152,18 +140,15 @@ def test_cache_layout(blosc2_cache: str) -> None:
     assert meta['patient_uniform_sample_prob'] == _TINY_UNIFORM_PROB
     assert tuple(meta['channels']) == CHANNEL_NAMES
 
-    # the builder's emitted {mean, std} must COVER the model's input stack with
-    # nothing left over
+    # the builder's emitted {mean, std} must COVER the model's input stack, nothing left over
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
     stats = _cache_stats(out_dir)
     assert set(stats) == _BUILDER_NORM_STATS_KEYS, f"norm stats keys = {set(stats)}"
     for name, mv in stats.items():
         assert set(mv) == {'mean', 'std'}, f"{name} stats = {mv}"
-        # std > 0 is the load-time contract: a channel whose window held no event fits
-        # std = 0, and normalize divides by std + 1e-8
+        # std > 0 is load-time contract: no-event channel fits std=0, normalize divides by std+1e-8
         assert np.isfinite(mv['mean']) and np.isfinite(mv['std']) and mv['std'] > 0
-    # no gap either way: an omitted channel reaches the input gather as a KeyError, an
-    # invented one is a fit for something the model never reads
+    # no gap either way: an omitted channel is a KeyError, an invented one fits something unread
     assert set(stats) == set(NORM_CHANNEL_NAMES), (
         f"builder-emitted stats {sorted(stats)} vs model channels "
         f"{sorted(NORM_CHANNEL_NAMES)}: the builder must fit every channel and "
@@ -222,8 +207,7 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
 
         assert MIN_CONTEXT_PATCHES <= n_ctx <= MAX_CONTEXT_PATCHES
         assert patches.shape == (n_ctx + PREDICTION_PATCHES, PATCH_DIM)
-        # one target row per HEAD SLOT, not per horizon patch: padded slots gather
-        # patch 0 and ``valid`` discards them
+        # one target row per HEAD SLOT: padded slots gather patch 0, ``valid`` discards them
         assert targets.shape == (MAX_MASKED_PATCHES, PATCH_SIZE)
         assert patches.dtype == torch.float32 and targets.dtype == torch.float32
         assert torch.isfinite(patches).all(), f"non-finite patches at {i}"
@@ -246,12 +230,10 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
 
 def test_stats_missing_a_channel_are_refused_by_the_loader(blosc2_cache: str) -> None:
     """A missing channel must FAIL rather than leave that channel untrained.
-
-    The input gather walks ``CHANNEL_NAMES`` and indexes ``stats[name]``, so a
-    ``.get(name, {'mean': 0, 'std': 1})`` fallback anywhere on this path turns a
-    missing fit into an untrained channel that trains to completion. The short file is
-    CONSTRUCTED here, so a builder that stops emitting one cannot retire this path.
-    """
+    Input gather walks ``CHANNEL_NAMES`` and indexes ``stats[name]``, so a
+    ``.get(name, {'mean': 0, 'std': 1})`` fallback anywhere turns a missing fit into an
+    untrained channel that trains to completion. Short file CONSTRUCTED here, so a builder
+    that stops emitting one cannot retire this path."""
     from data import T1DMDataset
 
     stats = {k: v for k, v in _cache_stats(blosc2_cache).items()
@@ -426,12 +408,10 @@ def test_no_partial_dir_left_after_success(blosc2_cache: str) -> None:
 
 def _oracle_cache_stats(cache_dir: str, n_rows: int | None = None) -> dict:
     """A naive oracle for the streaming Welford in ``compute_normalization_stats_from_cache``.
-
-    Reads all four signals in full, applies the model fit's own forward transform —
-    ``kovatchev_f_np`` on bg, ``log1p(max(x, 0))`` on the sparse three — to the RAW
-    post-noise values, then a plain ``np.mean`` / ``np.std(ddof=1)``. ``total_exercise``
-    is read at its cached g/step scale: not a glucose, so log1p, never the risk transform.
-    """
+    Reads all four signals in full, applies the fit's own forward transform —
+    ``kovatchev_f_np`` on bg, ``log1p(max(x, 0))`` on the sparse three — to RAW post-noise
+    values, then plain ``np.mean``/``np.std(ddof=1)``. ``total_exercise`` reads at its
+    cached g/step scale: not a glucose, so log1p, never the risk transform."""
     import blosc2
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
     from utils import kovatchev_f_np
@@ -496,8 +476,7 @@ def test_normalization_stats_from_cache(
     for name in NORM_CHANNEL_NAMES:
         assert got_2[name]['mean'] == pytest.approx(oracle_2[name]['mean'], rel=1e-6, abs=1e-6), name
 
-    # the builder fits during transcode with the same transform and the same Kovatchev
-    # constants, so its emitted stats must agree with the recomputed ones
+    # builder fits during transcode with same transform/Kovatchev constants, must agree here.
     emitted = _cache_stats(blosc2_dir)
     assert set(emitted) == _BUILDER_NORM_STATS_KEYS
     for name in sorted(_BUILDER_NORM_STATS_KEYS):

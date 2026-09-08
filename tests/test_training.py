@@ -1,10 +1,5 @@
-"""The risk-space training stack: pinball ρ_τ, soft-DTW / DILATE, the learned
-Kendall-Gal weighting, ``risk_total_loss``, and the loop plumbing — offset sampler,
-resume alignment, checkpoint, optimizer step.
-
-The BG forecast is a single quantile head in Kovatchev risk space, trained by
-pinball + DILATE (soft-DTW divergence shape plus TDI on the median) mixed with MSE
-by ``MSE_ALPHA``.
+"""The risk-space training stack: pinball, soft-DTW/DILATE, Kendall-Gal weighting,
+risk_total_loss, loop plumbing; BG forecast is one quantile head trained by pinball+DILATE+MSE.
 """
 
 import math
@@ -54,18 +49,16 @@ def test_pinball_gradients():
     g = float(q.grad)
     assert math.isfinite(g)
     assert -1.0 - 1e-6 <= g <= 1.0 + 1e-6, f"pinball grad out of subgradient band: {g}"
-    # at τ=0.9: d/dq (a-q)(τ-1) = 1-τ = 0.1 > 0, so the loss rises with q and the
-    # positive gradient pushes it DOWN
+    # At tau=0.9: d/dq (a-q)(tau-1) = 1-tau = 0.1 > 0, so positive gradient pushes it DOWN.
     assert g > 0.0, f"over-prediction must have positive grad (push down): {g}"
     print(f"\n[DUMP] pinball grad | over-pred @τ=0.9 grad={g:.3f} (push down) ✓")
 
 
 def test_soft_dtw_grads_and_gamma_sweep():
-    """Differentiable and finite across a γ sweep, even at the worst-case risk pair
-    f(BG_CLAMP_MIN) against f(BG_CLAMP_MAX) over a 24-step horizon.
+    """Differentiable and finite across a gamma sweep, even at the worst-case risk pair
+    f(BG_CLAMP_MIN) vs f(BG_CLAMP_MAX) over a 24-step horizon.
 
-    That pair is derived through the transform, never written as a numeral, so it
-    follows the clamp; the band is asymmetric.
+    That pair is derived through the transform, never a numeral, so it follows the clamp.
     """
     from dilate import SoftDTWBatch, _pairwise_sq_cost
     from config import DILATE_GAMMA
@@ -168,12 +161,10 @@ def test_to_patch_major_rejects_transpose():
 
 
 def test_kendall_gal_weighting_combine():
-    """``risk_total_loss`` combines the two terms as
-    ``0.5·exp(−2·σ_Q)·L_Q + σ_Q + 0.5·exp(−2·σ_D)·L_DR + σ_D``,
-    ``L_DR = (1 − MSE_ALPHA)·L_D + MSE_ALPHA·L_M``.
+    """risk_total_loss combines 0.5*exp(-2*sQ)*L_Q + sQ + 0.5*exp(-2*sD)*L_DR + sD, where
+    L_DR = (1-MSE_ALPHA)*L_D + MSE_ALPHA*L_M.
 
-    At ``KENDALL_LOGVAR_INIT == 0`` that reduces to ``0.5·L_Q + 0.5·L_DR``, and the
-    ``log_sigma_*`` components echo the clamped params.
+    At KENDALL_LOGVAR_INIT==0 that reduces to 0.5*L_Q + 0.5*L_DR; log_sigma_* echo the params.
     """
     from risk_loss import risk_total_loss, KendallGalWeighting
     from config import PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES, MSE_ALPHA
@@ -200,8 +191,7 @@ def test_kendall_gal_weighting_combine():
         "log-σ components must be present under the learned weighting"
     assert abs(float(comp['log_sigma_Q'])) < 1e-6 and abs(float(comp['log_sigma_D'])) < 1e-6
 
-    # bumping σ_Q down-weights L_Q, since the 0.5·exp(−2σ) prefactor shrinks, and adds
-    # the +σ_Q barrier
+    # Bumping sigma_Q down-weights L_Q (0.5*exp(-2*sigma) shrinks) and adds the +sigma_Q barrier.
     with torch.no_grad():
         weighting.log_sigma_Q.add_(1.0)
     total2, comp2 = risk_total_loss(q_tau, median, true_bg, weighting)
@@ -268,8 +258,7 @@ def test_risk_total_loss_f_applied_once_and_finite():
 
     B, P, S = 2, PREDICTION_PATCHES, PATCH_SIZE
     torch.manual_seed(0)
-    # genuine ascending quantiles off a head_raw + anchor, so q_tau and median are
-    # self-consistent and grad-bearing
+    # Genuine ascending quantiles off a head_raw + anchor, so q_tau/median are self-consistent.
     head_raw = torch.randn(B, P, S, 1 + 2 * ((N_QUANTILES - 1) // 2), requires_grad=True)
     last_bg = torch.full((B,), 120.0)
     q_tau, median = assemble_quantiles(head_raw, last_bg)
@@ -303,8 +292,7 @@ def test_risk_total_loss_lower_when_matched():
     B, P, S = 2, PREDICTION_PATCHES, PATCH_SIZE
     weighting = KendallGalWeighting()
     last_bg = torch.full((B,), 120.0)
-    # ramp the truth: against a flat truth the median delta is zero at every step and the
-    # two signs collapse onto the same anchor
+    # Ramp the truth: a flat truth collapses both signs onto the same anchor at zero delta.
     true_bg = torch.full((B, P, S), 120.0)
     for p in range(P):
         for s in range(S):
@@ -315,8 +303,7 @@ def test_risk_total_loss_lower_when_matched():
 
     def _loss_for(delta_sign: float) -> float:
         head = torch.zeros(B, P, S, 1 + 2 * n_spread)
-        # per-step median delta = sign * (f(true_step) - f(last)): +1 tracks the truth,
-        # -1 anti-tracks it
+        # Per-step median delta = sign * (f(true_step) - f(last)): +1 tracks truth, -1 anti-tracks.
         for p in range(P):
             for s in range(S):
                 tgt_risk = kovatchev_f(true_bg[:, p, s])
@@ -522,8 +509,7 @@ def test_training_100_steps_loss_trend():
     print(f"\n[DUMP] training_100step | first25={first:.4f} last25={last:.4f} "
           f"worst25={worst:.4f}")
 
-    # the weighted loss can go negative through the +log_sigma barriers, so compare
-    # drift in magnitude
+    # Weighted loss can go negative through the +log_sigma barriers, so compare drift in magnitude.
     assert math.isfinite(worst) and math.isfinite(last)
     assert worst < abs(first) + max(2.0, 1.5 * abs(first)), (
         f"loss spiked mid-run: worst25={worst:.4f} vs first25={first:.4f}")
@@ -550,8 +536,7 @@ def test_weight_decay_schedule_correction():
     def _in(group: dict, param: torch.Tensor) -> bool:
         return any(p is param for p in group['params'])
 
-    # output projections are excluded from the correction, a normalized matrix such as
-    # the patch embedding is included
+    # Output projections excluded from the correction; a matrix like patch_embed is included.
     assert _in(output_group, model.bg_head[-1].weight)
     assert not _in(corrected_group, model.bg_head[-1].weight)
     if model.time_head is not None:
@@ -581,26 +566,22 @@ def test_weight_decay_schedule_correction():
         eff = corrected_group['lr'] * corrected_group['weight_decay']
         print(f"[DUMP] wd_correction | step={step:6d} ratio={r:.6f} "
               f"corrected_wd={wd:.6e} eff_decay={eff:.6e}")
-        # weight_decay scaled to base*ratio ...
+        # weight_decay scaled to base*ratio.
         assert math.isclose(wd, MUON_WEIGHT_DECAY * r, rel_tol=1e-9, abs_tol=1e-12)
-        # ... so the effective per-step decay lr*wd = peak * lambda * ratio^2
-        # = gamma_t^2/gamma_max * lambda (Algorithm 1 line 12).
+        # Effective decay lr*wd = peak*lambda*ratio^2 = gamma_t^2/gamma_max*lambda (Alg 1 line 12).
         assert eff == pytest.approx(0.02 * MUON_WEIGHT_DECAY * r * r, rel=1e-9, abs=1e-15)
         # Excluded groups keep their constant decay.
         assert output_group['weight_decay'] == MUON_WEIGHT_DECAY
         assert adam_decayed['weight_decay'] == ADAM_WEIGHT_DECAY
         assert kendall_group['weight_decay'] == 0.0
 
-    # at peak LR (ratio == 1, step == warmup_steps) the corrected effective decay is
-    # bit-identical to plain decoupled decay, peak*lambda
+    # At peak LR (ratio==1) the corrected decay is bit-identical to plain decay, peak*lambda.
     _update_lr(muon_opt, adam_opt, warmup_steps, 0.02, 0.003, warmup_steps, total_steps,
                lr_min_ratio, wd_correction=True)
     assert ratio(warmup_steps) == 1.0
     assert corrected_group['lr'] * corrected_group['weight_decay'] == 0.02 * MUON_WEIGHT_DECAY
 
-    # drive the group to a drifted tail value (ratio << 1) with the correction ON and
-    # no intervening ratio==1 reset, so the off-path assertion exercises the restore
-    # rather than reading a value an earlier peak-LR call left at base
+    # Drive the group to a drifted tail value with no intervening ratio==1 reset first.
     _update_lr(muon_opt, adam_opt, 99000, 0.02, 0.003, warmup_steps, total_steps,
                lr_min_ratio, wd_correction=True)
     assert corrected_group['weight_decay'] < MUON_WEIGHT_DECAY   # drifted below base
@@ -614,10 +595,8 @@ def test_weight_decay_schedule_correction():
 def test_csv_header_and_row_same_length():
     """Header and row writer stay element-for-element aligned.
 
-    Both come from one ``(name, decimals)`` spec, so the length equality is what
-    checks that the extraction still holds. The checkpoint's ``val_record`` is a THIRD
-    surface, deliberately not compared: it carries keys no CSV column has and misses
-    columns the CSV writes.
+    Both come from one (name, decimals) spec. The checkpoint's val_record is a THIRD
+    surface, deliberately not compared: it carries keys no CSV column has and misses others.
     """
     import csv
     import io
@@ -637,8 +616,7 @@ def test_csv_header_and_row_same_length():
             f"{sorted({c for c in header if header.count(c) > 1})}"
         )
 
-        # through the writer the loop uses, so a widening that appears only once the
-        # row is serialised is caught too
+        # Through the writer the loop uses, so a widening only visible when serialised is caught.
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(header)
@@ -664,11 +642,8 @@ def test_val_log_has_no_dead_alias():
 def test_val_log_bins_masked_bg_on_d():
     """Every masked-BG family is reported per ``d``, and none is pooled.
 
-    ``d`` is the distance in patches to the nearest visible evidence on either side.
-    The sampler concentrates supervision at small ``d``, so a pooled masked-BG scalar
-    falls without the model improving and must not exist to be selected on. Both axes
-    and the infill names come from ``metrics.protocols``: a local range would be a
-    second copy.
+    A pooled masked-BG scalar falls without the model improving (sampler concentrates at
+    small d) and must not exist to be selected on. Axes come from metrics.protocols.
     """
     from config import PREDICTION_PATCHES
     from metrics.protocols import FORECAST, INFILL, column, reachable_d
@@ -696,8 +671,7 @@ def test_val_log_bins_masked_bg_on_d():
         assert col.replace('coverage90@', 'sharp90@') in names, (
             f"{col} has no sharpness companion")
 
-    # a family name with no axis suffix IS a pooled masked-BG scalar;
-    # ``metrics.protocols.column`` refuses to build one, this catches another route
+    # No axis suffix IS a pooled masked-BG scalar; catches a route around column()'s refusal.
     for fam in ('crps', 'winkler90'):
         assert fam not in names, f"{fam} is pooled over d"
     for name in names:

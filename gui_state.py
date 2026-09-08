@@ -1,9 +1,7 @@
 """Everything the GUI remembers between frames, in one mutable ``GUIState`` passed by reference.
 
-Threading is confined to ``gui._run_prediction_async``: the worker writes ``is_computing``,
-``status_message`` and the ``prediction.*`` slots, the main loop reads them every frame and
-defers the prediction layer until ``is_computing`` goes False.  Attribute assignment is
-atomic, so no lock.
+Threading: ``gui._run_prediction_async`` (worker thread) writes ``is_computing``,
+``status_message`` and ``prediction.*``; main loop reads them per frame. Atomic write, no lock.
 """
 
 import copy
@@ -36,9 +34,8 @@ MEAL_NAMES = ('breakfast', 'lunch', 'dinner', 'snack')
 class Event:
     """Intervention template compiled to CurveEvents at prediction time.
 
-    ``time_offset_min`` is minutes from the start of the prediction zone; ``magnitude`` is the
-    kind's natural unit (g carbs, U insulin); ``fast_frac`` splits a meal's carbs between the
-    fast and slow absorption bells.
+    ``time_offset_min``: minutes from the prediction-zone start. ``magnitude``: kind's
+    natural unit (g carbs, U insulin). ``fast_frac``: splits a meal's carbs fast/slow.
     """
     kind: str
     time_offset_min: float
@@ -71,26 +68,15 @@ class CurveEvent:
 class PencilStroke:
     """One freehand announced-dose stroke, as parallel ``xs`` / ``ys`` samples.
 
-    ``xs`` are ABSOLUTE patch positions, like ``CurveEvent``; ``ys`` raw doses — g/5min carbs,
-    U/5min insulin, g/step carb-equivalent exercise.  Resampled onto the (patch, timestep) grid
-    and smoothed at compile time (``gui._pencil_strokes_to_raw_values``); 0 outside its ``xs``.
+    ``xs``: ABSOLUTE patch positions, like ``CurveEvent``. ``ys``: raw doses (g/5min carbs,
+    U/5min insulin, g/step exercise), resampled/smoothed at compile time; 0 outside ``xs``.
     """
     channel: int             # display channel (1=carbs, 2=insulin, 3=exercise)
     xs: list[float] = field(default_factory=list)   # absolute patch positions
     ys: list[float] = field(default_factory=list)   # raw values (g/5min, U/5min or g/step)
 
 
-# Free-form masking: forecast, begin-fill and infill are POSITIONS of one masked-BG objective,
-# not modes.  Everything here is pure — no pygame, no model, no torch — so it is testable with
-# no display.  ``n_pred`` is a parameter, never ``config``: ``gui.main`` rewrites
-# ``inference.PREDICTION_PATCHES`` to the loaded checkpoint's horizon and leaves ``config``
-# alone, so a module-level binding would go stale against the window inference builds.
-#
-# THE TRAILING SPAN IS NOT OPTIONAL.  ``inference._resolve_mask_spans`` requires every patch of
-# ``[n_ctx, n_ctx + n_pred)`` masked: that zone carries no observed BG, so a visible patch there
-# announces a fabricated ``z = 0`` (~142 mg/dL) as a reading.  Every emitted set therefore ends
-# with ``(n_ctx, n_pred)``, the user's budget is what is left of ``MAX_MASKED_PATCHES``, and a
-# pure interior infill is unreachable.
+# Trailing span (n_ctx, n_pred) is mandatory: inference._resolve_mask_spans requires it masked.
 
 MASK_PRESET_FORECAST = 'forecast'
 MASK_PRESET_BEGIN_FILL = 'begin_fill'
@@ -137,11 +123,9 @@ def user_mask_capacity(n_pred: int) -> int:
 def merge_mask_spans(spans: list[MaskSpan]) -> list[MaskSpan]:
     """Sort by start and fuse every overlapping OR ABUTTING pair into one span.
 
-    Two masked spans never abut: the visible separator is what makes the anchor, the per-span
-    spline's node sequence and the DILATE length bucket well defined, and ``utils._span_layout``
-    identifies spans by adjacency in ``mask_idx`` because of it.  An abutting pair IS one
-    longer span, so this fuses rather than rejects.
-    """
+    Two masked spans never abut: the separator makes the anchor, spline node sequence and DILATE
+    length bucket well defined (``utils._span_layout`` identifies spans by adjacency). An
+    abutting pair IS one longer span, so this fuses rather than rejects."""
     out: list[MaskSpan] = []
     for s in sorted(spans, key=lambda z: (z.start, z.length)):
         if s.length < 1:
@@ -180,7 +164,7 @@ def validate_user_spans(spans: list[MaskSpan], n_ctx: int, n_pred: int) -> str:
 def add_user_span(
     spans: list[MaskSpan], new: MaskSpan, n_ctx: int, n_pred: int,
 ) -> tuple[list[MaskSpan], str]:
-    """Add one span, merging and validating; returns ``(spans, reason)``, ``reason`` ``''`` on success.
+    """Add one span. Returns ``(spans, reason)``; ``''`` reason means success.
 
     Refuses as a whole — on failure the set returned is the ORIGINAL one, never half-applied.
     """
@@ -194,7 +178,7 @@ def add_user_span(
 def emit_mask_spans(
     spans: list[MaskSpan], n_ctx: int, n_pred: int,
 ) -> list[tuple[int, int]]:
-    """``[(start_patch, length), ...]`` over the ``n_ctx + n_pred`` window, for ``inference.predict``.
+    """``[(start_patch, length), ...]`` over ``n_ctx + n_pred``, for ``inference.predict``.
 
     Sorted, non-abutting, inside the window, always ending with the trailing forecast span —
     the four rules ``inference._resolve_mask_spans`` asserts.  ``spans`` need not be merged.
@@ -208,8 +192,8 @@ def emit_mask_spans(
 def preset_user_spans(preset: str, n_ctx: int, n_pred: int) -> list[MaskSpan]:
     """The user spans one preset places, empty when it does not fit.
 
-    ``forecast`` places none — the trailing span is emitted either way.  The other two place
-    one span of the forecast's own length, so the presets differ only in WHERE it sits.
+    ``forecast`` places none; the trailing span still gets emitted. The other two place one span
+    of the forecast's length, differing only in WHERE it sits.
     """
     assert preset in MASK_PRESETS, f"unknown mask preset {preset!r}"
     if preset == MASK_PRESET_FORECAST:
@@ -230,27 +214,18 @@ def preset_user_spans(preset: str, n_ctx: int, n_pred: int) -> list[MaskSpan]:
 def mask_span_ood(
     spans: list[tuple[int, int]], n_ctx: int, n_pred: int,
 ) -> dict[int, str]:
-    """``{index into the emitted spans: reason}`` for spans the sampler never supervised.
+    """``{span index: reason}`` for spans the sampler never supervised; a hint, not a block.
 
-    A hint, never a block: the fan is still a fan, but it was never trained on a mask of this
-    shape, so its calibration is evidence of nothing.  Absent keys are in-distribution.
-    Three conditions, every threshold read off the sampler's constants: a span longer than
-    ``max(MASK_SPAN_LENGTHS)``; a masked patch farther than that from visible evidence on
-    either side (``d``, from ``data._mask_slots``, the distance every masked-BG metric bins on);
-    more spans than ``MASK_MAX_SPANS``.
-    Only the third fires at today's constants — the user's budget is
-    ``MAX_MASKED_PATCHES - n_pred`` = 8 = ``max(MASK_SPAN_LENGTHS)``, so no admissible span is
-    longer than the length law, and ``d <= length`` makes the second subsume into the first at
-    ANY constants.  ``tests/test_gui_masking.py`` pins each relation.
-    """
+    Only the ``MASK_MAX_SPANS`` condition ever fires today: the budget caps span length under
+    ``max(MASK_SPAN_LENGTHS)``, so ``d <= length`` subsumes the other two at any constants.
+    ``tests/test_gui_masking.py`` pins the relation."""
     from data import _mask_slots
     max_len = max(config.MASK_SPAN_LENGTHS)
     seq_len = int(n_ctx) + int(n_pred)
     out: dict[int, str] = {}
     total = sum(int(L) for _s, L in spans)
     if total > config.MAX_MASKED_PATCHES:
-        # unemittable, not merely unsupervised: ``_mask_slots`` has nowhere to put the
-        # surplus, so say so instead of indexing past the head's slots
+        # unemittable, not unsupervised — no slot for the surplus in _mask_slots, so say so instead
         return {i: (f"{total} masked patches exceeds the head's "
                     f"{config.MAX_MASKED_PATCHES} slots")
                 for i in range(len(spans))}
@@ -277,9 +252,8 @@ def mask_dose_fill(
     """``{feat_idx: z}`` under the checkpoint's ``blind`` policy with stats to hand, else ``None``.
 
     ``announced`` rides the recorded doses through a masked patch; ``blind`` pins them at
-    ``normalize(0)`` as training did, and handing such a checkpoint the recorded doses feeds it
-    a channel it learned to read as constant.
-    """
+    ``normalize(0)`` as training did — feeding recorded doses to such a checkpoint hands it
+    a channel it learned to read as constant."""
     from data import MASKED_CHANNEL_POLICY_BLIND, zero_dose_fill
     if policy != MASKED_CHANNEL_POLICY_BLIND or not stats:
         return None
@@ -297,9 +271,8 @@ def span_anchor_cell(start: int, length: int) -> tuple[int, int]:
     """``(patch, step)`` of one span's anchor, in window coordinates.
 
     Splits ``data._anchor_step_for_span``'s step index — the SAME one-sided, left-preferring
-    rule the model is handed, so the readout cannot show an anchor the forward did not use.
-    A span at patch 0 takes its RIGHT neighbour's first step, every other its left's last.
-    """
+    rule the model is handed. A span at patch 0 takes its RIGHT neighbour's first step, every
+    other its left's last."""
     from data import _anchor_step_for_span
     step = _anchor_step_for_span(int(start), int(length))
     return step // config.PATCH_SIZE, step % config.PATCH_SIZE
@@ -331,28 +304,22 @@ class PredictionResult:
     """
     median_bg: np.ndarray | None = None     # (P*S,) headline BG forecast (mg/dL)
     bands: np.ndarray | None = None         # (P, S, N_QUANTILES) per-τ band edges (mg/dL)
-    # (P,) ABSOLUTE patch of each ``bands`` row — ``predict``'s own ``mask_idx``. The masked set
-    # is arbitrary, so the chart places row j at patch mask_idx[j], never at a fixed offset from
-    # the context end. None ⇒ the rows ARE the trailing forecast, in order (and the rolling path).
+    # (P,) ABSOLUTE patch per bands row (mask_idx); None = rows are the trailing forecast, in order
     span_patches: np.ndarray | None = None
     n_rolls: int = 1                        # number of rolls for extended prediction
     is_what_if: bool = False                # whether this is an input-perturbation what-if
-    overrides_raw: dict[int, np.ndarray] | None = None  # raw carb/insulin/exercise announced in the pred zone
-    # Time-of-day probe, diagnostic only (``gui._decode_tod``). All None when the probe is off
-    # (``TIME_PROBE_ENABLED`` False) or the decode failed.
+    overrides_raw: dict[int, np.ndarray] | None = None  # raw doses announced in the pred zone
+    # Time-of-day probe (gui._decode_tod), diagnostic only; None when off or decode failed
     tod_pred_hour: float | None = None      # model-decoded prediction-origin hour-of-day, [0, 24)
-    tod_confidence: float | None = None     # resultant length R of the per-bin belief, [0, 1], higher = more confident
-    tod_bin_probs: np.ndarray | None = None  # (P, TIME_PROBE_N_BINS) per-patch softmax belief; None when probe off
-    # ``attribution.Attribution`` for the selected span; None when the overlay is off or it
-    # failed. Keyed to the same masked set and doses as the bands above — a map from another
-    # forward would explain a forecast nobody is looking at.
+    tod_confidence: float | None = None     # resultant length R, [0,1], higher = more confident
+    tod_bin_probs: np.ndarray | None = None  # (P, TIME_PROBE_N_BINS) belief; None if probe off
+    # attribution.Attribution for this span (masked set/doses keyed); None if off or failed
     attribution: Any = None
 
 
 class GUIState:
     def __init__(self) -> None:
-        # One entry per display channel, zipped against gui.CHANNEL_COLORS to build the sidebar
-        # toggles — a short list truncates that zip and the missing toggle just disappears.
+        # Per-channel, zipped with gui.CHANNEL_COLORS for sidebar toggles; short list drops toggles
         self.channel_visible: list[bool] = [True, True, True, True]
         self.channel_names: list[str] = [
             'Blood Glucose', 'Carbs', 'Insulin', 'Exercise',
@@ -361,8 +328,7 @@ class GUIState:
         self.active_tool: str = TOOL_NONE
         self.selected_channel: int = -1       # which channel is selected for editing
 
-        # {output channel 0=carbs, 1=insulin, 2=exercise: (P, S) NORMALIZED}, passed straight
-        # to inference.predict_what_if. BG is never overridable — the model always predicts it.
+        # {0=carbs,1=insulin,2=exercise: (P,S) NORMALIZED}; predict_what_if input, BG excluded
         self.overrides: dict[int, np.ndarray] = {}
 
         self.prediction: PredictionResult = PredictionResult()
@@ -372,13 +338,12 @@ class GUIState:
         self.patient_seed: int = 42
         self.patient_summary: dict[str, str] | None = None
         self.bg_raw: np.ndarray | None = None  # raw BG for context region (mg/dL)
-        self.context_raw: np.ndarray | None = None  # (n_ctx*PATCH_SIZE, N_INPUT_FEATURES) raw display values
+        self.context_raw: np.ndarray | None = None  # raw (n_ctx*PATCH_SIZE, N_INPUT_FEATURES)
         self.norm_stats: dict | None = None
         self.last_bg: float = 100.0           # last observed BG before prediction zone
         self.sim_start_hour: float = 0.0      # hour-of-day at first context timestep
         self.sim_start_day: int = 0            # day index at first context timestep
-        # Live simulator, so "Sim Fwd" advances the truth in place and appends patches to the
-        # context. None until a patient is loaded.
+        # Live simulator: "Sim Fwd" advances truth in place, appends patches; None until loaded
         self.sim: Any = None
 
         # display channel being edited: 1=Carbs, 2=Insulin, 3=Exercise (BG is not editable)
@@ -399,12 +364,10 @@ class GUIState:
         self.selected_event_idx: int = -1
         self.dragging_point: str | None = None  # 'peak', 'left', 'right', or None
 
-        # Pencil strokes and CurveEvents coexist: both compile to announced doses and SUM
-        # (``gui._compile_overrides_from_edits``).
+        # Coexists with CurveEvents; compiles to doses that SUM (_compile_overrides_from_edits)
         self.pencil_strokes: list[PencilStroke] = []
 
-        # juice / meal / bolus templates, compiled to CurveEvents at prediction time by
-        # ``gui._events_to_curve_events``
+        # juice/meal/bolus templates -> CurveEvents at predict time (_events_to_curve_events)
         self.events: list[Event] = []
         self.events_panel_visible: bool = True
 
@@ -413,8 +376,7 @@ class GUIState:
         self.builder_time_patch: float = -1.0  # where user clicked for event time
         self.builder_params: dict[str, Any] = {}
 
-        # Independent of ``prediction``, so it survives Predict / Sim Fwd / Reset; cleared on
-        # New Patient.
+        # Independent of prediction; survives Predict/Sim Fwd/Reset, cleared on New Patient
         self.last_eval: EvalResult | None = None
 
         # Cosmetic only — the prediction tensors are never modified.
@@ -423,24 +385,17 @@ class GUIState:
 
         self.screenshot_count: int = 0
 
-        # User spans over the CONTEXT only; the mandatory trailing span is appended at emit
-        # time. Cleared on every context change — Sim Fwd appends patches and New Patient
-        # replaces them, so a kept span would mask different data than the user drew.
+        # Context-only spans, trailing span appended at emit; cleared on any context change
         self.mask_spans: list[MaskSpan] = []
         self.selected_mask_idx: int = -1       # index into mask_spans, -1 = the forecast
         self.mask_preset: str = MASK_PRESET_FORECAST
-        # the checkpoint's own ``data.stored_masked_channel_policy``; under 'blind' the masked
-        # spans carry ``data.zero_dose_fill`` and dose painting is disabled
+        # checkpoint's stored_masked_channel_policy; 'blind' -> zero_dose_fill, painting disabled
         self.masked_channel_policy: str = 'announced'
 
-        # The exact inputs ``inference.predict`` consumed for the forecast on screen, so the
-        # maps can be filled or re-aimed without a second prediction — a re-run would have to
-        # reproduce this forward exactly and nothing would check that it had. None until a
-        # prediction runs; cleared with the prediction it belongs to.
+        # inference.predict inputs for on-screen forecast, re-aim maps w/o rerun; None until run
         self.last_forward: dict[str, Any] | None = None
 
-        # Off by default: the maps cost an extra grad-enabled forward per prediction.
-        # ``attn_layer`` -1 is the rollout across all layers, else that layer's own attention.
+        # Off by default, costs an extra grad forward; attn_layer -1 = all layers rolled up
         self.attn_overlay_visible: bool = False
         self.attn_layer: int = -1
 

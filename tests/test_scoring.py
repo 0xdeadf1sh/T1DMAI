@@ -1,13 +1,6 @@
-"""Proper scoring rules for the masked-BG fan (``metrics.scoring``). Three fans recur:
-
-  * DEGENERATE, every τ on one value: CRPS is the absolute error, Winkler the pure
-    escape penalty, coverage 0/1;
-  * CALIBRATED, the exact quantiles of the law the truth is drawn from;
-  * MISCALIBRATED, that one shrunk: worse on every rule while reading SHARPER, which
-    is why sharpness never travels without coverage.
-
-CRPS also gets an independent reference: dense quadrature of the pinball loss over τ.
-Every array is mg/dL; the space guard is tested directly.
+"""Proper scoring rules for the masked-BG fan (metrics.scoring). Three fans recur:
+DEGENERATE (one value), CALIBRATED (exact quantiles), MISCALIBRATED (shrunk, sharper
+but worse). CRPS also gets dense pinball quadrature as an independent reference.
 """
 from __future__ import annotations
 
@@ -127,11 +120,8 @@ def test_crps_pwl_matches_dense_quadrature():
 
 
 def test_crps_trapezoid_excess_matches_its_closed_form():
-    """Only ``q(0.5)..q(0.75)`` is non-degenerate, so the whole rule difference comes
-    from that subinterval (h = 0.25, spread D).
-
-    It must equal ``2·[D·h·u(1−u)(1−h)/2 − D·h²·(u³+(1−u)³)/6]``, peaking at ``D/24``
-    with the truth mid-gap.
+    """Only q(0.5)..q(0.75) is non-degenerate, so the whole difference is from that
+    subinterval (h=0.25, spread D): 2*[D*h*u(1-u)(1-h)/2 - D*h^2*(u^3+(1-u)^3)/6], peaking at D/24.
     """
     base, D, h, ta = 150.0, 20.0, 0.25, 0.5
     qrow = np.array([base] * 4 + [base + D] * 3, dtype=np.float64)
@@ -186,11 +176,9 @@ def test_crps_by_d_bins_and_marks_the_pooled_figure():
 
 
 def test_pooled_moves_with_the_d_mixture_alone():
-    """Identical per-``d`` skill, different pooled score, because the supervision shares
-    differ.
+    """Identical per-d skill, different pooled score, because the supervision shares differ.
 
-    Hence ``POOLED_NOT_COMPARABLE``: the pooled figure improves when the mask mixture
-    softens, so it cannot select a checkpoint.
+    Hence POOLED_NOT_COMPARABLE: the figure improves when the mask mixture softens.
     """
     def pooled_for(n_easy: int, n_hard: int) -> float:
         true = np.full((n_easy + n_hard, 1), 100.0)
@@ -364,15 +352,10 @@ def test_predictive_cdf_is_the_fan_interpolated():
 
 
 def _alarm_case():
-    """Four groups × four patches (``d`` = 1..4) × ``PATCH_SIZE`` steps.
+    """Four groups x four patches (d=1..4) x PATCH_SIZE steps.
 
-    A patch centred on 80 mg/dL dips its τ=0.25 edge to 60 and alarms; one centred on
-    150 never does. Truth is flat 150 apart from the two planted hypos.
-
-      g0: alarms at d = 3, true hypo at d = 3 step 0  → detected, lead 65 min
-      g1: alarms at d = 1, true hypo at d = 1 step 5  → detected, lead 30 min
-      g2: alarms at d = 2, no hypo                    → false alarm
-      g3: never alarms, no hypo
+    g0 alarms at d=3, true hypo at d=3 (detected, lead 65min); g1 alarms/hypo at d=1
+    (lead 30min); g2 alarms at d=2, no hypo (false alarm); g3 never alarms, no hypo.
     """
     n, s = 16, PATCH_SIZE
     center = np.full((n, s), 150.0)

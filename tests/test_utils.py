@@ -44,8 +44,7 @@ def test_attention_mask_shape():
 
     assert mask[n_ctx:, :n_ctx].all(), "Prediction-to-context should be all True"
 
-    # the prediction zone attends to itself in BOTH directions; no future leaks,
-    # since context-to-prediction is already blocked above
+    # prediction zone attends itself in BOTH directions; no leak (context->pred already blocked).
     pred_block = mask[n_ctx:, n_ctx:]
     assert pred_block.all(), "Prediction-to-prediction should be all True (bidirectional)"
 
@@ -61,11 +60,8 @@ def test_attention_mask_shape():
 def test_attention_mask_is_not_memoized():
     """No cheap key identifies an arbitrary masked set, so a memo on
     ``(n_context, n_prediction)`` hands one sample's mask to another with no shape error.
-
-    The witness that matters: two DIFFERENT masked sets at the SAME ``n_ctx`` must
-    produce different masks. The bit-identity gate cannot catch a returning memo — it
-    runs the one key the memo was built for.
-    """
+    Witness: two DIFFERENT masked sets at the SAME ``n_ctx`` must produce different masks.
+    The bit-identity gate can't catch a returning memo — it runs the one key it was built for."""
     import utils
     from utils import create_attention_mask, create_attention_mask_from_visible
 
@@ -84,8 +80,7 @@ def test_attention_mask_is_not_memoized():
         "two different masked sets at the same n_ctx produced the SAME mask — "
         "a memo keyed on (n_context, n_prediction) is back")
 
-    # repeated identical calls hand back INDEPENDENT tensors: a caller that edits one
-    # must not poison the next
+    # repeated identical calls hand back INDEPENDENT tensors: editing one must not poison the next.
     assert not hasattr(utils, '_ATTENTION_MASK_CACHE'), \
         "utils._ATTENTION_MASK_CACHE must be deleted — no memo can be correct here"
     m1 = create_attention_mask(n_ctx, T - n_ctx)
@@ -100,9 +95,7 @@ def test_attention_mask_is_not_memoized():
           f"{n_diff} of {T * T} entries; no cache attribute; fresh tensor per call ✓")
 
 
-# the Kovatchev transform is the ONLY mg/dL <-> risk-space bridge. kovatchev_f imports
-# BG_CLAMP_MIN/MAX from the simulator, the units tripwire; kovatchev_f_inv clamps the
-# risk input, exps, then clamps the mg/dL output.
+# Kovatchev transform is the ONLY mg/dL<->risk bridge; f_inv clamps risk in, exp, clamps output.
 
 def _sim_clamps() -> tuple[float, float]:
     import T1DMSIM.simulator as sim
@@ -111,11 +104,8 @@ def _sim_clamps() -> tuple[float, float]:
 
 def test_kovatchev_constants_against_reference():
     """SCALE 2.2211457449985317 / POWER 1.084 / OFFSET 5.540076976170212, against an
-    independent reference and against the defining endpoints.
-
-    f(40) = -sqrt(10) and f(400) = +sqrt(10), so the risk 10*f^2 saturates at 100 at
-    both CGM device rails.
-    """
+    independent reference and against the defining endpoints. f(40) = -sqrt(10) and
+    f(400) = +sqrt(10), so the risk 10*f^2 saturates at 100 at both CGM device rails."""
     from utils import kovatchev_f
 
     SCALE, POWER, OFFSET = 2.2211457449985317, 1.084, 5.540076976170212
@@ -139,11 +129,8 @@ def test_kovatchev_constants_against_reference():
 
 def test_kovatchev_f_units_tripwire():
     """``kovatchev_f`` guards controlled callers: a z-scored value trips the hard
-    ``g >= BG_CLAMP_MIN`` assert.
-
-    Pool-independent, since every legal z satisfies z_max < BG_CLAMP_MIN - 1e-3. Re-f
-    of an f'd value lands wholly below that floor and trips too.
-    """
+    ``g >= BG_CLAMP_MIN`` assert. Pool-independent, since every legal z satisfies
+    z_max < BG_CLAMP_MIN - 1e-3. Re-f of an f'd value lands below that floor, trips too."""
     from utils import kovatchev_f
 
     bg_min, _ = _sim_clamps()
@@ -172,8 +159,7 @@ def test_kovatchev_f_inv_range_and_inverse():
     assert torch.allclose(back, grid, atol=1e-2, rtol=1e-3), (
         f"f_inv(f(g)) must recover g: {back.tolist()} vs {grid.tolist()}")
 
-    # risk extremes that would otherwise overflow exp or log a negative base: they
-    # must clamp into [BG_CLAMP_MIN, BG_CLAMP_MAX], finite
+    # risk extremes that would overflow exp/log a negative base must clamp to [BG_CLAMP_MIN, MAX].
     extreme = torch.tensor([-1e3, -8.2, -3.5, 3.0, 40.0, 1e3])
     out = kovatchev_f_inv(extreme)
     assert torch.isfinite(out).all(), "f_inv must stay finite on extreme risk inputs"
@@ -186,11 +172,8 @@ def test_kovatchev_f_inv_range_and_inverse():
 
 def test_kovatchev_f_inv_nan_guard():
     """A non-finite risk input is scrubbed to the band edges BEFORE the clamp, so
-    ``f_inv`` can never emit a NaN mg/dL.
-
-    ``clamp`` alone lets NaN through — it compares false against both bounds — so the
-    explicit ``nan_to_num`` is the load-bearing guard.
-    """
+    ``f_inv`` can never emit a NaN mg/dL. ``clamp`` alone lets NaN through — it compares
+    false against both bounds — so the explicit ``nan_to_num`` is the load-bearing guard."""
     from utils import kovatchev_f_inv
 
     bg_min, bg_max = _sim_clamps()
@@ -278,8 +261,7 @@ def _get_stats():
     return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
 
 
-# assemble_quantiles turns the head's raw (B, P, S, 1 + 2*N_SPREADS) output into
-# ascending risk-space quantiles anchored at f(last_bg)
+# assemble_quantiles: raw (B,P,S,1+2*N_SPREADS) -> ascending risk quantiles, anchor f(last_bg).
 
 def test_assemble_quantiles_index_for_index_and_gap():
     """assemble_quantiles emits (B,P,S,7) ascending quantiles whose index-for-
@@ -301,8 +283,7 @@ def test_assemble_quantiles_index_for_index_and_gap():
 
     assert torch.allclose(median, q_tau[..., 3], atol=1e-6), "median must == q[...,3]"
 
-    # index for index, not merely monotone in value: the level ORDER must line up
-    # with QUANTILE_LEVELS
+    # index for index, not merely monotone in value: level ORDER must line up with QUANTILE_LEVELS.
     assert list(QUANTILE_LEVELS) == sorted(QUANTILE_LEVELS)
     diffs = q_tau[..., 1:] - q_tau[..., :-1]
     assert (diffs >= BG_QUANTILE_SPREAD_MIN - 1e-6).all(), (
@@ -371,8 +352,7 @@ def test_assemble_quantiles_carry_spread_widens_band():
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
 
-    # each edge's distance from the median becomes hypot(carry, its own native offset):
-    # QUADRATURE, not a +carry shift (SPEC/inference.md §8.1)
+    # edge dist from median = hypot(carry, native): QUADRATURE not +carry (SPEC/inference.md §8.1).
     m0 = q0[..., median_idx].unsqueeze(-1)
     up_off0 = q0[..., median_idx + 1:] - m0
     dn_off0 = m0 - q0[..., :median_idx]
@@ -381,8 +361,7 @@ def test_assemble_quantiles_carry_spread_widens_band():
     assert torch.allclose(qc[..., median_idx + 1:], want_up, atol=1e-6)
     assert torch.allclose(qc[..., :median_idx], want_dn, atol=1e-6)
 
-    # strictly wider everywhere off the median, and by LESS than the 2*carry an
-    # additive carry would have added
+    # strictly wider everywhere off median, by LESS than the 2*carry an additive carry would add.
     width0 = q0[..., -1] - q0[..., 0]
     widthc = qc[..., -1] - qc[..., 0]
     assert (widthc > width0).all(), "carry must strictly widen the 5-95 band"
@@ -393,11 +372,8 @@ def test_assemble_quantiles_carry_spread_widens_band():
 
 def test_assemble_quantiles_carry_spread_is_per_level():
     """ONE offset PER LEVEL, laid out like the head's spread columns,
-    ``[.75 .9 .95 | .25 .1 .05]``; a scalar is that scalar in all six slots.
-
-    One carry shared by the levels is the roll-seam defect: it seeds .75 from .95's
-    accumulation.
-    """
+    ``[.75 .9 .95 | .25 .1 .05]``; a scalar is that scalar in all six slots. One carry
+    shared by the levels is the roll-seam defect: it seeds .75 from .95's accumulation."""
     from utils import assemble_quantiles
     from config import QUANTILE_LEVELS, N_SPREADS
 
@@ -414,9 +390,7 @@ def test_assemble_quantiles_carry_spread_is_per_level():
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
 
-    # upper edges take carry[:3] in place, lower edges carry[3:] flipped into the fan's
-    # ascending order ([.05 .1 .25] <- [.25 .1 .05]), each in quadrature with its own
-    # native offset
+    # upper edges take carry[:3]; lower take carry[3:] flipped ascending, each in quadrature.
     m0 = q0[..., median_idx].unsqueeze(-1)
     up_off0 = q0[..., median_idx + 1:] - m0
     dn_off0 = m0 - q0[..., :median_idx]
@@ -451,8 +425,7 @@ def test_reshape_consistency_with_to_patch_major():
     print("\n[DUMP] R3 reshape | delta.reshape(B,P*S) == _to_patch_major(delta) ✓")
 
 
-# ModelEMA's finiteness guard: one NaN in the live weights must not permanently poison
-# the shadow, since decay*NaN + ... stays NaN forever
+# ModelEMA finiteness guard: one NaN in live weights mustn't poison shadow (decay*NaN+.. stays NaN).
 
 class _TinyModel(torch.nn.Module):
     def __init__(self) -> None:

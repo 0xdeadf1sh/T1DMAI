@@ -1,6 +1,4 @@
-// Dump the app's insulin preset catalogue and each rapid preset's per-5-min action
-// curve as JSON. The Loop exponential model stays single-copy in t1dm-core; this only
-// reads it out so a probe elsewhere can consume the curve as data.
+// Dump the insulin preset catalogue and each rapid preset's per-5-min action curve as JSON.
 use serde_json::json;
 use t1dm_core::{exp_action_curve, insulin_preset_catalog, InsulinFamily};
 

@@ -10,8 +10,10 @@ import json
 import re
 from pathlib import Path
 
-import config  # loss-schema fallbacks (DILATE_ALPHA/GAMMA, QUANTILE_LEVELS) absent from the checkpoint's serialized config; every structural flag is derived from the weights via _derive_arch
-from make_figures import CGEGA_COLUMNS_TRUSTWORTHY  # the single gate on the validation log's cgega_* columns; see the constant's comment for why and what flips it
+# config: fallback for consts absent from the checkpoint (DILATE_ALPHA/GAMMA, QUANTILE_LEVELS)
+import config
+# CGEGA_COLUMNS_TRUSTWORTHY gates the validation log's cgega_* columns; see its own comment
+from make_figures import CGEGA_COLUMNS_TRUSTWORTHY
 
 import numpy as np
 import matplotlib as mpl
@@ -25,8 +27,7 @@ CKPT_PATH = REPO / "checkpoints" / "t1dmai_best.pt"
 OUT_DIR = REPO / "figures"
 METRICS_DIR = REPO / "metrics"
 
-# metrics.core.calibrate.HORIZONS, restated locally so the card has no import-time dependency
-# on the evaluation core — it only reads the JSON those scripts emit.
+# metrics.core.calibrate.HORIZONS restated: no import-time dep on eval core, reads JSON only
 REPORT_HORIZONS = (30, 60, 120)
 REPORT_SOURCES = (
     ("sim",       "Simulator (in-domain)", ("sim",)),
@@ -226,8 +227,7 @@ def _param_breakdown(sd: dict) -> tuple[dict[str, int], int]:
                 break
         else:
             ungrouped += n
-    # Every tensor lands in exactly one group, else the wedges sum to less than the headline
-    # total; fail loudly when a new top-level module escapes the regex table above.
+    # Every tensor lands in one group, else wedges sum below total; new modules need a pattern
     assert ungrouped == 0, (
         f"_param_breakdown: {ungrouped} params matched no group — add a pattern "
         f"(group sums {sum(out.values())} vs total {total})"
@@ -236,13 +236,11 @@ def _param_breakdown(sd: dict) -> tuple[dict[str, int], int]:
 
 
 def _derive_arch(sd: dict, cfg: dict) -> dict:
-    """Architecture flags recovered from the checkpoint weight SHAPES, never from ``config.py``.
+    """Architecture flags recovered from checkpoint weight SHAPES, never from ``config.py``.
 
-    The shapes travel with the checkpoint; ``resize_model.py`` rewrites ``BG_HEAD_HIDDEN`` in
-    the live config and leaves no tripwire behind it.  Returns ``bg_head_hidden``,
-    ``n_spreads``, ``n_quantiles``, ``time_probe``, ``time_probe_hidden`` and
-    ``time_probe_bins`` (0 when the probe was off at train time).
-    """
+    Shapes travel with the checkpoint; ``resize_model.py`` rewrites ``BG_HEAD_HIDDEN`` live and
+    leaves no tripwire. Returns ``bg_head_hidden``, ``n_spreads``, ``n_quantiles``, ``time_probe``,
+    ``time_probe_hidden`` and ``time_probe_bins`` (0 if probe was off at train time)."""
     # bg_head.0: (BG_HEAD_HIDDEN, D_MODEL)
     bg_head_hidden = sd['bg_head.0.weight'].shape[0]
     # the head runs on one step state at a time: out_last = 1 + 2·N_SPREADS
@@ -250,8 +248,7 @@ def _derive_arch(sd: dict, cfg: dict) -> dict:
     assert out_last % 2 == 1, (
         f"head out width {out_last} should be 1 + 2·N_SPREADS (odd)")
     n_spreads = (out_last - 1) // 2
-    # time_head.0 → (HIDDEN, D_MODEL), time_head.2 → (N_BINS, HIDDEN); present iff
-    # TIME_PROBE_ENABLED at train time, so read presence and dims off the state dict
+    # time_head.0 (HIDDEN,D_MODEL), .2 (N_BINS,HIDDEN); present iff TIME_PROBE_ENABLED at train
     time_probe = 'time_head.0.weight' in sd
     return {
         'bg_head_hidden': bg_head_hidden,
@@ -303,8 +300,7 @@ def card_overview(cfg: dict, summary: dict, total_params: int, arch: dict) -> No
         _stat_tile(ax, x0 + i * (tile_w + pad), tile_y, tile_w, tile_h,
                    label, big, sub, color)
 
-    # Diagnostic probe, best-over-run from summary.json; '—' when it was off, so a
-    # TIME_PROBE_ENABLED=False run still lays out.
+    # Diagnostic probe, best-over-run from summary.json; '—' when off, so layout still works
     tod_tiles = [
         ("TOD MAE",      _b('tod_mae_h', '{:.2f}', ' h'), "hour-of-day error (lower better)",  TEAL),
         ("Clock ±2h",    _b('tod_acc_2h', '{:.0f}', '%'), "origin decoded within 2 h",         SAGE),
@@ -437,9 +433,7 @@ def card_architecture(cfg: dict, total_params: int, arch: dict) -> None:
     block(0.32, 0.260, 0.36, 0.040, "Final RMSNorm", "",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T, title_size=10)
 
-    # Both heads read the SAME masked-slot hidden state: the risk-space BG quantile fan, and
-    # the time-of-day probe when the checkpoint carries it — a diagnostic, not a forecast.
-    # Widths come from _derive_arch, off the weights, never from config.py.
+    # Both heads read the SAME masked-slot hidden state; widths come from _derive_arch, off weights
     _hh = arch['bg_head_hidden']
     _d = cfg['d_model']
     _ps = cfg['patch_size']
@@ -562,12 +556,9 @@ def card_param_breakdown(groups: dict[str, int], total: int) -> None:
 def _policy_wording(cfg: dict) -> dict[str, str]:
     """Card wording for what a masked patch carries, off the checkpoint's own stamp.
 
-    The card is published, so a ``blind`` checkpoint must not be described in the announced
-    convention's terms: its dose channels are withheld at ``data.zero_dose_fill``, which makes
-    every dose-response claim on the card false and the what-if regime unavailable.
-    Returns ``policy``, ``dose_note``, ``regime``, ``row``, ``footer`` and ``caveat`` (empty
-    under ``announced``).
-    """
+    The card is public: a ``blind`` checkpoint's dose channels are withheld at
+    ``data.zero_dose_fill``, so it must not use announced-convention wording, and what-if is
+    unavailable. Returns ``policy``, ``dose_note``, ``regime``, ``row``, ``footer``, ``caveat``."""
     from data import MASKED_CHANNEL_POLICY_BLIND, stored_masked_channel_policy
     policy = stored_masked_channel_policy(cfg)
     if policy == MASKED_CHANNEL_POLICY_BLIND:
@@ -597,8 +588,7 @@ def _policy_wording(cfg: dict) -> dict[str, str]:
 
 def card_io_schema(cfg: dict, arch: dict) -> None:
     fig, ax = _setup_card((13.8, 9.8))
-    # panels are pinned at absolute fractions, not flowed from the returned y, so lift the
-    # header to keep its rule clear of the panel tops at 0.79
+    # panels are pinned at absolute fractions, not flowed from y; lift header clear of tops at 0.79
     y = _header(ax, "Inputs & Outputs",
                 "Tensor shapes and channel schema",
                 "What the model consumes (per patch) and what it returns (per timestep).",
@@ -616,19 +606,14 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             f"{cfg['patch_size']} timesteps × {config.N_INPUT_FEATURES} features  =  {config.PATCH_DIM} numbers",
             fontsize=9.5, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # Exactly N_INPUT_FEATURES: bg, three dose plan channels, the mask bit. Exercise is a
-    # carb-equivalent glucose-disposal curve on the carb scale, not an intensity.
-    # What feats 1-3 carry on a MASKED patch is the checkpoint's policy, not the schema.
-    # Feat 4 is the one input that is not a normalized signal: one BIT per patch, 1.0 where
-    # feat 0 is withheld. Announced rather than inferred — a span may end at the last patch,
-    # start at patch 0 or sit between visible ones, and z = 0 in a masked bg slot is a legal
-    # reading, not a sentinel.
     wording = _policy_wording(cfg)
     feats = [
         ("BG absolute",           "mg/dL",     "always · 0 where masked"),
         ("Carbs",                 "g / 5 min", wording["dose_note"]),
         ("Insulin",               "U / 5 min", wording["dose_note"]),
+        # exercise is a carb-equivalent glucose-disposal curve on the carb scale, not an intensity
         ("Exercise (carb-equiv)", "g / 5 min", wording["dose_note"]),
+        # bit/patch, not normalized; z=0 in a masked BG slot is a legal reading, not a sentinel
         ("BG masked",             "bit/patch", "1 where BG is withheld"),
     ]
     assert len(feats) == config.N_INPUT_FEATURES
@@ -647,8 +632,7 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
                 family=FONT_BODY, transform=ax.transAxes, style="italic")
         row_y -= 0.029
 
-    # Under ``blind`` the caveat is the load-bearing half: a reader taking the announced
-    # framing would expect a dose response the weights cannot produce.
+    # Under blind the caveat is load-bearing: announced framing implies a response weights lack
     ax.text(p_x + 0.018, row_y - 0.006,
             f"Masked-patch dose channels: {wording['regime']}",
             fontsize=9, color=NAVY, weight="bold", transform=ax.transAxes)
@@ -670,8 +654,7 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             f"{cfg['prediction_patches']*cfg['patch_size']} timesteps",
             fontsize=9.5, color=SLATE, family=FONT_BODY, transform=ax.transAxes)
 
-    # ascending fan of N_QUANTILES risk-space quantiles per timestep; inference inverts each
-    # through kovatchev_f_inv to mg/dL, τ=0.5 being the headline forecast
+    # ascending N_QUANTILES fan, risk space; inference inverts via kovatchev_f_inv, τ=0.5 = headline
     levels = config.QUANTILE_LEVELS
     mid = len(levels) // 2
     chans = []
@@ -883,8 +866,7 @@ def card_loss_design(cfg: dict, train: dict[str, np.ndarray]) -> None:
         ax.text(0.030, y0 + 0.025, weight, fontsize=8.5, color=DIMMED,
                 family=FONT_MONO)
 
-    # the learned Kendall-Gal log-variances per training step — a trace of the L_Q / L_DR
-    # balance as it moves, not a static split
+    # learned Kendall-Gal log-variances per step: trace of the L_Q/L_DR balance, not a static split
     ax = fig.add_subplot(gs[0, 1]); ax.set_facecolor(PAPER)
     sig_series = [("log_sigma_Q", "σ_Q  (pinball)", NAVY),
                   ("log_sigma_D", "σ_D  (DILATE/MSE)", TEAL)]
@@ -923,9 +905,7 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
     elapsed_h = tsum["progress"]["elapsed_hours"]
     sps = tsum["progress"]["steps_per_second"]
     samples = cfg["total_steps"] * cfg["batch_size"]
-    # Every window is a fresh simulator patient, so patients seen == window draws; hours seen
-    # is their CGM-time (avg context + prediction patches × 30 min/patch); patches seen is the
-    # PADDED sequence the model forward-passes (context padded to MAX).
+    # patients seen == window draws; patches seen is PADDED (context padded to MAX), not raw length
     patients = samples
     _avg_patches = (cfg["min_context_patches"] + cfg["max_context_patches"]) / 2 + cfg["prediction_patches"]
     hours_seen = samples * _avg_patches * cfg["patch_size"] * 5 / 60.0
@@ -1011,8 +991,7 @@ def card_compute_budget(train: dict[str, np.ndarray], tsum: dict, cfg: dict) -> 
 
 
 def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
-    # ~32 rows + 6 eyebrows at full strength, so the pitch is tightened and the figure
-    # stretched to keep the table inside ax [0, 1]
+    # ~32 rows + 6 eyebrows at full strength: pitch tightened, figure stretched to fit ax [0,1]
     ROW = 0.0145      # per-row vertical pitch (axes fraction)
     BAND = 0.014      # alternating row-shade height (axes fraction)
     SEC_PAD = 0.003   # trailing gap after each section
@@ -1040,11 +1019,7 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
           ("hypo_precision",  True, "hypo precision",                 "{:.3f}", "{:.3f}"),
           ("hyper_recall",    True, f"hyper recall  (BG > {config.BG_HYPER_THRESHOLD:.0f} mg/dL)", "{:.3f}", "{:.3f}"),
           ("hyper_precision", True, "hyper precision",                "{:.3f}", "{:.3f}")]),
-        # Coverage of the 90% band (τ 0.05–0.95), target 0.90. Over- and under-coverage both
-        # miss, so these track toward 0.90 as a distance, the closest a best/last-10 table gets.
-        # Every coverage row is followed by the mean band WIDTH that bought it — coverage alone
-        # is not a calibration claim. A run with no sharpness column renders "—" rather than
-        # dropping the row, so the omission stays visible.
+        # Coverage target 0.90; paired with band WIDTH — coverage alone isn't a calibration claim
         ("Calibration  (90% band coverage, target 0.90)", GOLD,
          [("coverage90@30",  True,  "coverage @30m",              "{:.3f}", "{:.3f}"),
           ("sharp90@30",     False, "  band width @30m  (mg/dL)", "{:.1f}", "{:.1f}"),
@@ -1053,13 +1028,10 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
           ("coverage90@120", True,  "coverage @120m",             "{:.3f}", "{:.3f}"),
           ("sharp90@120",    False, "  band width @120m (mg/dL)", "{:.1f}", "{:.1f}")]),
     ]
-    # rows added since CARD_H was sized; the canvas grows by exactly their space, so the
-    # physical pitch and every font size stay put
+    # rows added since CARD_H sized; canvas grows by exactly their space, pitch/fonts stay put
     _EXTRA_ROWS = 3
 
-    # CG-EGA (Kovatchev 2004): %AP higher better, %EP lower better, per region. Read straight
-    # out of validation_log.csv, so the section stands or falls with CGEGA_COLUMNS_TRUSTWORTHY;
-    # withheld, the canvas shortens by exactly their space and the table ends a section early.
+    # CG-EGA (Kovatchev 2004): %AP higher/%EP lower better; gated by CGEGA_COLUMNS_TRUSTWORTHY
     cgega_section = (
         "CG-EGA clinical accuracy", PLUM,
         [("cgega_ap_hypo",  True,  "%AP hypo  (accurate, higher better)",    "{:.3f}", "{:.3f}"),
@@ -1106,8 +1078,7 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
         if yy.size == 0:
             return float("nan"), 0, float("nan")
         idx = int(np.argmax(yy) if higher_is_better else np.argmin(yy))
-        # last 10 ACTUAL validation rows, not the last 10 finite cells: a sparse column would
-        # otherwise reach back arbitrarily far and mislabel the window
+        # last 10 ACTUAL rows, not last 10 finite cells — a sparse column would reach back far
         last10 = float(np.nanmean(yv[-10:])) if np.isfinite(yv[-10:]).any() else float("nan")
         return yy[idx], int(ss[idx]), last10
 
@@ -1166,9 +1137,8 @@ def card_evaluation(cfg: dict, reports: dict[str, dict]) -> None:
     """In-domain simulator evaluation, from the post-training ``metrics/sim/stats.json``.
 
     Surfaces the precision-floored per-horizon hypo decision offsets (``selected_offsets``) and
-    the per-horizon hypo/hyper event recall/precision (``event_metrics``).  Skipped entirely
-    when no report exists.
-    """
+    the per-horizon hypo/hyper event recall/precision (``event_metrics``). Skipped entirely
+    when no report exists."""
     if not reports:
         return  # No reports yet — omit the section gracefully.
 
@@ -1347,8 +1317,7 @@ def card_showcase(cfg: dict, summary: dict,
         chart_subtitle = f"Final values  (step {final_step:,})"
         excursion_subtitle = f"Recall and precision  (final, step {final_step:,})"
 
-    # the headline card names its regime: every clinical figure below reads differently when
-    # masked-patch doses are withheld
+    # headline names its regime; every clinical figure below reads differently when doses withheld
     header_sub += f"  Masked-patch doses: {_policy_wording(cfg)['regime']}."
 
     fig, ax = _setup_card((18.7, 13.2))
@@ -1514,8 +1483,7 @@ def card_showcase(cfg: dict, summary: dict,
     block(0.155, 0.170, 0.160, 0.024, "Final RMSNorm", "",
           ec=NAVY, bar_color=NAVY, fc=NAVY_T)
 
-    # to the output heads: the risk-space BG quantile fan, plus the diagnostic time-of-day
-    # probe when the checkpoint carries it
+    # to the output heads: risk-space BG quantile fan, plus diagnostic time-of-day probe if present
     _hh = arch['bg_head_hidden']
     _d = cfg['d_model']
     _ps = cfg['patch_size']
@@ -1700,10 +1668,7 @@ def main() -> None:
     _set_style()
     OUT_DIR.mkdir(exist_ok=True)
 
-    # The checkpoint's embedded ``training_config`` is the resolved CLI > config.py snapshot
-    # that produced these weights — authoritative, unlike the mutable config.py or a
-    # logs/resolved_config.json that may belong to a newer run. Flags it does not carry come
-    # from the weight shapes, via _derive_arch.
+    # checkpoint's training_config is authoritative (not config.py); missing flags via _derive_arch
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["model_state_dict"]
     cfg = ckpt["training_config"]

@@ -1,36 +1,8 @@
-"""The two fixed evaluation protocols, and the axes every masked-BG figure is reported on.
+"""The two fixed evaluation protocols and the d axis every masked-BG figure is reported on.
 
-Validation does not follow the training mask distribution: a metric averaged over it is dominated by the easy
-regime and improves for free. These two are the only comparable figures:
-
-    protocol   mask                                     columns          baseline
-    forecast   right edge, exactly PREDICTION_PATCHES   every existing   persistence
-    infill     sampled interior spans                   infill_*, per d  LINEAR INTERPOLATION
-
-FORECAST puts exactly ONE masked patch at each of d = 1, 2, 3, 4 per window, which is what makes per-``d``
-calibration well populated (§2.10's Mondrian fit calibrates this protocol and gives infill a coarse one) and
-keeps its columns element-for-element comparable with the historical tables. Its names are the EXISTING ones:
-``metrics.core.suite.compute_suite`` computes them and nothing here restates one.
-
-INFILL is scored against LINEAR INTERPOLATION between the bracketing visible BGs, NEVER persistence, which is
-a forecasting baseline and against a two-sided task a strawman. Its columns take the ``infill_`` prefix and a
-``d``, so the two protocols cannot be averaged by accident — ``column()`` refuses an infill column without one.
-
-THE d AXIS — the distance in patches to the nearest visible evidence ON EITHER SIDE. Every masked-BG metric
-bins on it, never on span length, which confounds one-sided and two-sided cases at equal difficulty, and never
-on arm. Forecast @30/@60/@90/@120 IS d = 1..4 one-sided. ``data._mask_slots`` is the single definition.
-
-POOLING IS FORBIDDEN. The sampler concentrates supervision at small ``d`` and on the two-sided case;
-``SAMPLER_REFERENCE`` below is the only copy of the exact shares. A pooled masked-BG scalar averages a mask
-distribution rather than a difficulty: it improves for free and must never become a selection metric.
-
-EVERY RUN REPORTS, via ``RunReport``: its realised ``d`` histogram and mean masked-patch count against
-``SAMPLER_REFERENCE`` — a departure means the sampler changed; its ``n_ctx`` (§3.25: headline numbers are
-measured at ``MAX_CONTEXT_PATCHES``, a length training barely samples); and per cohort the KEPT and DROPPED
-segment and window counts (§3.24). Eligibility is PINNED to the 24 h footprint, which is what fixes the
-window set across runs: segments are cut at every CGM gap over 30 min and short ones dropped, so a wider
-context would otherwise re-select the cohort.
-"""
+forecast: right-edge PREDICTION_PATCHES span, existing columns, scored vs persistence.
+infill: sampled interior spans, infill_*@d columns, scored vs linear interpolation only.
+d = patches to nearest visible evidence either side (data._mask_slots); never pool over d."""
 from __future__ import annotations
 
 import math
@@ -53,20 +25,19 @@ from config import (                                     # noqa: E402
     _PATCHES_PER_HOUR,
     QUANTILE_LEVELS,
 )
-# slot layout, ``d`` rule and anchor rule: ONE definition, in data.py, shared with the training builder
+# slot layout, d rule, anchor rule: one definition, in data.py, shared with the training builder
 from data import sample_mask_spans, _mask_slots          # noqa: E402
 
 GRID_MIN = 5                                  # minutes
 SPAN_STEPS = PREDICTION_PATCHES * PATCH_SIZE  # steps in one right-edge forecast span
 
 
-# Selection thresholds, UNSET deliberately: §2.7's reference pretrain has not run, so no measured
-# distribution exists to set a level against. Asking for one raises rather than returning a plausible number.
+# Selection thresholds, UNSET: no reference pretrain to measure a level against; fails closed.
 THRESHOLDS: dict[str, float] = {}
 
 
 def threshold(name: str) -> float:
-    """The selection threshold named ``name``, or a loud failure — a default here would be a guess."""
+    """The selection threshold named ``name``, or a loud failure — a default here is a guess."""
     if name in THRESHOLDS:
         return THRESHOLDS[name]
     raise LookupError(
@@ -94,9 +65,7 @@ INFILL = Protocol(
     name='infill', prefix='infill_', baseline='interpolation', sided='two-sided')
 PROTOCOLS = (FORECAST, INFILL)
 
-# The inference builder requires the whole future zone masked — a visible future patch would announce a
-# fabricated reading — so the trailing span is mandatory, costs PREDICTION_PATCHES of MAX_MASKED_PATCHES,
-# and rides UNSCORED: scoring it would put one-sided rows in the infill namespace.
+# Trailing forecast span costs PREDICTION_PATCHES, rides unscored (else one-sided in infill).
 INFILL_BUDGET_PATCHES = MAX_MASKED_PATCHES - PREDICTION_PATCHES
 assert INFILL_BUDGET_PATCHES >= min(MASK_SPAN_LENGTHS), (
     f"the head's {MAX_MASKED_PATCHES} slots leave {INFILL_BUDGET_PATCHES} for "
@@ -106,13 +75,8 @@ assert INFILL_BUDGET_PATCHES >= min(MASK_SPAN_LENGTHS), (
 
 
 def reachable_d(protocol: Protocol) -> tuple[int, ...]:
-    """The ``d`` bins a protocol can populate, derived from the geometry.
-
-    FORECAST: no right neighbour, so slot ``j`` sits at ``d = j + 1`` and the span covers
-    d = 1..PREDICTION_PATCHES, one patch each.
-    INFILL: an interior span of length ``L`` is two-sided and caps at ``d = ceil(L / 2)``, so the set follows
-    MASK_SPAN_LENGTHS and the interior budget. The two protocols do not even cover the same axis.
-    """
+    """The ``d`` bins a protocol can populate. forecast: one-sided, d = 1..PREDICTION_PATCHES.
+    infill: two-sided, caps at ceil(L/2) per span length in MASK_SPAN_LENGTHS within the budget."""
     if protocol is FORECAST:
         return tuple(range(1, PREDICTION_PATCHES + 1))
     if protocol is INFILL:
@@ -122,13 +86,8 @@ def reachable_d(protocol: Protocol) -> tuple[int, ...]:
 
 
 def column(protocol: Protocol, base: str, d: int | None = None) -> str:
-    """Column name for ``base`` under ``protocol``.
-
-    FORECAST keeps every EXISTING name and takes no ``d`` suffix: its reported horizons already ARE the d bins
-    (``metrics.core.run_eval.horizon_d_patches``).
-    INFILL takes the ``infill_`` namespace and REQUIRES a ``d``: without one the column is a pooled masked-BG
-    scalar, which improves for free under any mask distribution weighted toward small d.
-    """
+    """Column name for ``base`` under ``protocol``. forecast keeps the existing name, no d suffix
+    (horizons already are the d bins). infill requires a d — without one the column pools over d."""
     if protocol is FORECAST:
         if d is not None:
             raise ValueError(
@@ -163,12 +122,8 @@ def column(protocol: Protocol, base: str, d: int | None = None) -> str:
 
 @dataclass(frozen=True)
 class MaskedSet:
-    """One protocol's masked set over an ``n_ctx + PREDICTION_PATCHES`` window.
-
-    ``spans`` is every masked span in the inference builder's order; ``scored`` the subset this protocol
-    scores. They differ only for INFILL, where the mandatory trailing span rides unscored.
-    ``mask_idx`` / ``valid`` / ``d`` / ``anchor_step`` are ``data._mask_slots``' own arrays, untouched.
-    """
+    """One protocol's masked set over an ``n_ctx + PREDICTION_PATCHES`` window. ``scored`` is the
+    subset of ``spans`` this protocol scores (infill's mandatory trailing span rides unscored)."""
     protocol: Protocol
     n_ctx: int
     spans: tuple[tuple[int, int], ...]
@@ -192,19 +147,14 @@ class MaskedSet:
         return self.mask_idx[self.scored_slot]
 
     def scored_rows(self) -> np.ndarray:
-        """Row indices of the scored slots in ``inference.predict``'s output.
-
-        ``predict`` returns one row per VALID slot in slot order, padded ones dropped; this maps a scored slot
-        onto its row without assuming the rows are a trailing zone.
-        """
+        """Row indices of the scored slots in ``inference.predict``'s output (one row per valid
+        slot, padded dropped) — maps a scored slot to its row without assuming a trailing zone."""
         row_of_slot = np.cumsum(self.valid) - 1
         return row_of_slot[self.scored_slot]
 
     def scored_steps(self) -> np.ndarray:
-        """Window-relative STEP index of every scored element, row-major.
-
-        Length ``n_scored * PATCH_SIZE``, aligned element-for-element with ``median_bg`` at ``scored_rows()``.
-        """
+        """Window-relative STEP index of every scored element, row-major, length ``n_scored *
+        PATCH_SIZE``, aligned element-for-element with ``median_bg`` at ``scored_rows()``."""
         base = self.scored_patches()[:, None] * PATCH_SIZE
         return (base + np.arange(PATCH_SIZE)[None, :]).ravel()
 
@@ -232,10 +182,8 @@ def _expand(protocol: Protocol, n_ctx: int,
 
 
 def forecast_masked_set(n_ctx: int) -> MaskedSet:
-    """The FORECAST protocol at ``n_ctx``: one right-edge span, whole context visible.
-
-    One masked patch lands at each of d = 1..PREDICTION_PATCHES, so every window fills every bin once.
-    """
+    """The FORECAST protocol at ``n_ctx``: one right-edge span, whole context visible; one masked
+    patch lands at each of d = 1..PREDICTION_PATCHES, so every window fills every bin once."""
     spans = [(int(n_ctx), PREDICTION_PATCHES)]
     ms = _expand(FORECAST, n_ctx, spans, spans)
     assert tuple(int(x) for x in ms.scored_d()) == reachable_d(FORECAST), (
@@ -245,17 +193,10 @@ def forecast_masked_set(n_ctx: int) -> MaskedSet:
 
 
 def infill_masked_set(n_ctx: int, rng: np.random.Generator) -> MaskedSet:
-    """The INFILL protocol at ``n_ctx``: sampled INTERIOR spans, plus the mandatory tail.
-
-    Placement reuses ``data.sample_mask_spans`` over ``[1, n_ctx - 1)`` and shifts by one patch, so the
-    stars-and-bars rule, the visible separator and the whole-vector rejection keep one definition. The shift
-    is what makes this INFILL and not a mix: patch 0 stays visible, so no span is a backcast, and patch
-    ``n_ctx - 1`` stays visible, so no interior span abuts the trailing forecast span. Every interior span is
-    two-sided and ``d`` measures real observed evidence on both sides.
-    The budget is ``MAX_MASKED_PATCHES - PREDICTION_PATCHES``, and a draw over it is rejected WHOLE, which
-    reweights toward fewer spans than the training sampler — expected: this is a fixed protocol with its own
-    reported ``d`` histogram, not a reproduction of the training mixture.
-    """
+    """The INFILL protocol at ``n_ctx``: sampled interior spans, plus the mandatory trailing tail.
+    Reuses ``data.sample_mask_spans`` over ``[1, n_ctx - 1)`` shifted by one patch so patch 0 and
+    ``n_ctx - 1`` stay visible (no backcast, no abutting the forecast tail). An over-budget draw is
+    rejected whole, which reweights toward fewer spans than the training sampler — expected."""
     interior_len = int(n_ctx) - 2
     need = MAX_MASKED_PATCHES + MASK_MAX_SPANS - 1
     if interior_len < need:
@@ -279,7 +220,7 @@ def infill_masked_set(n_ctx: int, rng: np.random.Generator) -> MaskedSet:
 
 
 def persistence_baseline(anchor_bg: float, n_steps: int) -> np.ndarray:
-    """FORECAST's baseline: the last observed reading held flat, as ``compute_suite`` already scores it."""
+    """FORECAST's baseline: the last observed reading held flat."""
     return np.full(int(n_steps), float(anchor_bg), dtype=np.float64)
 
 
@@ -297,12 +238,8 @@ def interpolation_baseline(left_bg: float, right_bg: float,
 
 def baseline_for(masked_set: MaskedSet, cgm: np.ndarray,
                  window_start: int) -> np.ndarray:
-    """The protocol's own baseline over its scored steps -> ``(n_scored * PATCH_SIZE,)``, mg/dL.
-
-    Aligned with ``masked_set.scored_steps()``; ``cgm`` is the truth over the trajectory the window is cut
-    from and ``window_start`` its patch 0. The protocol picks the baseline, so a caller cannot pair them
-    wrongly: infill takes interpolation ONLY.
-    """
+    """The protocol's own baseline over its scored steps -> ``(n_scored * PATCH_SIZE,)``, mg/dL,
+    aligned with ``masked_set.scored_steps()``; ``window_start`` is the trajectory's patch 0."""
     cgm = np.asarray(cgm, dtype=np.float64)
     out: list[np.ndarray] = []
     for start, L in masked_set.scored:
@@ -317,10 +254,7 @@ def baseline_for(masked_set: MaskedSet, cgm: np.ndarray,
     return np.concatenate(out) if out else np.zeros(0, dtype=np.float64)
 
 
-# Exact ENUMERATION of ``data.sample_mask_spans`` over n_ctx ~ U{MIN..MAX_CONTEXT_PATCHES}, both placement
-# branches, by ``d_balance.d_distribution``; checked against 4e5 live draws at every quota, within 1 sigma at
-# each ``d``. Not a measurement: a realised histogram that departs means the SAMPLER changed.
-# Pinned to the knobs below, and ``sampler_reference_applies`` refuses the comparison once one moves.
+# Enumeration of the sampler (d_balance.d_distribution) — a departing histogram means it moved.
 SAMPLER_REFERENCE = {
     'max_context_patches': 336,
     'min_context_patches': 168,
@@ -336,11 +270,8 @@ SAMPLER_REFERENCE = {
 
 
 def sampler_reference_applies() -> tuple[bool, str]:
-    """Whether ``SAMPLER_REFERENCE`` still describes the live sampler.
-
-    After a knob change it enumerates a different sampler, and the comparison would report a config edit as a
-    departure.
-    """
+    """Whether ``SAMPLER_REFERENCE`` still describes the live sampler (a knob change would else
+    read as a departure)."""
     live = {
         'max_context_patches': MAX_CONTEXT_PATCHES,
         'min_context_patches': MIN_CONTEXT_PATCHES,
@@ -358,10 +289,8 @@ def sampler_reference_applies() -> tuple[bool, str]:
 
 
 class DHistogram:
-    """Per-``d`` accumulator: shares, patches per sample, mean masked.
-
-    Counts are kept PER SAMPLE, so every reported standard error is empirical, not assumed.
-    """
+    """Per-``d`` accumulator: shares, patches per sample, mean masked. Counts are kept per sample,
+    so every reported standard error is empirical, not assumed."""
 
     def __init__(self, label: str):
         self.label = label
@@ -427,11 +356,8 @@ class DHistogram:
         return "\n".join(lines)
 
     def compare_to_sampler_reference(self) -> str:
-        """Realised figures against ``SAMPLER_REFERENCE``, in units of the run's own sem.
-
-        No pass/fail level (§2.7's reference pretrain has not run); sem units separate a sampler change from
-        sampling noise.
-        """
+        """Realised figures against ``SAMPLER_REFERENCE``, in units of the run's own sem — no
+        pass/fail level; sem units separate a sampler change from sampling noise."""
         ok, why = sampler_reference_applies()
         if not ok:
             return ("  sampler reference does NOT apply — " + why +
@@ -456,12 +382,8 @@ class DHistogram:
 
 
 def sampler_d_histogram(n_draws: int = 20000, seed: int = 0) -> DHistogram:
-    """Draw from the TRAINING sampler and bin on ``d`` — the sampler audit.
-
-    ``n_ctx`` is drawn as training draws it, uniform over ``[MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES]``, so
-    the histogram compares directly with ``SAMPLER_REFERENCE``. Every masked patch counts: this is the
-    sampler, not a protocol.
-    """
+    """Draw from the training sampler and bin on ``d`` — the sampler audit, comparable directly
+    with ``SAMPLER_REFERENCE``. Every masked patch counts: this is the sampler, not a protocol."""
     rng = np.random.default_rng(seed)
     hist = DHistogram(f"training sampler, {n_draws} draws, seed {seed}")
     for _ in range(int(n_draws)):
@@ -473,10 +395,7 @@ def sampler_d_histogram(n_draws: int = 20000, seed: int = 0) -> DHistogram:
     return hist
 
 
-# Cohort census (§3.24) and context note (§3.25). Eligibility is PINNED to the 24 h footprint and does NOT
-# follow MAX_CONTEXT_PATCHES: ``calibrate.py`` drops a short segment with a bare ``continue``, and segments
-# are cut at every CGM gap over 30 min, so the survivors are the longest gap-free wears and a wider context
-# would silently re-select the cohort.
+# Eligibility is PINNED to 24h, not MAX_CONTEXT_PATCHES — else a wider context re-selects the cohort
 ELIGIBILITY_HOURS = 24.0
 ELIGIBILITY_CONTEXT_PATCHES = int(round(ELIGIBILITY_HOURS * _PATCHES_PER_HOUR))
 ELIGIBILITY_STEPS = (ELIGIBILITY_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
@@ -531,13 +450,9 @@ class CohortCensus:
 
 def census_segments(cohort: str, segment_steps: Iterable[int], n_ctx: int,
                     stride_patches: int = 8) -> CohortCensus:
-    """Kept and dropped segments and windows for one cohort.
-
-    ``segment_steps`` are per-segment lengths in steps, floored to whole patches as the window loops floor
-    them; ``n_ctx`` is the width this evaluation RUNS at, ``stride_patches`` the gap between window starts.
-    Eligibility is the PINNED 24 h footprint, so the window set is the same at every ``n_ctx``; what an
-    ``n_ctx`` past the pin cannot serve is reported as lost to ``n_ctx``, never dropped silently.
-    """
+    """Kept and dropped segments and windows for one cohort. Eligibility is the pinned 24h
+    footprint, so the window set is fixed across ``n_ctx``; what a wider ``n_ctx`` can't serve
+    is reported as lost to ``n_ctx``, never dropped silently."""
     stride = int(stride_patches) * PATCH_SIZE
     run_footprint = (int(n_ctx) + PREDICTION_PATCHES) * PATCH_SIZE
     n_seg = kept = ineligible = lost_seg = 0
@@ -562,11 +477,8 @@ def census_segments(cohort: str, segment_steps: Iterable[int], n_ctx: int,
 
 
 def context_note(n_ctx: int) -> str:
-    """One line naming the evaluated context width against the trained mixture.
-
-    Headline numbers are measured at ``MAX_CONTEXT_PATCHES``, one of the widths drawn uniformly over
-    ``[MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES]``: the mean trained context is the mixture's, not this one.
-    """
+    """One line naming the evaluated context width against the trained mixture: headline numbers
+    are measured at ``MAX_CONTEXT_PATCHES``, one width of the uniformly-sampled training mixture."""
     widths = MAX_CONTEXT_PATCHES - MIN_CONTEXT_PATCHES + 1
     mean_p = (MAX_CONTEXT_PATCHES + MIN_CONTEXT_PATCHES) / 2.0
     return (
@@ -612,8 +524,7 @@ class RunReport:
         if not self._hists:
             lines.append("  (no masked sets observed)")
         else:
-            # A protocol's histogram is FIXED by the protocol and must NOT match SAMPLER_REFERENCE; only
-            # ``sampler_d_histogram`` is comparable to it.
+            # Fixed by the protocol, not SAMPLER_REFERENCE-comparable — only sampler_d_histogram is.
             lines.append("  (protocol histograms are fixed by the protocol and are "
                          "NOT comparable to SAMPLER_REFERENCE; the training "
                          "sampler's own audit is protocols.sampler_d_histogram)")
@@ -624,14 +535,9 @@ class RunReport:
 
 
 class InfillScores:
-    """The point-error side of the ``infill_*`` columns, per ``d``; interpolation is the only baseline.
-
-    Squared and absolute errors accumulate per ``d`` for the model and the baseline, so every emitted column
-    names its ``d`` and no pooled scalar is reachable from here.
-    The FAN side belongs to ``metrics.scoring``, the single definition of CRPS, Winkler, coverage-with-
-    sharpness and joint coverage; this class only collects the fan, truth and ``d`` for it. The alarm curve is
-    a FORECAST figure — infill has no alarm decision time, so ``forecast_lead_minutes`` does not apply.
-    """
+    """The point-error side of the ``infill_*`` columns, per ``d``; interpolation is the only
+    baseline, no pooled scalar reachable. Fan side is ``metrics.scoring``'s; this class only
+    collects fan/truth/d for it. Alarm lead time is a FORECAST figure, does not apply here."""
 
     def __init__(self):
         self._n: Counter = Counter()
@@ -647,11 +553,8 @@ class InfillScores:
 
     def add(self, d_patches: np.ndarray, pred: np.ndarray, true: np.ndarray,
             baseline: np.ndarray, bands: np.ndarray | None = None) -> None:
-        """Record one window's scored patches.
-
-        ``d_patches`` ``(P,)`` in row order; ``pred`` / ``true`` / ``baseline`` ``(P, PATCH_SIZE)`` mg/dL;
-        ``bands`` optional ``(P, PATCH_SIZE, N_QUANTILES)`` decoded fan, mg/dL.
-        """
+        """Record one window's scored patches. ``d_patches`` ``(P,)``; ``pred``/``true``/
+        ``baseline`` ``(P, PATCH_SIZE)`` mg/dL; ``bands`` optional ``(P, PATCH_SIZE, K)``."""
         d_patches = np.asarray(d_patches, dtype=np.int64)
         pred = np.asarray(pred, dtype=np.float64).reshape(len(d_patches), PATCH_SIZE)
         true = np.asarray(true, dtype=np.float64).reshape(len(d_patches), PATCH_SIZE)
@@ -673,11 +576,8 @@ class InfillScores:
         self._n_groups += 1
 
     def fan(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """``(q, true, d, group)`` over every scored patch, in ``scoring.score_fan``'s shapes.
-
-        ``q`` ``(N, PATCH_SIZE, N_QUANTILES)`` mg/dL, ``true`` ``(N, PATCH_SIZE)`` mg/dL, ``d`` ``(N,)``,
-        ``group`` ``(N,)`` the window index. Empty arrays when no fan was collected.
-        """
+        """``(q, true, d, group)`` over every scored patch, in ``scoring.score_fan``'s shapes;
+        ``group`` is the window index. Empty arrays when no fan was collected."""
         if not self._q:
             return (np.zeros((0, PATCH_SIZE, len(QUANTILE_LEVELS))),
                     np.zeros((0, PATCH_SIZE)), np.zeros(0, dtype=np.int64),
@@ -722,19 +622,15 @@ def score_infill_trajectory(model, stats, feats: np.ndarray, cgm: np.ndarray,
                             announce: tuple[int, ...] = (0, 1, 2),
                             report: RunReport | None = None,
                             device=None) -> int:
-    """Run the INFILL protocol over one trajectory into ``scores`` -> the number of windows scored.
-
-    Each window draws its own interior spans, forwards once, and scores ONLY those: the mandatory trailing
-    span rides unscored, since a one-sided row does not belong in the infill namespace. Truth is observed CGM
-    the model was not shown; the baseline is linear interpolation, never persistence.
-    """
+    """Run the INFILL protocol over one trajectory into ``scores`` -> windows scored. Each window
+    scores only its interior spans (the mandatory trailing span rides unscored); baseline is
+    linear interpolation, never persistence."""
     from inference import predict                          # local: keeps torch off import
     from metrics.core.features import context_window
     from metrics.core.calibrate import _future_overrides
     from config import CHANNEL_TO_FEAT
 
-    # A set short of CHANNEL_TO_FEAT leaves the dropped slot at normalize(0), a legal "no event", so the
-    # protocol would score a regime training never saw.
+    # short of CHANNEL_TO_FEAT leaves a slot at normalize(0), scoring a regime training never saw.
     assert tuple(announce) == tuple(CHANNEL_TO_FEAT), (
         f"announced set {tuple(announce)} != announceable set "
         f"{tuple(CHANNEL_TO_FEAT)}")

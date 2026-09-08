@@ -1,72 +1,7 @@
 """
-T1DMAI Data Pipeline — on-the-fly and cached sample generation from T1DMSIM.
-
-``T1DMDataset.__getitem__`` returns one sample:
-
-* ``patches``           — (T, PATCH_DIM) float.  T = n_ctx + PREDICTION_PATCHES.
-                          Each patch is PATCH_SIZE × N_INPUT_FEATURES values and
-                          is either VISIBLE or MASKED.  A masked patch withholds
-                          bg (feat 0) and announces itself through the bg_masked
-                          bit (feat 4, written into all PATCH_SIZE of its
-                          step-major columns); carb (feat 1) / insulin (feat 2) /
-                          exercise (feat 3) keep their true or announced values
-                          everywhere, unless the dataset is ``blind`` (below).
-* ``targets``           — (MAX_MASKED_PATCHES, PATCH_SIZE) float, ground-truth BG
-                          in mg/dL, one row per head slot.  The RAW
-                          ``bg_observed`` — the SAME signal fed as input, no
-                          smoothing — and NOT f-transformed in the batch: the
-                          Kovatchev risk transform is applied once at the top of
-                          the loss.
-* ``n_context_patches`` — int, length of the variable-size context window.
-* ``bg_formula_data``   — per-sample arrays consumed by the loss, validation and
-                          inference.  The masked set, all (MAX_MASKED_PATCHES,):
-                          ``mask_idx`` (patch index per head slot), ``valid``,
-                          ``anchor_bg`` (mg/dL), ``d`` (patches to the nearest
-                          visible evidence on either side) and ``slot_hour``
-                          (true hour of day).  Plus ``last_bg`` (raw last-context
-                          BG, mg/dL), ``true_bg_trajectory`` and
-                          ``extended_true_bg_trajectory`` (mg/dL ground truth from
-                          the context edge over the horizon and the long horizon),
-                          ``pred_start_hour``, and the announced future
-                          ``extended_{carb,insulin,exercise}_{norm,raw}`` used by
-                          the conditioned rolling override and the counterfactual
-                          probes.
-
-One raw post-noise space, no smoothing.  Every signal channel — bg, carb, insulin
-AND exercise — is fed RAW, and there is no causal smoother on inputs or on the
-forecast target.  The SAME raw bg is the model input, the forecast TARGET and
-``last_bg`` (bg clamped only to [BG_CLAMP_MIN, BG_CLAMP_MAX]; carb / insulin /
-exercise floored at 0).  Deployment realism is intrinsic: the live CGM/dose stream
-is consumed as-is and the autoregressive roll re-feeds the model's own raw output,
-so train and inference input distributions match.
-
-There is no prediction zone.  ``sample_mask_spans`` draws 1-3 non-abutting spans
-anywhere in the window and the model emits a quantile fan for every masked patch:
-a span ending at patch T-1 is a FORECAST, one starting at patch 0 a BACKCAST,
-anything else INFILL — one objective, three cases.
-
-* Context windows are sampled uniformly in [MIN_CONTEXT_PATCHES,
-  MAX_CONTEXT_PATCHES]; ``collate_fn`` left-pads to the BATCH maximum.
-* The input feature stack is exactly [bg_absolute, carb, insulin, exercise_equiv,
-  bg_masked]; there are no temporal sin/cos features.  bg (feat 0) enters in
-  Kovatchev risk space — z(f(bg)) — while carb/insulin/exercise keep log1p+z.
-  Exercise is the simulator's carbohydrate-EQUIVALENT glucose-disposal curve in
-  g/step, fed at that scale, never rescaled to an intensity and never
-  risk-transformed.  bg_masked (feat 4) is a BIT and is never normalized, so the
-  feature count and the normalized-channel count are not the same number.
-* Feats 1-3 are PLAN channels: nothing but what the patient announced is ever
-  written into them, masked patches included.  bg (feat 0) is zeroed exactly at
-  the masked patches, so the model cannot copy the signal it is asked to emit.
-* ``blind=True`` is the ONE departure, and it is off by default.  It withholds
-  feats 1-3 on masked patches too, at the per-channel zero-RAW ``normalize(0)``
-  (``zero_dose_fill``) — the same "no dose" baseline
-  ``inference.predict_rolling`` writes when nothing is announced — so
-  ``train_blind.py`` can measure the model with no conditioning at all.  A model
-  only ever sees one convention, so feat 4 still announces the withholding and
-  there is no second bit.
-* Masking is NOT inferable from position, and z = 0 in a withheld bg slot decodes
-  to an ordinary reading (~142 mg/dL on the balanced pool), not a sentinel —
-  which is why feat 4 announces the masked set explicitly.
+T1DMAI data pipeline: on-the-fly and cached sample generation from T1DMSIM.
+Sample dict contract lives on ``T1DMDataset.__getitem__``; space/objective rules
+are in this repo's CLAUDE.md.
 """
 
 import json
@@ -92,23 +27,14 @@ from normalization import (
     CHANNEL_NAMES, SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS, normalize,
 )
 
-# The input stack is [*CHANNEL_NAMES, bg_masked]: the leading
-# ``len(CHANNEL_NAMES)`` columns are normalized signal channels, the trailing one
-# a per-PATCH 0/1 bit that is never normalized.  The two counts differ and must
-# not be asserted equal.  Derived, never restated.
+# [*CHANNEL_NAMES, bg_masked]; the bit is never normalized, so the two counts differ on purpose.
 BG_MASKED_FEAT = len(CHANNEL_NAMES)
 assert N_INPUT_FEATURES == len(CHANNEL_NAMES) + 1, (
     f"N_INPUT_FEATURES={N_INPUT_FEATURES} should be len(CHANNEL_NAMES)="
     f"{len(CHANNEL_NAMES)} normalized channels plus the bg_masked bit"
 )
 
-# What a masked patch withholds; a model only ever sees one of the two.
-# ``announced`` withholds bg alone and lets the announced carb / insulin /
-# exercise ride through; ``blind`` withholds those three as well.  The string is
-# checkpoint provenance only — no parameter shape depends on it, so a strict
-# state-dict load accepts weights trained under either — and
-# ``calibrate_conformal.py`` compares it against the policy it implements.  An
-# ABSENT key means ``announced``.
+# Checkpoint provenance only, no parameter shape depends on it; an absent key means 'announced'.
 MASKED_CHANNEL_POLICY_ANNOUNCED = 'announced'
 MASKED_CHANNEL_POLICY_BLIND = 'blind'
 
@@ -121,10 +47,7 @@ def masked_channel_policy(blind: bool) -> str:
 def stored_masked_channel_policy(training_config: dict[str, Any] | None) -> str:
     """The masked-channel policy a checkpoint's ``training_config`` records.
 
-    The ONE reader of the absent-key convention, so a second convention cannot
-    appear: every consumer goes through here.  An absent key reads as
-    ``announced`` unconditionally, never as "unknown" — a blind run always stamps
-    the key, so a checkpoint lacking it cannot be a blind one.
+    Sole reader of the absent-key convention: absent means ``announced``, never "unknown".
     """
     tc = training_config or {}
     return str(tc.get('masked_channel_policy', masked_channel_policy(blind=False)))
@@ -138,14 +61,7 @@ def checkpoint_masked_channel_policy(ckpt: dict[str, Any] | None) -> str:
 def zero_dose_fill(stats: dict[str, dict[str, float]]) -> dict[int, float]:
     """``{feat_idx: z}`` over ``MASKABLE_FEATS`` — per-feat ``normalize(0)``, z-space.
 
-    What a blind masked patch carries in feats 1-3.  NOT ``z = 0``: the sparse
-    channels are log1p'd before the z-score, so ``z = 0`` inverts to
-    ``expm1(mean)`` — a phantom ~0.47 g/step of carb on the balanced pool, not an
-    absence of one.  ``normalize(0)`` is the channel's ``-mean/std``, means "no
-    dose", and is the same baseline ``inference.predict_rolling`` writes into an
-    un-overridden slot, so a blind roll is in-distribution.
-    Derived from the loaded stats every time, never written down: the values are
-    properties of the pool the stats were fit on.
+    NOT ``z=0``: log1p channels invert z=0 to ``expm1(mean)``, a phantom dose, not an absence.
     """
     zero_raw = normalize(
         np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats,
@@ -160,13 +76,7 @@ def blind_masked_doses(
 ) -> None:
     """Withhold the dose channels of every masked patch, IN PLACE.
 
-    ``patches`` ``(..., T, PATCH_DIM)`` step-major rows, ``masked`` ``(..., T)``
-    bool, ``fill`` from ``zero_dose_fill``.  The one place the blind convention is
-    implemented: ``_build_sample`` applies it to the sample's own masked set and
-    to ``next_window``'s, ``train_blind.py``'s two protocol forwards to the sets
-    they mask, so validation scores the task the model trained on.  Feat 0 and
-    feat 4 are untouched — the bg withholding and the announcement bit are the
-    same under either policy.
+    ``patches`` (..., T, PATCH_DIM) step-major, ``masked`` (..., T) bool. Feats 0/4 untouched.
     """
     assert patches.shape[-1] == PATCH_DIM, (
         f"patch row width {patches.shape[-1]} != PATCH_DIM {PATCH_DIM}")
@@ -178,57 +88,14 @@ def blind_masked_doses(
         block = patches[..., feat_idx::N_INPUT_FEATURES]
         patches[..., feat_idx::N_INPUT_FEATURES] = block.masked_fill(withheld, z)
 
-# Post-warmup hours of raw trajectory per sample.  A sample needs at most
-# MAX_CONTEXT_PATCHES + max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
-# patches, read off config so a resize carries this with it.
-#
-# Warmup discards a whole number of hours, so step 0 is midnight and the
-# pred_start_step jitter is also an hour-of-day range.  ``_pick_pred_start_step``
-# picks uniformly among the patch-aligned starts, of which there are
-#   n_candidates = N / PATCH_SIZE
-#                  - max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
-#                  - n_ctx + 1
-# returning None once that falls below 1.  The max() equals
-# NIGHT_LONG_HORIZON_PATCHES only because 16 > 4 today, and becomes
-# PREDICTION_PATCHES as soon as the supervised horizon outgrows the nocturnal one.
-# Candidates sit at 30-min spacing, so a day holds 48 slots and hour-of-day
-# coverage is uniform at a fixed n_ctx iff n_candidates % 48 == 0, i.e.
-# N ≡ 90 (mod 288); any other length puts an extra candidate on slot 0.
-#
-# At N = 2394 steps, n_candidates = 384 - n_ctx, exact at every whole-day width
-# up to the ceiling (n_ctx ∈ {48, 96, ..., 336}, 24 h through 7 days), and 2394 is
-# the SMALLEST congruent length leaving a 336-patch context any candidate at all:
-# that needs (336 + 16) × 6 = 2112 steps and 2106 is the previous congruent
-# length.  At the ceiling it leaves exactly 48 candidates, one full day.
-#
-# n_ctx is drawn uniformly, so the pooled hour-of-day histogram is a mixture over
-# widths and never flat; the residual peak sits at slot 47 (23:30) and the trough
-# at slot 0, so the tilt runs away from midnight rather than onto it.
-#
-# PAIRED with T1DMSIM/cache_simulator.py's --sim-hours: ``T1DMDataset.__init__``
-# rejects a cache whose meta['sim_hours'] differs.  Raising it lengthens every
-# on-the-fly simulator request in proportion.
+# N≡90 mod 288 for exact hour-of-day coverage to a 336-patch context; must match cache_simulator.py.
 ON_THE_FLY_SIM_HOURS: float = 199.5
 
-# The i-th calibration patient draws ``master_seed + CALIBRATION_SEED_OFFSET + i``
-# — a band clear of both the training hashed seeds and normalization's
-# ``+1_000_000``.  It backs split-conformal recalibration only, never the training
-# loop or the headline validation metrics.
+# Clear of training hashed seeds and normalization's +1_000_000 band; backs split-conformal only.
 CALIBRATION_SEED_OFFSET: int = 2_000_000
 
 
-# Cache-pool partitioning, train / val / cal disjointness.  ``sha256(seed) %
-# pool_size`` reprojects the validation (``master_seed + 10_000_000``) and
-# calibration (``CALIBRATION_SEED_OFFSET``) seed bands INDEPENDENTLY and uniformly
-# over ``[0, pool_size)``, so without this a val/cal sample lands on the exact
-# cache row a train sample uses and leaks a held-out trajectory into training.
-# (The on-the-fly path is immune — distinct seed bands hash to distinct 63-bit
-# seeds and never touch a shared finite pool.)
-#
-# So the pool is carved into three DISJOINT slabs keyed by ``cache_partition``,
-# each mapping ``cache_idx = slab_start + (patient_seed % slab_size)``: no row is
-# shared across partitions for ANY master seed.  The reserves are structural
-# constants, not training tunables.
+# 3 DISJOINT slabs (cache_idx = slab_start + seed%slab_size) so val/cal never land on a train row.
 CACHE_PARTITIONS: tuple[str, ...] = ('train', 'val', 'cal')
 CACHE_VAL_SLAB_ROWS: int = 100_000   # reserved tail rows for the validation bands
 CACHE_CAL_SLAB_ROWS: int = 100_000   # reserved tail rows for the calibration band
@@ -237,15 +104,7 @@ CACHE_CAL_SLAB_ROWS: int = 100_000   # reserved tail rows for the calibration ba
 def _cache_slab_geometry(pool_size: int, partition: str) -> tuple[int, int]:
     """``(slab_start, slab_size)`` cache-row band of a partition, half-open, ``slab_size >= 1``.
 
-    The three bands are pairwise DISJOINT and cover ``[0, pool_size)``, train
-    keeping the large contiguous head::
-
-        train : [0, pool_size - val_slab - cal_slab)
-        cal   : [pool_size - val_slab - cal_slab, pool_size - val_slab)
-        val   : [pool_size - val_slab, pool_size)
-
-    The val/cal reserves are clamped to at most a third of the pool and at least
-    one row, so a tiny test pool cannot starve train.
+    Order: train head, then cal, then val tail. Reserves clamped to a third of the pool, min 1 row.
     """
     assert partition in CACHE_PARTITIONS, partition
     assert pool_size >= 3, f"cache pool_size={pool_size} too small to partition"
@@ -265,12 +124,7 @@ def _cache_slab_geometry(pool_size: int, partition: str) -> tuple[int, int]:
 class _UniformSkillRngProxy:
     """A numpy ``Generator`` proxy overriding only ``multivariate_normal``.
 
-    The T1DMSIM patient sampler draws skills in one ``rng.multivariate_normal``
-    call, sigmoids, then clips to ``[SKILL_MIN, SKILL_MAX]``; the normal sampler
-    squeezes most patients to the centre and makes extreme ones rare.  Short-
-    circuiting that one call lands the post-sigmoid skills UNIFORMLY across the
-    range, oversampling the tails.  Every other method is forwarded unchanged, so
-    the non-skill parameters keep their usual distributions.
+    Short-circuits skill sampling to land post-sigmoid skills UNIFORMLY, oversampling tails.
     """
 
     def __init__(self, rng: np.random.Generator, skill_min: float, skill_max: float) -> None:
@@ -294,18 +148,13 @@ class _UniformSkillRngProxy:
 def _make_simulator(patient_seed: int, uniform_skills: bool):
     """A fresh ``T1DMSimulator``, optionally with uniform-skill sampling.
 
-    Never cached across calls: the simulator is stateful — ``generate_hours``
-    advances its clock — so a cache hit on a used seed hands back an instance
-    already past the warmup window and silently corrupts every sample drawn at
-    that seed.
+    Never cached: stateful, a reused seed's instance is past warmup.
     """
     from T1DMSIM.simulator import T1DMSimulator
     if not uniform_skills:
         return T1DMSimulator(seed=patient_seed)
 
-    # Monkey-patch the module-level ``generate_patient`` for the duration of the
-    # constructor rather than duplicating the simulator's patient generation;
-    # restored immediately so other instances are unaffected.
+    # Monkey-patches generate_patient for the constructor only; restored in finally below.
     from T1DMSIM import simulator as _sim_mod
 
     original = _sim_mod.generate_patient
@@ -324,10 +173,7 @@ def _make_simulator(patient_seed: int, uniform_skills: bool):
 def simulate_discard_warmup(sim, hours: float, warmup_hours: float = SIMULATOR_WARMUP_HOURS) -> dict:
     """``sim.generate_hours(hours + warmup_hours)`` less the first ``warmup_hours``.
 
-    The simulator starts from an empty meal / insulin history, so the first day
-    has unrealistic dynamics — no prior-day IOB, no residual carb-on-board, fresh
-    basal.  Every non-test caller routes through here, so training, normalization,
-    inference and the GUI all see the same cold-start-free window.
+    Discards the cold-start day (no prior IOB/COB). Every non-test caller routes through here.
     """
     from T1DMSIM.simulator import DT_MINUTES
     raw = sim.generate_hours(hours + warmup_hours)
@@ -343,10 +189,7 @@ def _pick_pred_start_step(
 ) -> int | None:
     """A patch-aligned pred-zone start anywhere in the trajectory, or ``None``.
 
-    Requires only ``n_ctx`` patches of context behind it and ``n_pred_steps`` raw
-    timesteps ahead.  Callers pass the long-horizon footprint
-    (NIGHT_LONG_HORIZON_PATCHES * PATCH_SIZE) as the room, so the trailing
-    ground-truth slice fits even though the supervised zone is shorter.
+    Callers pass the long-horizon footprint as room, so the ground-truth slice fits.
     """
     n_ctx_steps = n_ctx * PATCH_SIZE
 
@@ -374,14 +217,7 @@ def _pick_pred_start_step_at_hour(
 ) -> int | None:
     """A patch-aligned start whose hour-of-day is nearest ``target_hour``, circular.
 
-    ``hour_of_day`` is the (N,) per-step clock of the trimmed trajectory; the
-    context / horizon room requirement is ``_pick_pred_start_step``'s, and so is
-    the ``None`` return.  Reached through ``force_pred_start_hour``, for an
-    evaluation with its origins pinned to one hour — a bedtime origin
-    (``NOCTURNAL_START_HOUR`` ≈ 22:00), say, so a rolled forecast spans the whole
-    night.  One candidate within ``tol_hours`` of the target is picked at random
-    for variety (there is about one per day); with none eligible, the single
-    nearest.
+    Used for pinned-hour eval (e.g. bedtime). Random within ``tol_hours``, else nearest.
     """
     n_steps = len(hour_of_day)
     earliest = n_ctx * PATCH_SIZE
@@ -413,9 +249,7 @@ CACHE_CHANNEL_NAMES = (
 )
 
 
-# On-disk cache formats (T1DMSIM/cache_simulator.py): ``blosc2`` compressed,
-# ``npy`` a raw uncompressed per-channel memmap.  Same ``meta.json`` fields and
-# per-row read semantics either way.
+# blosc2: compressed. npy: raw uncompressed memmap. Same meta.json fields and read semantics.
 CACHE_FORMAT_BLOSC2 = 'blosc2-ndarray-v1'
 CACHE_FORMAT_NPY = 'npy-memmap-v1'
 SUPPORTED_CACHE_FORMATS = (CACHE_FORMAT_BLOSC2, CACHE_FORMAT_NPY)
@@ -424,30 +258,7 @@ SUPPORTED_CACHE_FORMATS = (CACHE_FORMAT_BLOSC2, CACHE_FORMAT_NPY)
 class T1DMDataset(Dataset):
     """T1DM training dataset; length ``total_steps * batch_size``.
 
-    Each index maps to a unique ``(step, position)`` pair, deterministically
-    deriving a patient seed via ``compute_patient_seed``.  With ``cache_path=None``
-    the simulator runs on demand inside the worker and dominates the per-batch
-    cost; with a ``T1DMSIM/cache_simulator.py`` directory it reads pre-generated
-    trajectories instead, mapping ``patient_seed % slab_size`` within this
-    partition's slab, so different ``master_seed``s draw different mixes from one
-    pool and every ``idx`` stays deterministic.
-
-    ``patient_uniform_sample_prob`` is the per-sample probability of drawing
-    skills uniformly across [SKILL_MIN, SKILL_MAX] rather than from the
-    simulator's multivariate normal, oversampling tail patients; ``0.0`` disables
-    it.  It and ``simulator_warmup_hours`` are IGNORED in cache mode — both are
-    baked in at generation time, and a warmup mismatch raises at load.
-
-    ``seed_offset`` shifts the whole patient-seed band (0 = training;
-    ``CALIBRATION_SEED_OFFSET`` for the reserved conformal partition).
-    ``cache_partition`` picks the DISJOINT cache slab — ``'val'`` and ``'cal'``
-    take the reserved tails, ``'train'`` the head — which is what keeps the +10M
-    val / +2M cal bands from collapsing onto train rows; it has no effect on the
-    on-the-fly path, where distinct seed bands never collide anyway.
-    ``force_pred_start_hour`` pins the prediction origin to the patch-aligned step
-    nearest that hour (validation only).  ``blind`` withholds the dose channels on
-    masked patches too, at ``zero_dose_fill``; ``train_blind.py`` is its only
-    caller.
+    ``seed_offset``/``cache_partition`` pick the seed band and slab; ``blind`` withholds doses too.
     """
 
     def __init__(
@@ -483,16 +294,13 @@ class T1DMDataset(Dataset):
         # (slab_start, slab_size) for this partition; None in on-the-fly mode.
         self._cache_slab: tuple[int, int] | None = None
 
-        # Lazy — populated on first access inside the worker, so no open cache
-        # handle is pickled across the DataLoader fork boundary.
+        # Lazy: populated on first access, so no open cache handle is pickled across the fork.
         self._cache_arrays: dict[str, Any] | None = None
         self._cache_icr: np.ndarray | None = None
         self._cache_pool_size: int | None = None
         self._cache_n_timesteps: int | None = None
         self._cache_meta: dict[str, Any] | None = None
-        # npy-memmap madvise metadata, name -> (mmap, data_offset_bytes,
-        # row_bytes).  None under blosc2 (different memory model) or when
-        # MADV_DONTNEED is unavailable.
+        # name -> (mmap, data_offset_bytes, row_bytes); None under blosc2 or w/o MADV_DONTNEED.
         self._cache_mmaps: dict[str, tuple[Any, int, int]] | None = None
         self._madv_dontneed: int | None = (
             getattr(mmap, 'MADV_DONTNEED', None) if CACHE_MADVISE_DONTNEED else None
@@ -523,8 +331,7 @@ class T1DMDataset(Dataset):
                     "— rebuild it with T1DMSIM/cache_simulator.py."
                 )
 
-            # A cache with no cache_format key at all is already rejected by the
-            # required-keys check above.
+            # A missing cache_format key is already rejected by the required-keys check above.
             cache_format = str(meta['cache_format'])
             if cache_format not in SUPPORTED_CACHE_FORMATS:
                 raise ValueError(
@@ -534,9 +341,7 @@ class T1DMDataset(Dataset):
                     "current T1DMSIM/cache_simulator.py."
                 )
 
-            # Every value baked into the trajectories must match the dataset's
-            # runtime assumptions: a disagreement changes what the model sees
-            # against the on-the-fly path, so it fails loudly instead.
+            # Baked-in values must match runtime assumptions, or the model sees a different input.
             cache_warmup = float(meta['simulator_warmup_hours'])
             if abs(cache_warmup - float(simulator_warmup_hours)) > 1e-6:
                 raise ValueError(
@@ -577,15 +382,11 @@ class T1DMDataset(Dataset):
             self._cache_pool_size = int(meta['pool_size'])
             self._cache_n_timesteps = int(meta['n_timesteps'])
             self._cache_meta = meta
-            # Carve this partition's disjoint band now that pool_size is known, so
-            # a held-out seed can never reproject onto a train cache row.
+            # Carved now pool_size is known, so a held-out seed never reprojects onto a train row.
             self._cache_slab = _cache_slab_geometry(
                 self._cache_pool_size, self.cache_partition)
 
-            # A pool smaller than total_steps * batch_size cycles, which is
-            # benign: ``_build_sample`` draws a fresh random context+horizon window
-            # each time and one trajectory admits many patch-aligned windows, so
-            # every reuse is a DIFFERENT training window.
+            # A smaller-than-batch pool cycles; benign since each reuse draws a fresh random window.
 
     def __len__(self) -> int:
         return self.total_steps * self.batch_size
@@ -593,17 +394,7 @@ class T1DMDataset(Dataset):
     def _load_cache(self) -> tuple[dict[str, Any], np.ndarray]:
         """Open the cache arrays on first use in this process.
 
-        Gives the per-channel array dict and the per-patient ICR array (tiny,
-        fully in RAM).  Two formats, by ``meta['cache_format']``:
-
-        * ``'blosc2-ndarray-v1'`` — chunked byte-shuffle + zstd ``.b2nd``; a
-          per-row read decompresses exactly one chunk.
-        * ``'npy-memmap-v1'`` — raw uncompressed ``.npy`` memmap; a per-row read
-          faults in only the touched pages.
-
-        Only the npy format is mapped.  Workers share the kernel page cache either
-        way and ``arr[i:i+1]`` returns a fresh row, so ``__getitem__`` is identical
-        across formats.
+        Per-channel array dict plus the per-patient ICR array. Only the npy format is mapped.
         """
         if self._cache_arrays is None:
             assert self.cache_path is not None
@@ -628,20 +419,14 @@ class T1DMDataset(Dataset):
                             "directory is corrupt or partially-written — rebuild it."
                         )
                     arrays[name] = arr
-                    # Suppress the kernel's 128 KB readahead so a fault pulls only
-                    # the pages the row touches.  Without it the per-row
-                    # MADV_DONTNEED below drops the row's ~2 pages and leaves ~30
-                    # readahead pages resident, growing page cache ~128 KB per read
-                    # (~0.5 GB/step).  Best-effort; access is 100% random, so there
-                    # is no sequential throughput to trade away.
+                    # Suppresses 128 KB readahead; access is 100% random, so it buys nothing.
                     _madv_random = getattr(mmap, 'MADV_RANDOM', None)
                     if _madv_random is not None:
                         try:
                             arr._mmap.madvise(_madv_random)
                         except (OSError, ValueError, AttributeError):
                             pass
-                    # Per-row byte geometry, so __getitem__ can MADV_DONTNEED
-                    # exactly the pages it faults in.
+                    # Per-row byte geometry, for __getitem__'s MADV_DONTNEED.
                     mmaps[name] = (
                         arr._mmap, int(arr.offset),
                         int(arr.shape[1] * arr.dtype.itemsize),
@@ -651,13 +436,7 @@ class T1DMDataset(Dataset):
             else:
                 import blosc2
                 for name in CACHE_CHANNEL_NAMES:
-                    # Deliberately NOT mmap_mode='r'.  A mapped .b2nd faults each
-                    # touched chunk's compressed pages into this process and
-                    # nothing can drop them again — blosc2 exposes no mapping to
-                    # madvise.  Random access then grows RssFile ~100 KB per channel
-                    # per row (~400 MB/step at BATCH_SIZE=512) until the whole cache
-                    # is resident.  Plain file reads leave the pages in ordinary
-                    # page cache, charged to nobody and reclaimed under pressure.
+                    # Not mmap_mode='r': blosc2 has no madvise, so mapped pages never drop.
                     arr = blosc2.open(
                         os.path.join(self.cache_path, f'{name}.b2nd'),
                         mode='r',
@@ -689,13 +468,7 @@ class T1DMDataset(Dataset):
     def _madvise_row(self, cache_idx: int) -> None:
         """Reclaim the page-cache pages just read for row ``cache_idx``.
 
-        Under npy-memmap every row read faults a page or two of the multi-TB
-        channel files into this worker's mapping, and the access barely repeats,
-        so they would otherwise accumulate as unbounded page cache.
-        ``madvise(MADV_DONTNEED)`` over the page-aligned range drops them at once;
-        a re-read re-faults from the file.  Best-effort: a no-op under blosc2
-        (never mapped) or without ``MADV_DONTNEED``, and any per-call failure is
-        swallowed so a platform quirk cannot break data loading.
+        Best-effort: a no-op under blosc2 (never mapped) or without ``MADV_DONTNEED``.
         """
         mmaps = self._cache_mmaps
         advice = self._madv_dontneed
@@ -728,32 +501,25 @@ class T1DMDataset(Dataset):
             cache_arrays, cache_icr = self._load_cache()
             assert self._cache_pool_size is not None
             assert self._cache_slab is not None
-            # This partition's DISJOINT band: a held-out (val/cal) seed can only
-            # resolve to a reserved tail row, never a train row.
+            # DISJOINT band: a held-out (val/cal) seed can only resolve to a reserved tail row.
             slab_start, slab_size = self._cache_slab
             cache_idx = slab_start + int(patient_seed % slab_size)
             if self._cache_mmaps is not None:
-                # npy-memmap: ``[idx:idx+1]`` is a VIEW into the shared mmap, so
-                # each row is copied out to sever it before MADV_DONTNEED drops
-                # the pages — without the copy the sample aliases the very pages
-                # dropped and re-faults them on use.  ``[idx:idx+1]`` rather than
-                # ``[idx]`` keeps the call on the slice path the stubs annotate.
+                # Copies the row out before MADV_DONTNEED, else it aliases the dropped pages.
                 data = {
                     name: np.array(cache_arrays[name][cache_idx:cache_idx + 1])[0]
                     for name in CACHE_CHANNEL_NAMES
                 }
                 self._madvise_row(cache_idx)
             else:
-                # blosc2: indexing decompresses the touched chunk into a fresh
-                # writable ndarray — no defensive copy needed, no mapping to advise.
+                # blosc2 indexing decompresses into a fresh array; no copy or advise needed.
                 data = {
                     name: np.asarray(cache_arrays[name][cache_idx:cache_idx + 1])[0]
                     for name in CACHE_CHANNEL_NAMES
                 }
             icr = float(cache_icr[cache_idx])
         else:
-            # Keyed off ``patient_seed`` so the same idx always resolves the same
-            # way; the XOR is a separate deterministic substream.
+            # Keyed off patient_seed so the same idx always resolves the same way.
             if self.patient_uniform_sample_prob > 0.0:
                 mode_rng = np.random.default_rng(patient_seed ^ 0x5A17_5EEDD)
                 use_uniform = bool(mode_rng.random() < self.patient_uniform_sample_prob)
@@ -766,8 +532,7 @@ class T1DMDataset(Dataset):
             )
             icr = float(sim.patient.icr)
 
-        # Separate substream, so the mode rng above cannot influence window
-        # selection.
+        # Separate substream, so the mode rng above cannot influence window selection.
         rng = np.random.default_rng(patient_seed ^ 0xDEADBEEF)
         return _build_sample(
             data=data,
@@ -789,13 +554,8 @@ def make_calibration_dataset(
 ) -> T1DMDataset:
     """The conformal-calibration dataset over the reserved seed band.
 
-    Patient seeds are ``master_seed + CALIBRATION_SEED_OFFSET + i``, disjoint from
-    the training hashed seeds and from normalization's ``+1_000_000`` band, so the
-    recalibration pass scores patients neither the loss nor the headline
-    validation ever saw.  ``master_seed`` and ``normalization_stats`` must be the
-    training run's own, and ``blind`` its masked-channel policy: split conformal
-    is valid only on the distribution the model runs under, so a blind checkpoint
-    must be calibrated on blind windows.
+    Seeds are ``master_seed + CALIBRATION_SEED_OFFSET + i``, disjoint from train.
+    ``blind`` must match the checkpoint's policy.
     """
     return T1DMDataset(
         master_seed=master_seed,
@@ -815,42 +575,8 @@ def sample_mask_spans(
 ) -> list[tuple[int, int]]:
     """The masked spans of one sample over a ``seq_len``-patch window, left to right.
 
-    ``(start_patch, length)`` pairs, strictly increasing in ``start_patch``, with
-    at least one visible patch between consecutive spans and
-    ``sum(length) <= MAX_MASKED_PATCHES``.  A span ending at patch
-    ``seq_len - 1`` is a forecast, one starting at patch 0 a backcast, anything
-    else infill.  The draw is the same under either masked-channel policy —
-    nothing here reads the flag.
-
-    Procedure::
-
-        n_spans      ~ U{1 .. MASK_MAX_SPANS}
-        each L_i     ~ U(MASK_SPAN_LENGTHS), independently
-        if sum(L) > MAX_MASKED_PATCHES: resample the WHOLE length vector
-        with prob MASK_RIGHT_EDGE_QUOTA: last span flush right, rest over the
-                                         prefix by stars-and-bars
-        otherwise:                       stars-and-bars over n_spans + 1 gaps
-
-    The over-budget rejection redraws the whole vector, never one element:
-    per-element redrawing yields a different length distribution and so a
-    different ``d`` histogram.  Placement is a uniform composition of the slack
-    over the gaps, with a MANDATORY visible patch between neighbouring spans; no
-    rejection loop on placement, no curriculum, no annealing.
-
-    ``MASK_RIGHT_EDGE_QUOTA`` is the one departure from uniform placement and
-    changes ONLY where the last span lands: ``n_spans`` and the length law are
-    drawn identically in both branches, so the span-length histogram is
-    quota-independent and only the ``d`` histogram moves.  Under uniform placement
-    a FORECAST — the deployed case — is an accident worth ~3% of windows, and the
-    band it emits there decays with training while every selection scalar
-    improves.  ``config.MASK_RIGHT_EDGE_QUOTA`` carries the paired evidence.
-
-    Both branches are enumerated exactly in ``d_balance.d_distribution``; a change
-    here not mirrored there moves every ``d``-binned figure's reference.
-
-    Two masked spans never abut: the separator is what makes the anchor, the
-    spline's node sequence and the DILATE length bucket well defined per span, and
-    two spans with nothing between them are one longer span.
+    ``(start_patch, length)`` pairs; sampler semantics per this repo's CLAUDE.md
+    (masked-BG objective section). Mirror a placement change in ``d_balance.d_distribution``.
     """
     lengths_pool = np.asarray(MASK_SPAN_LENGTHS, dtype=np.int64)
     n_spans = int(rng.integers(1, MASK_MAX_SPANS + 1))
@@ -862,8 +588,7 @@ def sample_mask_spans(
             break
 
     total_masked = int(span_lengths.sum())
-    # One mandatory visible patch per interior boundary, charged up front; the
-    # slack is what remains to spread freely over the n_spans + 1 gaps.
+    # One mandatory visible patch per interior boundary, charged up front.
     slack = seq_len - total_masked - (n_spans - 1)
     if slack < 0:
         raise RuntimeError(
@@ -888,11 +613,7 @@ def sample_mask_spans(
         return g
 
     spans: list[tuple[int, int]] = []
-    # The right-edge branch pins the LAST span at the final patch and composes the
-    # rest over the prefix clear of it and its separator.  That prefix holds
-    # exactly ``slack`` free patches — pinning is the uniform arrangement with the
-    # trailing gap fixed at 0, and fixing a gap frees the separator it no longer
-    # needs — so the branch needs no feasibility test of its own.
+    # Pins the LAST span at the final patch; rest compose over the prefix, trailing gap fixed at 0.
     last = int(span_lengths[-1])
     right_edge = MASK_RIGHT_EDGE_QUOTA > 0.0 and rng.random() < MASK_RIGHT_EDGE_QUOTA
 
@@ -928,13 +649,7 @@ def sample_mask_spans(
 def _anchor_step_for_span(start_patch: int, length: int) -> int:
     """Window-relative step index of one masked span's anchor.
 
-    ONE-SIDED and LEFT-PREFERRING: the LAST step of the left neighbour patch, or
-    the FIRST step of the right neighbour when the span starts at patch 0 — the
-    only no-left-neighbour case there is.  Every slot of a contiguous span gets
-    the SAME value.  The single anchor rule.
-
-    Read at the raw mg/dL array on the training path: a right-edge span,
-    ``start_patch = n_ctx``, gives ``bg_window[n_ctx * PATCH_SIZE - 1]``.
+    ONE-SIDED, LEFT-PREFERRING: last step of the left neighbour, or first of the right at patch 0.
     """
     if start_patch > 0:
         return start_patch * PATCH_SIZE - 1
@@ -947,23 +662,8 @@ def _mask_slots(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Spans expanded into the head's fixed ``MAX_MASKED_PATCHES`` (= M) slots.
 
-    ``(mask_idx, valid, d, anchor_step)``, each of length M.  Padded slots gather
-    patch 0 and are discarded by ``valid``.
-
-    ``d`` is the distance in patches to the nearest visible evidence on EITHER
-    side — never the span length, which confounds one-sided and two-sided cases at
-    equal difficulty, and never the arm.
-
-    ``d`` and the anchor disagree by construction, so any metric binned on ``d``
-    reports a distance the anchor did not use.  THE ANCHOR IGNORES THE NEAR SIDE,
-    being one-sided and left-preferring: the last slot of a two-sided 4-patch span
-    sits at ``d = 1`` off its right neighbour while anchoring 4 patches left.  A
-    third of supervision anchors farther than the nearest visible evidence;
-    ``tests/test_mask_sampler.py`` enumerates the share exactly over ``(T,
-    n_spans, length vector, placement branch, gap composition)`` and prints it
-    rather than anyone writing it down.  It costs no information — masked rows
-    attend to everything — only a harder job for the head's offset
-    parameterisation.
+    ``(mask_idx, valid, d, anchor_step)``, length M; padded slots gather patch 0, valid=False.
+    ``d`` (nearest-side) and the anchor (ONE-SIDED left-preferring) disagree by construction.
     """
     M = MAX_MASKED_PATCHES
     mask_idx = np.zeros(M, dtype=np.int64)
@@ -998,24 +698,10 @@ def _build_sample(
 ) -> dict[str, Any]:
     """One training sample from a raw simulator output dict.
 
-    Everything after the simulator call lives here, so every caller reuses one
-    feature pipeline.  Keys out: ``patches``, ``targets``, ``n_context_patches``,
-    ``bg_formula_data``.  The prediction window may start at any patch-aligned
-    position — one model covers day and night windows alike.
-
-    ``data`` carries 1-D length-N ``bg_observed``, ``total_carb``,
-    ``total_insulin``, ``total_exercise``, ``hour_of_day``, ``day`` (plus
-    ``insulin_resistance`` and ``hgo``, which the input stack does not use).
-    ``icr`` is accepted for caller compatibility and not consumed.
-
-    One raw post-noise space, no smoothing: those four RAW signals are the model
-    input, and the same raw bg is the BG target and ``last_bg`` (clamped to the
-    physical range; the sparse channels floored at 0).  No input/target asymmetry
-    and no filter.
+    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``. ``icr`` is
+    accepted for caller compatibility and not consumed. Raw post-noise space, no smoothing.
     """
-    # ``total_exercise`` is the carbohydrate-EQUIVALENT glucose-disposal curve in
-    # g/step — what the simulator subtracts from the appearance term — fed at that
-    # trained scale and never rescaled to an intensity.
+    # total_exercise is a carb-EQUIVALENT glucose-disposal curve in g/step; never rescaled.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     bg_raw = data['bg_observed'].astype(np.float32)
     carb_raw = data['total_carb'].astype(np.float32)
@@ -1026,27 +712,18 @@ def _build_sample(
 
     N = len(bg_raw)
 
-    # No smoother.  bg is clamped only so it is a legal Kovatchev-f / last_bg
-    # argument: the cache is already rail-filtered into the open interval
-    # BG_CLAMP_MIN + 1 … BG_CLAMP_MAX - 1, derived the same way at
-    # T1DMSIM/cache_simulator.py:180-181 so a clamp change cannot desynchronise
-    # the two, but on-the-fly generation and edge reads still need the guard.
+    # No smoother; clamp only makes bg a legal Kovatchev-f/last_bg argument (edge-read guard).
     bg = np.clip(bg_raw, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.maximum(carb_raw, 0.0).astype(np.float32)
     insulin = np.maximum(insulin_raw, 0.0).astype(np.float32)
     exercise = np.maximum(exercise_raw, 0.0).astype(np.float32)
 
-    # The canonical input layout: 0 bg_absolute, 1 carb, 2 insulin, 3 exercise
-    # (g/step carb-equivalent), 4 bg_masked (the per-PATCH announcement bit,
-    # written per window below).  hour_of_day and day_index are metadata for
-    # prediction-start selection, not input features.
+    # [bg_absolute, carb, insulin, exercise g/step, bg_masked bit written per window below].
     features = np.stack([
         bg, carb, insulin, exercise,
         np.zeros_like(bg),
     ], axis=-1)  # (N, N_INPUT_FEATURES)
-    # Two different numbers: N_INPUT_FEATURES columns, of which only the LEADING
-    # len(CHANNEL_NAMES) are normalized signal channels.  The trailing bg_masked
-    # column is a bit and never sees the z-score.
+    # Only the LEADING len(CHANNEL_NAMES) columns are normalized; the trailing bg_masked is a bit.
     assert features.shape[-1] == N_INPUT_FEATURES, (
         f"feature stack has {features.shape[-1]} cols, expected "
         f"N_INPUT_FEATURES={N_INPUT_FEATURES}"
@@ -1057,30 +734,25 @@ def _build_sample(
         f"{len(CHANNEL_NAMES)}, N_INPUT_FEATURES={N_INPUT_FEATURES}"
     )
 
-    # Column order == CHANNEL_NAMES order, so the gather never reads a dropped
-    # channel.  Exercise is a carb-equivalent disposal rate, not a glucose, so it
-    # takes the log1p branch and never the risk transform.
+    # Exercise is a carb-equivalent disposal rate, not a glucose: log1p branch, never risk.
     for c, name in enumerate(CHANNEL_NAMES):
         mean = stats[name]['mean']
         std = stats[name]['std']
         col = features[:, c]
         if name in RISK_SPACE_CHANNELS:
-            # bg fed as z(f(bg)), the sole BG input path; clamped above, so f is
-            # well-defined.
+            # bg fed as z(f(bg)), the sole BG input path; clamped above so f is well-defined.
             col = kovatchev_f_np(col)
         elif name in SPARSE_LOG1P_CHANNELS:
             col = np.log1p(np.maximum(col, 0.0))
         features[:, c] = (col - mean) / (std + 1e-8)
 
-    # One random window per sample: ``n_ctx`` variable, the horizon length fixed
-    # and free to start at any patch-aligned position.
+    # One random window per sample: n_ctx variable, horizon fixed, patch-aligned start.
     n_ctx = int(rng.integers(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1))
     long_horizon_patches = max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
     total_patches_needed = n_ctx + long_horizon_patches
     total_steps_needed = total_patches_needed * PATCH_SIZE
 
-    # A multiple of PATCH_SIZE, so the reshape below is clean; too short for the
-    # drawn n_ctx falls back to the minimum context.
+    # Multiple of PATCH_SIZE for a clean reshape; too short for drawn n_ctx falls back to minimum.
     N_trimmed = (N // PATCH_SIZE) * PATCH_SIZE
     if N_trimmed < total_steps_needed:
         n_ctx = MIN_CONTEXT_PATCHES
@@ -1091,8 +763,7 @@ def _build_sample(
     n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
     # The room requirement is the long horizon, so the trailing GT slice fits.
     if force_pred_start_hour is not None:
-        # Falls back to a uniform-random origin when no candidate near the target
-        # hour leaves enough room.
+        # Falls back to a uniform-random origin when no candidate near the target hour fits.
         pred_start_step = _pick_pred_start_step_at_hour(
             hour_of_day[:N_trimmed], n_ctx, n_long_horizon_steps,
             float(force_pred_start_hour), rng,
@@ -1106,8 +777,7 @@ def _build_sample(
             N_trimmed, n_ctx, n_long_horizon_steps, rng,
         )
     if pred_start_step is None:
-        # No valid window: raising skips the sample and the DataLoader retries the
-        # next index.  Only a pathologically short simulator output reaches here.
+        # Raising skips the sample; DataLoader retries the next index.
         raise RuntimeError(
             f"No prediction window found; trajectory length {N_trimmed}, "
             f"n_ctx={n_ctx}, n_pred={n_pred_steps}"
@@ -1115,15 +785,10 @@ def _build_sample(
     start_step = pred_start_step - n_ctx * PATCH_SIZE
     end_step = start_step + total_steps_needed
 
-    # ``bg_window`` covers the whole long-horizon range so the validation rolling
-    # pass has raw ground-truth BG at every horizon; the model consumes only the
-    # first PREDICTION_PATCHES patches of the prediction zone.
+    # bg_window covers the long-horizon range; the model consumes only PREDICTION_PATCHES of it.
     window = features[start_step:end_step]
     bg_window = bg[start_step:end_step]
-    # The announced future-input overrides for the rolling validation and the
-    # counterfactual probes, sliced to the long horizon below.  ``predict_rolling``
-    # discards the raw side; the counterfactual probe re-normalizes through the
-    # same log1p-z stats on the baseline and perturbed sides alike.
+    # Announced future-input overrides for rolling validation and counterfactual probes.
     _carb_feat = CHANNEL_TO_FEAT[0]
     _insulin_feat = CHANNEL_TO_FEAT[1]
     _exercise_feat = CHANNEL_TO_FEAT[2]
@@ -1134,14 +799,10 @@ def _build_sample(
     insulin_raw_window = insulin[start_step:end_step]
     exercise_raw_window = exercise[start_step:end_step]
 
-    # A leading-axis slice of a C-contiguous array is contiguous, so this reshape
-    # is a view and the sole materializing ``.copy()`` is at the
-    # ``torch.from_numpy`` boundary.
+    # A leading-axis slice of a C-contiguous array stays contiguous, so this reshape is a view.
     patches_3d = window.reshape(total_patches_needed, PATCH_SIZE, N_INPUT_FEATURES)
 
-    # The model sees seq_len patches, each visible or masked.  Only the first
-    # PREDICTION_PATCHES past the context are exposed; anything beyond exists in
-    # ``window`` solely to carry the long-horizon ground truth.
+    # Only the first PREDICTION_PATCHES past context are exposed; the rest is GT-only.
     seq_len = n_ctx + PREDICTION_PATCHES
     spans = sample_mask_spans(seq_len, rng)
     masked_patches = np.concatenate(
@@ -1149,87 +810,52 @@ def _build_sample(
     )
     mask_idx, valid, mask_d, anchor_step = _mask_slots(spans, seq_len)
 
-    # Flattened (PATCH_SIZE, N_INPUT_FEATURES) → PATCH_DIM, STEP-MAJOR: a
-    # feature's columns are the ``f::N_INPUT_FEATURES`` stride.
+    # step-major PATCH_DIM: a feature's columns are the f::N_INPUT_FEATURES stride.
     all_patches_t = torch.from_numpy(
         patches_3d[:seq_len].reshape(seq_len, PATCH_SIZE * N_INPUT_FEATURES).copy()
     )
     masked_rows = torch.from_numpy(masked_patches)
-    # A masked patch withholds bg — feat 0, the only NON_MASKABLE_FEATS entry —
-    # because that is what the model is asked to emit.  The loop touches
-    # NON_MASKABLE_FEATS only, so every MASKABLE_FEATS column passes through
-    # untouched whatever N_INPUT_FEATURES is.
+    # A masked patch withholds bg (feat 0, the only NON_MASKABLE_FEATS entry).
     for feat_idx in NON_MASKABLE_FEATS:
         all_patches_t[masked_rows, feat_idx::N_INPUT_FEATURES] = 0.0
-    # Under the blind policy the same patches withhold their doses too, at the
-    # zero-RAW "no dose" fill rather than at z = 0.
+    # Under blind, the same patches withhold doses too, at zero-RAW fill rather than z=0.
     blind_fill = zero_dose_fill(stats) if blind else None
     unblinded_dose_rows = None
     unblinded_dose_patches = None
     if blind_fill is not None:
         blind_flags = torch.zeros(seq_len, dtype=torch.bool)
         blind_flags[masked_rows] = True
-        # What the patient ACTUALLY did on the withheld patches, kept before the
-        # fill overwrites it in place.  The blind policy is a property of the
-        # OBJECTIVE — of which patches the model may read — not of the history, so
-        # a caller that un-masks must be able to un-blind with it.  The
-        # long-horizon roll is that caller: its context is observed CGM history, so
-        # restoring bg while leaving the fill in feats 1-3 hands the roll a history
-        # asserting that a meal and a bolus did not happen.
+        # Kept before the fill overwrites it: the long-horizon roll un-blinds bg from history.
         unblinded_dose_rows = np.asarray(masked_rows, dtype=np.int64).copy()
         unblinded_dose_patches = all_patches_t[masked_rows].clone()
         blind_masked_doses(all_patches_t, blind_flags, blind_fill)
-    # The masked set is announced explicitly: masking is not inferable from
-    # position, and z = 0 in a withheld bg slot decodes to an ordinary reading
-    # (~142 mg/dL on the balanced pool), not a sentinel.  The bit is per PATCH and
-    # the layout step-major, so it goes into ALL PATCH_SIZE columns of feat 4 —
-    # which is why PATCH_DIM grows by PATCH_SIZE to carry one bit.  Anywhere
-    # outside the step-major block breaks PATCH_DIM and the stride idiom above.
+    # Masking is not inferable from position (z=0 decodes to an ordinary reading), hence the bit.
     all_patches_t[masked_rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
     assert all_patches_t.shape[-1] == PATCH_DIM, (
         f"patch row width {all_patches_t.shape[-1]} != PATCH_DIM {PATCH_DIM}"
     )
 
-    # One target per head slot: RAW BG (mg/dL) at each masked patch, NOT
-    # f-transformed in the batch — the risk transform is applied once in the loss.
-    # Padded slots gather patch 0 exactly as ``mask_idx`` does, and ``valid`` is
-    # what discards them.
+    # RAW BG (mg/dL) per head slot, NOT f-transformed here; the risk transform is in the loss.
     pred_start_in_window = n_ctx * PATCH_SIZE
     bg_patches = bg_window[:seq_len * PATCH_SIZE].reshape(seq_len, PATCH_SIZE)
     targets_t = torch.from_numpy(bg_patches[mask_idx].copy())   # (M, S) mg/dL
 
-    # RAW prediction-zone BG for validation / inference — the same raw signal as
-    # the target, sourced here and never from a left-padded ``context[-1, -1, 0]``.
+    # RAW prediction-zone BG, sourced here and never from a left-padded context[-1, -1, 0].
     true_bg_traj = bg_window[
         pred_start_in_window:pred_start_in_window + PREDICTION_PATCHES * PATCH_SIZE
     ]
     extended_true_bg_traj = bg_window[
         pred_start_in_window:pred_start_in_window + n_long_horizon_steps
     ]
-    # Anchors: ONE-SIDED and LEFT-PREFERRING, read off the RAW mg/dL array with no
-    # decode round trip.  ``_anchor_step_for_span`` is the single rule.
-    #
-    # Padded slots hold ``last_bg`` — an arbitrary but LEGAL mg/dL from this window
-    # — so the forward's (B, M) units tripwire never fires on a slot ``valid`` is
-    # about to discard.
-    #
-    # ``last_bg`` is the right-edge case of the same rule: the span of
-    # PREDICTION_PATCHES starting at patch n_ctx anchors on
-    # ``bg_window[n_ctx * PATCH_SIZE - 1]``.  It stays because the rolling
-    # validation and the inference paths forecast from the context edge and read it.
+    # Padded slots hold last_bg (a LEGAL mg/dL), so the forward's units tripwire never fires.
     last_bg = float(bg_window[_anchor_step_for_span(n_ctx, PREDICTION_PATCHES)])
     anchor_bg = np.full(MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
     anchor_bg[valid] = bg_window[anchor_step[valid]]
 
-    # Per-slot TRUE hour of day, at the masked patch's own first step.  Derived
-    # instead as ``pred_start_hour + 0.5 * j`` it is off by
-    # ``(mask_idx[j] - n_ctx - j) * 0.5`` h under a general masked set, with every
-    # shape still matching; a right-edge span reproduces it exactly.
+    # Per-slot TRUE hour of day, at the masked patch's own first step (not derived/interpolated).
     slot_hour = hour_of_day[start_step + mask_idx * PATCH_SIZE].astype(np.float32)
 
-    # Announced future carbs / insulin / exercise over the long horizon, for the
-    # conditioned rolled-forecast override.  Exercise is a PLAN channel exactly
-    # like the doses: what the patient announced, never an inferred session.
+    # Announced future carbs/insulin/exercise for the conditioned rolled-forecast override.
     _lh = slice(pred_start_in_window, pred_start_in_window + n_long_horizon_steps)
     extended_carb_norm = carb_norm_window[_lh]
     extended_insulin_norm = insulin_norm_window[_lh]
@@ -1242,10 +868,7 @@ def _build_sample(
     pred_start_hour = float(hour_of_day[pred_start_step])
 
     bg_formula_data = {
-        # The masked set, all (M,) with M = MAX_MASKED_PATCHES.  Padded slots
-        # gather patch 0 and carry a legal anchor; ``valid`` is the ONLY thing
-        # that discards them, so a loss or metric path that drops it supervises
-        # those slots against patch 0.
+        # (M,) with M=MAX_MASKED_PATCHES; padded slots gather patch 0, valid is what drops them.
         'mask_idx': mask_idx,          # (M,) int64  patch index per head slot
         'valid': valid,                # (M,) bool
         'anchor_bg': anchor_bg,        # (M,) float32 mg/dL
@@ -1263,13 +886,7 @@ def _build_sample(
         'extended_exercise_raw': extended_exercise_raw.copy(),
     }
     if unblinded_dose_rows is not None:
-        # BLIND ONLY and UN-COLLATED ONLY: ``collate_fn`` builds its batched dict
-        # from an allowlist and carries neither these nor the ``extended_*`` arrays
-        # above, both being consumed from a single ``dataset[i]`` by the validation
-        # roll.  ABSENT rather than None under the announced policy, which is
-        # load-bearing — nothing was overwritten there to undo, and the announced
-        # sample must stay byte-identical through the flag
-        # (``tests/test_blind_dataset.py`` digests it key by key).
+        # Blind-only, un-collated; absent (not None) under announced (tests/test_blind_dataset.py).
         bg_formula_data['unblinded_dose_rows'] = unblinded_dose_rows
         bg_formula_data['unblinded_dose_patches'] = unblinded_dose_patches
 
@@ -1280,18 +897,7 @@ def _build_sample(
         'bg_formula_data': bg_formula_data,
     }
 
-    # Cross-window time-of-day probe input, window k+1: window k shifted forward
-    # by exactly PREDICTION_PATCHES, so its context ends at pred_start + P and it
-    # predicts [pred_start+P, pred_start+2P].  TEACHER-FORCED on the SAME
-    # already-normalized ``features`` — a pure re-slice, the normalize crossing
-    # above stays the authoritative one.  It carries ONE masked span, the
-    # right-edge forecast zone: feat 0 withheld there so no future bg leaks, feat
-    # 4 announcing it, carb/insulin/exercise announced throughout.  Window k's
-    # general masked set is deliberately NOT reused — the probe compares two
-    # forecasts one horizon apart.  Same n_ctx, so the two windows share the
-    # PADDING geometry and nothing else: the masked sets differ, and the attention
-    # mask is a function of the masked set, so each window gets its own from
-    # ``collate_fn``.  Diagnostic only.
+    # Cross-window time-of-day probe: window k+1, teacher-forced, one right-edge span; diagnostic.
     if TIME_PROBE_ENABLED and TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0:
         next_end_patch = n_ctx + 2 * PREDICTION_PATCHES
         next_valid = next_end_patch <= total_patches_needed   # in-range on patches_3d
@@ -1300,8 +906,7 @@ def _build_sample(
             next_spans, seq_len
         )
         next_masked_rows = torch.arange(n_ctx, n_ctx + PREDICTION_PATCHES)
-        # One horizon further along the SAME window, so window k+1's own step 0 is
-        # at PREDICTION_PATCHES * PATCH_SIZE in ``bg_window``.
+        # Window k+1's own step 0 is at PREDICTION_PATCHES*PATCH_SIZE in bg_window.
         next_offset = PREDICTION_PATCHES * PATCH_SIZE
         if next_valid:
             next_patches_t = torch.from_numpy(
@@ -1324,19 +929,14 @@ def _build_sample(
                 start_step + next_offset + next_mask_idx * PATCH_SIZE
             ].astype(np.float32)
         else:
-            # Room exists only under NIGHT_LONG_HORIZON_HOURS ==
-            # PREDICTION_HORIZON_HOURS.  A finite placeholder, masked out
-            # downstream; last_bg reuses window k's legal mg/dL so the forward's
-            # units tripwire never fires, and the announcement bit is still written
-            # so the placeholder is not a window claiming every patch is observed.
+            # Finite placeholder, masked out downstream; reuses window k's legal last_bg.
             next_patches_t = torch.zeros(seq_len, PATCH_DIM, dtype=torch.float32)
             next_patches_t[next_masked_rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
             next_last_bg = last_bg
             next_anchor_bg = np.full(MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
             next_pred_start_hour = pred_start_hour
             next_slot_hour = np.full(MAX_MASKED_PATCHES, pred_start_hour, dtype=np.float32)
-        # Both windows of the pair are drawn under one convention, the placeholder
-        # branch's masked rows included.
+        # Both windows of the pair are drawn under one convention, placeholder branch included.
         if blind_fill is not None:
             next_blind_flags = torch.zeros(seq_len, dtype=torch.bool)
             next_blind_flags[next_masked_rows] = True
@@ -1358,26 +958,10 @@ def _build_sample(
 
 
 def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate variable-length samples into a padded batch::
+    """Collate variable-length samples into a padded batch.
 
-          patches:           (B, max_T, PATCH_DIM)             float32
-          targets:           (B, M, PATCH_SIZE)                float32 (mg/dL)
-          attn_mask:         (B, max_T, max_T)                 bool
-          bg_formula_data:   batched dict (see _build_sample)
-          n_context_patches: (B,)                              long
-          next_window:       optional batched dict, present iff the samples carry
-                             it, with its OWN ``attn_mask``
-
-    Left-pads to ``max_T = max(seq_lens)``, the BATCH maximum, never
-    ``MAX_SEQ_LEN``, which appears nowhere in this module: a forward asserting
-    ``patches.shape[1] == MAX_SEQ_LEN`` fires on most validation batches, so every
-    forward takes ``(B, T, .)`` with ``T <= MAX_SEQ_LEN``.  Padding positions are
-    blocked by the per-batch attention mask, whose diagonal is forced True so
-    softmax cannot NaN on an all-False row.
-
-    Head-slot indices are rebased onto the PADDED axis here: a sample's masked
-    patch ``p`` sits at ``n_pad + p``.  Padded slots keep index 0 — the padded
-    tensor's position 0 — and are discarded by ``valid``.
+    Left-pads to ``max_T = max(seq_lens)``, the BATCH max, never ``MAX_SEQ_LEN``. Head-slot
+    ``p`` rebases to ``n_pad + p``; padded slots keep index 0, discarded by ``valid``.
     """
     B = len(samples)
     M = MAX_MASKED_PATCHES
@@ -1386,8 +970,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     max_T = max(seq_lens)
     n_pads = [max_T - sl for sl in seq_lens]
 
-    # Left-padding zeros are fine: the attention mask is what disables padding
-    # positions.
+    # Left-padding zeros are fine: the attention mask is what disables padding positions.
     patches_batch = torch.zeros(B, max_T, PATCH_DIM, dtype=torch.float32)
     targets_batch = torch.stack([s['targets'] for s in samples])           # (B, M, PATCH_SIZE)
     n_ctx_tensor = torch.tensor(n_contexts, dtype=torch.long)
@@ -1402,8 +985,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     for i, s in enumerate(samples):
         n_pad = n_pads[i]
 
-        # Data at [n_pad:max_T], so the prediction horizon sits at the right edge
-        # for every sample in the batch.  The model relies on this.
+        # Data at [n_pad:max_T], so the prediction horizon sits at the right edge for every sample.
         patches_batch[i, n_pad:, :] = s['patches']
 
         is_pad[i, :n_pad] = True
@@ -1412,21 +994,11 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         mask_idx_batch[i, row_valid] = idx[row_valid]
         masked[i, mask_idx_batch[i, row_valid]] = True
 
-    # Visible rows see visible columns, masked rows see everything real, pad rows
-    # and columns are blocked, and the diagonal is forced True at EVERY position
-    # including padding — that last step is what keeps a pad row, blocked as a row
-    # and as a column, from being all-False and NaN-ing the softmax on the
-    # direct-to-SDPA bool path.  The assert is this call site's guard on it.
+    # Diagonal is forced True at EVERY position (padding included) so no row is all-False.
     attn_masks = utils.create_attention_mask_from_visible(~masked, is_pad)
     assert attn_masks.any(dim=-1).all(), "an all-False attention row NaNs softmax"
 
-    # Feat 4 must agree with the masked set that built the attention mask, and
-    # nothing else catches a disagreement: z = 0 in a withheld bg slot decodes to
-    # an ordinary reading (~142 mg/dL on the balanced pool), so a patch announced
-    # visible while its bg is withheld teaches the model to read a fabricated
-    # observation and every loss and metric downstream stays finite and plausible.
-    # The bit is per patch and the layout step-major, so all PATCH_SIZE columns
-    # carry it identically.
+    # Feat 4 must agree with the masked set that built attn_mask; nothing else catches drift.
     _bit = patches_batch[..., BG_MASKED_FEAT::N_INPUT_FEATURES]   # (B, max_T, PATCH_SIZE)
     assert _bit.shape[-1] == PATCH_SIZE, (
         f"feat {BG_MASKED_FEAT} stride slice gave {_bit.shape[-1]} columns, "
@@ -1439,11 +1011,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "feat 4 does not reproduce the sampled mask that built attn_mask"
     )
 
-    # Window k+1 shares window k's n_ctx, so it shares the left-pad ``n_pad`` and
-    # the padding geometry — ``is_pad`` below is window k's.  The masked set is NOT
-    # shared (k+1 masks its own right-edge forecast span, k whatever its sampler
-    # drew), and the attention mask is a function of the masked set, so k+1 gets
-    # its own at ``next_window['attn_mask']``.
+    # Window k+1 shares k's n_ctx/n_pad but not the masked set, so it gets its own attn_mask.
     next_window_batched = None
     if 'next_window' in samples[0]:
         nw_patches = torch.zeros(B, max_T, PATCH_DIM, dtype=torch.float32)
@@ -1463,11 +1031,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         nw_attn_masks = utils.create_attention_mask_from_visible(~nw_masked, is_pad)
         assert nw_attn_masks.any(dim=-1).all(), "an all-False attention row NaNs softmax"
 
-        # The same feat-4-versus-mask agreement as above, against THIS window's
-        # masked set.  A patch announced masked while the attention mask still
-        # offers it as evidence contradicts itself and nothing downstream notices:
-        # the withheld bg is zeroed either way and every loss and metric stays
-        # finite.
+        # Same feat-4-versus-mask agreement as above, against THIS window's masked set.
         _nw_bit = nw_patches[..., BG_MASKED_FEAT::N_INPUT_FEATURES]   # (B, max_T, PATCH_SIZE)
         assert _nw_bit.shape[-1] == PATCH_SIZE, (
             f"feat {BG_MASKED_FEAT} stride slice gave {_nw_bit.shape[-1]} columns, "
@@ -1481,32 +1045,27 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         )
 
         next_window_batched = {
-            'patches': nw_patches,                                                   # (B, max_T, PATCH_DIM)
-            'attn_mask': nw_attn_masks,                                              # (B, max_T, max_T) bool
-            'mask_idx': nw_mask_idx,                                                 # (B, M) long, padded axis
-            'valid_slots': nw_valid_slots,                                           # (B, M) bool
+            'patches': nw_patches,  # (B, max_T, PATCH_DIM)
+            'attn_mask': nw_attn_masks,  # (B, max_T, max_T) bool
+            'mask_idx': nw_mask_idx,  # (B, M) long, padded axis
+            'valid_slots': nw_valid_slots,  # (B, M) bool
             'anchor_bg': torch.from_numpy(
-                np.stack([s['next_window']['anchor_bg'] for s in samples])),         # (B, M) mg/dL
+                np.stack([s['next_window']['anchor_bg'] for s in samples])),  # (B, M) mg/dL
             'd': torch.from_numpy(
-                np.stack([s['next_window']['d'] for s in samples])),                 # (B, M) long
+                np.stack([s['next_window']['d'] for s in samples])),  # (B, M) long
             'slot_hour': torch.from_numpy(
-                np.stack([s['next_window']['slot_hour'] for s in samples])),         # (B, M) hours
+                np.stack([s['next_window']['slot_hour'] for s in samples])),  # (B, M) hours
             'last_bg': torch.tensor(
                 [s['next_window']['last_bg'] for s in samples], dtype=torch.float32),  # (B,) mg/dL
-            'pred_start_hour': torch.tensor(
-                [s['next_window']['pred_start_hour'] for s in samples], dtype=torch.float32),  # (B,)
+            'pred_start_hour': torch.tensor(  # (B,)
+                [s['next_window']['pred_start_hour'] for s in samples], dtype=torch.float32),
             'valid': torch.tensor(
-                [s['next_window']['valid'] for s in samples], dtype=torch.bool),      # (B,)
+                [s['next_window']['valid'] for s in samples], dtype=torch.bool),  # (B,)
         }
 
-    # The trajectories are raw mg/dL ground truth; ``last_bg`` and
-    # ``pred_start_hour`` are per-sample scalars.  The announced-future
-    # ``extended_*`` arrays are deliberately NOT stacked here: they are consumed
-    # only from UN-COLLATED samples by the rolled-forecast override
-    # (``train._make_long_horizon_overrides_fn``, whose callers iterate the dataset
-    # directly), so they ride on each sample's own ``bg_formula_data``.
+    # extended_* arrays are deliberately NOT stacked: only consumed from UN-COLLATED samples.
     bg_formula_batched: dict[str, Any] = {
-        # The masked set, on the PADDED patch axis.  Every one of these is (B, M).
+        # The masked set, on the PADDED patch axis. Every one of these is (B, M).
         'mask_idx': mask_idx_batch,
         'valid': valid_batch,
         'anchor_bg': torch.from_numpy(

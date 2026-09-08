@@ -67,8 +67,7 @@ def test_mask_sampler_constants():
     assert MAX_MASKED_PATCHES >= MASK_SPAN_LENGTHS[-1], (
         f"a single longest span ({MASK_SPAN_LENGTHS[-1]}) must fit the masked-patch "
         f"budget ({MAX_MASKED_PATCHES}), or the sampler rejects for ever")
-    # the shortest drawable window must hold the largest masked set plus its
-    # mandatory separators, or sample_mask_spans raises
+    # shortest drawable window must hold the largest masked set plus its mandatory separators.
     shortest_T = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
     assert MAX_MASKED_PATCHES + (MASK_MAX_SPANS - 1) <= shortest_T, (
         f"{MAX_MASKED_PATCHES} masked patches + {MASK_MAX_SPANS - 1} separators "
@@ -118,8 +117,7 @@ def test_architecture_redesign_constants():
                  'PINBALL_LOSS_WEIGHT', 'DILATE_LOSS_WEIGHT'):
         assert not hasattr(config, gone), f"config.{gone} must be deleted"
 
-    # τ is selectable: any QUANTILE_LEVELS entry on the right side, so assert
-    # membership and side, not an index
+    # τ selectable: any QUANTILE_LEVELS entry on the right side; assert membership+side, not index.
     from config import QUANTILE_LEVELS
     assert (config.HYPO_ALARM_QUANTILE_TAU in QUANTILE_LEVELS
             and config.HYPO_ALARM_QUANTILE_TAU < 0.5), \

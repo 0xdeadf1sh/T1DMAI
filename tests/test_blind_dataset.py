@@ -1,8 +1,7 @@
 """The ``blind`` masked-channel policy, at the dataset boundary.
 
-``blind=True`` withholds feats 1-3 on a masked patch as well as bg, at
-``zero_dose_fill``'s per-channel ``normalize(0)``. ``train_blind.py`` is the only
-caller; the ``blind=False`` default is what every shipped checkpoint trained under.
+``blind=True`` withholds feats 1-3 on a masked patch too, at ``zero_dose_fill``'s
+``normalize(0)``. ``train_blind.py`` is the only caller; ``blind=False`` is what ships.
 """
 
 import hashlib
@@ -12,14 +11,12 @@ import torch
 
 from config import MASKABLE_FEATS, N_INPUT_FEATURES, PATCH_DIM, PATCH_SIZE
 
-# Fixed seed for every sample built here.  The digest below is a property of this
-# seed, the live config geometry and the loaded normalization stats.
+# Fixed seed for every sample here; the digest below depends on it, config, and norm stats.
 BLIND_SEED = 20260815
 
-# sha256 of the whole ``blind=False`` sample at BLIND_SEED: patches, targets,
-# n_context_patches, every bg_formula_data entry and the next_window dict. Stands for
-# a 168-336 patch context at MASK_RIGHT_EDGE_QUOTA = 0.50 over the 2394-step pool's
-# stats; restamp only per test_the_default_path_is_byte_identical_through_the_flag.
+# sha256 of the whole blind=False sample: patches, targets, bg_formula_data, next_window.
+
+# Restamp only per the docstring of test_the_default_path_is_byte_identical_through_the_flag.
 DEFAULT_PATH_DIGEST = (
     '04d2cf83341df27cfaa5ff1a8304dae686b5b1179dcde60cf3057705f1e38f49')
 
@@ -73,12 +70,10 @@ def _sample_digest(sample: dict) -> str:
 
 
 def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
-    """The flag's whole footprint: feats 1-3 of the masked patches, every step-major
-    cell, at exactly the fill.
+    """The flag's whole footprint: feats 1-3 of masked patches, every cell, at exactly the fill.
 
-    A leak is silent — an announced dose surviving a masked patch still trains and
-    still validates, measuring a partly-conditioned model under a blind name. The
-    masked SET must match too, or the two validation tables stop being comparable.
+    A leak is silent: an announced dose surviving a masked patch still trains and validates,
+    under a blind name. The masked SET must match too, or the tables aren't comparable.
     """
     from data import BG_MASKED_FEAT, zero_dose_fill
 
@@ -91,8 +86,7 @@ def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
     assert p.shape == b.shape, f"{tuple(p.shape)} vs {tuple(b.shape)}"
     assert p.shape[-1] == PATCH_DIM
 
-    # the announcement bit IS the masked set: require agreement before comparing
-    # anything keyed on it
+    # Announcement bit IS the masked set; require agreement before comparing anything keyed on it.
     bit_p = p[:, BG_MASKED_FEAT::N_INPUT_FEATURES][:, 0] > 0.5
     bit_b = b[:, BG_MASKED_FEAT::N_INPUT_FEATURES][:, 0] > 0.5
     assert torch.equal(bit_p, bit_b), "the blind flag moved the sampled mask"
@@ -119,8 +113,7 @@ def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
               f"[{float(announced.min()):+.4f}, {float(announced.max()):+.4f}] "
               f"-> {float(fill[feat_idx]):+.4f}")
 
-    # a masked span holding no dose satisfies everything above with the flag doing
-    # nothing; per-feat that is not guaranteed, across the three it is
+    # A masked span with no dose trivially satisfies the above; across all three feats it cannot.
     dose_cols = [f for feat in MASKABLE_FEATS
                  for f in range(feat, PATCH_DIM, N_INPUT_FEATURES)]
     assert not torch.equal(p[bit_p][:, dose_cols], b[bit_b][:, dose_cols]), (
@@ -144,11 +137,8 @@ def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
 
 
 def test_the_dataset_honours_the_flag_end_to_end():
-    """The THREADING, through ``__getitem__``: a dataset that stored the flag and never
-    passed it on satisfies every other test here.
-
-    Both policies are checked on the same index — blind samples are only evidence if
-    the plain dataset did not produce them.
+    """The THREADING, through ``__getitem__``: a dataset that stored the flag and never passed
+    it on satisfies every other test here. Both policies are checked on the same index.
     """
     from data import BG_MASKED_FEAT, T1DMDataset, zero_dose_fill
 
@@ -169,8 +159,7 @@ def test_the_dataset_honours_the_flag_end_to_end():
         assert torch.equal(cells, torch.full_like(cells, float(fill[feat_idx]))), (
             f"T1DMDataset(blind=True) did not blind feat {feat_idx} — the flag is "
             "stored but not threaded to the sample builder")
-    # the three dose channels TOGETHER, not one at a time: a sparse channel with no
-    # event legitimately carries normalize(0) already, so per-feature they coincide
+    # Three dose channels TOGETHER: a sparse channel with no event already carries normalize(0).
     dose_cols = [f for feat in MASKABLE_FEATS
                  for f in range(feat, PATCH_DIM, N_INPUT_FEATURES)]
     assert not torch.equal(p[bit][:, dose_cols], b[bit][:, dose_cols]), (
@@ -207,12 +196,9 @@ def test_next_window_is_blinded_too():
 
 
 def test_the_default_path_is_byte_identical_through_the_flag():
-    """Nothing else checks the SAMPLER's output: ``tests/test_bitident.py`` pins the
-    forward against a frozen input, so a builder writing a different dose cell passes it.
-
-    A mismatch is legitimate only when the sampler constants, the context window, the
-    channel transforms or the normalization pool deliberately moved. Restamp then, and
-    never to make this test pass.
+    """Nothing else checks the SAMPLER's output; test_bitident.py pins the forward against a
+    frozen input, so a builder writing a different dose cell passes it. Restamp only when the
+    sampler, context window, transforms or norm pool deliberately moved — never to pass this.
     """
     stats = _get_stats()
     got = _sample_digest(_build(blind=False, stats=stats))
@@ -223,11 +209,9 @@ def test_the_default_path_is_byte_identical_through_the_flag():
 
 
 def test_the_fill_is_the_no_dose_baseline_inference_already_writes():
-    """``zero_dose_fill`` == what ``inference`` puts in an un-announced slot, which is
-    why a blind model rolls in-distribution with no change to ``inference.py``.
-
-    Measured off ``_build_patches_tensor``'s output, never recomputed from the stats:
-    a second copy of the formula would only agree with itself.
+    """``zero_dose_fill`` == what ``inference`` puts in an un-announced slot, so a blind model
+    rolls in-distribution with no ``inference.py`` change. Measured off ``_build_patches_tensor``'s
+    output, never recomputed: a second copy of the formula would only agree with itself.
     """
     from inference import _build_patches_tensor
     from data import zero_dose_fill

@@ -1,13 +1,7 @@
-"""End-to-end properties the per-module unit suites do not naturally cover.
-
-* ``sign_balance@h`` (truth strictly below the median, target 0.5) and
-  ``inner50_cov@h`` (coverage of [τ.25, τ.75], target 0.5);
-* the training and inference anchors read the SAME raw context BG;
-* ``predict_rolling``'s band widens monotonically across roll boundaries and
-  re-feeds the zero-RAW dose baseline rather than a phantom z = 0;
-* the cache pool is carved into DISJOINT train/val/cal slabs, so the +10M val and
-  +2M cal seed bands cannot reproject onto a train row.
-"""
+"""End-to-end properties the per-module unit suites do not naturally cover:
+sign_balance/inner50_cov, the shared train/inference anchor, predict_rolling's
+monotone band widening and zero-RAW re-feed, and the disjoint train/val/cal
+cache slabs."""
 import math
 
 import numpy as np
@@ -51,8 +45,7 @@ def test_sign_balance_and_inner50_counts():
     expected_below = int((true_bg[:, h_idx] < pred_bg[:, h_idx]).sum())
     expected_inside = int(((true_bg[:, h_idx] >= 110.0) & (true_bg[:, h_idx] <= 130.0)).sum())
 
-    # hypo_lo / hyper_hi are the required band-edge detector inputs; in range here, so
-    # they leave the sign_balance and inner50 counts alone
+    # hypo_lo/hyper_hi are required detector inputs; in range here, so counts are unaffected
     q_mgdl = {'lo': torch.full((B, T), 80.0), 'hi': torch.full((B, T), 200.0),
               'inner_lo': inner_lo, 'inner_hi': inner_hi,
               'hypo_lo': torch.full((B, T), 100.0), 'hyper_hi': torch.full((B, T), 150.0)}
@@ -87,13 +80,9 @@ def test_inner50_absent_when_no_inner_band():
 
 
 def test_hypo_hyper_detection_keys_off_band_edges():
-    """Hypo/hyper recall keys off the band EDGES, so an in-range median must not hide
-    an edge that has crossed.
-
-    The edges arrive as the q_mgdl ``hypo_lo`` / ``hyper_hi`` keys, ``f_inv`` of
-    ``q_tau`` at the config taus, which are indexed through ``QUANTILE_LEVELS.index``
-    and never a bare literal.
-    """
+    """Hypo/hyper recall keys off the band EDGES (q_mgdl ``hypo_lo``/``hyper_hi``,
+    indexed via ``QUANTILE_LEVELS.index``, never a bare literal), so an in-range
+    median must not hide a crossed edge."""
     import config
     from train import compute_learning_metrics
     from config import (PREDICTION_PATCHES, PATCH_SIZE, QUANTILE_LEVELS,
@@ -117,8 +106,7 @@ def test_hypo_hyper_detection_keys_off_band_edges():
                 'inner_lo': fan[..., inner_lo_idx], 'inner_hi': fan[..., inner_hi_idx],
                 'hypo_lo': fan[..., lo_idx], 'hyper_hi': fan[..., hi_idx]}
 
-    # truth IS hypo and the median is in range, but the lower edge dips below the
-    # threshold: a median<70 detector would score zero recall here
+    # truth is hypo, median in range, but the lower edge dips below threshold
     offs = torch.tensor([-70.0, -65.0, -55.0, 0.0, 5.0, 10.0, 15.0])  # median at idx3
     fan_hypo = torch.full((B, T), 120.0).unsqueeze(-1) + offs          # (B,T,7) ascending
     median_hypo = fan_hypo[..., 3]                                     # == 120, in range
@@ -175,8 +163,7 @@ def test_precision_tolerance_forgives_near_boundary():
                 'inner_lo': fan[..., inner_lo_idx], 'inner_hi': fan[..., inner_hi_idx],
                 'hypo_lo': fan[..., lo_idx], 'hyper_hi': fan[..., hi_idx]}
 
-    # median 120, alarm edge 69, so the alarm fires; built to land at 69 for whatever
-    # HYPO_ALARM_QUANTILE_TAU resolves to rather than one hardcoded fan layout
+    # median 120, alarm edge 69 for whatever HYPO_ALARM_QUANTILE_TAU resolves to
     med_idx = QUANTILE_LEVELS.index(0.5)
     med_val, edge_val = 120.0, 69.0
     offs_list = []
@@ -272,14 +259,9 @@ def test_val_cal_rows_never_reproject_onto_train():
 
 def test_train_inference_anchor_identical():
     """Train and inference must compute the SAME anchor, or the head learns a delta
-    against an anchor it never sees at deployment.
-
-    ``_build_sample`` reads it off the raw mg/dL array at ``anchor_step``; inference
-    reconstructs the same cell from the normalized window, so the two agree to a
-    round-trip ulp. The claim is per SLOT: feat 0 of a masked patch is a legal-looking
-    ``z`` decoding to ~142 mg/dL, so the right-edge read is asserted separately, gated
-    on the context edge being visible.
-    """
+    against an anchor it never sees at deployment. Per SLOT: feat 0 of a masked
+    patch is a legal-looking ``z`` decoding to ~142 mg/dL, so the right-edge read
+    is asserted separately, gated on the context edge being visible."""
     import os
     import numpy as np
     from utils import last_bg_mgdl_from_context
@@ -292,10 +274,7 @@ def test_train_inference_anchor_identical():
         pytest.skip("normalization_stats.json required")
     stats = load_normalization_stats()
 
-    # ON_THE_FLY_SIM_HOURS, never a literal: it is what data.py requests for ONE
-    # sample, so it follows MAX_CONTEXT_PATCHES. A literal stops covering the floor
-    # when the window widens, and _build_sample then raises "No prediction window
-    # found" instead of reporting an anchor mismatch.
+    # never a literal: this follows MAX_CONTEXT_PATCHES, or a widened window raises here
     from data import ON_THE_FLY_SIM_HOURS
 
     sim = _make_simulator(patient_seed=4242, uniform_skills=False)
@@ -313,8 +292,7 @@ def test_train_inference_anchor_identical():
         seq_len = n_ctx + PREDICTION_PATCHES
         window = sample['patches'].reshape(seq_len, PATCH_SIZE, N_INPUT_FEATURES)
 
-        # spans are the maximal runs of adjacent masked patches, as
-        # ``utils._span_layout`` recovers them; each carries one anchor step
+        # spans: maximal runs of adjacent masked patches (``utils._span_layout``)
         idx = mask_idx[valid].tolist()
         steps: list[int] = []
         run_start = idx[0]
@@ -389,13 +367,10 @@ def test_predict_rolling_band_halfwidth_monotone():
     for a, b in zip(half_widths, half_widths[1:]):
         assert b >= a - 1e-6, (
             f"rolling band half-width shrank across a boundary: {half_widths}")
-    # strictly growing overall: the carry is positive once the model emits any spread,
-    # which the softplus floor BG_QUANTILE_SPREAD_MIN > 0 guarantees
+    # strictly growing: BG_QUANTILE_SPREAD_MIN > 0 keeps the carry positive
     assert half_widths[-1] > half_widths[0], (
         f"band must widen over rolls, got {half_widths}")
-    # in QUADRATURE, not linearly: this model's native fan is near-identical on every
-    # roll, so after n rolls the terminal half-width is √n × the first's. An additive
-    # carry gives n×, twice too wide by the fourth roll and pinned to the rails soon after.
+    # in QUADRATURE not linearly: terminal half-width is √n × the first roll's
     for r in range(1, n_rolls):
         want = half_widths[0] * math.sqrt(r + 1)
         assert abs(half_widths[r] - want) / want < 0.02, (
@@ -406,13 +381,9 @@ def test_predict_rolling_band_halfwidth_monotone():
 
 
 def test_predict_rolling_carry_is_per_level():
-    """ONE carry PER LEVEL, so a level resumes at its own width across a seam.
-
-    Every level's offset is non-decreasing over a seam, and a roll's first-step
-    .25/.75 pair still sits INSIDE the .05/.95 pair the previous roll ended on. One
-    scalar carry seeded from the outermost level puts the inner pair outside at every
-    seam, and two seams later the fan is one slab.
-    """
+    """ONE carry PER LEVEL: a roll's first-step .25/.75 pair still sits INSIDE the
+    .05/.95 pair the previous roll ended on. A shared scalar carry puts the inner
+    pair outside at every seam, and two seams later the fan is one slab."""
     from inference import predict_rolling
     from model import T1DMAI
     from config import (PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES,
@@ -468,13 +439,11 @@ def test_predict_rolling_phantom_baseline_not_z_zero():
     carb_z = float(zero_raw[carb_feat])
     insulin_z = float(zero_raw[insulin_feat])
 
-    # the sparse channels are log1p z-scored, so the zero-dose baseline is -mean/std,
-    # not 0 — at least one must be non-zero or the guard is moot
+    # log1p z-scored sparse channels: zero-dose baseline is -mean/std, not 0
     assert abs(carb_z) > 1e-3 or abs(insulin_z) > 1e-3, (
         "zero-RAW baseline collapsed to z=0 — the phantom-dose guard is moot")
 
-    # the cache->input gather keeps the channel order, so an input feat index equals
-    # its CHANNEL_NAMES index: carb -> feat 1 -> channel 1
+    # input feat index equals its CHANNEL_NAMES index: carb -> feat 1 -> channel 1
     carb_name = CHANNEL_NAMES[carb_feat]
     assert carb_name in SPARSE_LOG1P_CHANNELS, "carb must be a sparse log1p channel"
     back = denormalize(np.array([[carb_z]], dtype=np.float32), stats,

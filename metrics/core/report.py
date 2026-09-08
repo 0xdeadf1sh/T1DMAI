@@ -1,10 +1,7 @@
 """Report assembly for the in-domain T1DMSIM evaluation: README/JSON renderer and figure driver.
 
-``metrics/sim/`` is the entry point — fresh simulator patients, future carb/insulin/exercise announced.
-The training distribution, so an in-domain reference, not a peer comparison.
-``load_model`` builds ``T1DMAI()`` from the LIVE ``config.py`` and attaches ``conformal_delta`` for its
-callers to forward. ``metrics/day_curves.py`` has a second loader, which builds to match the checkpoint's
-WEIGHTS instead, and the day figures use that one.
+``metrics/sim/`` is the entry point: fresh sim patients, in-domain (not a peer comparison).
+``load_model`` builds from the LIVE config.py; day_curves.py's loader matches checkpoint weights.
 """
 from __future__ import annotations
 
@@ -31,8 +28,7 @@ from .calibrate import _future_overrides, CTX_STEPS, PRED_STEPS
 from .features import build_feature_stack, context_window, smoothed_cgm
 from .suite import HORIZONS
 
-# Per-horizon excursion display targets, ``(base@30min, slope_per_30min, floor)``.
-# DISPLAY-ONLY — row colour and Target text, never the loss or any selection.
+# Per-horizon excursion display targets (base@30min, slope_per_30min, floor); DISPLAY-ONLY.
 EXCURSION_TARGET_HYPO_RECALL = (0.70, 0.10, 0.30)
 EXCURSION_TARGET_HYPO_PRECISION = (0.70, 0.10, 0.30)
 EXCURSION_TARGET_HYPER_RECALL = (0.80, 0.10, 0.40)
@@ -54,8 +50,7 @@ def load_model(device, path: str = CKPT):
     sd = ckpt['model_state_dict']
     ema = ckpt.get('model_ema_state_dict')
     merged = {k: ema.get(k, v) for k, v in sd.items()} if ema else dict(sd)
-    # A checkpoint carrying an older probe geometry must still load its FORECAST weights exactly, so only
-    # mismatched ``time_head`` keys are dropped; a shape mismatch on any other tensor is fatal.
+    # An older probe geometry must still load FORECAST weights exactly: only time_head keys drop.
     model_sd = m.state_dict()
     dropped = [k for k, v in merged.items() if k in model_sd and model_sd[k].shape != v.shape]
     assert all(k.startswith('time_head.') for k in dropped), \
@@ -67,9 +62,7 @@ def load_model(device, path: str = CKPT):
                 if not k.startswith('time_head.')]
     assert not leftover, f"unexpected state_dict mismatch (non-probe): {leftover}"
     m.eval()
-    # Attached as an attribute so callers can forward it without changing this return tuple; ``None`` when
-    # the checkpoint was never calibrated. The stored delta is SIM-fit, valid on the simulator path only:
-    # another distribution must RE-FIT its own, since validity rests on cal/test exchangeability.
+    # Attribute, not the return tuple, so callers forward freely; SIM-fit, others must RE-FIT.
     cd = ckpt.get('conformal_delta')
     if cd is None:
         m.conformal_delta = None
@@ -193,7 +186,7 @@ def _baseline_table(res: dict) -> str:
 
 
 def _conformal_cqr_table(res: dict) -> str | None:
-    """Raw-vs-calibrated central-90% band coverage and the τ=0.10 hypo-edge escape rate, per horizon.
+    """Raw-vs-calibrated central-90% band coverage and τ=0.10 hypo-edge escape rate, per horizon.
 
     Guarded on ``res['conformal_cqr']``, so a band-less run renders the baseline table unchanged.
     Observed numbers only — no remediation prose: this ships.
@@ -218,9 +211,7 @@ def _conformal_cqr_table(res: dict) -> str | None:
 
 
 
-# SOTA bars MIRRORING train.py's ``_render_validation_table``, which is the source of truth: synced by hand.
-# The per-horizon excursion bars are not duplicated — ``_exc_target`` reads the ``EXCURSION_TARGET_*``
-# constants above. Only rows this report can score are emitted.
+# SOTA bars MIRRORING train.py's _render_validation_table, the source of truth; synced by hand.
 _VT_BG_RMSE_SOTA = {30: 15.0, 60: 25.0, 120: 36.0}
 _VT_MARD_SOTA = {30: 7.0, 60: 12.0, 120: 19.0}
 _VT_CLARKE_A_SOTA = {30: 95.0, 60: 85.0, 120: 72.0}
@@ -255,7 +246,7 @@ def _exc_target(spec: tuple[float, float, float], h_min: int) -> float:
 
 
 def _vt_tag(val, sota: float, higher: bool, warn_edge: float) -> str:
-    """pass / near / miss against a SOTA bar: train.py's green/yellow/red tiers, red at ``warn_edge``."""
+    """pass / near / miss against a SOTA bar: green/yellow/red tiers, red at ``warn_edge``."""
     if val is None:
         return ''
     if higher:
@@ -270,7 +261,7 @@ def _vt_cell(val, sota: float, higher: bool, warn_edge: float, nd: int) -> str:
 
 
 def _validation_table(res: dict) -> str:
-    """Markdown ``Metric | Forecast | Target`` table, mirroring train.py over the rows this report can score.
+    """Markdown ``Metric | Forecast | Target`` table over the rows this report can score.
 
     Forecast reads the announced-event ``res['metrics']`` / ``res['cgega']``; night-onset rows read
     ``res['night_onset']``.
@@ -370,13 +361,13 @@ def _validation_section(res: dict) -> str:
 
 
 def _band_series_label(median_curve: list[float] | None, suffix: str = "") -> str:
-    """Legend label for the band-scored RMSE series; qualified only when the median-line companion is drawn too."""
+    """Legend label for the band-scored RMSE series; qualified when median-line is also drawn."""
     base = f"T1DMAI{suffix}"
     return f"{base} (band-scored)" if median_curve is not None else base
 
 
 def _median_hour_curve(rbh: dict, hs: list[int], key: str) -> list[float] | None:
-    """Median-line companion to an ``rmse_by_hour`` series, over ``hs``; ``None`` when the JSON carries none."""
+    """Median-line companion to an ``rmse_by_hour`` series, over ``hs``; ``None`` when absent."""
     mk = f"{key}_median"
     if not all(isinstance(rbh.get(str(h)), dict) and mk in rbh[str(h)] for h in hs):
         return None
@@ -384,7 +375,7 @@ def _median_hour_curve(rbh: dict, hs: list[int], key: str) -> list[float] | None
 
 
 def _median_suite_curve(m: dict, hs: list[int], key: str) -> list[float] | None:
-    """Median-line companion to a suite series, from ``metrics[h]['median_line'][key]``; ``None`` without bands."""
+    """Median-line companion to a suite series, from median_line[key]; None without bands."""
     if not all(isinstance(m.get(str(h)), dict)
                and isinstance(m[str(h)].get('median_line'), dict)
                and key in m[str(h)]['median_line'] for h in hs):
@@ -516,8 +507,8 @@ _Generated by `build_report.py`. Raw numbers in `stats.json`._
 def render_sim_figure(R: dict, path: str):
     """RMSE vs horizon: model point and window-mean against persistence, no peers.
 
-    Hour-by-hour off ``rmse_by_hour`` when present, else the 3-point suite. Solid series are band-scored;
-    dashed is the median line, drawn only when the JSON carries it.
+    Hour-by-hour off ``rmse_by_hour`` when present, else the 3-point suite. Solid series are
+    band-scored; dashed is the median line, drawn only when the JSON carries it.
     """
     try:
         import matplotlib
@@ -557,8 +548,7 @@ def render_sim_figure(R: dict, path: str):
 
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 PRED = PREDICTION_PATCHES * PATCH_SIZE
-# parity/clarke roll to the night long horizon so the figures read hour-by-hour past one forward pass;
-# a single pass when no rolling is configured
+# parity/clarke roll to the night long horizon; a single pass when no rolling is configured.
 FIG_ROLLS = max(1, math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS))
 FIG_STEPS = FIG_ROLLS * PRED                             # rolled forecast length
 CAP = {'sim': 30}                                        # test windows per patient

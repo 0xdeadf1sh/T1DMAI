@@ -1,16 +1,8 @@
 """Window collection and excursion-decision calibration on the model-input bridge.
 
-The headline forecast is the quantile median ``median_bg = f_inv(median)``; the decision calibration needs
-only plain ``(pred_bg, true_bg)`` arrays.
-
-    collect_windows(model, stats, segments)  -> list[Window]  (median_bg + true CGM)
-    forecast_windows(windows)                -> (pred (N,T), true (N,T), last_bg (N,), patients)
-    calibrate_threshold(pred, true, bands=…) -> per-horizon recall–precision curves
-    select_offset(curve, …)                  -> one operating point under a precision floor
-
-The decision sweep reads the metric BAND EDGES (τ=``METRIC_BAND_TAU_LO`` hypo, ``METRIC_BAND_TAU_HI`` hyper)
-when a fan is supplied, matching the level metrics' basis; without one it reads the median line.
-"""
+Decision calibration works on plain (pred_bg, true_bg) mg/dL arrays: collect_windows
+captures median_bg forecasts, calibrate_threshold sweeps per-horizon recall/precision.
+With a fan supplied the sweep reads τ=METRIC_BAND_TAU_LO/HI band edges, else the median."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,11 +36,8 @@ def threshold_curve(pred: np.ndarray, true: np.ndarray, thr: float, side: str,
                     offsets=_OFFSET_GRID) -> list[dict]:
     """Recall–precision curve over a decision-offset sweep at ONE horizon point.
 
-    ``pred`` / ``true`` ``(N,)`` mg/dL at that point; the alarm fires at ``pred < thr + δ`` (hypo) or
-    ``pred > thr − δ`` (hyper), so a positive δ buys recall. Truth and decision are STRICT crossings.
-    -> ``{offset, recall, precision, n_true, n_pred}`` per δ: ``n_true`` constant, ``n_pred`` grows with δ,
-    recall and precision ``None`` on a zero denominator.
-    """
+    ``pred``/``true`` (N,) mg/dL; alarm fires at pred<thr+δ (hypo) or pred>thr−δ (hyper). Returns
+    ``{offset, recall, precision, n_true, n_pred}`` per δ, None on a zero denominator."""
     pred = np.asarray(pred, dtype=np.float64)
     true = np.asarray(true, dtype=np.float64)
     te = true < thr if side == 'hypo' else true > thr
@@ -67,13 +56,11 @@ def threshold_curve(pred: np.ndarray, true: np.ndarray, thr: float, side: str,
 def calibrate_threshold(pred: np.ndarray, true: np.ndarray,
                         offsets=_OFFSET_GRID,
                         bands: np.ndarray | None = None) -> dict:
-    """Per-horizon hypo and hyper recall–precision curves -> ``{'hypo': {h: curve}, 'hyper': {h: curve}}``.
+    """Per-horizon hypo/hyper recall-precision curves -> {'hypo': {h: curve}, 'hyper': {h: curve}}.
 
-    Fit on the CALIBRATION split; no precision floor or target recall baked in (PLAN §6/§7).
-    ``pred`` / ``true`` ``(N, PRED_STEPS)`` mg/dL; ``bands`` optional ``(N, PRED_STEPS, N_QUANTILES)`` mg/dL,
-    ascending τ. With ``bands`` the sweeps read the τ=``METRIC_BAND_TAU_LO`` / ``METRIC_BAND_TAU_HI`` edges,
-    without it the median line.
-    """
+    Fit on the CALIBRATION split, no floor/target baked in. ``pred``/``true`` (N, PRED_STEPS) mg/dL;
+    ``bands`` optional (N, PRED_STEPS, N_QUANTILES) mg/dL ascending τ — with it the sweep reads the
+    τ=METRIC_BAND_TAU_LO/HI edges, else the median line."""
     pred = np.asarray(pred, dtype=np.float64)
     true = np.asarray(true, dtype=np.float64)
     assert pred.ndim == 2 and pred.shape == true.shape, \
@@ -96,9 +83,8 @@ def select_offset(curve: list[dict], min_precision: float | None = None,
                   target_recall: float | None = None) -> tuple[float, float | None, float | None]:
     """One operating point from a ``threshold_curve`` -> ``(offset, recall, precision)``.
 
-    ``min_precision``: highest-recall δ whose precision clears the floor. ``target_recall``: smallest δ that
-    reaches it. Neither: the strict δ≈0 point, so nothing is baked in by default.
-    """
+    ``min_precision``: highest-recall δ clearing the floor. ``target_recall``: smallest δ reaching
+    it. Neither: the strict δ≈0 point."""
     pts = [p for p in curve if p['recall'] is not None]
     if not pts:
         return 0.0, None, None
@@ -118,10 +104,9 @@ def select_offset(curve: list[dict], min_precision: float | None = None,
 class Window:
     """One prediction window: the median BG forecast and the true CGM.
 
-    ``bands`` is the per-step mg/dL fan ``(PRED_STEPS, N_QUANTILES)``, ascending τ, RAW ``f_inv(q_tau)`` and
-    uncalibrated, for the CQR re-fit in ``run_eval.evaluate_from_windows``. None is legal — a window built
-    without one — and ``forecast_bands`` then returns None for the whole list.
-    """
+    ``bands`` is the per-step mg/dL fan (PRED_STEPS, N_QUANTILES), ascending τ, RAW f_inv(q_tau),
+    uncalibrated, for the CQR re-fit in run_eval.evaluate_from_windows. None is legal;
+    forecast_bands then returns None for the whole list."""
     patient: str
     pred_bg: np.ndarray          # (PRED_STEPS,) median_bg = f_inv(median), mg/dL
     last_bg: float               # raw (bg-clamped) last-context CGM, mg/dL
@@ -131,11 +116,10 @@ class Window:
 
 def _future_overrides(feats: np.ndarray, pred_start: int,
                       announce: tuple[int, ...]) -> dict[int, torch.Tensor]:
-    """The announced channels' prediction-zone future -> ``{ch: (PREDICTION_PATCHES, PATCH_SIZE)}``, normalized.
+    """Announced-channel prediction future -> {ch: (PREDICTION_PATCHES, PATCH_SIZE)}, normalized.
 
-    ``feats`` is the normalized ``(N, F)`` stack; output channel ``ch`` sits at input feature
-    ``CHANNEL_TO_FEAT[ch]`` — carb 0→feat 1, insulin 1→feat 2, exercise 2→feat 3.
-    """
+    ``feats`` is the normalized (N, F) stack; ch sits at CHANNEL_TO_FEAT[ch]
+    (carb 0→feat 1, insulin 1→feat 2, exercise 2→feat 3)."""
     fut = feats[pred_start:pred_start + PRED_STEPS]      # (PRED_STEPS, F), normalized
     ov: dict[int, torch.Tensor] = {}
     for ch in announce:
@@ -151,12 +135,9 @@ def collect_windows(model, stats, segments: list[Segment], device,
                     announce: tuple[int, ...] = (0, 1, 2)) -> list[Window]:
     """Slide prediction windows across each segment and capture the BG forecast.
 
-    ALWAYS conditioned: each window's true future ``announce`` channels reach the model, the deployment
-    regime where the patient declares the meal, dose or session. ``conditional`` is a no-op kept for callers.
-    ``stride_patches`` in patches between window starts; ``max_per_patient`` subsamples at random.
-    ``announce``: carb 0, insulin 1, exercise 2 — BG is never conditionable, and announcing an exercise
-    column of zeros declares "no session".
-    """
+    ALWAYS conditioned: each window's true future ``announce`` channels reach the model, the
+    deployment regime. ``stride_patches`` in patches between starts; ``max_per_patient`` subsamples
+    at random. ``announce``: carb 0, insulin 1, exercise 2 — BG is never conditionable."""
     by_patient: dict[str, list[Window]] = {}
     for seg in segments:
         n = (len(seg) // PATCH_SIZE) * PATCH_SIZE
@@ -172,7 +153,7 @@ def collect_windows(model, stats, segments: list[Segment], device,
             out = predict(model, ctx, normalization_stats=stats, device=device,
                           overrides=overrides)
             pred_bg = out['median_bg'].detach().cpu().numpy().astype(np.float64)
-            # RAW fan, no conformal_delta: run_eval's CQR fit needs uncalibrated bands. (P,S,K) -> (PRED_STEPS,K)
+            # RAW fan, no conformal_delta: run_eval's CQR fit needs uncalibrated bands.
             bands = out['bands'].detach().cpu().numpy().reshape(-1, N_QUANTILES).astype(np.float64)
             w = Window(
                 patient=seg.patient,
@@ -207,10 +188,9 @@ def forecast_windows(windows: list[Window]):
 
 
 def forecast_bands(windows: list[Window]) -> np.ndarray | None:
-    """Per-window RAW fans stacked into ``(N, PRED_STEPS, N_QUANTILES)``: ascending τ, mg/dL, uncalibrated.
+    """Per-window RAW fans stacked into (N, PRED_STEPS, N_QUANTILES): ascending τ, uncalibrated.
 
-    ``None`` when the list is empty or ANY window lacks ``bands``, so a caller skips the CQR path whole.
-    """
+    ``None`` when the list is empty or ANY window lacks ``bands``, so a caller skips CQR."""
     if not windows or any(w.bands is None for w in windows):
         return None
     return np.stack([w.bands for w in windows]).astype(np.float64)

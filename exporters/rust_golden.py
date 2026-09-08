@@ -1,11 +1,7 @@
-"""The pipeline golden `T1DMDROID`'s fp64 Rust pre/post is pinned against; regenerate when the contract moves.
-
-Nothing in that reimplementation — masked-patch fill, attention rule, per-slot anchors, quantile
-assembly — is exercised by this repository's tests.
-Per case: raw four-channel history, masked set, padded patch tensor, per-slot anchors, head output, decoded
-fan. Floats travel as values with a tolerance; the boolean attention pattern travels as a digest, exact.
-Two cases run the real model (forecast, infill); the ladders feed a DETERMINISTIC synthetic ``head_raw``
-through several span layouts, the only way to reach every span length the sampler can draw.
+"""The pipeline golden T1DMDROID's fp64 Rust pre/post is pinned against; regenerate on change.
+Per case: raw four-channel history, masked set, patch tensor, per-slot anchors, head output,
+decoded fan. Floats carry a tolerance; the boolean attention pattern is an exact digest. Two
+cases run the real model; ladders feed synthetic head_raw through every span length.
 """
 
 from __future__ import annotations
@@ -31,7 +27,7 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 def raw_history(n_steps: int) -> dict[str, np.ndarray]:
     """A deterministic, physiologically-shaped four-channel history, fp64 throughout.
 
-    The Rust normalizes in fp64 and rounds once at the end; an fp32 reference would disagree in the last bit.
+    The Rust normalizes in fp64 and rounds once at the end; fp32 would disagree in the last bit.
     """
     t = np.arange(n_steps, dtype=np.float64)
     bg = 120.0 + 28.0 * np.sin(2.0 * np.pi * t / 288.0) + 12.0 * np.sin(2.0 * np.pi * t / 47.0)
@@ -67,10 +63,9 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     p = cfg.PREDICTION_PATCHES if with_forecast else 0
     pad0 = T - n_ctx - p
 
-    # With a future zone the trailing span is mandatory; without one the whole window is observed history.
+    # With a future zone the trailing span is mandatory; else the whole window is observed history.
     if with_forecast:
-        # The consumer's builder appends the trailing span itself, so the fixture's `mask_spans` lists only
-        # the EXTRA context spans; `_resolve_mask_spans` demands the complete set, so name it here.
+        # Builder appends the trailing span; fixture's mask_spans lists only extra context spans.
         full = sorted([(int(s), int(L)) for s, L in (mask_spans or [])] + [(n_ctx, p)])
         spans = _resolve_mask_spans(full, n_ctx)
     else:
@@ -101,8 +96,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     context = torch.from_numpy(
         np.concatenate([feats, np.zeros((n_steps, 1))], axis=-1)
     ).reshape(n_ctx, cfg.PATCH_SIZE, cfg.N_INPUT_FEATURES).float()
-    # The hand-built fp64 tensor above avoids a second fp32 quantisation, but is only safe while it agrees
-    # with the shipped builder — else the golden pins this file's layout, not the one inference uses.
+    # hand-built fp64 tensor avoids a second fp32 quantisation; must agree with the shipped builder.
     if with_forecast:
         shipped, _ = _build_patches_tensor(
             torch.from_numpy(
@@ -161,7 +155,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
             hook.remove()
         head_raw = captured['hr']
         hidden = captured['hidden'][0]                       # (T, D_MODEL)
-    # the consumer's node rule per span, so its head_from_hidden path is pinned as well as its decode
+    # consumer's node rule per span, pinning head_from_hidden alongside the decode.
     spans_out = []
     j = 0
     while j < n_masked:
@@ -221,8 +215,7 @@ def main() -> None:
         build_case("infill", model, stats, n_ctx, [(60, 3), (100, 5)], True),
         # No future zone: a gap repair reads real evidence on BOTH sides of the span.
         build_case("infill_no_forecast", model, stats, n_ctx, [(80, 4)], False),
-        # Span lengths 1..4 at once, pinning the decode against the span layout; the sampler draws up to
-        # MASK_SPAN_LENGTHS[-1], so a second ladder covers the long end.
+        # Span lengths 1..4 pin decode vs layout; a second ladder covers MASK_SPAN_LENGTHS[-1].
         build_case("span_ladder", model, stats, n_ctx,
                    [(10, 1), (20, 2), (40, 3), (70, 4)], False, synthetic_head=True),
         build_case("span_ladder_long", model, stats, n_ctx,
@@ -238,11 +231,9 @@ def main() -> None:
         "max_masked_patches": cfg.MAX_MASKED_PATCHES,
         "prediction_patches": cfg.PREDICTION_PATCHES,
         "normalization_stats": stats,
-        # `normalization.normalize` is fp32, the consumer fp64-rounded-once: a few fp32 ulps of
-        # `ln(g)^power` apart, about 1e-6 in z. Not bit-identity.
+        # normalize is fp32, consumer fp64-rounded-once: ulps apart in ln(g)^p, not bit-identity.
         "tolerances": {"patches": 5e-6, "anchor": 1e-3, "risk": 1e-8, "head_raw_from_hidden": 1e-5},
-        # the head file's tensors, so a consumer can pin hidden -> nodes -> spline -> MLP == head_raw on
-        # the real-model cases; T1DMAI builds the spline weights in fp32, hence the looser tolerance
+        # head file's tensors pin hidden->nodes->spline->MLP==head_raw; fp32 spline, looser tol.
         "head": [{"name": n, "shape": list(t.shape), "values": [float(v) for v in t.reshape(-1).tolist()]}
                  for n, t in head_tensors(model)],
         "attn_digest_note": "sha256 over the boolean attend pattern, row-major, one byte "

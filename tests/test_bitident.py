@@ -1,22 +1,8 @@
 """The bit-identity gate: a checked-in reference, and the round trip.
 
-IDENTITY -- ``tests/bitident_ref.json`` is a forward frozen at one config and
-travels with the repository, so a forward change moves one side only. Refreeze
-deliberately, when its stamped config moves, never to turn a red test green::
-
-    venv/bin/python -m tests.test_bitident
-
-REPRODUCIBILITY -- the ``tmp_path`` round trip builds both sides in one process, so
-a forward change moves both and it sees none.
-
-JSON with each tensor's bytes in base64, because ``*.pt`` is gitignored and an
-untracked reference is the failure this half exists to prevent.
-
-Gated at max|delta| == 0.0 exactly: ``head_raw``, ``q_tau``, ``median``, plus the
-attention mask over ALL rows, PADDED ONES INCLUDED — a pad row wrongly opening onto
-visible columns changes no output, since pad columns are blocked, so an output-only
-check passes straight over it.
-"""
+bitident_ref.json freezes one forward; refreeze only when its config moves, never
+to turn a red test green. Gated at max|delta|==0.0 on head_raw/q_tau/median and the
+attention mask over ALL rows — a misopened pad row is invisible to an output-only check."""
 
 import base64
 import importlib.util
@@ -33,11 +19,7 @@ import config
 BITIDENT = Path(__file__).resolve().parent.parent / "scratch" / "bitident.py"
 REFERENCE = Path(__file__).resolve().parent / "bitident_ref.json"
 
-# ``scratch/`` is gitignored, so a clean checkout has no implementation. Skip AND
-# warn, never raise: raising aborts collection with no conftest.py to contain it,
-# ending the session at zero tests; skipping alone reads as green under `-q`.
-# pytest prints its warnings summary under `-q`, so an ungated forward is named on
-# every run rather than only under `-rs`.
+# scratch/ is gitignored; skip+warn not raise — raise ends the session at zero tests.
 if not BITIDENT.exists():
     _ABSENT = (
         "BIT-IDENTITY GATE OFF -- the forward is UNGATED. Its implementation "
@@ -54,15 +36,11 @@ _spec = importlib.util.spec_from_file_location("bitident_gate", BITIDENT)
 bitident = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bitident)
 
-# interior, non-abutting, inside the SHORTEST row's real region: ``build_batch``
-# left-pads a MIN_CONTEXT_PATCHES row up to MAX_CONTEXT_PATCHES, so every column
-# must clear MAX - MIN. Derived, never hardcoded — literals fall into the pad the
-# next time the context window moves.
+# Spans must clear MAX_CONTEXT_PATCHES-MIN (shortest row's pad); derived, never hardcoded.
 _INFILL_FLOOR = config.MAX_CONTEXT_PATCHES - config.MIN_CONTEXT_PATCHES
 INFILL_SPANS = [(_INFILL_FLOOR + 6, 2), (_INFILL_FLOOR + 12, 3)]
 
-# the batch's shape and content, which ``capacity()`` does not carry: these move the
-# frozen inputs rather than the arithmetic, so another value answers another question
+# batch shape/content aren't in capacity(); changing them moves inputs, not arithmetic.
 GEOMETRY_KEYS = (
     "PATCH_SIZE",
     "N_INPUT_FEATURES",
@@ -157,10 +135,9 @@ def _unanswerable(doc: dict) -> str | None:
 def pinned():
     """One thread, and the global RNG left as it was found.
 
-    Attention matmul reduction order is thread-count dependent, so a freeze and a
-    compare at different thread counts are not bitwise comparable. ``build_model``
-    reseeds the global generator, forked here so no other module inherits it.
-    """
+    Attention matmul reduction order is thread-count dependent, so freeze/compare
+    at different counts aren't bitwise comparable. ``build_model`` reseeds the
+    global generator, forked here so no other module inherits it."""
     prior = torch.get_num_threads()
     torch.set_num_threads(1)
     try:

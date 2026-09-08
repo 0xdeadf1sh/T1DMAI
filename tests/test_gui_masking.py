@@ -1,9 +1,7 @@
 """The GUI's free-form masking model (``gui_state``, no display).
-
 The emitted set is what ``inference.predict`` takes, so it obeys the four rules
 ``inference._resolve_mask_spans`` asserts: sorted, never abutting, inside the window,
-whole future zone masked.
-"""
+whole future zone masked."""
 
 import numpy as np
 import pytest
@@ -194,11 +192,8 @@ def test_long_span_hint_reads_the_length_law(monkeypatch):
 def test_distance_never_exceeds_span_length():
     """``d`` is the distance to the nearest visible evidence on EITHER side, so a
     two-sided span caps it at ``ceil(L/2)`` and a one-sided one at ``L``: ``d <= L``
-    always, and the length hint fires first.
-
-    The distance check stays because it is the condition the objective is about; this
-    test is what says it is subsumed today.
-    """
+    always, and the length hint fires first. The distance check stays because it is
+    the condition the objective is about; this test says it is subsumed today."""
     from data import _mask_slots
     for emitted, n_ctx, n_pred in [
         ([(0, 5), (20, 3), (N_CTX, N_PRED)], N_CTX, N_PRED),

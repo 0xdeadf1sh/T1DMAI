@@ -1,16 +1,8 @@
 """normalization.py and data.py — shapes, normalization, collation.
-
-Five input features ``[bg, carb, insulin, exercise, bg_masked]`` over FOUR
-normalized channels: ``bg_absolute`` in Kovatchev risk space, the other three
-log1p. Feat 4 is a per-patch bit with no statistics. ``exercise_equiv`` is
-carbohydrate-EQUIVALENT glucose disposal in g/step, so it takes carb's encoding and
-never the Kovatchev transform.
-
-A sample is ``T`` patches, each visible or masked; targets are the raw mg/dL BG of
-the ``MAX_MASKED_PATCHES`` head slots, ``(M, S)``. A masked patch withholds bg and
-announces itself in feat 4, while carb / insulin / exercise always carry their true
-or announced values.
-"""
+Five input features ``[bg, carb, insulin, exercise, bg_masked]`` over FOUR normalized
+channels: ``bg_absolute`` in Kovatchev risk space, other three log1p; feat 4 is a
+per-patch bit, no statistics. ``exercise_equiv`` is g/step carb-EQUIVALENT glucose
+disposal, carb's encoding, never Kovatchev; targets raw mg/dL BG of ``MAX_MASKED_PATCHES`` slots."""
 
 import math
 import numpy as np
@@ -42,10 +34,8 @@ def _get_stats():
 def test_channel_names_are_the_four_input_signals():
     """The order pins every channel index in the project, so this is a literal pin,
     not a count — and the two counts, 4 channels against 5 features, pin separately.
-
     ``exercise_equiv`` is a log1p channel like carb, never a risk-space one: it is
-    carbohydrate-equivalent glucose disposal in g/step, not a glucose.
-    """
+    carbohydrate-equivalent glucose disposal in g/step, not a glucose."""
     from config import N_INPUT_FEATURES
     from data import BG_MASKED_FEAT
     from normalization import (CHANNEL_NAMES, N_CHANNELS, SPARSE_LOG1P_CHANNELS,
@@ -65,15 +55,11 @@ def test_channel_names_are_the_four_input_signals():
          f"exercise_equiv, got {RISK_SPACE_CHANNELS}")
 
 
-# the balanced pool's fitted exercise_equiv stats and the float32 z a zero-RAW cell
-# takes under them; both exact, both move with the POOL — refit against
-# ``normalization_stats.json`` whenever the cache geometry changes. The channel is
-# g/step carbohydrate-EQUIVALENT disposal: rescale it and a different quantity trains.
+# balanced pool's fitted exercise_equiv stats + zero-RAW z; move with POOL, refit if it changes.
 _BALANCED_EXERCISE_MEAN = 0.025454530988451768
 _BALANCED_EXERCISE_STD = 0.18077422733814857
 _BALANCED_EXERCISE_ZERO_Z = -0.1408083886
-# largest raw exercise cell over the balanced pool, so the grid below spans the whole
-# trained range rather than a comfortable middle
+# largest raw exercise cell over the balanced pool, so the grid spans the whole trained range.
 _BALANCED_EXERCISE_MAX_RAW = 22.4029
 
 
@@ -88,13 +74,9 @@ def _cwd_stats_or_skip() -> dict:
 
 def test_exercise_channel_roundtrip_and_zero_baseline():
     """feat 3 survives normalize→denormalize, and a no-session cell lands on the fitted
-    zero-RAW baseline, not on 0.0.
-
-    Neither failure raises on its own: a Kovatchev transform on exercise breaks the
-    round-trip, and a rescaling — or the wrong pool's stats — moves the baseline a
-    masked patch is filled with, retraining the channel on another quantity at the
-    same shapes.
-    """
+    zero-RAW baseline, not on 0.0. Neither failure raises on its own: a Kovatchev
+    transform on exercise breaks the round-trip, and a rescaling — or the wrong pool's
+    stats — moves the baseline a masked patch fills with, retraining the channel."""
     from normalization import (CHANNEL_NAMES, normalize, denormalize,
                                SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS)
 
@@ -131,8 +113,7 @@ def test_exercise_channel_roundtrip_and_zero_baseline():
     assert zero_z != 0.0, \
         "a sparse log1p channel's zero-dose baseline must not collapse to z=0"
 
-    # the large normalized range is no reason to rescale: insulin reaches a
-    # comparable z at its own maximum
+    # large normalized range is no reason to rescale: insulin reaches a comparable z at its own max.
     z_max = float(normalize(raw, stats)[-1, ex_col])
     print(f"\n[DUMP] exercise_channel | col={ex_col} mean={ex_stats['mean']:.12g} "
           f"std={ex_stats['std']:.12g}; roundtrip max abs err={max_err:.3e}; "
@@ -141,11 +122,9 @@ def test_exercise_channel_roundtrip_and_zero_baseline():
 
 def test_normalization_stats_at_load_are_complete_and_nondegenerate():
     """One entry per input channel, each with a strictly positive std.
-
     A three-key file raises ``KeyError`` in ``data.py``, loud. A four-key file with
     ``std: 0.0`` does not: the pipeline divides by ``0 + 1e-8``, scaling feat 3 by
-    ~1e8, and trains to completion behind a plausible validation table.
-    """
+    ~1e8, and trains to completion behind a plausible validation table."""
     import json
     from normalization import (CHANNEL_NAMES, load_normalization_stats,
                                NORM_STATS_FILE)
@@ -192,9 +171,7 @@ def test_normalize_denormalize_roundtrip():
 
     stats = _get_stats()
     rng = np.random.default_rng(0)
-    # non-negative: the sparse forward path is log1p(max(x, 0)), so a negative input
-    # would not round-trip. bg must sit inside [BG_CLAMP_MIN, BG_CLAMP_MAX] too — f
-    # clamps, and a sub-floor bg clamps rather than recovers
+    # non-negative: sparse path is log1p(max(x,0)); bg must sit in [BG_CLAMP_MIN,MAX], f clamps.
     import T1DMSIM.simulator as sim
     raw = rng.uniform(0.0, 50.0, size=(7, len(CHANNEL_NAMES))).astype(np.float32)
     bg_col = CHANNEL_NAMES.index('bg_absolute')
@@ -221,11 +198,9 @@ def test_normalize_denormalize_roundtrip():
 
 def test_bg_risk_roundtrip_and_last_bg_anchor():
     """feat 0 is ``z(f(bg))``, so the two crossings must compose to the identity.
-
     bg recovers through ``z → f_inv`` to ≈1e-3 relative, carb/insulin through
     ``log1p → expm1`` near-exactly. ``last_bg_mgdl_from_context`` is the same inverse,
-    and the train and inference anchors must both go through it.
-    """
+    and the train and inference anchors must both go through it."""
     import torch
     from normalization import normalize, denormalize, CHANNEL_NAMES
     from utils import last_bg_mgdl_from_context
@@ -293,8 +268,7 @@ def test_dataset_shapes():
     assert patches.shape[1] == PATCH_DIM, f"Expected {PATCH_DIM} patch features, got {patches.shape[1]}"
     assert patches.shape[0] >= MIN_CONTEXT_PATCHES + PREDICTION_PATCHES, "Need at least min_context + prediction patches"
 
-    # padded slots gather patch 0 as mask_idx does, so the row count is fixed at M and
-    # is never the masked-patch count
+    # padded slots gather patch 0 via mask_idx, so row count is fixed at M, never the masked count.
     assert targets.shape == (MAX_MASKED_PATCHES, PATCH_SIZE), \
         f"targets shape {targets.shape} != {(MAX_MASKED_PATCHES, PATCH_SIZE)}"
     import T1DMSIM.simulator as sim
@@ -310,12 +284,9 @@ def test_dataset_shapes():
 
 def test_masked_set_always_conditioned():
     """On a masked patch bg is zeroed while carb, insulin and exercise keep their true
-    or announced values, at every position, masked or visible.
-
-    The masked set comes from ``bg_formula_data``, never from position. Exercise
-    sessions are rarer than meals, so feat 3 is guarded on never being the literal-0.0
-    fill — the shape a dropped column takes — not on being non-zero somewhere.
-    """
+    or announced values, at every position, masked or visible. The masked set comes
+    from ``bg_formula_data``, never position. Exercise sessions are rarer than meals, so
+    feat 3 is guarded on never being the literal-0.0 fill, not on being non-zero somewhere."""
     from data import (_build_sample, _make_simulator, simulate_discard_warmup,
                       ON_THE_FLY_SIM_HOURS)
     from config import (PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM, CHANNEL_TO_FEAT)
@@ -348,14 +319,12 @@ def test_masked_set_always_conditioned():
     # bg is the predicted target, always zeroed on a masked patch
     assert (feat_grid[masked, :, 0] == 0.0).all(), \
         "bg feat 0 must be zeroed on every masked patch"
-    # carb and insulin carry the announced doses over the WHOLE window, and on a real
-    # trajectory some are non-zero
+    # carb/insulin carry announced doses over the WHOLE window; some non-zero on a real trajectory.
     assert np.any(feat_grid[masked, :, carb_feat] != 0.0), \
         "carb feat 1 must carry true doses on the masked patches"
     assert np.any(feat_grid[masked, :, insulin_feat] != 0.0), \
         "insulin feat 2 must carry true doses on the masked patches"
-    # a no-session exercise cell is normalize(0), which is NOT 0.0 for a log1p
-    # channel — an all-zero column means the gather dropped it
+    # no-session exercise cell is normalize(0), NOT 0.0; all-zero column means gather dropped it.
     exercise_baseline = float(normalize(
         np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats)[0, exercise_feat])
     ex_col = feat_grid[:, :, exercise_feat]
@@ -437,11 +406,8 @@ def test_collation_padding():
 
 def test_next_window_batch_shape_and_space():
     """``next_window`` is window ``k`` shifted forward one horizon, built and normalized
-    entirely inside data.py.
-
-    Its pred zone must keep bg zeroed, or future bg leaks. At weight 0 the key is
-    absent altogether.
-    """
+    entirely inside data.py. Its pred zone must keep bg zeroed, or future bg leaks.
+    At weight 0 the key is absent altogether."""
     from data import T1DMDataset, collate_fn
     from config import (PREDICTION_PATCHES, PATCH_DIM, N_INPUT_FEATURES,
                         NON_MASKABLE_FEATS, MAX_MASKED_PATCHES,
@@ -456,8 +422,7 @@ def test_next_window_batch_shape_and_space():
                           normalization_stats=stats)
     samples = [dataset[i] for i in range(B)]
 
-    # window k+1 carries ONE masked span, its own right-edge forecast zone, so it ships
-    # the main window's per-slot arrays plus the (B,) scalars
+    # window k+1 carries ONE masked span (its forecast zone): per-slot arrays plus (B,) scalars.
     for s in samples:
         assert 'next_window' in s, "probe on => each sample must carry next_window"
         nw = s['next_window']
@@ -485,15 +450,13 @@ def test_next_window_batch_shape_and_space():
     assert nw['slot_hour'].shape == (B, M)
     assert int(nw['valid_slots'].sum(dim=1).min()) == PREDICTION_PATCHES, \
         "the shifted window's masked set is its own right-edge forecast span"
-    # a padded slot still needs a legal mg/dL anchor: the units tripwire reads all M,
-    # and valid is what discards them downstream
+    # padded slot still needs a legal mg/dL anchor: units tripwire reads all M, valid discards them.
     import T1DMSIM.simulator as sim
     assert (nw['anchor_bg'] >= sim.BG_CLAMP_MIN - 1e-3).all() and \
            (nw['anchor_bg'] <= sim.BG_CLAMP_MAX + 1e-3).all(), \
         "every next_window anchor, padded slots included, must be physical mg/dL"
 
-    # NIGHT_LONG_HORIZON_HOURS (8 h) leaves room for one 2 h shift, so every sample's
-    # next window is in range
+    # NIGHT_LONG_HORIZON_HOURS (8h) leaves room for one 2h shift, so every next window is in range.
     assert bool(nw['valid'].all()), \
         f"all next windows should be valid at default config, got {nw['valid'].tolist()}"
 

@@ -1,9 +1,7 @@
 """Gradient correctness for the hand-rolled soft-DTW / DILATE autograd (dilate.py).
 
-A wrong backward stays invisible: the forward value can be finite while the
-gradient is wrong. DILATE preserves fp64 (only fp16/bf16 downcast), so fp64
-gradcheck is meaningful. The Triton sweep is a second implementation of the same
-recursion, tied to the gradchecked one only by ``test_softdtw_triton_matches_reference``.
+A wrong backward stays invisible: forward can be finite while gradient is wrong. DILATE
+preserves fp64, so fp64 gradcheck is meaningful; Triton is checked against it separately.
 """
 import pytest
 import torch
@@ -34,8 +32,7 @@ def test_softdtw_triton_matches_reference():
 
     assert dilate._HAVE_TRITON, "triton missing: the CUDA fp32 path is untested"
     torch.manual_seed(0)
-    # dilate_loss rejects H = 0 and B = 0, but a direct apply() reaches them; the
-    # two sweeps must agree about which returns and which raises
+    # dilate_loss rejects H=0/B=0, but a direct apply() reaches them; both sweeps must agree.
     assert not dilate._use_triton(torch.rand(3, 0, 0, device="cuda"))
     empty = SoftDTWBatch.apply(torch.rand(0, 6, 6, device="cuda"), DILATE_GAMMA)
     assert empty.shape == (0,)
@@ -50,8 +47,7 @@ def test_softdtw_triton_matches_reference():
             assert not dilate._use_triton(ref_c.double())
             assert dilate._use_triton(tri_c)
 
-            # fp64 selects the eager sweep, so the arms differ only in which
-            # sweep filled R and E
+            # fp64 selects the eager sweep, so the arms differ only in which sweep filled R and E.
             ref_v = SoftDTWBatch.apply(ref_c.double(), DILATE_GAMMA).float()
             tri_v = SoftDTWBatch.apply(tri_c, DILATE_GAMMA)
             g = torch.randn(B, device="cuda")
@@ -124,8 +120,7 @@ def test_dilate_divergence_zero_at_match():
     assert gnorm < 1e-5
 
 
-# risk_loss.py self-mean-centres median and y_risk over the flat (P*S) axis before
-# the DILATE call, so DILATE's DC/level gradient is ~0 — the pinball L_Q owns the level
+# risk_loss.py centres median/y_risk over (P*S) before DILATE; DC gradient ~0, L_Q owns level.
 
 def test_dilate_dc_invariant_after_centring():
     torch.manual_seed(0)

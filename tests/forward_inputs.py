@@ -1,14 +1,8 @@
-"""Forward-input fixtures for the masked-BG contract::
-
-    forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)
-      patches   (B, T, PATCH_DIM)   PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES
-      attn_mask (B, T, T) bool      T <= MAX_SEQ_LEN, never == it
-      anchor_bg (B, M) mg/dL        one anchor per masked patch
-      mask_idx  (B, M) int64        the patch index each head slot reads
-
-Both fixtures withhold feat 0 on masked patches and write the feat-4 bit into all
-``PATCH_SIZE`` step-major columns of that patch, as ``data._build_sample`` does.
-"""
+"""Forward-input fixtures for the masked-BG contract: forward(patches, attn_mask, anchor_bg,
+mask_idx) -> (q_tau, median). patches (B,T,PATCH_DIM); attn_mask (B,T,T) bool, T<=MAX_SEQ_LEN;
+anchor_bg (B,M) mg/dL; mask_idx (B,M) int64, patch index per head slot. Both fixtures withhold
+feat 0 on masked patches and write the feat-4 bit into all PATCH_SIZE step-major columns, as
+``data._build_sample`` does."""
 
 from typing import Sequence
 

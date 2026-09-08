@@ -1,12 +1,7 @@
-"""The time-of-day probe: per-slot hour-of-day logits over ``TIME_PROBE_N_BINS``
-circular bins, no mean-pool.
+"""The time-of-day probe: per-slot hour-of-day logits over TIME_PROBE_N_BINS bins, no mean-pool.
 
-At ``TIME_PROBE_DETACH=False`` its gradient co-trains the shared trunk; the forward
-VALUE of the forecast is unaffected either way. Logits are ``(B, M, N_BINS)`` and
-slot ``j`` is patch ``mask_idx[:, j]``, so only a right-edge span makes slot ``j``
-the patch at ``pred_start + j``.
-
-The bin helpers themselves are covered in ``tests/test_time_probe_bins.py``.
+TIME_PROBE_DETACH=False co-trains the trunk; forecast VALUE is unaffected either way.
+Slot j is patch mask_idx[:, j]. Bin helpers are covered in test_time_probe_bins.py.
 """
 
 import math
@@ -123,8 +118,7 @@ def test_probe_does_not_perturb_forecast():
 
     torch.manual_seed(0)
     model = T1DMAI().eval()
-    # one set of inputs for both calls; the forward draws no RNG, so any difference
-    # comes solely from the probe
+    # One input set for both calls; forward draws no RNG, so any difference comes from the probe.
     patches, attn_mask, anchor_bg, mask_idx = _forward_inputs(B=2)
 
     with torch.no_grad():
@@ -215,9 +209,8 @@ def test_time_head_presence():
 def test_probe_construction_preserves_forecast_init_rng(monkeypatch):
     """Building with vs without the probe must give byte-identical forecast weights.
 
-    The probe's ``nn.Linear`` consumes RNG; in the main stream that draw shifts every
-    forecast weight inited after it, so the head is built under a saved/restored RNG
-    state and re-inited last.
+    The probe's nn.Linear consumes RNG; in the main stream that shifts every later weight,
+    so the head is built under a saved/restored RNG state and re-inited last.
     """
     import model as model_mod
 
@@ -276,12 +269,10 @@ def _stats():
 
 
 def test_cross_window_training_step_smoke():
-    """data.py -> two forwards -> L_cross -> backward, on a tiny ``num_workers=0`` batch.
+    """data.py -> two forwards -> L_cross -> backward, on a tiny num_workers=0 batch.
 
-    The second forward consumes the SHIPPED ``next_window`` tensors, the same fields
-    train.py hands the model, so a collate that builds window k+1's mask from the wrong
-    masked set fails here. The penalty is ``utils``'s at a fixed one-horizon advance,
-    not train.py's per-sample variant: this covers the data.py -> model plumbing only.
+    Second forward consumes the SHIPPED next_window tensors, same fields train.py hands
+    the model, so a wrong-masked-set collate fails here. Covers data.py -> model plumbing only.
     """
     from data import T1DMDataset, collate_fn
     from model import T1DMAI
@@ -310,10 +301,9 @@ def test_cross_window_training_step_smoke():
     attn_mask = batch['attn_mask']
     bfd = batch['bg_formula_data']
 
-    # the two windows share n_ctx and so the left-pad, but NOT the masked set: window
-    # k+1 has its own right-edge span, so it needs its own anchor_bg, mask_idx and
-    # attention mask. The rebuild is an ORACLE, not the input — the forward below runs
-    # on the shipped field, which is pinned to it.
+    # Windows share n_ctx and left-pad, but NOT the masked set: k+1 needs its own anchor/mask/attn.
+
+    # The rebuild below is an ORACLE, not the input; forward runs on the shipped field alone.
     max_T = patches.shape[1]
     is_pad = torch.zeros(B, max_T, dtype=torch.bool)
     nw_masked = torch.zeros(B, max_T, dtype=torch.bool)

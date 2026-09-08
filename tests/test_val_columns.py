@@ -1,14 +1,8 @@
-"""Every column the validation header declares is written by the validation run.
-
-``tests/test_training.py`` pins the header to the row writer by length; this pins
-the ``val_metrics`` dict underneath both. The assertion is about KEY PRESENCE: an
-empty bin sets its key to None, which is a measurement, while an absent key is a
-metric nobody computed and writes an empty cell on every row of every run.
-
-One validation runs for real — model, dataset, three forwards, both protocols —
-because a static check over the column list is what let the gap open. The conformal
-probe returns nothing under 50 windows, so its subject is built here instead.
-"""
+"""Every column the validation header declares must be written by validation.
+Pins ``val_metrics`` under ``test_training.py``'s header/writer check: an absent
+key leaves an empty cell, None means an empty bin. Conformal's subject is built
+here since it needs 50+ windows to fire; validation runs for real, not a static
+check."""
 import math
 import re
 
@@ -24,25 +18,18 @@ from risk_loss import KendallGalWeighting
 
 import train
 
-# the fixed-protocol bins fill at any N, but the GLYCEMIC-REGION ones fill only if
-# some drawn window's TRUE BG goes under 70: empty at 12, exactly 0.0 at 24, a real
-# 0.08 at 48. The margin is the point — a fixture one draw from an empty bin fails
-# for the wrong reason. Raise this rather than inject a value, which would pass even
-# with the metric no longer computed.
+# glycemic-region bins need a window with TRUE BG<70: empty at 12, real at 48.
 N_VAL = 48
 
-# written onto the record by the caller, from the training-side loss history, after
-# _run_validation returns
+# written onto the record by the caller, after _run_validation returns
 CALLER_WRITTEN = {'step', 'train_loss_ema', 'overfit_ratio'}
 
-# ``cov_sharp_row`` renders ``<cov>% @ w <width> mg/dL``, a missing width as ``@ w —``:
-# only the width VALUE separates them, so a pairing check cannot match on the prefix
+# ``cov_sharp_row`` renders ``<cov>% @ w <width> mg/dL``; missing width is ``@ w —``.
 _COV_VALUE = re.compile(r'\d+\.\d{2}%')
 _COV_WIDTH = re.compile(r'@ w \d+(?:\.\d+)? mg/dL')
 _COV_LABELS = ('coverage90', 'inner50_cov', 'joint90 whole path')
 
-# families the table no longer renders, each mapped to a column the record must still
-# carry: from the page, a trimmed row and a dropped metric look the same
+# families trimmed from the table, mapped to the column that must still carry them
 CSV_ONLY = {
     'crps @': 'crps@30',
     'winkler90 @': 'winkler90@30',
@@ -53,9 +40,7 @@ CSV_ONLY = {
     'pred_tir': 'pred_tir',
 }
 
-# families restored to the page, each pinned to a label the table must render. Listed
-# rather than deleted from CSV_ONLY: the trim boundary is a decision, and drifting off
-# the page is the same defect as drifting on. Each must still be a declared column.
+# families restored to the page, listed rather than deleted from CSV_ONLY
 RESTORED_TO_THE_TABLE = {
     'conf cov90 raw': 'conf_cov90_raw',
     'conf hypo-escape raw': 'conf_hypo_esc_raw',
@@ -76,10 +61,7 @@ RESTORED_TO_THE_TABLE = {
     'night_hyper_recall': 'night_hyper_recall',
 }
 
-# ``train._conformal_val_probe`` returns nothing under 50 validation windows and N_VAL
-# is 48, two short, so its keys are absent from ``val_metrics`` and an absence check
-# would pass on nothing. The render below is fed these at the scale a real probe
-# returns, to give the assertion a subject.
+# the conformal probe needs 50+ windows, N_VAL=48 is short, so fake its keys here
 SYNTHETIC_CONFORMAL = {
     'conf_cov90_raw': 0.7213, 'conf_width_raw': 44.2,
     'conf_cov90_cal': 0.8967, 'conf_width_cal': 61.5,
@@ -118,16 +100,12 @@ def _coverage_rows(table: str) -> "list[str]":
 def _expected_coverage_rows() -> int:
     """From the same lists the table renders from."""
     return (2 * len(train.COVERAGE_HORIZONS_MIN)                     # coverage90, inner50_cov
-            + bool(train._excursion_bucket_horizons(PREDICTION_PATCHES)))  # joint90, far horizon only
+            + bool(train._excursion_bucket_horizons(PREDICTION_PATCHES)))  # joint90, far horizon
 
 
 def _assert_alarm_points_are_operating_points(metrics: dict) -> int:
-    """Returns the number of τ that fired, so a caller can pin that the lead assertion
-    was reached at all.
-
-    A rate bought at a two-minute lead is not a usable alarm and the rate alone cannot
-    show it. An alarm that never fired has no lead, and absent is not 0.
-    """
+    """Returns the τ count that fired. A rate bought at a two-minute lead is not a
+    usable alarm; an alarm that never fired has no lead, and absent is not 0."""
     n_events = metrics['alarm_hypo_n_events']
     assert isinstance(n_events, float)
     fired = 0
@@ -149,12 +127,8 @@ def _assert_alarm_points_are_operating_points(metrics: dict) -> int:
 
 
 def _firing_alarm_columns() -> dict:
-    """A fan whose hypo alarm fires at every τ: half the groups descend to 45 mg/dL, so
-    every lower edge dips under 70 ahead of the truth.
-
-    The live fixture raises no detection at any τ, reaching the lead-time rule on
-    nothing.
-    """
+    """A fan whose hypo alarm fires at every τ: half the groups descend to 45 mg/dL,
+    so every lower edge dips under 70 ahead of the truth."""
     offs = np.linspace(-30.0, 30.0, len(QUANTILE_LEVELS))
     rng = np.random.default_rng(3)
     q, true, d, group = [], [], [], []
@@ -172,11 +146,8 @@ def _firing_alarm_columns() -> dict:
 
 
 def test_no_declared_val_column_is_unwritten(val_metrics):
-    """No header column is missing from the record the writers read.
-
-    The conformal probe may be absent: it fits on excursion windows only, so a set
-    carrying none is a property of the sample, not of the wiring.
-    """
+    """No header column is missing from the record the writers read. The conformal
+    probe may be legitimately absent: it fits on excursion windows only."""
     declared = [c for c, _ in train._val_log_columns()]
     assert declared, 'the validation header declares no columns at all'
     optional = {c for c in declared if c.startswith('conf_')}
@@ -233,19 +204,15 @@ def test_a_detection_rate_is_never_reported_without_its_lead_time():
 
 
 def test_the_rendered_table_shows_the_calibration_rows(val_metrics):
-    """The selection scalar cannot stand in for calibration: ``val_loss_total`` improved
-    monotonically across a whole run while the deployed one-sided band decayed.
-
-    So every coverage row stays, each with the width that bought it, and the
-    one/two-sided pair at the same ``d`` beside them.
-    """
+    """``val_loss_total`` cannot stand in for calibration. Every coverage row stays,
+    each with the width that bought it, and the one/two-sided pair at the same
+    ``d`` beside them."""
     table = train._strip_ansi(train._render_validation_table(1, val_metrics, None))
     for needle in ('Quantile Calibration', 'coverage90 @30m', 'inner50_cov @30m',
                    'joint90 whole path', 'one-sided cov90 @d1',
                    'two-sided cov90 @d1'):
         assert needle in table, f"validation table is missing {needle!r}"
-    # sharpness never travels apart from coverage. The row count is pinned too: a
-    # coverage the table stops rendering leaves the loop nothing to check
+    # sharpness never travels apart from coverage; the row count is pinned too
     rows = _coverage_rows(table)
     expected = _expected_coverage_rows()
     assert len(rows) == expected, (
@@ -259,14 +226,10 @@ def test_the_rendered_table_shows_the_calibration_rows(val_metrics):
 
 
 def test_rows_dropped_from_the_table_are_still_recorded(val_metrics):
-    """The table is a reading surface at a 1000-step cadence; ``validation_log.csv`` is
-    the record.
-
-    From the page a trimmed row and an uncomputed metric look the same, so each
-    dropped family is pinned to the column that still carries it, and to its absence.
-    """
-    # a CSV_ONLY family needs a VALUE in the render input, or its absence from the
-    # page says nothing about the trim
+    """The table is a reading surface; ``validation_log.csv`` is the record. Each
+    dropped family is pinned to the column that still carries it, and to its
+    absence from the page."""
+    # a CSV_ONLY family needs a VALUE in the render input, else its page absence proves nothing
     metrics = {**val_metrics, **SYNTHETIC_CONFORMAL}
     table = train._strip_ansi(train._render_validation_table(1, metrics, None))
     declared = {c for c, _ in train._val_log_columns()}
@@ -285,13 +248,9 @@ def test_rows_dropped_from_the_table_are_still_recorded(val_metrics):
 
 
 def test_percent_metrics_are_not_scaled_twice_on_the_page(val_metrics):
-    """``tod_acc_*`` and ``tod_gross_rate`` are stored as PERCENTAGES — the CSV column,
-    ``make_card.py`` and ``compare.py`` all read them that way — while every other
-    rate key is a fraction the table scales itself.
-
-    Getting it wrong is silent: a 16.3% clock printed 1630.00% sits above its 60% bar
-    and colours green. So the assertion is on the rendered cell, not the dict.
-    """
+    """``tod_acc_*`` / ``tod_gross_rate`` are stored as PERCENTAGES, unlike every
+    other rate key. Wrong, a 16.3% clock prints 1630.00% and colours green — the
+    assertion is on the rendered cell, not the dict."""
     percent_rows = {'tod acc ±1h': 'tod_acc_1h',
                     'tod acc ±2h': 'tod_acc_2h',
                     'tod acc (bin)': 'tod_acc_bin',
@@ -317,13 +276,9 @@ def test_percent_metrics_are_not_scaled_twice_on_the_page(val_metrics):
 
 
 def test_per_horizon_detection_bars_decline_with_horizon(val_metrics):
-    """Detection is not horizon-flat, so ``EXCURSION_TARGET_*`` declines with horizon;
-    held at the 30-minute bar, every far bucket reads red on every run.
-
-    ``tests/test_training.py`` asserts the schedule; this pins that the TABLE tiers
-    against it. Hence a probe value between the far bar and the near one, which the
-    two answer opposite ways, and an assertion on the rendered colour.
-    """
+    """``EXCURSION_TARGET_*`` declines with horizon; held at the 30-minute bar,
+    every far bucket reads red. This pins that the TABLE tiers against the
+    schedule, via a probe value the near and far bars answer opposite ways."""
     hs = train._excursion_bucket_horizons(PREDICTION_PATCHES)
     assert len(hs) >= 2, 'one bucket cannot show a decline'
     near, far = hs[0], hs[-1]
@@ -337,8 +292,7 @@ def test_per_horizon_detection_bars_decline_with_horizon(val_metrics):
         assert bar_far < bar_near, (
             f'{name} does not decline from {near} to {far} min: '
             f'{bar_near} -> {bar_far}')
-        # green under the far bar, red under the near one; ``higher_row``'s default
-        # warn gap is 10 points below the bar it is given
+        # ``higher_row``'s default warn gap is 10 points below the bar it is given
         probe = 0.5 * (bar_far + min(bar_near - 10.0, 100.0))
         assert bar_far <= probe < bar_near - 10.0, (
             f'{name}: no value separates the two bars, so the render below '
@@ -356,14 +310,10 @@ def test_per_horizon_detection_bars_decline_with_horizon(val_metrics):
 
 
 def test_joint_coverage_is_trended_toward_its_bound_not_a_band_midpoint():
-    """``joint90``'s colour band and its improvement direction disagree: 70–92 is
-    acceptable, but joint coverage is bounded above by the smallest marginal in scope,
-    so higher is better up to that bound.
-
-    Trended as a band, a recovery from 82% to 88% moves away from the 81 midpoint and
-    renders a red arrow beside a green value. ``coverage90 @120m`` is the control: same
-    movement, same builder, and it must stay green.
-    """
+    """``joint90``'s colour band (70-92) disagrees with its direction: bounded
+    above by the smallest marginal in scope, higher is better up to that bound, so
+    a band midpoint trend renders 82%->88% red. ``coverage90 @120m`` is the
+    control and must stay green."""
     fan = {'_fan_joint_width@120': 60.0, 'sharp90@120': 60.0}
 
     def arrow(key, label, cur, prev):
@@ -390,14 +340,9 @@ def test_joint_coverage_is_trended_toward_its_bound_not_a_band_midpoint():
 
 
 def test_a_sample_with_no_slot_pair_cannot_dilute_the_jump_row():
-    """``_slot_jump_hours`` divides by ``pair.sum().clamp(min=1.0)``, so a sample with
-    one valid slot and no consecutive pair comes back 0.0 — the best attainable value
-    on a row barred at ``<1.000 h``.
-
-    Averaging those in measures how often the sampler drew one span of one patch, not
-    whether the clock is stable. Constructed, not drawn: at any N a no-pair sample is
-    luck, and an assertion whose subject never appears passes on absence.
-    """
+    """A sample with one valid slot and no consecutive pair returns 0.0 (the
+    ``pair.sum().clamp(min=1.0)`` 0/0 guard), the best value on a row barred at
+    ``<1.000 h``. Constructed, not drawn: a no-pair sample at any N is luck."""
     B, M, bins = 4, 3, train.TIME_PROBE_N_BINS
     logits = torch.zeros(B, M, bins)
     logits[:, :, 0] = 10.0                       # a pinned clock: deviation is the advance
@@ -426,13 +371,9 @@ def test_a_sample_with_no_slot_pair_cannot_dilute_the_jump_row():
 
 
 def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
-    """The VALIDATION does the filtering, not just the helper: a caller that takes the
-    tuple and averages the whole vector satisfies the test above completely.
-
-    So both candidate means are recomputed from the same weights and batches, and
-    ``tod_jump_h`` must be the filtered one. The subject is asserted first: if no
-    window lacks a pair the two means coincide and the assertion passes on nothing.
-    """
+    """The VALIDATION does the filtering, not just the helper: both candidate means
+    are recomputed from the same weights and batches, and ``tod_jump_h`` must be
+    the filtered one, not a caller averaging the whole vector."""
     device = torch.device('cpu')
     stats = load_normalization_stats()
     torch.manual_seed(20_260_815)
@@ -453,8 +394,7 @@ def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
     metrics = train._run_validation(model, T1DMDataset(**kw), stats, device, weighting)
     reported = metrics['tod_jump_h']
 
-    # the same forward, batched the same way, so the candidates differ only in which
-    # rows they average
+    # same forward, same batching: the candidates differ only in which rows they average
     from data import collate_fn
     every, paired = [], []
     with torch.no_grad():
@@ -484,12 +424,8 @@ def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
 
 
 def test_families_restored_to_the_table_are_rendered_and_still_recorded(val_metrics):
-    """The other half of the trim boundary: a restored family must render AND stay a
-    declared column.
-
-    Without this, moving an entry out of ``CSV_ONLY`` satisfies every assertion in the
-    file whether or not the row exists.
-    """
+    """A restored family must render AND stay a declared column, or moving an entry
+    out of ``CSV_ONLY`` satisfies every assertion whether the row exists or not."""
     metrics = {**val_metrics, **SYNTHETIC_CONFORMAL}
     table = train._strip_ansi(train._render_validation_table(1, metrics, None))
     declared = {c for c, _ in train._val_log_columns()}

@@ -1,15 +1,7 @@
-"""``train_blind.py`` is a copy of ``train.py``, so nothing keeps it honest by
-construction. Five divergences that fail silently are pinned here:
+"""``train_blind.py`` is a copy of ``train.py``; nothing keeps it honest by construction.
 
-* both protocol forwards place their own masked sets after the dataset built the
-  sample, so the dataset's blinding never reaches them;
-* the long-horizon roll announces nothing, while its OBSERVED context restores the
-  doses the mask withheld — history, not objective;
-* no ``cf_*`` column survives, in the header or on the page;
-* the run writes to ``checkpoints_blind/`` and ``logs_blind/`` only.
-
-Plus ``calibrate_conformal.py``'s provenance guard: no parameter shape records the
-policy, so a blind checkpoint loads into a conditioned band fit either way.
+Pins: both protocol forwards blind after the sample is built; the roll's OBSERVED
+context restores masked doses; no cf_* column survives; writes only to *_blind dirs.
 """
 
 import ast
@@ -52,11 +44,9 @@ def _dose_cells(patches: torch.Tensor, rows, cols) -> dict[int, torch.Tensor]:
 
 
 def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
-    """``_forecast_protocol`` masks ``[T - PREDICTION_PATCHES, T)`` on a window the
-    sampler masked elsewhere, so those patches usually carry their true doses.
-
-    Withhold only bg there and the whole horizon-keyed clinical suite is measured on
-    a conditioned forecast this model never trains on.
+    """``_forecast_protocol`` masks ``[T-PREDICTION_PATCHES, T)``; the sampler usually
+    masked elsewhere, so those patches carry true doses. Withhold only bg and the whole
+    clinical suite measures a conditioned forecast this model never trains on.
     """
     fill = zero_dose_fill(stats)
     fc = train_blind._forecast_protocol(
@@ -71,8 +61,7 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
     print(f"\n[DUMP] forecast protocol: {len(rows)}/{N_SAMPLES} rows kept, "
           f"T={T}, zone={zone[0]}..{zone[-1]}")
 
-    # the conditioned protocol on the SAME batch is the subject: the input the blind
-    # model must NOT be validated on
+    # The conditioned protocol on the SAME batch: the input the blind model must NOT validate on.
     fc_announced = train._forecast_protocol(
         blind_batch['patches'], blind_batch['bg_formula_data']['mask_idx'].long(),
         blind_batch['bg_formula_data']['valid'], blind_batch['n_context_patches'])
@@ -91,8 +80,7 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
         "the announced protocol built the same tensor — this batch announces no "
         "dose in its forecast zone, so the assertions above have no subject")
 
-    # and only there: blinding the whole window satisfies everything above and
-    # destroys the context the forecast reads
+    # And only there: blinding the whole window satisfies the above and destroys the context.
     T_all = list(range(T - PREDICTION_PATCHES))
     assert torch.equal(fc['patches'][:, T_all], fc_announced['patches'][:, T_all]), (
         "the forecast protocol changed a patch outside its masked zone")
@@ -100,11 +88,10 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
 
 
 def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
-    """``_infill_protocol`` REPLACES the training mask, restoring every withheld bg and
-    drawing its own spans.
+    """``_infill_protocol`` REPLACES the training mask, restoring bg and drawing its own spans.
 
-    So the blinding follows ITS masked set: a patch it reveals keeps what the sample
-    left there, a patch it masks is blinded whether the sampler masked it or not.
+    Blinding follows ITS masked set: a revealed patch keeps what the sample left there; a
+    masked patch is blinded whether the sampler masked it or not.
     """
     fill = zero_dose_fill(stats)
     bf = blind_batch['bg_formula_data']
@@ -129,8 +116,7 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
         assert torch.equal(got, expected), (
             f"feat {feat} on a patch this protocol masks is not the fill")
 
-    # and ONLY they are: wiping the whole window's dose channels satisfies everything
-    # above while blinding the visible evidence the infill task is defined against
+    # And ONLY they: wiping the window satisfies the above while blinding the infill's evidence.
     _revealed = ~masked
     for feat in MASKABLE_FEATS:
         got = p[:, :, feat::N_INPUT_FEATURES][_revealed]
@@ -146,9 +132,8 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
 def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatch):
     """``predict_rolling`` is called with no ``overrides_fn``.
 
-    ``train.py`` passes the true future doses to tame a zero-basal OOD runaway; here
-    that would make ``night_bg_rmse_*`` answer a question no other row does. Observed
-    at the call, not in the source — a builder returning None greps the same.
+    ``train.py`` passes true future doses to tame a zero-basal OOD runaway; here that would
+    answer a question no other row does. Observed at the call, not the source.
     """
     import inference
     seen: list[dict] = []
@@ -179,10 +164,8 @@ def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatc
 def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
     """``_observed_patches`` un-blinds feats 1-3, not feat 0 alone.
 
-    Restoring bg and stopping there leaves no gap but an ASSERTION — that a half-hour
-    was seen and carried no carbs and no insulin — over spans that carried a meal or a
-    bolus. Pinned against the announced sample at the same seed, whose only difference
-    is the masked dose cells, so equality here means exact rather than non-constant.
+    Stopping at bg leaves an ASSERTION that a seen half-hour carried no carbs or insulin.
+    Pinned against the announced sample at the same seed, so equality here is exact.
     """
     kw = dict(master_seed=SEED, total_steps=N_SAMPLES, batch_size=1,
               normalization_stats=stats, patient_uniform_sample_prob=0.0)
@@ -236,12 +219,10 @@ def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
 
 
 def test_no_counterfactual_column_survives(blind_batch):
-    """The probe perturbs a masked span's announced doses, which a blind model reads as
-    a constant: every row would report the perturbation's own absence as a model
-    property — ``cf_insulin_dir`` at chance, ``train.py``'s signature for a model that
-    stopped responding to insulin.
+    """A blind model reads a perturbed dose as constant, so cf_insulin_dir would sit at
+    chance — train.py's signature for a model that stopped responding to insulin.
 
-    Asserted absent here AND present in ``train.py``, or a rename passes on nothing.
+    Asserted absent here AND present in train.py, or a rename passes on nothing.
     """
     blind_cols = [name for name, _ in train_blind._val_log_columns()]
     plain_cols = [name for name, _ in train._val_log_columns()]
@@ -250,9 +231,7 @@ def test_no_counterfactual_column_survives(blind_batch):
     dropped = [c for c in plain_cols if c.startswith('cf_')]
     assert dropped, "train.py's header has no cf_* column — this test has no subject"
 
-    # SEQUENCE equality, not set: a set cannot see a duplicated column, and a
-    # duplicate shifts every later index, so a positional reader silently reports one
-    # metric under another's name
+    # SEQUENCE equality, not set: a set hides a duplicate column, which shifts every later index.
     assert len(blind_cols) == len(set(blind_cols)), (
         "the blind header repeats a column: "
         f"{sorted({c for c in blind_cols if blind_cols.count(c) > 1})}")
@@ -285,9 +264,8 @@ def test_no_counterfactual_column_survives(blind_batch):
 def test_the_fork_never_writes_to_the_conditioned_run_s_directories():
     """Not one ``checkpoints/`` or ``logs/`` path literal survives in the fork.
 
-    ``train.py`` opens its CSVs in ``'w'`` on step 0 and writes
-    ``checkpoints/t1dmai_best.pt`` on every improvement, so a blind run beside a live
-    conditioned one takes its logs and its best checkpoint with it.
+    train.py writes its CSVs and checkpoints/t1dmai_best.pt in place, so a blind run beside
+    a live conditioned one takes its logs and best checkpoint with it.
     """
     src = open(train_blind.__file__).read()
     bad = sorted({
@@ -302,11 +280,9 @@ def test_the_fork_never_writes_to_the_conditioned_run_s_directories():
 
 
 def test_the_conformal_fit_blinds_the_interior_span(stats):
-    """The infill span sits INSIDE the context, so its doses arrive with the context and
-    ``inference._build_patches_tensor`` withholds only bg there.
-
-    A delta fitted on those residuals with the doses announced does not describe the
-    blind model's interval.
+    """The infill span sits INSIDE the context; its doses arrive with the context and
+    inference._build_patches_tensor withholds only bg there. A delta fit with doses
+    announced does not describe the blind model's interval.
     """
     import calibrate_conformal as C
     from config import MAX_CONTEXT_PATCHES

@@ -1,31 +1,6 @@
 """
-Per-channel normalization statistics: fit, load, apply.
-
-Run once before training::
-
-    python normalization.py
-
-The fit simulates a pool of independent patients and accumulates Welford stats
-into ``normalization_stats.json``, read back by ``data.py``, ``train.py``,
-``inference.py`` and ``gui.py``.
-
-Four normalized signal channels, and they are the whole input feature stack —
-there are no temporal columns:
-
-- ``bg_absolute`` — z-scored in Kovatchev RISK space: ``f`` before the z-fit, and
-  the sole bg input path.  ``f_inv`` after the un-z-score on the way back.  The
-  head emits BG in risk space too, anchored and inverted to mg/dL downstream.
-- ``carb_intake`` / ``insulin_combined`` / ``exercise_equiv`` — sparse: at zero
-  most of the time with heavy-tailed spikes (meals, boluses, exercise), so
-  ``log1p`` runs before the mean/std fit.  ``log1p(x) ≈ x`` near zero leaves the
-  dense baseline put while compressing spikes into the bulk; the inverse is
-  ``expm1`` clamped ``≥ 0``, these channels being physically non-negative.
-  ``exercise_equiv`` is carbohydrate-EQUIVALENT glucose disposal in g/step, so it
-  takes carb's encoding exactly and never a glucose's.
-
-``SPARSE_LOG1P_CHANNELS`` and ``RISK_SPACE_CHANNELS`` are the single sources of
-truth for which channel takes which branch; every normalize/denormalize call site
-in the project consults them, and changing either requires re-running this script.
+Per-channel normalization statistics: fit, load, apply. Run once: python normalization.py
+SPARSE_LOG1P_CHANNELS / RISK_SPACE_CHANNELS are the single source of truth for the branch.
 """
 
 from __future__ import annotations
@@ -34,18 +9,14 @@ import math
 from typing import Any
 import numpy as np
 
-# The normalization pool is ``master_seed + 1_000_000 + i``.  Training hashes its
-# own patient seeds, so the two are not disjoint *ranges* — a collision between
-# this offset band and a hashed training seed is astronomically unlikely, and that
-# is what keeps the fit off training samples.
+# Pool seed = master_seed + 1_000_000 + i; a training-seed collision is astronomically unlikely.
 from config import (
     NORM_N_PATIENTS, NORM_STATS_FILE,
     MASTER_SEED,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
 )
 
-# Order pins every channel's integer index project-wide and the order Welford's
-# accumulator iterates in.  Reordering invalidates every saved checkpoint.
+# Order pins each channel's index project-wide; reordering invalidates every saved checkpoint.
 CHANNEL_NAMES = [
     'bg_absolute',         # observed CGM glucose, mg/dL, post-CGM-noise
     'carb_intake',         # carbohydrate absorption, g/step, post-absorption-noise
@@ -55,9 +26,7 @@ CHANNEL_NAMES = [
 
 N_CHANNELS = len(CHANNEL_NAMES)
 
-# Pinned at 4 and deliberately NOT tied to ``config.N_INPUT_FEATURES``, which is
-# 5: input feat 4 (``bg_masked``) is a per-patch BIT announcing that feat 0 is
-# withheld, carries no statistics, and is neither normalized nor denormalized here.
+# Pinned at 4, not config.N_INPUT_FEATURES=5: feat 4 (bg_masked) is a bit, not normalized here.
 assert N_CHANNELS == 4, (
     f"CHANNEL_NAMES has {N_CHANNELS} entries; N_CHANNELS is pinned at 4 "
     "(bg_absolute, carb_intake, insulin_combined, exercise_equiv). Adding or "
@@ -76,8 +45,7 @@ RISK_SPACE_CHANNELS: frozenset[str] = frozenset({'bg_absolute'})
 def _forward_transform(x: np.ndarray, name: str) -> np.ndarray:
     """The pre-normalization transform of one channel; dense channels pass through."""
     if name in RISK_SPACE_CHANNELS:
-        # ``kovatchev_f_np`` clamps the raw bg to the physical range internally,
-        # so f is always well-defined and no smoothing is needed.
+        # kovatchev_f_np clamps raw bg internally, so f is always well-defined; no smoothing needed.
         from utils import kovatchev_f_np
         return kovatchev_f_np(x)
     if name in SPARSE_LOG1P_CHANNELS:
@@ -133,28 +101,14 @@ def compute_normalization_stats(
     """
     Per-channel ``{name: {mean, std}}`` from ``n_patients`` independent simulations.
 
-    The pool is drawn from the SAME generative process as the cache / on-the-fly
-    training data — the ``patient_uniform_sample_prob`` skill mix and the
-    ``ON_THE_FLY_SIM_HOURS`` post-warmup window (what ``n_hours=None`` resolves
-    to), the ``simulator_warmup_hours`` cold-start discard — so the saved stats
-    match the distribution the model sees.  Fitting on a different distribution
-    (100% normal-skill patients over a 720 h run, say) silently mis-scales every
-    normalized input.
-
-    Seeds are ``master_seed + 1_000_000 + i``.  Training derives its patient seeds
-    by hashing, so this band and the training seeds are not disjoint *ranges*; a
-    collision is astronomically unlikely, so the fit effectively never sees a
-    training sample.
+    Matches training's generative process (skill mix, warmup, sim hours); stats fit the input.
     """
-    # float64 because this sums tens of millions of values; float32 accumulates
-    # visible rounding error over a stream this long.
+    # float64: sums tens of millions of values; float32 accumulates visible rounding error here.
     counts = np.zeros(N_CHANNELS, dtype=np.float64)
     means = np.zeros(N_CHANNELS, dtype=np.float64)
     M2s = np.zeros(N_CHANNELS, dtype=np.float64)
 
-    # Lazy: ``data.py`` imports from this module, so a top-level import is
-    # circular.  Reusing data.py's ``_make_simulator`` and ``ON_THE_FLY_SIM_HOURS``
-    # is what keeps the pool on the same generative process as training.
+    # Lazy: data.py imports this module (circular); reuses its _make_simulator/ON_THE_FLY_SIM_HOURS.
     from data import simulate_discard_warmup, _make_simulator, ON_THE_FLY_SIM_HOURS
     if n_hours is None:
         n_hours = ON_THE_FLY_SIM_HOURS
@@ -166,8 +120,7 @@ def compute_normalization_stats(
     for i in range(n_patients):
         # mod 2^31-1 keeps the seed inside ``np.random.default_rng``'s legal range.
         seed = (master_seed + 1_000_000 + i) % (2**31 - 1)
-        # Same XOR constant as data.py's substream, so the skill mix matches the
-        # cache / training at the same ``patient_uniform_sample_prob``.
+        # Same XOR constant as data.py; skill mix matches at patient_uniform_sample_prob.
         use_uniform = bool(
             np.random.default_rng(seed ^ 0x5A17_5EEDD).random() < patient_uniform_sample_prob
         )
@@ -175,24 +128,20 @@ def compute_normalization_stats(
         # Drops the artificial cold-start window (no IOB, fresh basal).
         data = simulate_discard_warmup(sim, n_hours, warmup_hours=simulator_warmup_hours)
 
-        # ``bg_observed`` is post-CGM-noise: the input pipeline normalizes the
-        # observed BG, never the clean ``data['bg']``.
+        # bg_observed is post-CGM-noise; the pipeline normalizes it, never the clean data['bg'].
         bg = data['bg_observed'].astype(np.float64)
         carb = data['total_carb'].astype(np.float64)
         insulin = data['total_insulin'].astype(np.float64)
         exercise = data['total_exercise'].astype(np.float64)
 
-        # Order MUST match CHANNEL_NAMES so the stats keys line up.  A short list
-        # truncates the zip below in silence: that channel finalizes to
-        # {mean: 0.0, std: 0.0}, which the input pipeline divides by.
+        # Order MUST match CHANNEL_NAMES; a short list silently zip-truncates a channel to std=0.0.
         raw_channels = [bg, carb, insulin, exercise]
         assert len(raw_channels) == len(CHANNEL_NAMES), (
             f"{len(raw_channels)} raw channels against {len(CHANNEL_NAMES)} "
             "CHANNEL_NAMES; every named channel needs its own array."
         )
 
-        # Transformed BEFORE the Welford update, on the RAW post-noise channels
-        # with no smoothing, so the saved stats live in the space the model is fed.
+        # Transformed before Welford, on raw post-noise channels; stats live in the model's space.
         channels = [
             _forward_transform(arr, name)
             for arr, name in zip(raw_channels, CHANNEL_NAMES)
@@ -213,19 +162,9 @@ def compute_normalization_stats_from_cache(
     batch_rows: int = 4096,
 ) -> dict[str, dict[str, float]]:
     """
-    Per-channel ``{name: {mean, std}}`` read DIRECTLY from a ``simulator_cache`` pool.
+    Per-channel ``{name: {mean, std}}`` read directly from a simulator_cache pool (exact, no resim).
 
-    Where :func:`compute_normalization_stats` re-simulates the matching
-    distribution, this reads the trajectories the model actually trains on, so the
-    result is exact against the pool.  The transform is identical, so the output
-    is a drop-in replacement.  Rows are streamed in ``batch_rows`` slices, so the
-    full pool never resides in RAM.
-
-    ``cache_path`` is a ``T1DMSIM/cache_simulator.py`` directory: ``meta.json``
-    plus per-channel ``.npy`` (``npy-memmap-v1``) or ``.b2nd``
-    (``blosc2-ndarray-v1``) arrays.  ``sample_rows=None`` reads every row and is
-    exact; an int reads only the leading block, which is as representative as a
-    random one — each cache row is an i.i.d. draw keyed on its own index.
+    sample_rows=None reads every row exactly; an int samples the leading i.i.d. block.
     """
     import os
     # Lazy: dodges the data ↔ normalization circular import.
@@ -247,8 +186,7 @@ def compute_normalization_stats_from_cache(
             f"Cache channels {tuple(meta['channels'])} disagree with expected "
             f"{CACHE_CHANNEL_NAMES}; rebuild the cache."
         )
-    # Temporal, IS and HGO channels are not normalized.  The per-channel read in
-    # the loop must follow CHANNEL_NAMES order, NOT this tuple's.
+    # Temporal, IS and HGO channels are not normalized; the loop follows CHANNEL_NAMES order.
     needed = ('bg_observed', 'total_carb', 'total_insulin', 'total_exercise')
 
     arrays: dict[str, Any] = {}
@@ -259,9 +197,7 @@ def compute_normalization_stats_from_cache(
     elif cache_format == CACHE_FORMAT_BLOSC2:
         import blosc2
         for name in needed:
-            # Deliberately NOT mmap_mode='r' (see data.py's _load_cache): a mapped
-            # .b2nd accumulates every chunk it touches with no way to release
-            # them, and this pass reads the WHOLE pool.
+            # Not mmap: a mapped .b2nd never releases touched chunks, and this reads the whole pool.
             arrays[name] = blosc2.open(
                 os.path.join(cache_path, f'{name}.b2nd'), mode='r')
     else:
@@ -291,17 +227,14 @@ def compute_normalization_stats_from_cache(
         insulin = np.asarray(arrays['total_insulin'][start:stop], dtype=np.float64)
         exercise = np.asarray(arrays['total_exercise'][start:stop], dtype=np.float64)
 
-        # Order MUST match CHANNEL_NAMES so the stats keys line up.  A short list
-        # truncates the zip in silence: that channel finalizes to
-        # {mean: 0.0, std: 0.0}.
+        # Order MUST match CHANNEL_NAMES; a short list silently zip-truncates a channel to std=0.0.
         raw_channels = [bg, carb, insulin, exercise]
         assert len(raw_channels) == len(CHANNEL_NAMES), (
             f"{len(raw_channels)} raw channels against {len(CHANNEL_NAMES)} "
             "CHANNEL_NAMES; every named channel needs its own array."
         )
         for c, (arr, name) in enumerate(zip(raw_channels, CHANNEL_NAMES)):
-            # Each (B, T) block transformed with NO smoothing, matching
-            # data._build_sample, so the stats live in the space the model is fed.
+            # Each (B, T) block transformed with no smoothing, matching data._build_sample's space.
             _welford_batch_update(counts, means, M2s, c, _forward_transform(arr, name))
 
         if start == 0 or stop % (batch_rows * 25) < batch_rows or stop == n_rows:
@@ -323,11 +256,8 @@ def save_normalization_stats(
 def load_normalization_stats(path: str = NORM_STATS_FILE) -> dict[str, dict[str, float]]:
     """Load ``{name: {mean, std}}``, raising on a missing channel or a bad statistic.
 
-    Validated on the way in, because nothing downstream distinguishes a malformed
-    file from a well-formed one.  A missing channel reaches ``normalize`` through
-    a ``.get`` default and trains an untrained channel; a ``std`` of ``0.0``
-    divides by ``0 + 1e-8`` and scales its channel by ~1e8.  Neither raises, and
-    both train to completion behind a plausible validation table.
+    A missing channel silently trains untrained; std=0.0 scales the channel by ~1e8.
+    Neither raises — both complete training behind a plausible table.
     """
     with open(path, 'r') as f:
         stats = json.load(f)
@@ -366,14 +296,11 @@ def normalize(
 ) -> np.ndarray:
     """Normalize a ``(..., N_CHANNELS)`` raw array; float32, same shape out.
 
-    ``channel_names`` must be in the same order as ``data``'s last axis and
-    defaults to ``CHANNEL_NAMES``.  Must stay symmetric to ``denormalize`` — the
-    round trip is identity to within float precision.
+    channel_names order matches data's last axis; must stay symmetric with denormalize.
     """
     if channel_names is None:
         channel_names = CHANNEL_NAMES
-    # Copied so the caller's array is not mutated, float32 to match what the model
-    # and the DataLoader expect.
+    # Copied so the caller's array isn't mutated; float32 to match the model/DataLoader.
     result = data.copy().astype(np.float32)
     for c, name in enumerate(channel_names):
         mean = stats[name]['mean']
@@ -396,19 +323,15 @@ def denormalize(
 ) -> 'np.ndarray | torch.Tensor':  # type: ignore[name-defined]
     """The inverse of ``normalize`` over a ``(..., N_CHANNELS)`` array or tensor.
 
-    Same type and shape out.  The torch branch runs entirely in autograd-tracked
-    ops, so a caller needing the gradient through ``expm1`` keeps a clean backward
-    path.
+    Same type and shape out; the torch branch is autograd-tracked, so grad flows through expm1.
     """
-    # Lazy: the GUI / inference paths import this module at process startup and
-    # must not drag torch into a numpy-only context.
+    # Lazy: GUI/inference import this module at startup and must not drag in torch.
     import torch
     if channel_names is None:
         channel_names = CHANNEL_NAMES
 
     if isinstance(data, torch.Tensor):
-        # Cloned so the caller's tensor is not mutated in place; fp32 regardless
-        # of any upstream autocast dtype.
+        # Cloned so the caller's tensor isn't mutated; fp32 regardless of upstream autocast dtype.
         result = data.clone().float()
         for c, name in enumerate(channel_names):
             mean = stats[name]['mean']
@@ -419,8 +342,7 @@ def denormalize(
                 from utils import kovatchev_f_inv
                 x = kovatchev_f_inv(x)
             elif name in SPARSE_LOG1P_CHANNELS:
-                # clamp(min=0) absorbs float round-off; the channel is physically
-                # non-negative.
+                # clamp(min=0) absorbs float round-off; the channel is physically non-negative.
                 x = torch.expm1(x).clamp(min=0.0)
             result[..., c] = x
         return result

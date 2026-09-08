@@ -1,4 +1,4 @@
-"""Matplotlib adapter for the clock-face histogram; all trig lives in ``utils.clock_wedge_geometry``."""
+"""Matplotlib adapter for the clock-face histogram; trig lives in ``utils.clock_wedge_geometry``."""
 
 from __future__ import annotations
 

@@ -1,27 +1,8 @@
-"""Model-input bridge: Segment -> the normalized ``N_INPUT_FEATURES`` stack
-``[bg_absolute, carbs, insulin, exercise_equiv, bg_masked]``.
-
-bg (feat 0) is Kovatchev risk space — ``kovatchev_f`` BEFORE the z-score; carb, insulin and exercise are log1p+z.
-``bg_masked`` is 0.0 throughout: a Segment records what happened, and the masked set is chosen downstream.
-
-The carb/insulin channels are the simulator's absorption/action CURVES, so raw events are convolved with
-analytic kernels rebuilt from the simulator's constants (``scratch/kernel_match.py``: r=0.94 carb, 0.99 bolus
-against the simulator's own channels):
-
-    carb     mean meal mixture  (fast/med/slow gamma + protein/fat tail)
-    insulin  gamma k=3, θ=25    (rapid bolus action)
-    exercise gamma k=3, θ=15    (carbohydrate-equivalent disposal)
-
-Insulin is one rapid-delivery series — bolus IU plus CSII basal at IU/h → IU/step; a long-acting analogue
-arriving as a 24 h-spread rate is approximated as rapid.
-
-Exercise (feat 3) is g/step carbohydrate-EQUIVALENT disposal, on carb's log1p+z transform, never an intensity.
-A source with no activity record writes explicit zeros: an unwritten sparse column sits at z = 0, a phantom
-dose, while no session is ``normalize(log1p(0))``, z = -0.1387 under the balanced pool.
-
-``EXERCISE_KERNEL`` is the unit-area shape of ONE announced session, for ``metrics/whatif.py``'s point-event
-counterfactual. ``segment_to_channels`` never convolves it — a Segment's ``exercise`` is already per-step.
-"""
+"""Model-input bridge: Segment -> normalized (N, N_INPUT_FEATURES) stack, [bg_absolute, carbs,
+insulin, exercise_equiv, bg_masked]. carb/insulin are the simulator's absorption/action CURVES: raw
+events convolved with kernels rebuilt from simulator constants (validated r=0.94 carb, 0.99 bolus
+against the simulator's own channels). Insulin combines bolus IU + basal IU/h into one rapid series;
+a 24h long-acting analogue is approximated as rapid. EXERCISE_KERNEL is for whatif.py only."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -102,12 +83,10 @@ def _convolve(amounts: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 
 
 def segment_to_channels(seg: Segment) -> dict[str, np.ndarray]:
-    """Raw events -> ``carb`` (g/step absorption), ``insulin`` (IU/step action), ``exercise`` (g/step disposal).
-
-    A Segment carrying pre-resolved ``carb_curve`` / ``insulin_curve`` short-circuits the kernels and returns
-    those as-is. ``exercise`` passes through un-convolved on BOTH paths — it is already per-step, and both must
-    carry it or the feature stack's raw-column lookup has no feat 3.
-    """
+    """Raw events -> carb (g/step absorption), insulin (IU/step action), exercise (g/step disposal).
+    A Segment with pre-resolved carb_curve/insulin_curve short-circuits the kernels, returned as-is.
+    exercise passes through un-convolved on both paths since it is already per-step; both paths must
+    carry it or the feature stack's raw-column lookup has no feat 3."""
     if seg.carb_curve is not None:
         assert seg.insulin_curve is not None, "carb_curve without insulin_curve"
         return {'carb': np.asarray(seg.carb_curve, dtype=np.float64),
@@ -121,19 +100,15 @@ def segment_to_channels(seg: Segment) -> dict[str, np.ndarray]:
 
 
 def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.ndarray:
-    """The normalized ``(N, F)`` input stack for a whole Segment.
-
-    Per ``stats``: bg (feat 0) through the Kovatchev transform BEFORE the z-score (``RISK_SPACE_CHANNELS``),
-    carb/insulin/exercise through log1p (``SPARSE_LOG1P_CHANNELS``). Exercise (feat 3) is written explicitly
-    even when zero — an unwritten column sits at z = 0, a phantom dose, not ``normalize(log1p(0))``.
-    Feat ``BG_MASKED_FEAT`` is the announcement bit: no statistics, no z-score, 0.0 throughout, since every
-    step of a Segment is OBSERVED; the masked set is written downstream.
-    """
+    """The normalized (N, F) input stack for a whole Segment. Per stats: bg (feat 0) through the
+    Kovatchev transform before the z-score (RISK_SPACE_CHANNELS), carb/insulin/exercise through
+    log1p (SPARSE_LOG1P_CHANNELS). Exercise is written explicitly even when zero, since unwritten
+    sits at z = 0, a phantom dose. Feat BG_MASKED_FEAT is the announcement bit: no stats, 0.0
+    throughout, since every step of a Segment is OBSERVED; the masked set is written downstream."""
     n = len(seg)
     ch = segment_to_channels(seg)
 
-    # raw post-noise, mirroring ``data._build_sample``: bg to the physical range, the sparse three floored
-    # at 0, no smoothing
+    # raw post-noise (mirrors data._build_sample): bg clamped physical, sparse three floored at 0.
     bg = np.clip(seg.cgm, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float64)
     carb = np.clip(ch['carb'], 0.0, None).astype(np.float64)
     insulin = np.clip(ch['insulin'], 0.0, None).astype(np.float64)
@@ -141,8 +116,7 @@ def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.
 
     feats = np.zeros((n, N_INPUT_FEATURES), dtype=np.float32)
     raw = {0: bg, 1: carb, 2: insulin, 3: exercise}
-    # every normalized column must be written — an unwritten one is a silent z = 0.
-    # Normalized channels are 0..BG_MASKED_FEAT-1, mask bit above: the stack is one column wider.
+    # every normalized column must be written; an unwritten one is a silent z = 0, mask bit above.
     assert len(CHANNEL_NAMES) == len(raw) == BG_MASKED_FEAT < N_INPUT_FEATURES, (
         f"{len(CHANNEL_NAMES)} CHANNEL_NAMES, {len(raw)} raw columns, "
         f"BG_MASKED_FEAT {BG_MASKED_FEAT}, N_INPUT_FEATURES {N_INPUT_FEATURES}"
@@ -160,7 +134,7 @@ def build_feature_stack(seg: Segment, stats: dict[str, dict[str, float]]) -> np.
 def smoothed_cgm(cgm: np.ndarray) -> np.ndarray:
     """RAW CGM (mg/dL), bg-clamped — the truth every metric and anchor is scored against.
 
-    No smoothing despite the name, kept for its call sites: the model consumes raw post-noise signals.
+    No smoothing despite the name; kept for its call sites since the model consumes raw signals.
     """
     return np.clip(np.asarray(cgm, dtype=np.float64), BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
 

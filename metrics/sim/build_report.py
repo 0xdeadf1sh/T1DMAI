@@ -1,7 +1,7 @@
-"""In-domain T1DMSIM report: fresh simulator patients at fixed seeds, future carb and insulin announced.
+"""In-domain T1DMSIM report: fresh simulator patients at fixed seeds, future doses announced.
 
-Writes metrics/sim/{stats.json, README.md, figures/rmse_vs_horizon.png}.
-The simulator is the training distribution — in-domain reference, not generalisation, not a peer comparison.
+Writes metrics/sim/{stats.json, README.md, figures/rmse_vs_horizon.png}. In-domain reference,
+not generalisation, not a peer comparison.
 """
 from __future__ import annotations
 

@@ -32,8 +32,7 @@ assert _max_idx < PRED_STEPS, (
     f"PREDICTION_HORIZON_HOURS is too small for HORIZONS={HORIZONS}"
 )
 
-# Plotting axis only, off a ROLLED forecast; the suite stays on HORIZONS above.
-# 30 min is the near-term clinical and published-peer anchor, then hourly to NIGHT_LONG_HORIZON_HOURS.
+# Plotting axis only (rolled forecast): 30 min anchor, then hourly to NIGHT_LONG_HORIZON_HOURS.
 _NIGHT_LONG_MIN = int(round(config.NIGHT_LONG_HORIZON_HOURS * 60))
 FIGURE_HORIZONS = (30,) + tuple(range(60, _NIGHT_LONG_MIN + 1, 60))
 FIGURE_HORIZON_IDX = {h: horizon_step_index(h) for h in FIGURE_HORIZONS}

@@ -1,8 +1,6 @@
-"""LiteRT (.tflite) NPU-path exporter, via ``litert-torch`` (formerly ``ai-edge-torch``).
-
-Same modified forward as the XNNPACK exporter: external struct mask, ``slot_sel``, cut at ``head_raw``, three outputs.
-fp32 CPU XNNPACK stays the authority; both precisions are checked on host against the eager forward first.
-Emits ``<id>.tflite`` + ``<id>.litert.descriptor.json``, engine ``litert_npu_fp32`` / ``litert_npu_fp16``.
+"""LiteRT (.tflite) NPU-path exporter, via litert-torch (formerly ai-edge-torch). Same modified
+forward as XNNPACK: struct mask, slot_sel, cut at head_raw. fp32 CPU XNNPACK stays the
+authority; both precisions are checked on host against eager first. Engine litert_npu_fp32/fp16.
 """
 
 from __future__ import annotations
@@ -18,8 +16,7 @@ import torch
 import config as cfg
 from exporters.modified_forward import HeadRawForward, load_model
 from exporters.descriptor import build_descriptor, build_model_card, write_descriptor
-# Same representative input and eager references as XNNPACK — one graph, one input.
-# Pulls only torch/numpy/config; no executorch at module load.
+# same representative input/eager refs as XNNPACK; pulls no executorch at module load
 from exporters.executorch_xnnpack import (
     build_representative_input, eager_time_logits, stock_head_raw,
 )

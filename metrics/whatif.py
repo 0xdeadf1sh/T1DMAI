@@ -1,54 +1,7 @@
 """What-if effectiveness: does an announced dose move the forecast the way physiology requires?
 
-The model is always conditioned, so what-if is a deployment capability, not a mode. Every number is a
-response against the model's OWN baseline for the same window, never a ground truth: no record carries an
-observable counterfactual, and the simulator cannot supply one either — ``T1DMSimulator.generate`` draws
-conditionally on BG, so one injected dose diverges the entire later event schedule. Read it as a physiologic
-characterization, not an accuracy score; train.py's ``cf_*`` probe is the in-domain twin.
-
-A dose enters as a point event at the origin, convolved with the input bridge's own kernels. All three run
-240 min, past the forecast window, so only the leading fraction acts inside the horizon:
-``_meta.kernel_mass_in_horizon`` reports that fraction, without which every magnitude below reads low.
-
-Five blocks per source, 15 forwards per window (11 with the exercise arm refused, 14 with the empty-future arm):
-
-  ``carb`` / ``insulin`` / ``exercise`` — a dose ladder at (0, ¼, ½, 1, 2)× the ``CF_*`` reference dose. Per
-    level: mean ΔBG and correct-sign fraction per horizon, plus the mean peak of the intended direction.
-    Across the ladder: the per-window sensitivity slope through the origin (mg/dL per unit of the arm's own
-    dose, fitted on the terminal step, reported beside ``unit``); onset and peak latency of the reference dose
-    over the windows reaching that onset; the mean ``adverse`` excursion, the largest move AGAINST its own
-    direction; and monotonicity in three strengths — terminal, every horizon step at once, and the plain
-    fraction of (rung, step) pairs that hold.
-    ``rescue``: whether a dose clears an excursion the baseline predicts — hypo lifted over
-    ``BG_HYPO_THRESHOLD`` by carbohydrate, hyper brought under ``BG_HYPER_THRESHOLD`` by insulin or exercise.
-    Eligibility and success are both scored only from ``RESCUE_LAG_MIN`` on, since a dose has no mass before
-    then and the whole horizon would fail every window whose nadir precedes the response. The graded
-    companion is mean time beyond the threshold per rung.
-
-  ``empty_future`` — the same window with every carb and bolus event inside the prediction zone stripped.
-    Basal, past-event tails and a session already under way cannot be un-injected and stay, so announced
-    exercise keeps its true value here too. Reports turning points (reversals retracing more than
-    ``TURN_MIN_MGDL``, so wiggle far under CGM noise is not counted as shape), the largest counter-trend
-    swing, the net drift and the monotone fraction. Monotonicity is the physiologic expectation only on the
-    ``quiet`` subset — nothing logged in the trailing context either — so the two are reported apart.
-
-  ``null_rail`` — the 0-dose arm rebuilds its overrides through the same raw → log1p → z path as a dosed arm,
-    so it must reproduce the baseline ``_future_overrides`` builds. A non-zero ``max_abs_dbg`` is a plumbing
-    fault in the override path, not a model result. All three dosed channels are covered.
-
-ONE ARM REFUSES TO RUN, off a property of the source: the empty-future arm needs raw carb/bolus EVENTS to
-strip, and a simulator run keeps none — its Segments carry pre-resolved channels, every meal already
-convolved in — so a strip would remove nothing and report the null arm's shape as "an untouched future".
-Where no segment carries event mass the block is ``{'n': 0, 'not_probed': …}`` and ``n_quiet`` is null: no
-window can be shown quiet from a record with no events in it.
-
-Runs on checkpoints/t1dmai_best.pt over fresh T1DMSIM patients from the TEST seed pool, disjoint from
-calibration, writing metrics/whatif.json. Nothing here feeds a loss or a checkpoint selection, so dose
-response is exactly what a training change can destroy quietly while RMSE improves.
-``--insulin-curve-json`` curves come from ``metrics/curvegen``, which links ``t1dm-core`` rather than
-restating its exponential model; carb shapes arrive as the ``(k, theta, duration_min)`` a real ``meal_event``
-row stores, so the GI→gamma mapping is not duplicated here either.
-``T1DMAI()`` is built from the live ``config.py``: align it to the checkpoint with ``resize_model.py`` first.
+Every number is a response against the model's own baseline, not a ground truth -- a
+physiologic characterization. Five blocks: carb/insulin/exercise ladders, empty_future, null_rail.
 """
 from __future__ import annotations
 import argparse, os, sys, json
@@ -60,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)                              # day_curves (load_model)
-sys.path.insert(0, os.path.join(HERE, 'sim'))         # sim_data (the Segment-shaped simulator source)
+sys.path.insert(0, os.path.join(HERE, 'sim'))         # sim_data (Segment-shaped simulator source)
 torch.set_num_threads(8)
 
 from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
@@ -74,16 +27,15 @@ from metrics.core.horizons import HORIZONS, HORIZON_IDX, GRID_MIN
 from metrics.core import run_eval
 from day_curves import load_model
 from inference import predict
-import sim_data                                       # metrics/sim — the Segment-shaped simulator source
+import sim_data                                       # metrics/sim, the sim source
 import figstyle as F
 from figstyle import plt
 
 F.style()
 
-# FORECAST protocol per window: one masked span at the last patch, whole context visible. ``PRED`` is that
-# span in steps and the extent a dose ladder is announced over. Slot j sits at d = j + 1, one-sided, so the
-# 30/60/120 min rows ARE d = 1/2/4 (``run_eval.horizon_d_patches``).
-# The dose ARM is never a bin: arms are compared at equal d, never pooled across it.
+# FORECAST protocol: one masked span at the last patch; slot j sits at d=j+1, one-sided.
+
+# 30/60/120 min rows ARE d=1/2/4; arms compared at equal d, never pooled across it.
 PRED = PREDICTION_PATCHES * PATCH_SIZE
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 SIM_DATASET = 'sim'                        # fresh T1DMSIM patients: the source
@@ -91,32 +43,29 @@ DATASETS = (SIM_DATASET,)
 STRIDE = 8 * PATCH_SIZE
 CAP = 40                                   # windows/segment
 ANNOUNCE = (0, 1, 2)                       # carb, insulin, exercise
-# A set short of ``CHANNEL_TO_FEAT`` leaves the dropped slot at ``normalize(0)`` — for exercise_equiv a
-# legal "no session" (−0.139 z on the balanced pool) — so the probe would measure a regime training never saw.
+# A set short of CHANNEL_TO_FEAT hits normalize(0): a legal "no session", an unseen regime.
 assert ANNOUNCE == tuple(CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(CHANNEL_TO_FEAT)}")
-# anchored on the training probe's dose scale, so both read on one axis; the 1.0x rung IS the CF_* dose
+# Anchored on the training probe's dose scale; the 1.0x rung IS the CF_* dose.
 LADDER = (0.0, 0.25, 0.5, 1.0, 2.0)
 CARB_DOSES = tuple(f * CF_CARB_BOLUS_G for f in LADDER)
 INSULIN_DOSES = tuple(f * CF_INSULIN_BOLUS_U for f in LADDER)
-# grams of carbohydrate-EQUIVALENT disposal per session, never minutes, never an intensity;
-# the 1x rung is one population-mean session
+# Grams carb-EQUIVALENT disposal per session, never minutes; 1x rung is one population-mean session.
 EXERCISE_DOSES = tuple(f * CF_EXERCISE_G for f in LADDER)
 REF_IDX = LADDER.index(1.0)
-QUIET_CTX_MIN = 180                        # trailing context a 'quiet' window must have no events in
+QUIET_CTX_MIN = 180                        # trailing context with no events, for a 'quiet' window
 QUIET_STEPS = QUIET_CTX_MIN // GRID_MIN
 TURN_MIN_MGDL = 2.0                        # retracement a reversal must exceed to count as a turn
 TURN_HIST_MAX = 4                          # turning-point histogram bins 0..MAX-1, then MAX+
 ONSET_EPS = 5.0                            # mg/dL a response must reach to count as begun
-RESCUE_LAG_MIN = 30                        # a dose cannot act before this; rescue is scored after it
+RESCUE_LAG_MIN = 30                        # a dose cannot act before this; rescue scored after it
 RESCUE_LAG = RESCUE_LAG_MIN // GRID_MIN
-TERM = HORIZON_IDX[HORIZONS[-1]]           # terminal forecast step (120 min at the default geometry)
+TERM = HORIZON_IDX[HORIZONS[-1]]           # terminal forecast step (120 min at default geometry)
 KERNEL_MASS = {'carb': float(CARB_KERNEL[:PRED].sum()),
                'insulin': float(BOLUS_KERNEL[:PRED].sum()),
                'exercise': float(EXERCISE_KERNEL[:PRED].sum())}
 
-# Why an arm did not run, carried in the JSON so a zero never reads like a measurement.
-# Both are decided from the segments, not from a flag a caller can forget.
+# Why an arm didn't run, carried in JSON so a zero never reads as a measurement; from segments.
 EX_NOT_ANNOUNCED = (
     "exercise column is identically zero across these segments, so there is no "
     "session to perturb and the baseline is uniformly 'no session' — every real "
@@ -138,7 +87,7 @@ def _dose_curve(dose: float, kernel: np.ndarray) -> np.ndarray:
 def _renorm(raw: np.ndarray, stats: dict, name: str) -> torch.Tensor:
     """Raw per-step ``(PRED,)`` sparse channel -> normalized ``(P, S)`` override tensor.
 
-    Mirrors ``build_feature_stack``'s log1p+z branch exactly, so the zero-dose arm reproduces the override
+    Mirrors ``build_feature_stack``'s log1p+z branch, so the zero-dose arm reproduces the override
     sliced from the feature stack.
     """
     z = (np.log1p(np.maximum(raw, 0.0)) - stats[name]['mean']) / (stats[name]['std'] + 1e-8)
@@ -172,8 +121,8 @@ def _reversal(y: np.ndarray) -> float:
 def _latency(delta: np.ndarray, sign: int) -> tuple[float | None, float]:
     """``(onset, peak)`` minutes of the INTENDED-direction response.
 
-    Both read ``sign * delta``, not ``|delta|``: a dose that first pushes the wrong way must not count that
-    excursion as its onset. ``onset`` is None where the response never reaches ``ONSET_EPS``.
+    Both read ``sign * delta``, not ``|delta|``: a wrong-way push must not count as onset.
+    ``onset`` is None where the response never reaches ``ONSET_EPS``.
     """
     signed = sign * delta
     hit = np.nonzero(signed >= ONSET_EPS)[0]
@@ -190,19 +139,17 @@ def _frac(hits: int, n: int) -> float | None:
 
 
 def exercise_is_announced(segs: list) -> bool:
-    """True where at least one segment carries a non-zero exercise column — the exercise ladder's admission test.
+    """True if a segment carries a non-zero exercise column: the exercise ladder's admission test.
 
-    Read from the data, not the source's name, so a source that stops or starts filling the column needs no
-    edit here.
+    Read from the data, not the source name, so filling the column needs no edit here.
     """
     return any(bool(np.any(np.asarray(s.exercise, dtype=np.float64) > 0.0)) for s in segs)
 
 
 def events_are_recorded(segs: list) -> bool:
-    """True where at least one segment carries raw carb/bolus events — the empty-future arm's admission test.
+    """True if any segment carries raw carb/bolus events — the empty-future arm's admission test.
 
-    A source of pre-resolved channels only leaves these arrays at zero, indistinguishable from "nothing
-    happened" once stripped.
+    A source of pre-resolved channels only leaves these at zero, indistinguishable from "nothing".
     """
     return any(bool(np.any(s.carb_grams > 0.0) or np.any(s.bolus_units > 0.0))
                for s in segs)
@@ -212,17 +159,12 @@ def run(model, stats: dict, device, segs: list,
         stride: int = STRIDE, cap: int = CAP,
         carb_kernel: np.ndarray | None = None,
         bolus_kernel: np.ndarray | None = None) -> dict:
-    """Probe every strided window of ``segs`` -> the source's summary dict.
+    """Probe every strided window of segs -> the source's summary dict.
 
-    ``stride`` in steps, ``cap`` in windows per segment, both sized for the simulator pool. Every figure is a
-    FRACTION over windows — a sign rate off nine windows moves in steps of 0.11 — so a smaller draw wants
-    both loosened.
-    Two arms are admitted or refused from the segments themselves, before any forward: the exercise ladder
-    needs ``exercise_is_announced``, the empty-future arm ``events_are_recorded``. A refused arm reports its
-    reason and no numbers.
+    Every figure is a FRACTION over windows -- a sign rate off nine windows moves in steps of
+    0.11. Exercise and empty-future arms are admitted or refused from the segments themselves.
     """
-    # a supplied kernel replaces the population default for the DOSE arms only; the empty-future arm
-    # deconvolves with the same kernel it is given, so the two stay consistent within a run
+    # Supplied kernel replaces the default for DOSE arms; empty-future deconvolves with it too.
     ck = CARB_KERNEL if carb_kernel is None else carb_kernel
     bk = BOLUS_KERNEL if bolus_kernel is None else bolus_kernel
 
@@ -258,10 +200,8 @@ def run(model, stats: dict, device, segs: list,
                     ex_t: torch.Tensor, ov=ov) -> np.ndarray:
                 """Forecast with all three dosed channels replaced.
 
-                The dict is passed whole, then overwritten key by key: writing only the perturbed channels
-                would SILENTLY drop the untouched announcements, since an unannounced maskable slot takes a
-                legal ``normalize(0)``. These three keys are the whole of ``ANNOUNCE``, pinned to
-                ``CHANNEL_TO_FEAT`` at import, so a fourth announceable channel fails there instead.
+                Dict passed whole, then overwritten key by key: only writing perturbed channels
+                would SILENTLY drop other announcements (unannounced slots take normalize(0)).
                 """
                 out = predict(model, ctx, normalization_stats=stats, device=device,
                               overrides={**ov, 0: carb_t, 1: ins_t, 2: ex_t})
@@ -289,8 +229,7 @@ def run(model, stats: dict, device, segs: list,
                     idl[j] = _fc(c_null_t,
                                  _renorm(i_fut + _dose_curve(u, bk), stats,
                                          'insulin_combined'), e_null_t) - null
-            # a COUNTERFACTUAL session, riding on top of what the window already announces, never scaled
-            # out of g/step
+            # A COUNTERFACTUAL session on what the window already announces, never scaled to g/step.
             if ex_ok:
                 ed = np.zeros((len(EXERCISE_DOSES), PRED))
                 for j, g in enumerate(EXERCISE_DOSES):
@@ -301,8 +240,7 @@ def run(model, stats: dict, device, segs: list,
                 ex_d.append(ed)
 
             if ev_ok:
-                # only events whose ONSET is inside the prediction zone: past tails, basal and a session
-                # already under way cannot be retracted, so exercise keeps its true value here
+                # Only events with ONSET in the prediction zone; a session under way can't retract.
                 c_empty = np.clip(c_fut - _convolve(seg.carb_grams[ps:ps + PRED], ck), 0.0, None)
                 i_empty = np.clip(i_fut - _convolve(seg.bolus_units[ps:ps + PRED], bk), 0.0, None)
                 empties.append(_fc(_renorm(c_empty, stats, 'carb_intake'),
@@ -323,8 +261,8 @@ def _side(deltas: list[np.ndarray], doses: tuple[float, ...], nulls: list[np.nda
           sign: int, thr: float, unit: str, rule: str) -> dict:
     """Summarize one dose ladder.
 
-    ``sign`` is the direction the announcement must move the forecast: +1 carbohydrate, -1 insulin and
-    exercise. It is the whole of the sign gate; ``sign_gate`` records the rule beside the numbers.
+    ``sign`` is the direction the announcement must move the forecast: +1 carb, -1 insulin/exercise.
+    It is the whole of the sign gate; ``sign_gate`` records the rule beside the numbers.
     """
     n = len(deltas)
     if n == 0:
@@ -339,8 +277,7 @@ def _side(deltas: list[np.ndarray], doses: tuple[float, ...], nulls: list[np.nda
     point_ok = np.all(mono_step >= -1e-6, axis=(1, 2))
     inversions = np.count_nonzero(mono_step[:, :, TERM] < -1e-6, axis=1)
 
-    # peak only where an onset was reached: argmax over a response that never materializes drags the
-    # median toward step 0
+    # Peak only where an onset was reached; argmax on a response that never fires drags to step 0.
     onsets, peaks = [], []
     for d in D[:, REF_IDX, :]:
         o, p = _latency(d, sign)
@@ -348,8 +285,7 @@ def _side(deltas: list[np.ndarray], doses: tuple[float, ...], nulls: list[np.nda
             onsets.append(o); peaks.append(p)
     adverse = np.maximum(-sign * D[:, REF_IDX, :], 0.0).max(axis=1)
 
-    # a dose cannot act instantly: scoring the whole horizon would fail every window whose baseline nadir
-    # precedes the response
+    # A dose can't act instantly; scoring the whole horizon fails windows whose nadir precedes it.
     N = np.stack(nulls)[:, RESCUE_LAG:]
     Dr = D[:, :, RESCUE_LAG:]
     exc = (N.min(axis=1) < thr) if sign > 0 else (N.max(axis=1) > thr)
@@ -368,19 +304,18 @@ def _side(deltas: list[np.ndarray], doses: tuple[float, ...], nulls: list[np.nda
         'n': n,
         'doses': [round(d, 3) for d in doses],
         'unit': unit,
-        # THRESHOLD deliberately null: the gate is one run's correct-sign fraction against another's, and
-        # no reference run is fixed, so a number here would be a guess behind a shipping decision.
+        # THRESHOLD null: no reference run is fixed, a number here would be a shipping guess.
         'sign_gate': {'rule': rule, 'sign': sign, 'metric': 'correct_sign_frac',
                       'threshold': None,
                       'threshold_unset_because':
                           'no reference pretrain exists to take the baseline from'},
-        # the bin every per-horizon row is taken at; arms are compared within a row, never pooled across rows
+        # The bin every per-horizon row is at; arms compared within a row, never pooled across rows.
         'horizon_d': {str(h): {'d_patches': run_eval.horizon_d_patches(h),
                                'one_sided': True}
                       for h in HORIZONS},
         'mean_dbg': {str(h): [round(float(v), 2) for v in D[:, :, HORIZON_IDX[h]].mean(axis=0)]
                      for h in HORIZONS},
-        # the 0-rung has no direction to be right about: null, not 0.0, and still aligned with ``doses``
+        # The 0-rung has no direction to be right about: null, not 0.0, still aligned with doses.
         'correct_sign_frac': {str(h): [None] + [round(float(v), 3) for v in
                                                 (sign * D[:, 1:, HORIZON_IDX[h]] > 0).mean(axis=0)]
                               for h in HORIZONS},
@@ -430,7 +365,7 @@ def _summarize(carb_d: list[np.ndarray], ins_d: list[np.ndarray], ex_d: list[np.
               'quiet': {'n': 0, 'not_probed': NO_EVENTS_TO_STRIP}})
     return {
         'n_windows': len(nulls),
-        # null, not "all of them", where the empty-future arm was refused: no events, no proof of quiet
+        # null, not 'all of them', when empty-future was refused: no events, no proof of quiet.
         'n_quiet': int(q.sum()) if ev_ok else None,
         'carb': _side(carb_d, CARB_DOSES, nulls, +1, BG_HYPO_THRESHOLD, 'g',
                       'announced carbohydrate must raise the forecast'),
@@ -503,8 +438,7 @@ def _panel_curves(ax, block: dict, ramp: tuple[str, ...], unit: str, title: str,
     F.legend(ax, loc=loc, ncol=2)
 
 
-# One identity per dosed arm across every panel, from figstyle's fixed slots, never rank-assigned.
-# ``ARM_RESCUE``: carbohydrate clears a forecast hypo, insulin and exercise a forecast hyper.
+# One identity per arm across panels, fixed slots; ARM_RESCUE: carb clears hypo, others hyper.
 ARMS = (('carb', F.SERIES[0], 'carbohydrate'),
         ('insulin', F.SERIES[1], 'insulin'),
         ('exercise', F.SERIES[2], 'exercise'))
@@ -631,7 +565,7 @@ def _fig_cohort(ds: str, r: dict, step) -> str:
 def _parse_args() -> "argparse.Namespace":
     """CLI; every default reproduces the no-argument behaviour exactly.
 
-    The flags point the probe at a checkpoint other than the live best, so two training runs can be compared
+    The flags point the probe at a checkpoint other than the live best, so two runs can be compared
     on the same windows. Nothing about the probe changes.
     """
     p = argparse.ArgumentParser(description="What-if dose-response probe.")
@@ -673,7 +607,7 @@ def _parse_args() -> "argparse.Namespace":
 
 
 def _load_cohort(ds: str, args: "argparse.Namespace") -> list:
-    """Fresh simulator Segments from the TEST seed pool, disjoint from calibration, so every one is unseen."""
+    """Fresh simulator Segments from the TEST seed pool, disjoint from calibration -- unseen."""
     assert ds == SIM_DATASET, f"unknown source {ds!r}"
     return sim_data.make_sim_segments(
         sim_data.TEST_SEEDS[:max(1, int(args.sim_seeds))], float(args.sim_hours))
@@ -724,8 +658,7 @@ def main() -> None:
     res['_meta']['kernel_mass_in_horizon'] = {
         'carb': float((CARB_KERNEL if carb_kernel is None else carb_kernel)[:PRED].sum()),
         'insulin': float((BOLUS_KERNEL if bolus_kernel is None else bolus_kernel)[:PRED].sum()),
-        # no CLI replaces the exercise kernel: the simulator's session shape is the only one the channel
-        # was trained on
+        # No CLI replaces the exercise kernel: the simulator's session shape is the trained one.
         'exercise': KERNEL_MASS['exercise'],
     }
     if SIM_DATASET in datasets:

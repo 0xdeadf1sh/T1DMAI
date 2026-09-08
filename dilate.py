@@ -1,21 +1,7 @@
 """DILATE — shape + time distortion loss (Le Guen & Thome, NeurIPS 2019), risk space.
 
-shape is the soft-DTW DIVERGENCE ``sDTW(m,y) - ½sDTW(m,m) - ½sDTW(y,y)`` (Blondel et al.
-2021): plain soft-DTW is not zero at ``m == y``, since the soft-min still pays an entropic
-price. time is TDI ``= <A, Ω>``, ``A = ∂sDTW/∂C``, evaluated as the directional derivative
-of the soft-DTW value along ``Ω`` by one extra forward rather than by materialising ``A``.
-
-The DP is swept along anti-diagonals — ``2H-1`` of them, every cell on one independent —
-with the whole batch and the whole diagonal vectorised, never a per-sample Python loop.
-Both sweeps are dispatch-bound, so the measured cost tracks ``H`` and ignores the batch
-size; on CUDA fp32 a Triton kernel sinks the diagonal loop into one launch, and the eager
-loop is the definition of record everywhere else (CPU, fp64, no Triton). The two agree to
-fp32 rounding — ``tests/test_dilate.py``.
-
-Cost is the squared difference in risk space; one cell peaks at
-``(f(BG_CLAMP_MAX) - f(BG_CLAMP_MIN))**2 = 99.6416``. A non-finite median or cost is NOT
-asserted away — it propagates into the returned loss so train.py's isfinite / EMA-restore
-guard handles it.
+shape is soft-DTW DIVERGENCE; tdi is ``<A, Ω>`` via a directional derivative, not by
+materialising ``A``. Non-finite median/cost propagates, not asserted away (train.py's guard).
 """
 
 import torch
@@ -28,8 +14,7 @@ try:
 except ImportError:
     DILATE_TDI_FD_EPS = 0.05
 
-# Triton carries the DP on CUDA fp32 only; absence is not an error, the eager
-# reference below is complete on its own.
+# Triton carries the DP on CUDA fp32 only; absent, the eager reference is complete alone.
 try:
     import triton
     import triton.language as tl
@@ -37,9 +22,7 @@ try:
 except ImportError:                                            # pragma: no cover
     _HAVE_TRITON = False
 
-# One program holds a whole anti-diagonal in one warp, so H is bounded by the largest
-# block Triton maps to it. Above this the reference runs; no caller comes close
-# (H = span length x PATCH_SIZE).
+# One warp holds a whole anti-diagonal, bounding H; above it the reference runs instead.
 _TRITON_MAX_H = 1024
 
 
@@ -66,10 +49,8 @@ def _softmin(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, gamma: float) ->
 def _use_triton(cost: torch.Tensor) -> bool:
     """Whether the Triton DP may carry this call — fp32 CUDA and nothing else.
 
-    The eager reference is the definition of record and the only path the fp64
-    ``gradcheck`` exercises; both must agree (``test_softdtw_triton_matches_reference``).
-    ``H > 0`` is correctness, not an optimisation: the reference returns ``R[0, 0] = 0``
-    while a ``H = 0`` launch asks for a zero-width block and fails to compile.
+    ``H > 0`` is correctness, not an optimisation: a ``H = 0`` launch asks for a zero-width
+    block and fails to compile. Eager and Triton must agree (test_softdtw_triton_matches_reference).
     """
     return (_HAVE_TRITON and cost.is_cuda and cost.dtype == torch.float32
             and 0 < cost.shape[1] <= _TRITON_MAX_H)
@@ -80,9 +61,8 @@ if _HAVE_TRITON:
     def _softdtw_forward_kernel(cost_ptr, r_ptr, gamma, H, BLOCK: tl.constexpr):
         """One program per batch row; the whole anti-diagonal in one warp, sweep = one launch.
 
-        ``R`` is read and written through L2 (``.cg``), not L1, so the previous diagonal a
-        later iteration reads is the one this iteration stored; ``num_warps=1`` at the call
-        site keeps the diagonal inside one warp and ``tl.debug_barrier`` orders the accesses.
+        ``R`` reads/writes through L2 (``.cg``), not L1; ``num_warps=1`` keeps the diagonal
+        inside one warp and ``tl.debug_barrier`` orders the accesses across iterations.
         """
         b = tl.program_id(0)
         HR = H + 1
@@ -99,8 +79,7 @@ if _HAVE_TRITON:
             diag = tl.load(r_ptr + here - HR - 1, mask=live, other=0.0, cache_modifier=".cg")
             left = tl.load(r_ptr + here - 1, mask=live, other=0.0, cache_modifier=".cg")
             c = tl.load(cost_ptr + cost_base + (i - 1) * H + (j - 1), mask=live, other=0.0)
-            # The +inf boundary divides to -inf, exp 0; every reachable cell has a
-            # finite predecessor, so z is never -inf.
+            # +inf boundary divides to -inf, exp 0; every reachable cell has a finite predecessor.
             sa = up / neg_gamma
             sb = diag / neg_gamma
             sc = left / neg_gamma
@@ -114,9 +93,8 @@ if _HAVE_TRITON:
     def _softdtw_backward_kernel(cost_ptr, r_ptr, e_ptr, gamma, H, BLOCK: tl.constexpr):
         """Reverse sweep for the alignment soft-assignment ``E``.
 
-        The reference's ``D``/``Rp`` padding is a masked load here — off-grid ``Rp`` reads
-        -inf and off-grid ``D`` reads 0, which is what those rings held — so this pass
-        allocates ``E`` alone where the reference allocates three tables of that size.
+        Off-grid ``Rp`` reads -inf and off-grid ``D`` reads 0 via masked loads, matching the
+        reference's padding rings — so this pass allocates only ``E``, not three padded tables.
         """
         b = tl.program_id(0)
         HR = H + 1
@@ -162,10 +140,8 @@ if _HAVE_TRITON:
 class SoftDTWBatch(torch.autograd.Function):
     """Batched soft-DTW value + gradient, vectorised anti-diagonal DP.
 
-    ``R[i, j] = C[i, j] + softmin_γ(R[i-1, j], R[i-1, j-1], R[i, j-1])`` over an
-    ``(H+1, H+1)`` table per sample; the value is ``R[H, H]``. Backward runs the dual
-    recursion for the alignment soft-assignment ``E`` and pushes it onto the cost:
-    ``∂loss/∂C = grad · E``. Neither pass builds an autograd graph over the ``2H-1`` steps.
+    ``R[i,j] = C[i,j] + softmin_γ(R[i-1,j], R[i-1,j-1], R[i,j-1])``, value is ``R[H,H]``.
+    Backward pushes dual recursion ``E`` onto the cost: ``∂loss/∂C = grad·E``, no autograd graph.
     """
 
     @staticmethod
@@ -180,8 +156,7 @@ class SoftDTWBatch(torch.autograd.Function):
         assert H == W, "soft-DTW expects a square (H, H) cost matrix"
         dev, dt = cost.device, cost.dtype
 
-        # Padded by one on each axis: R[:, 0, :] and R[:, :, 0] are the +inf boundary
-        # (no path enters from off-grid), R[:, 0, 0] = 0 is the origin.
+        # Padded by one axis: R[:,0,:]/R[:,:,0] are +inf boundary (no off-grid path); R[:,0,0]=0.
         R = torch.full((B, H + 1, H + 1), float("inf"), device=dev, dtype=dt)
         R[:, 0, 0] = 0.0
 
@@ -204,8 +179,7 @@ class SoftDTWBatch(torch.autograd.Function):
                 c = cost[:, i - 1, j - 1]                          # (B, K)
                 R[:, i, j] = c + _softmin(r_up, r_diag, r_left, gamma)
 
-        # A non-finite value is deliberately NOT asserted away: it propagates into the
-        # loss so train.py's isfinite / _maybe_restore_from_ema guard handles it.
+        # Non-finite value not asserted away: the isfinite/EMA-restore guard catches it downstream.
         value = R[:, H, H].clone()                             # (B,)
 
         ctx.save_for_backward(cost, R)
@@ -229,8 +203,7 @@ class SoftDTWBatch(torch.autograd.Function):
         E[:, H + 1, H + 1] = 1.0
 
         if _use_triton(cost):
-            # D and Rp below are pure padding; the kernel reads their rings as masked-load
-            # defaults, so it allocates E alone.
+            # D and Rp below are pure padding, masked-load defaults; kernel allocates E alone.
             _softdtw_backward_kernel[(B,)](
                 cost, R, E, float(gamma), H,
                 BLOCK=triton.next_power_of_2(H), num_warps=1)
@@ -239,14 +212,12 @@ class SoftDTWBatch(torch.autograd.Function):
             D = torch.zeros((B, H + 2, H + 2), device=dev, dtype=dt)
             D[:, 1:H + 1, 1:H + 1] = cost
 
-            # Outer ring -inf so an off-grid neighbour never wins the soft-assignment;
-            # the terminal cell seeds the recursion.
+            # Outer ring -inf so an off-grid neighbour never wins; terminal cell seeds recursion.
             Rp = torch.full((B, H + 2, H + 2), -float("inf"), device=dev, dtype=dt)
             Rp[:, 0:H + 1, 0:H + 1] = R
             Rp[:, H + 1, H + 1] = R[:, H, H]
 
-            # Each cell's soft-assignment is the sum of its three successors' assignments
-            # times the local soft-min derivatives a/b/c.
+            # Each cell's soft-assignment sums its three successors' assignments times a/b/c.
             for k in range(2 * H, 1, -1):
                 i_lo = max(1, k - H)
                 i_hi = min(H, k - 1)
@@ -290,22 +261,12 @@ def dilate_loss(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``L = α·shape + (1-α)·tdi`` in risk space. m, y_risk ``(B, H)``; returns three scalars.
 
-    shape is the soft-DTW DIVERGENCE, so it and its gradient vanish at ``m == y``; the
-    ``y``-self term is a forecast constant and is detached. tdi is ``<A, Ω>`` as a one-sided
-    finite difference of the soft-DTW value along ``Ω``, never by materialising ``A``.
-
-    NOT scale-free in ``H``: shape grows with the horizon while the normalised ``Ω`` does
-    not, so ``alpha`` weights a different mixture at each ``H`` — a caller combining calls
-    at different ``H`` must weight and log them per bucket.
-
-    gamma is a softness knob (smaller ⇒ harder min), overflow-free in fp32 to 1e-3;
-    soft-DTW is 1-homogeneous in ``(cost, gamma)``. Smaller ``tdi_fd_eps`` trades ``O(ε)``
-    bias for fp headroom in the value difference.
+    NOT scale-free in ``H``: shape grows with the horizon, so ``alpha`` weights a different
+    mixture at each ``H`` — combine calls at different ``H`` weighted and logged per bucket.
     """
     assert m.dim() == 2 and y_risk.dim() == 2, "m and y_risk must be (B, H)"
     assert m.shape == y_risk.shape, "m and y_risk must share shape (B, H)"
-    # (0, H) would mean to NaN with no exception, and that NaN passes ``val_total <
-    # best_val_loss`` (False for NaN against inf), ending the run with no best checkpoint.
+    # (0, H) means NaN with no exception; NaN < best_val_loss is False, so no checkpoint ever saves.
     assert m.shape[0] > 0, (
         "dilate_loss got an EMPTY batch (0 rows): the mean over the batch axis "
         "would be NaN. Skip empty span-length buckets in the caller."
@@ -314,8 +275,7 @@ def dilate_loss(
     assert 0.0 <= alpha <= 1.0, "alpha must be in [0, 1]"
     assert gamma > 0.0, "gamma must be positive"
     assert tdi_fd_eps > 0.0, "tdi_fd_eps must be positive"
-    # PROMOTE fp16/bf16 only, never downcast: a hard ``.float()`` truncates an fp64 input
-    # and breaks fp64 ``gradcheck``, whose numerator would be dominated by fp32 rounding.
+    # PROMOTE fp16/bf16 only, never downcast: .float() would truncate fp64 and break gradcheck.
     if m.dtype in (torch.float16, torch.bfloat16):
         m = m.float()
     if y_risk.dtype in (torch.float16, torch.bfloat16):
@@ -336,8 +296,7 @@ def dilate_loss(
     shape_per = sdtw_my - 0.5 * sdtw_mm - 0.5 * sdtw_yy        # (B,)
     shape = shape_per.mean()
 
-    # One extra forward, reusing sdtw_my, approximates <A, Ω> to O(tdi_fd_eps); autograd
-    # then carries the exact TDI gradient through SoftDTWBatch's first-order backward.
+    # One extra forward approximates <A,Ω> to O(eps); autograd carries the exact TDI gradient.
     omega = _omega_distance(H, m.device, m.dtype)             # (H, H)
     sdtw_my_eps = SoftDTWBatch.apply(
         cost_my + tdi_fd_eps * omega.unsqueeze(0), gamma)      # (B,)

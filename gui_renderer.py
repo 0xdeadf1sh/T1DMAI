@@ -17,8 +17,7 @@ except ImportError:
     PYGAME_AVAILABLE = False
 
 
-# Multiplies every font size, widget rect and layout spacing; ``gui.py`` and
-# ``gui_controls.py`` import it from here rather than keeping their own.
+# Multiplies every font size, widget rect and layout spacing; gui.py imports it from here.
 UI_SCALE: float = 1.5
 
 
@@ -275,9 +274,8 @@ def draw_clock_face(
 ) -> None:
     """Blit a ``utils.ClockGeometry`` clock face; ``cx``/``cy``/``radius`` in screen pixels.
 
-    All trigonometry lives in ``utils.clock_wedge_geometry``, whose coords are y-up unit-disk;
-    the only host step is the y-DOWN flip ``(x, y) -> (cx + radius*x, cy - radius*y)``.
-    ``tick_color=None`` skips the 12/3/6/9 ticks; ``R`` is already baked into ``geom``.
+    Trig lives in ``utils.clock_wedge_geometry`` (y-up unit-disk); the only host step is the
+    y-DOWN flip ``(x, y) -> (cx + radius*x, cy - radius*y)``. ``tick_color=None`` skips ticks.
     """
     if not PYGAME_AVAILABLE:
         return

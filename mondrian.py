@@ -1,48 +1,7 @@
 """Region-binned (Mondrian) split-conformal recalibration of the BG quantile fan.
 
-``conformal.py`` fits ONE marginal ``delta[s, k]`` over the whole calibration
-set. A fan headed for hypoglycaemia and one headed for hyperglycaemia have
-different residual distributions, so the pooled offset under-covers one regime
-and over-covers the other. This re-fits the same correction once per REGION bin.
-
-THE REGION is a function of the WINDOW, taken from where the forecast is HEADING
-— the median line's mean over the final patch (``forecast_destination``) —
-deliberately not the last observed BG, since a shipped correction is applied to a
-forecast. ``REGION_EDGES = (110.0,)``: one edge, inside the euglycaemic band,
-well clear of the hypo threshold. A bin edge at a CLINICAL threshold (70) is the
-one placement to avoid: it splits the windows that decide the alarm across two
-separately-fit corrections and starves the low bin. ``conformal`` holds the
-median FIXED, so a window's region is identical before and after correction — the
-binning is not circular and needs no second pass.
-
-THE ARITHMETIC FLOOR. ``conformal._conformal_offset`` takes order statistic
-``floor((n+1)*tau)`` on the lower edge, so at tau = 0.05:
-
-  * ``n >= 19`` — the index reaches 1, i.e. an offset exists at all;
-  * ``n >= 39`` — the index reaches 2, i.e. the offset is no longer the sample
-    MINIMUM of the calibration residuals, an estimate that moves with a single
-    outlier.
-
-Below 39 a bin takes the MARGINAL delta and ``fit_mondrian`` records that it did:
-a stated rule, not an accident of small numbers.
-
-Every coverage figure is reported per bin with ``n``, the DISTINCT PATIENT count
-and the MEAN BAND WIDTH. Coverage alone is not interpretable — it is bought with
-width, and n windows drawn from two patients are not n independent observations.
-
-TWO PROTOCOLS, ONE OF WHICH SHIPS. Forecast, backcast and infill residuals are
-not exchangeable: most infill supervision sits at small ``d``, bracketed by
-visible evidence on both sides. Conditioning on (region, d, sidedness) would
-multiply the bins by six against the n >= 19 floor, so the split is by REMIT —
-the FORECAST fit ships; :func:`fit_infill_conformal` is a coarse fit that
-announces every fallback on stdout and carries ``shipped = False``, so the easier
-infill residuals never enter the shipped band.
-
-``conformal.py`` is untouched: ``fit_quantile_conformal`` runs once per bin on
-that bin's own rows and the results are stacked, ``apply_quantile_conformal``
-once per bin GROUP with that bin's ``(S, K)`` slice. Never a gathered per-window
-delta — its ``ndim == 2`` assert refuses one, and that assert is what stops a 1-D
-``(K,)`` delta broadcasting silently across every horizon step.
+Bins on where the forecast is HEADING (median line's last-patch mean), not last observed BG.
+Below n=39 a bin takes the MARGINAL delta (n>=19 for any offset); only FORECAST ships.
 """
 from __future__ import annotations
 
@@ -58,8 +17,7 @@ N_REGION_BINS: int = len(REGION_EDGES) + 1
 MIN_N_OFFSET_EXISTS: int = 19
 MIN_N_OWN_FIT: int = 39
 
-# The final patch, not the single last step: one 5-minute grid point of a median
-# line is a noisier heading than the 30 minutes it closes on.
+# The final patch, not the last step: one 5-min grid point is noisier than the 30 min it closes on.
 DESTINATION_STEPS: int = PATCH_SIZE
 
 
@@ -73,10 +31,8 @@ def bin_label(b: int) -> str:
 def forecast_destination(q: np.ndarray, median_idx: int) -> np.ndarray:
     """Where each window's forecast is HEADING, mg/dL — the region variable.
 
-    ``q`` ``(N, S, K)`` mg/dL fan ascending in K, ``median_idx`` its tau=0.5
-    column, giving ``(N,)`` mean of the median line over the last
-    ``DESTINATION_STEPS`` steps. Invariant under conformal correction, which
-    holds the median fixed.
+    ``q`` (N,S,K) mg/dL fan ascending in K; mean of the ``median_idx`` column over the last
+    ``DESTINATION_STEPS`` steps. Invariant under conformal correction, which holds the median fixed.
     """
     assert q.ndim == 3, q.shape
     return q[:, -DESTINATION_STEPS:, median_idx].mean(axis=1).astype(np.float64)
@@ -103,16 +59,8 @@ def fit_mondrian(cal_q: np.ndarray, cal_true: np.ndarray, cal_bin: np.ndarray,
                  verbose: bool = False) -> tuple[np.ndarray, np.ndarray, dict]:
     """Fit one conformal correction per region bin, plus the marginal baseline.
 
-    ``cal_q`` ``(N, S, K)`` mg/dL fans ascending in K, ``cal_true`` ``(N, S)``
-    mg/dL, ``cal_bin`` ``(N,)``, ``levels`` the K ascending quantile levels,
-    ``patients`` an optional per-window id sequence for the distinct count. Gives
-    ``delta`` ``(N_REGION_BINS, S, K)``, ``marginal`` ``(S, K)`` and a meta dict
-    whose ``bins`` carry ``n``, ``n_patients``, ``own_fit``, ``fallback_reason``.
-
-    ``conformal.fit_quantile_conformal`` has no bin argument, so it runs ONCE PER
-    BIN and the results are stacked. The marginal fit over ALL rows is both the
-    thin-bin fallback and the pre-Mondrian baseline, measured here so the two arms
-    are always compared within one run.
+    Gives delta (N_REGION_BINS,S,K), marginal (S,K), and a meta dict with n/n_patients/own_fit.
+    Marginal is both the thin-bin fallback and pre-Mondrian baseline, compared within one run.
     """
     assert cal_q.ndim == 3 and cal_true.ndim == 2, (cal_q.shape, cal_true.shape)
     N, S, K = cal_q.shape
@@ -175,12 +123,8 @@ def fit_infill_conformal(cal_q: np.ndarray, cal_true: np.ndarray, cal_bin: np.nd
                          patients=None) -> tuple[np.ndarray, np.ndarray, dict]:
     """The INFILL protocol's own coarse fit — never part of the shipped band.
 
-    Same region axis as the forecast fit and nothing finer: infill residuals are
-    additionally conditioned on ``d`` and on sidedness, and crossing those with
-    the region would multiply the bins by six against the n >= 19 floor. Calibrated
-    coarsely, REPORTED per ``d``, kept in its own slot.
-    Every marginal fallback is announced on stdout — a fallback is the expected
-    case here, and a silent one would read as a fitted correction.
+    Same region axis as forecast, nothing finer (crossing with d/sidedness would multiply
+    bins by six against the n>=19 floor). Every marginal fallback is announced on stdout.
     """
     delta, marginal, meta = fit_mondrian(
         cal_q, cal_true, cal_bin, levels, median_idx,
@@ -191,13 +135,10 @@ def fit_infill_conformal(cal_q: np.ndarray, cal_true: np.ndarray, cal_bin: np.nd
 
 def apply_mondrian(q: np.ndarray, delta: np.ndarray, bin_idx: np.ndarray,
                    median_idx: int) -> np.ndarray:
-    """Apply :func:`fit_mondrian`'s ``(N_REGION_BINS, S, K)`` delta to a ``(N, S, K)`` mg/dL fan.
+    """Apply fit_mondrian's (N_REGION_BINS,S,K) delta to a (N,S,K) mg/dL fan.
 
-    Windows are GROUPED by ``bin_idx`` ``(N,)`` and each group passed that bin's
-    ``(S, K)`` slice; the returned fan has the median column untouched. A gathered
-    per-window ``(N, S, K)`` delta is never formed:
-    ``conformal.apply_quantile_conformal`` asserts its delta is 2-D, and that
-    assert stops a 1-D ``(K,)`` delta broadcasting across every horizon step.
+    Windows GROUPED by bin_idx (N,), each group passed that bin's (S,K) slice; median column
+    untouched. A gathered per-window delta is never formed: apply_quantile_conformal asserts 2-D.
     """
     assert q.ndim == 3, q.shape
     N, S, K = q.shape
@@ -247,16 +188,8 @@ def bin_report(arms: dict, true: np.ndarray, bin_idx: np.ndarray,
                step_groups: dict | None = None) -> list[dict]:
     """Per-bin coverage WITH its n, distinct-patient count and mean width, per arm.
 
-    ``arms`` ``{name: (N, S, K) fan}`` — raw / marginal / mondrian, all scored on
-    the same windows so the comparison is within one run; ``true`` ``(N, S)``
-    mg/dL; ``lo_idx``/``hi_idx`` the band edges coverage and width are read on.
-    ``step_groups`` ``{label: step indices}`` from
-    :func:`forecast_d_step_groups` / :func:`d_step_groups` adds a per-``d``
-    ``by_d`` block to each bin: ``d`` is the only axis a masked-BG metric may be
-    binned on, and a figure pooled over it mixes difficulties and is not a
-    selection metric.
-    One dict per bin: ``bin``, ``label``, ``n``, ``n_patients``, per-arm
-    ``cov``/``width`` over the whole horizon, plus ``by_d``.
+    ``arms`` {name: (N,S,K) fan}, all scored on the same windows. ``step_groups`` adds a
+    per-``d`` ``by_d`` block: pooling over ``d`` mixes difficulties and isn't a selection metric.
     """
     bin_idx = np.asarray(bin_idx, dtype=np.int64)
     rows_out: list[dict] = []
@@ -294,9 +227,7 @@ def bin_report(arms: dict, true: np.ndarray, bin_idx: np.ndarray,
 def print_bin_report(report: list[dict], target: float, title: str) -> None:
     """Render :func:`bin_report` as a table — coverage never without n and width.
 
-    A ``by_d`` block prints under its bin. ``d`` is the axis the masked-BG metrics
-    are read on; the whole-horizon row above it is a summary, never a selection
-    figure.
+    A ``by_d`` block prints under its bin; the row above is a summary, never selection.
     """
     arms = list(report[0]['arms']) if report else []
     head = f"{'region':>12} {'d':>4} {'n':>6} {'pats':>5} " + " ".join(

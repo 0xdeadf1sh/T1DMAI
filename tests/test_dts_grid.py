@@ -1,14 +1,6 @@
-"""The DTS Error Grid against the coordinates its own paper publishes.
+"""The DTS Error Grid (Klonoff et al. 2024) against the 16 border vertices its own paper publishes.
 
-Closed-form risk of Klonoff et al. 2024, J Diabetes Sci Technol 18(6):1346-1361.
-Table A1's 16 border vertices are an independent statement of the same geometry, so
-they are the oracle. They agree to 1.11 mg/dL, not exactly — consistent with the
-paper's rounded coefficients, and largest on the vertical below-clamp segments where
-the border is a chord of nothing, so not a drawing artefact. A wrong coefficient, a
-dropped clamp or a transposed axis moves a vertex by tens of mg/dL.
-
-The 50 mg/dL clamp is read off the paper's prose rather than its formula, and eight
-of the sixteen vertices exist only under it.
+They agree to 1.11 mg/dL, not exactly, consistent with the paper's rounded coefficients.
 """
 
 import numpy as np
@@ -20,12 +12,7 @@ from dts_grid import (
     dts_zones,
 )
 
-# Table A1, Supplemental Appendix 2. Each border is a 3-point polyline; the two
-# endpoints pin the geometry and the middle point (the corner, at the clamp) follows.
-# LOWER runs below the line of identity (monitor under-reads), UPPER above it; each
-# border bounds the zone INSIDE it, so the B lines enclose zone A.
-# The published supplement labels the E rows "D Lower"/"D Upper" — a slip in the
-# sub-headers, not the coordinates: Figure A1 puts them outside the D lines.
+# Table A1: each border is (corner at clamp, far endpoint); LOWER is under the line of identity.
 TABLE_A1 = {
     # border: (corner at the clamp, far endpoint), in (reference, monitor) mg/dL
     ('b', 'lower'): ((62.5, 0.0), (62.5, 50.0), (600.0, 480.0)),
@@ -41,8 +28,7 @@ TABLE_A1 = {
 # The |Risk| contour each border traces: the upper edge of the zone INSIDE it.
 BORDER_RISK = {'b': 0.5, 'c': 1.5, 'd': 2.5, 'e': 3.5}
 
-# worst observed table-vs-function gap is 1.11 mg/dL, at the D-lower and E-lower
-# clamp corners; materially larger is a defect, not rounding
+# worst observed table-vs-function gap is 1.11 mg/dL; materially larger is a defect, not rounding
 VERTEX_TOL_MGDL = 1.2
 
 
@@ -100,13 +86,8 @@ def test_published_vertices_lie_on_the_risk_contour(zone):
 
 
 def test_the_asymmetry_is_in_log_space_not_in_the_ratio():
-    """Overestimates are penalised harder — 2.75 against 2.25, since a falsely high
-    reading prompts insulin — but not visibly at zone A.
-
-    Exponentiating nearly cancels the coefficients at the innermost edge: A runs
-    -19.93% / +19.94%, a symmetric ±20% band by coincidence. So the claim is made in
-    LOG space, and again at the outer edge where the cancellation has stopped.
-    """
+    """Overestimates are penalised harder (2.75 vs 2.25), a claim made in LOG space —
+    exponentiating nearly cancels the coefficients at zone A's edge (a ±20% coincidence)."""
     ref = np.full(3, 200.0)
     pred = np.array([200.0 * 0.8, 200.0, 200.0 * 1.2])
     risk = dts_risk(ref, pred)
@@ -126,8 +107,7 @@ def test_the_asymmetry_is_in_log_space_not_in_the_ratio():
             f"at |Risk|={edge} the overestimate side is not the tighter one — "
             "the 2.75/2.25 asymmetry has been lost or inverted")
 
-    # the A edge's two linear deviations agree to 1.5e-4, so only the log-space form
-    # above can fail
+    # the A edge's two linear deviations agree to 1.5e-4, so only the log-space form above can fail
     a_over = _solve_monitor(200.0, DTS_ZONE_EDGES[0], upper=True) / 200.0 - 1.0
     a_under = 1.0 - _solve_monitor(200.0, DTS_ZONE_EDGES[0], upper=False) / 200.0
     assert abs(a_over - a_under) < 2e-4
@@ -139,13 +119,8 @@ def test_the_asymmetry_is_in_log_space_not_in_the_ratio():
 
 
 def test_the_zone_transition_happens_at_the_edge_and_the_edge_is_closed():
-    """Each edge is closed — ``0-0.5`` A, ``>0.5-1.5`` B — so a point ON a border
-    takes the lower-risk zone.
-
-    A pair exactly on an edge is not constructible: the exp/log round trip lands a
-    few ULP off in float64. Hence the relative 1e-12 bracket, three orders above that
-    noise and ten below any meaningful glucose difference.
-    """
+    """Each edge is closed — ``0-0.5`` A, ``>0.5-1.5`` B — so a point ON a border takes the
+    lower-risk zone. An exact-edge pair isn't constructible (float64 ULP), hence the 1e-12 nudge."""
     nudge = 1e-12
     ref = np.full(len(DTS_ZONE_EDGES), 100.0)
     on = np.array([_solve_monitor(100.0, e, upper=True) for e in DTS_ZONE_EDGES])
@@ -214,12 +189,8 @@ def test_counts_and_fractions_round_trip():
 
 
 def test_both_trainers_render_every_zone_and_no_a_plus_b():
-    """No A+B row: the paper calls presenting A+B as acceptable inappropriate and
-    names pZA alone as the measure. Clarke's own A+B row is a different grid and stays.
-
-    ``train_blind.py`` is a copy of ``train.py``; nothing but this test keeps the grid
-    common ground between them.
-    """
+    """No A+B row: the paper calls presenting A+B as acceptable inappropriate; pZA alone is
+    the measure. ``train_blind.py`` copies ``train.py``; only this test keeps the grid in sync."""
     import train
     import train_blind
 

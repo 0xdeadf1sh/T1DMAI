@@ -1,17 +1,7 @@
-"""Render the figures the README embeds, into screenshots/.
-
-Three figures, each light and dark so the README can serve the matching one:
-
-    architecture{,-dark}.png   signals -> encoder -> quantile fan -> mg/dL, and its consumers
-    risk-space{,-dark}.png     the Kovatchev warp and the loss asymmetry it creates
-    forecast{,-dark}.png       backcast, infill and forecast over one context window,
-                               each cropped to 24 h around its masked span
+"""Renders the README's figures (architecture, risk-space, forecast; light+dark) into screenshots/.
 
     python make_readme_figures.py --skip-forecast       # diagrams only, no checkpoint
     python make_readme_figures.py --checkpoint PATH [--seed N]
-
-The masked-BG figure has no default checkpoint: the ladder's weights are per-run artifacts
-under the gitignored models/<capacity>/checkpoints/.
 """
 
 from __future__ import annotations
@@ -274,9 +264,7 @@ def draw_architecture(t: Theme, path: Path) -> None:
 def _mask_inset(ax, t: Theme, x: float, y: float, s: float) -> None:
     """A 2x2 schematic of the attention mask.
 
-    The axes are VISIBLE and MASKED, not context and prediction: a masked span
-    may end at the last patch (forecast), start at patch 0 (backcast) or sit
-    between visible patches (infill), so neither axis is a position.
+    Axes are VISIBLE/MASKED, not context/prediction: a span may be forecast, backcast or infill.
     """
     half = s / 2
     allow, block = t.fill(t.NAVY), t.paper
@@ -306,8 +294,7 @@ def _mask_inset(ax, t: Theme, x: float, y: float, s: float) -> None:
 
 
 
-# The plotted span is the physical clamp, so the panels cover every BG the model can produce;
-# the transform's anchors sit inside it, f solved so f(40) = -sqrt(10) and f(400) = +sqrt(10).
+# The plotted span is the physical clamp; f is solved so f(40) = -sqrt(10), f(400) = +sqrt(10).
 BG_LO, BG_HI = BG_CLAMP_MIN, BG_CLAMP_MAX
 BG_ANCHOR_LO = 40.0
 
@@ -425,9 +412,7 @@ def _sim_window(seed: int, stats, hours: float):
     exr = np.maximum(raw["total_exercise"], 0.0).astype(np.float32)
     from data import BG_MASKED_FEAT
 
-    # Four normalized signal columns; the bg_masked bit above them is not a signal — no
-    # statistics, never through normalize. Every step here is observed, so its column stays 0.0
-    # and the masked set is written downstream, by the builder that knows it.
+    # Four normalized signal columns; bg_masked above them is a bit, never through normalize.
     cols = [bg, carb, ins, exr]
     assert len(cols) == BG_MASKED_FEAT < config.N_INPUT_FEATURES, (
         f"{len(cols)} raw signal columns against BG_MASKED_FEAT={BG_MASKED_FEAT}, "
@@ -443,9 +428,8 @@ CROP_HOURS = 24.0          # the slice each panel shows out of the whole window
 def _anchor_step(span_start: int, span_len: int, patch_size: int) -> tuple[int, bool]:
     """The window step this span's fan is anchored on, and which end it joins.
 
-    One-sided and LEFT-PREFERRING: a span takes its left neighbour's last step, its right
-    neighbour's first only when it opens the window.  The head decodes a delta from that step,
-    so the fan has zero width there — the join is structural, not cosmetic.
+    One-sided and LEFT-PREFERRING: left neighbour's last step, or right neighbour's
+    first only when the span opens the window.
     """
     if span_start == 0:
         return (span_start + span_len) * patch_size, False      # join on the right
@@ -468,8 +452,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     seq_len = n_ctx + P
     crop_patches = int(CROP_HOURS * pph)
 
-    # the trailing forecast is masked in every case, so a backcast or infill span gets what is
-    # left of the head's slots
+    # trailing forecast masked in every case, so a backcast/infill span gets the rest of the slots
     span_len = cfg.MAX_MASKED_PATCHES - P
 
     # 10 h of slack, so the patch-aligned start below never runs off a short trajectory
@@ -480,9 +463,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     context = torch.from_numpy(ctx_np.copy())
     origin = start + ctx_steps
 
-    # The whole announceable set, so every pass conditions on what training conditioned on;
-    # anything left out reads as "none". Announced in all three passes, not just the forecast:
-    # the trailing zone is masked under every set, so omitting it would condition them apart.
+    # The whole announceable set, in all three passes, so the trailing masked zone conditions alike.
     ANNOUNCE = tuple(cfg.CHANNEL_TO_FEAT)                  # (0, 1, 2)
     ov = {ch: torch.from_numpy(
               feats[origin:origin + pred_steps, cfg.CHANNEL_TO_FEAT[ch]]
@@ -589,8 +570,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
                 mec=t.paper, mew=0.9, zorder=7)
 
         seen = np.concatenate([window_bg[v0:v1], bands_j[:, 5], bands_j[:, 1], med_j])
-        # air either side, so a span flush against the crop edge does not read as a line
-        # running off the panel
+        # air either side, so a span flush against the crop edge doesn't read as running off it
         ax.set_xlim(hours(v0) - 0.4, hours(v1 - 1) + 0.4)
         ax.set_ylim(max(40.0, min(85.0, float(np.nanmin(seen)) * 0.90)),
                     min(400.0, max(220.0, float(np.nanmax(seen)) * 1.07)))
@@ -660,8 +640,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(OUT_DIR))
-    # No default: the ladder's checkpoints are per-run artifacts under the gitignored
-    # models/<capacity>/, so a baked-in path is a promise the tree cannot keep.
+    # No default: checkpoints are per-run artifacts under the gitignored models/<capacity>/.
     ap.add_argument("--checkpoint", default=None,
                     help="checkpoint .pt for the masked-BG figure; required unless "
                          "--skip-forecast")

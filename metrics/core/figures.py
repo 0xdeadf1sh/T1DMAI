@@ -1,10 +1,7 @@
 """Actual-vs-predicted BG figures for the evaluation report.
 
-Pure plotting: numpy arrays in, PNG out. The driver supplies median BG forecast and true CGM per window.
-
-  * trajectory_grid  — example windows: CGM (context+future) vs prediction
-  * parity_scatter   — predicted vs true per horizon, with the identity line
-  * clarke_grid      — Clarke Error Grid, zones drawn, per horizon
+Pure plotting: numpy in, PNG out. trajectory_grid (CGM vs prediction), parity_scatter
+(predicted vs true per horizon), clarke_grid (Clarke Error Grid zones), per horizon.
 """
 from __future__ import annotations
 
@@ -109,10 +106,8 @@ def _clarke_AB(pred, true):
 def trajectory_grid(examples: list, path: str, title: str, ncols: int = 3):
     """``examples``: dicts of {ctx_tail, true_future, pred_future, label}.
 
-    Optional keys, drawn when present: ``band_lo``/``band_hi``, calibrated 90% edges, each
-    ``(len(pred_future),)`` mg/dL; ``pred_hour``/``true_hour`` in ``[0, 24)`` with confidence ``tod_R``;
-    ``time_probs`` ``(P, TIME_PROBE_N_BINS)``, one native clock per prediction patch.
-    A disabled probe leaves its keys absent and the band/forecast panel unchanged.
+    Optional keys, drawn when present: ``band_lo``/``band_hi`` mg/dL edges, ``pred_hour``/
+    ``true_hour`` with ``tod_R`` confidence, ``time_probs``. A disabled probe leaves them absent.
     """
     if not _OK or not examples:
         return

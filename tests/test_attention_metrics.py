@@ -1,9 +1,7 @@
 """Tests for metrics/attention.py — the accounting, not the model.
 
-The probe reduces a (T,) attention row into offset bins and side splits. Those
-sums have to conserve mass and partition the window, or a profile that looks
-plausible is quietly dropping or double-counting attention.
-"""
+The probe reduces a (T,) row into offset bins/side splits; they must conserve
+mass and partition the window, or a plausible profile hides a silent drop."""
 
 import numpy as np
 
@@ -59,8 +57,7 @@ def test_the_near_split_excludes_the_span_and_is_symmetric_in_reach():
     s = A._Series()
     s.add(mass, patch, span, masked, np.array([0.25] * 4))
 
-    # Reach 4 either side of patch 18, minus the span's patches 18-20:
-    # before = 14..17 (4 patches), after = 21..22 (2 patches).
+    # Reach 4 either side of patch 18 minus span 18-20: before=14..17 (4), after=21..22 (2).
     np.testing.assert_allclose(s.near_before, 4 / T, atol=1e-12)
     np.testing.assert_allclose(s.near_after, 2 / T, atol=1e-12)
     assert s.near_before + s.near_after < s.before + s.after

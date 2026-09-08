@@ -1,23 +1,7 @@
 """Canonical record every evaluation source parses into.
 
-A :class:`Segment` is a contiguous, gap-free, 5-minute-grid stretch of one patient's RAW events:
-
-    cgm          mg/dL          the CGM backbone (already gap-interpolated/split)
-    carb_grams   grams/step     meal carbohydrate ingested in that 5-min step
-    bolus_units  IU/step        discrete bolus insulin delivered in that step
-    basal_rate   IU/hour        piecewise-constant basal rate (forward-filled)
-    exercise     grams/step     carbohydrate-EQUIVALENT glucose disposal, on the
-                                simulator's scale; 0 = no activity record
-
-``exercise`` is the one field already in the model's units: a source reporting duration, heart rate or a
-0-1 intensity converts to g/step BEFORE this field, never after.
-
-Raw events, not model channels — the model consumes absorption/action curves, and building them is the
-input bridge's job, which needs basal and bolus separate (different kernels).
-A source already holding curves supplies ``carb_curve`` / ``insulin_curve`` instead; bare-amount sources
-leave both ``None``.
-
-All BG mg/dL; a mmol/L source converts with ``MGDL_PER_MMOL`` first.
+A Segment is a contiguous, gap-free, 5-min-grid stretch of RAW events (see field comments
+for units). exercise is g/step already; convert other sources before this field.
 """
 from __future__ import annotations
 
@@ -37,9 +21,8 @@ MIN_SEGMENT_STEPS: int = 60             # drop runt segments shorter than 5 h (6
 class Segment:
     """A contiguous 5-minute-grid stretch of one patient's record.
 
-    All arrays share length ``N``, aligned to a uniform ``GRID_MIN`` grid from ``t0``; ``cgm`` is finite everywhere.
-    ``carb_curve`` / ``insulin_curve``: supplied together or both ``None``, preferred over
-    ``features.segment_to_channels``'s own kernels, and carried by every slicing helper (``run_eval._slice``).
+    All arrays share length N, aligned to a uniform grid from t0; cgm is finite everywhere.
+    carb_curve/insulin_curve: supplied together or both None; preferred over the kernel default.
     """
     dataset: str
     patient: str
@@ -48,7 +31,7 @@ class Segment:
     carb_grams: np.ndarray     # (N,) grams ingested in this step
     bolus_units: np.ndarray    # (N,) bolus IU delivered in this step
     basal_rate: np.ndarray     # (N,) basal IU/hour, piecewise-constant
-    exercise: np.ndarray       # (N,) g/step carbohydrate-equivalent glucose disposal (0 if unavailable)
+    exercise: np.ndarray       # (N,) g/step carb-equivalent disposal (0 if unavailable)
     split: str = ''            # 'training' | 'testing' | '' — canonical-protocol origin
     carb_curve: np.ndarray | None = None      # (N,) g/step appearance, pre-resolved
     insulin_curve: np.ndarray | None = None   # (N,) IU/step action, pre-resolved (basal+bolus)
@@ -95,9 +78,8 @@ def segment_grid(
 ) -> list[Segment]:
     """Split a full uniform grid into gap-free Segments, each ≥ ``MIN_SEGMENT_STEPS`` long.
 
-    ``cgm`` (M,) mg/dL, NaN at missing steps: NaN runs ≤ ``MAX_INTERP_GAP_MIN`` interpolate inline, longer
-    ones break the record. ``grid_t0`` is the time of grid index 0; the (M,) event channels are already on
-    the same grid and are only sliced.
+    ``cgm`` (M,) mg/dL, NaN at missing steps: runs ≤ ``MAX_INTERP_GAP_MIN`` interpolate, longer
+    ones break the record. ``grid_t0`` is grid index 0's time; event channels are already gridded.
     """
     m = len(cgm)
     assert all(len(a) == m for a in (carb_grams, bolus_units, basal_rate, exercise))
@@ -174,8 +156,8 @@ def segment_grid(
 def lay_on_grid(grid_t0: datetime, n_steps: int, events: list[tuple[datetime, float]]) -> np.ndarray:
     """Bin point events ``(timestamp, amount)`` into a ``(n_steps,)`` grid.
 
-    Nearest-index ``round``, the same placement every adapter uses for CGM, so an event and its CGM sample
-    share a cell. Events outside ``[grid_t0, grid_t0 + n_steps·GRID_MIN)`` are dropped.
+    Nearest-index ``round``, the same placement every adapter uses for CGM, so an event and its
+    CGM sample share a cell. Events outside ``[grid_t0, grid_t0 + n_steps·GRID_MIN)`` are dropped.
     """
     out = np.zeros(n_steps, dtype=np.float64)
     for ts, amt in events:

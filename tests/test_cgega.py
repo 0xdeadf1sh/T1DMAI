@@ -10,8 +10,7 @@ import pytest
 import cg_ega
 
 
-# P-EGA / R-EGA re-implemented from scratch/_cgega_reference.py, independently of
-# cg_ega.py, so a divergence in either direction is caught
+# P-EGA/R-EGA re-implemented independently in _cgega_reference.py, to catch divergence either way.
 def _oracle_p_marks(y_true, y_pred, dy_true):
     mod = np.zeros_like(y_true, dtype=np.float64)
     mod[((dy_true > -2) & (dy_true <= -1)) | ((dy_true >= 1) & (dy_true < 2))] = 10
@@ -128,8 +127,7 @@ def test_large_point_error_is_erroneous():
     assert np.all(pm == 4), f"true-hyper/pred-hypo should be P-EGA E, got {pm}"
     assert np.all(marks["p_mark"] == 4), f"pipeline p_mark: {marks['p_mark']}"
     counts = cg_ega.cg_ega_counts(y_true, y_pred, last_t)
-    # P column E is all-EP in the hyper filter, so every R-mark cell is EP —
-    # including the t=0 lC transient off the shared anchor
+    # P column E is all-EP in the hyper filter, so every R-mark cell is EP, t=0 transient included.
     assert counts["ap_hyper"] == 0 and counts["be_hyper"] == 0, \
         f"large point error must be EP, got {counts}"
     assert counts["ep_hyper"] == T, f"expected all EP, got {counts}"

@@ -1,10 +1,7 @@
 """Read-only attribution for one masked span: attention rollout, and per-channel grad ⊙ input.
 
-Attention has no channel axis — ``patch_embed`` mixes every feature into one token — so
-"which channel" is the gradient's answer.  Feat 4 (``bg_masked``) is a bit, not a channel.
-``rollout``: Abnar & Zuidema (2020), ``0.5·A + 0.5·I`` per layer; a heuristic, not causal.
-``grad ⊙ input`` blind spot: an input at its normalized mean contributes 0 at any gradient.
-``model.forward`` detaches the anchor, so a bare backward gets the BG row's SIGN wrong.
+Feat 4 (bg_masked) has no channel column. rollout is a heuristic (Abnar & Zuidema 2020), not
+causal. model.forward detaches the anchor, so a bare backward gets the BG row's sign wrong.
 """
 
 from __future__ import annotations
@@ -21,8 +18,7 @@ from model import T1DMAI
 from normalization import CHANNEL_NAMES
 from utils import kovatchev_f
 
-# ``inference``'s chokepoint announces feat 4, checks it against the requested set, and
-# crosses the anchor's denormalize bridge; rebuilding the sample here would be a second copy.
+# inference's chokepoint announces feat 4 and crosses the denormalize bridge; reuse, don't rebuild.
 from inference import _resolve_mask_spans, _run_forward
 
 
@@ -30,9 +26,8 @@ from inference import _resolve_mask_spans, _run_forward
 class Attribution:
     """What one masked span read, over the ``T`` patches of its own window.
 
-    ``channels`` is signed: positive raises the span's median risk, negative lowers it.
-    It cannot answer on ``masked_patches`` rather than answering 0 — feat 0 is a literal
-    0.0 there, so ``grad ⊙ input`` is 0 whatever the gradient.
+    ``channels`` is signed: positive raises the span's median risk, negative lowers it. It is 0
+    on ``masked_patches`` because feat 0 is a literal 0.0 there, whatever the gradient.
     """
     where: np.ndarray          # (T,) rollout-composed attention mass per patch
     per_layer: np.ndarray      # (N_LAYERS, T) head-mean attention, layer by layer
@@ -67,12 +62,10 @@ def capture_attention(model: T1DMAI) -> Generator[list[list[torch.Tensor]], None
 
 
 def rollout(head_mean: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Compose per-layer attention into one patch→patch flow map.
+    """Compose per-layer attention into one patch→patch flow map (Abnar & Zuidema 2020).
 
-    Abnar & Zuidema (2020): ``0.5·A + 0.5·I`` per layer, renormalized, multiplied in order —
-    the last layer alone credits a patch for mass that never travelled through attention.
-    ``head_mean``: ``L`` × ``(T, T)``, layer order, head-averaged, row-stochastic.
-    Returns ``(T, T)`` row-stochastic.
+    ``head_mean``: ``L`` × ``(T, T)``, layer order, head-averaged, row-stochastic. Multiplied in
+    layer order so the last layer alone never gets sole credit. Returns ``(T, T)`` row-stochastic.
     """
     assert len(head_mean) > 0, "rollout needs at least one layer"
     T = head_mean[0].shape[-1]
@@ -94,10 +87,8 @@ def channel_saliency(
 ) -> torch.Tensor:
     """Fold a ``(T, PATCH_DIM)`` gradient back onto the channel axis, sign intact.
 
-    ``PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES`` step-major, so feat ``f`` owns the stride
-    ``[:, f::N_INPUT_FEATURES]``.  ``grad`` is ∂target/∂patches, ``patches`` the normalized
-    inputs it was taken at.  Returns ``(T, len(CHANNEL_NAMES))`` signed, feat order — feat 4
-    (``bg_masked``) is a mask announcement, not a channel, and has no column.
+    ``grad`` is ∂target/∂patches at ``patches``, step-major so feat ``f`` owns stride
+    ``[:, f::N_INPUT_FEATURES]``. Returns ``(T, len(CHANNEL_NAMES))`` signed; feat 4 has no column.
     """
     assert grad.shape == patches.shape, (
         f"grad {tuple(grad.shape)} and patches {tuple(patches.shape)} must match"
@@ -113,9 +104,7 @@ def channel_saliency(
     )
 
 
-# ``z·std + mean`` vs ``f(anchor_bg)``: they differ only by a float32 round trip through
-# ``kovatchev_f_inv``.  Beyond this the inverse hit its physical clamp, the anchor is no
-# longer linear in the cell, and its term is dropped rather than approximated.
+# z·std+mean vs f(anchor_bg) differ only by a float32 round trip, unless the inverse clamps.
 _ANCHOR_RECONSTRUCT_ATOL = 1e-3
 
 
@@ -141,7 +130,7 @@ def _anchor_term(
 def _span_slots(
     mask_idx: torch.Tensor, valid: torch.Tensor, span: tuple[int, int],
 ) -> torch.Tensor:
-    """``(M,)`` bool: True on a valid slot whose patch lies inside ``span`` (start_patch, length)."""
+    """``(M,)`` bool: valid slot whose patch lies inside ``span`` (start_patch, length)."""
     start, length = span
     return valid & (mask_idx >= start) & (mask_idx < start + length)
 
@@ -158,18 +147,12 @@ def explain(
 ) -> Attribution:
     """Explain one masked span of one forward: where it read, and from which channels.
 
-    ``context`` ``(n_ctx, PATCH_SIZE, N_INPUT_FEATURES)`` normalized; ``overrides`` the
-    announced doses as ``inference.predict`` takes them ({0: carb, 1: insulin, 2: exercise}
-    → normalized).  ``mask_spans=None`` is the trailing forecast span alone; ``span=None``
-    the trailing span of the set.  Every index returned is in WINDOW coordinates over the
-    ``n_ctx + PREDICTION_PATCHES`` window; ``window_offset`` is the shift onto the caller's
-    own axis, non-zero only once an autoregressive roll has slid the context.
-    Raises ``ValueError`` when ``span`` owns no valid head slot — nothing was predicted there.
+    ``mask_spans=None`` is the trailing forecast span, ``span=None`` its last span; indices
+    are window coords over ``n_ctx + PREDICTION_PATCHES``; raises ``ValueError`` if empty.
     """
     n_ctx = int(context.shape[0])
     spans = _resolve_mask_spans(mask_spans, n_ctx)
-    # ``spans[-1]``, never a restated ``(n_ctx, PREDICTION_PATCHES)``: the trailing span may
-    # start before ``n_ctx``, and the restated pair would miss its left half.
+    # spans[-1], never a restated (n_ctx, PREDICTION_PATCHES): it may start before n_ctx.
     target_span = (spans[-1] if span is None else (int(span[0]), int(span[1])))
 
     with capture_attention(model) as captured:
@@ -198,16 +181,13 @@ def explain(
     where = rollout(head_mean)[rows].mean(dim=0)
     per_layer = torch.stack([layer[rows].mean(dim=0) for layer in head_mean])
 
-    # One scalar to differentiate: this span's median risk.  Its slots share one anchor, so
-    # the pool is the span's own trajectory, not a mixture across spans.
+    # One scalar to differentiate: this span's median risk, pooled over its own slots only.
     patches = out['patches']
     target = out['median'][sel].mean()
     anchor_patch, anchor_live, anchor_const = _anchor_term(
         patches, out, normalization_stats,
     )
-    # ``anchor_live - anchor_const`` is 0 in VALUE and carries the anchor cell's gradient:
-    # restores the persistence path without moving the scalar being differentiated.
-    # Checked on this span's slots alone — another span's clamped anchor says nothing here.
+    # anchor_live - anchor_const is 0 in value, carries the anchor's gradient (this span only).
     anchor_in_graph = bool(torch.allclose(
         anchor_live[sel].detach(), anchor_const[sel],
         rtol=0, atol=_ANCHOR_RECONSTRUCT_ATOL,
@@ -236,19 +216,15 @@ def explain(
     )
 
 
-# Ink floor for the attention ramp, as a multiple of an even share.  Three decades, not two:
-# a trained model discounts a masked patch ~100-fold, and a floor at 1/100 of a share renders
-# exactly that residue as nothing.
+# Ink floor: three decades, since a trained model discounts a masked patch ~100-fold.
 _SHARE_RAMP_FLOOR = 0.001
 
 
 def share_ramp(mass: np.ndarray, lo: int, hi: int) -> np.ndarray:
-    """Map an attention row onto [0, 1] by its multiple of an even share.
+    """Map an attention row onto [0, 1] by its multiple of an even share, logarithmically.
 
-    The reference is ``1/T``, not zero, and the ramp is logarithmic in that multiple: the row
-    spans decades, and a linear ramp renders most of the window identically black.
-    ``mass`` ``(T,)`` sums to 1; ``[lo, hi)`` are the visible patches, which set the top of
-    the scale — never below an even share, however dark the view.
+    ``mass`` ``(T,)`` sums to 1; ``[lo, hi)`` are the visible patches, setting the scale's top —
+    never below an even share. Reference is ``1/T``, not zero; a linear ramp reads as black.
     """
     n = int(mass.shape[0])
     if n == 0:
@@ -267,9 +243,8 @@ def share_ramp(mass: np.ndarray, lo: int, hi: int) -> np.ndarray:
 def signed_ramp(values: np.ndarray, scale: float) -> np.ndarray:
     """Map signed saliency onto [-1, 1]; ``scale`` is the magnitude mapping to ±1, beyond it clips.
 
-    Channels must share one scale for "which channel" to be readable, but BG outweighs the
-    sparse dose rows enough that a linear ramp renders them blank; the square root keeps the
-    ordering and the sign while lifting them into view.
+    Channels share one scale so "which channel" stays comparable; BG outweighs the sparse dose
+    rows enough that a linear ramp goes blank, so the square root keeps sign while lifting them.
     """
     if scale <= 0:
         return np.zeros_like(values)

@@ -1,11 +1,11 @@
 # pyright: reportPossiblyUnboundVariable=false
-# every ``pygame`` reference is runtime-guarded by ``PYGAME_AVAILABLE``; pyright can't follow it
+
+# every pygame reference is runtime-guarded by PYGAME_AVAILABLE; pyright can't follow it
 """Input widgets for ``gui.py``: sliders, buttons, toggles, modals.
 
 Each widget draws itself and consumes a pygame event, ``handle_event`` returning True when it
-took one.  pygame is imported in a try/except so the module loads headless; ``PYGAME_AVAILABLE``
-is the gate every widget checks before touching a pygame API.
-"""
+took one. pygame imports in a try/except so the module loads headless; ``PYGAME_AVAILABLE``
+gates every widget's pygame calls."""
 
 import math
 import numpy as np
@@ -250,10 +250,9 @@ MODAL_CLOSE_HOVER = (180, 80, 90)
 class ModalWindow:
     """Centered floating panel with a dimmed backdrop and exclusive event capture.
 
-    The host draws it once per frame AFTER all other UI and routes events through it BEFORE
-    any background widget, so the modal can swallow them.  ``body_rect`` is in SCREEN
-    coordinates and the host may resize between frames, so ``_layout_body`` runs every frame.
-    """
+    Host draws it once per frame AFTER other UI, routes events through it BEFORE background
+    widgets. ``body_rect`` is in SCREEN coordinates; host may resize between frames, so
+    ``_layout_body`` runs every frame."""
 
     TITLE_BAR_H = ui_px(34)
     PAD = ui_px(14)
@@ -508,8 +507,7 @@ class HelpWindow(ModalWindow):
             )
 
 
-# Per event kind, in slider order, time offset first:
-# (attr_name, label, lo, hi, default, step, fmt); attr_name is the ``gui_state.Event`` field.
+# Per kind, slider order: (attr_name,label,lo,hi,default,step,fmt); attr_name = Event field
 EVENT_SLIDER_SPECS: dict[str, list[tuple]] = {
     'juice': [
         ('time_offset_min', "Time (min)", -30, 360,  0, 5, "{:+.0f}m"),

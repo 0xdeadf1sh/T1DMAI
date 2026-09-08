@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
-"""Cross-model comparison over the trained checkpoints under ``models/``.
+"""Cross-model comparison over the trained checkpoints under ``models/``: figures and JSON.
 
-Writes high-resolution figures and machine-readable JSON; no markdown.
-
-Two reporting bases, NOT interchangeable.  ``median_line`` is the genuine point forecast
-``f_inv(median)`` and the headline basis here — RMSE, MAE, MARD, Clarke, skill.  Band-scored is
-``pred_eff = clip(true, q_lo, q_hi)``: zero error wherever the truth falls inside the 50% band,
-a band-geometry diagnostic and not a point forecast.  Every emitted record carries a ``basis``
-field and every accessor is named for the basis it reads.  CG-EGA and hypo/hyper detection have
-no median-line counterpart and are reported band-scored, labelled so.
-
-Palette and chrome come from ``metrics/figstyle.py``, the single copy; one hue job per figure —
-capacity rides the ordinal blue ladder, the evaluation source keeps its categorical hue.
-
-    python compare.py [--out DIR]
+``median_line`` vs band-scored are NOT interchangeable — see each record's ``basis`` field.
+python compare.py [--out DIR]
 """
 from __future__ import annotations
 
@@ -28,8 +17,7 @@ from typing import Any
 import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-# One directory per capacity. The GUI discovers its checkpoint from the same root — a second
-# root is how the two start disagreeing about which checkpoint "medium" names.
+# One directory per capacity: a second root is how this and the GUI disagree about "medium".
 MODEL_ROOT = os.path.join(ROOT, 'models')
 
 sys.path.insert(0, os.path.join(ROOT, 'metrics'))
@@ -40,8 +28,7 @@ from matplotlib.lines import Line2D                                      # noqa:
 from matplotlib.patches import Patch                                     # noqa: E402
 
 SIZES = ('nano', 'small', 'medium')
-# Tuples rather than inlined, though each holds one entry: every figure iterates them, so a
-# second source is one edit instead of a loop re-threaded through forty call sites.
+# Tuples, not inlined, though each holds one entry: one edit here instead of forty call sites.
 VARIANTS = ('sim',)
 COHORTS = ('sim',)
 HORIZONS = ('30', '60', '120')
@@ -250,16 +237,14 @@ def dump(obj: Any, name: str) -> str:
     return path
 
 
-# INCHES, not figure fractions: the fonts are in points, so a fractional offset that clears the
-# title on a tall figure collides with it on a short one.
+# INCHES, not figure fractions: a fractional offset clears a tall title, collides on a short one.
 HEADER_IN = 0.86          # reserved band above the panels
 TITLE_IN = 0.17           # title baseline, from the top edge
 SUBTITLE_IN = 0.42        # subtitle baseline, from the top edge
 LEGEND_IN = 0.13          # legend top, from the top edge
 
 
-# Below this width the title and the legend cannot share a line: the legend drops under the
-# subtitle and the reserved band grows to hold it.
+# Below this width title and legend can't share a line: legend drops under subtitle, band grows.
 NARROW_IN = 11.0
 MIN_FIG_IN = 8.0          # floor on figure width, so a title has room to sit
 
@@ -912,9 +897,8 @@ def fig_whatif_quality(M: dict) -> None:
 def _empty_future_probed(M: dict) -> bool:
     """Did any run actually probe the empty-future arm?
 
-    It needs raw carb/bolus EVENTS to strip and a simulator segment carries pre-resolved
-    channels only, so ``whatif.run`` marks both arms ``not_probed``.  Drawing the figure anyway
-    ships three "no data" panels, which read as a measured zero.
+    A simulator segment carries pre-resolved channels only, so ``whatif.run`` marks both arms
+    ``not_probed``; drawing the figure anyway ships three "no data" panels as a measured zero.
     """
     for size in SIZES:
         for v in VARIANTS:

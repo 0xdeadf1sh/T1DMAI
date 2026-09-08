@@ -1,8 +1,7 @@
 """The exported ``HeadRawForward`` wrapper and the head side file, RUN against the real model.
 
-A stale block call raises only when the wrapper is CALLED and a stale reading position
-never raises at all, so every test here executes it. Lowering, serialization and on-device
-numerics are NOT covered.
+A stale reading position never raises, so every test here executes the wrapper. Lowering,
+serialization and on-device numerics are NOT covered.
 """
 
 import pytest
@@ -17,8 +16,7 @@ from exporters.modified_forward import NEG_FILL, HeadRawForward, build_struct_ma
 from model import T1DMAI
 from utils import create_attention_mask, step_states
 
-# the export's one fixed shape: context left-padded into MAX_CONTEXT_PATCHES slots,
-# prediction patches at the right edge
+# The export's fixed shape: context left-padded into MAX_CONTEXT_PATCHES, prediction at the edge.
 T = cfg.MAX_SEQ_LEN
 C = cfg.MAX_CONTEXT_PATCHES
 P = cfg.PREDICTION_PATCHES

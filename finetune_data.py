@@ -1,37 +1,8 @@
-"""MetaboNet + DiaData merge into a finetuning cache, and the gap-aware datasets over it.
+"""MetaboNet + DiaData merge into a finetuning cache; gap-aware datasets over it.
 
-Cache build (``python finetune_data.py build``): streams ``metabonet/train.parquet``,
-``metabonet/test.parquet`` and the DiaData MDB 5-min raw CSV inside
-``metabonet/archive.zip`` into four flat float32 channel files (``bg.bin``,
-``carb.bin``, ``insulin.bin``, ``exercise.bin``) plus ``index.json``. One subject =
-one contiguous 5-minute-grid slice; bg keeps NaN at CGM gaps; the dose columns are
-event-to-curve expansions per ``T1DMCOMMON/SPEC/invariants.md`` §5:
-
-- carbs: GI-50 gamma (k 3.25, theta 22.5, 292.5 min)
-- bolus: T1DMSIM gamma family via ``bolus_pk_for_dose`` with the recorded analogue's
-  ``BOLUS_VARIANTS`` parameters
-- pump basal (AID/SAP): per-slot deliveries convolved with the analogue's unit rapid
-  kernel; rows where only ``insulin`` is recorded route there too
-- MDI basal: per-injection Bateman ``basal_curve`` with ``BASAL_VARIANTS`` rates
-- workouts: duration x 0.5 g/min, gamma k 3 theta 15, duration + 90 min
-
-DiaData sources duplicating MetaboNet studies (RBG, DLCP3, PEDAP, HUPA-UCM,
-ShanghaiT1D) are dropped — same subjects, and their MetaboNet test periods would leak
-into training. The rest carry bg only; dose channels stay zero.
-
-A subject split across train/test keeps ONE joined timeline with ``test_start`` in the
-index; a training window must end before it, an eval origin sit at or after it.
-
-``_normalize_features`` is a sixth inline site of the per-channel forward transform
-(see T1DMAI/CLAUDE.md, *Transform sites*): it branches on ``RISK_SPACE_CHANNELS`` /
-``SPARSE_LOG1P_CHANNELS`` exactly as ``data._build_sample`` does. Gap handling: a patch
-with any missing bg step (after optional interpolation of gaps <= ``max_interp_steps``)
-is masked — bit set, attention-blocked, NO head slot — so the loss never sees it;
-supervised spans are sampled over fully measured patches with measured neighbours,
-where a single-step gap rescued by interpolation counts as measured.
-``finetune_collate_fn`` therefore derives the attention mask from the sample's full
-masked set, not from ``mask_idx`` alone.
-"""
+``python finetune_data.py build`` writes bg/carb/insulin/exercise channels via the
+event-to-curve rules of ``T1DMCOMMON/SPEC/invariants.md`` §5; a gap masks the head
+slot, never the loss. ``_normalize_features`` mirrors ``data._build_sample``'s transform."""
 
 import argparse
 import io
@@ -43,10 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 
-# BEFORE any ``from config import``: a DataLoader worker (forkserver) imports
-# this module fresh, so finetune.py's in-process checkpoint-dims patch never
-# reaches it — the parent serializes the patch into the environment and every
-# import of this module replays it first. Idempotent in the parent.
+# Env-patches config before ``from config import``: forkserver workers reimport this module fresh.
 import config as _config
 _PATCH_ENV = 'T1DMAI_FINETUNE_CONFIG_PATCH'
 if os.environ.get(_PATCH_ENV):
@@ -74,23 +42,16 @@ CACHE_CHANNELS = ('bg', 'carb', 'insulin', 'exercise', 'is_test')
 CHANNEL_DTYPES = {c: np.float32 for c in CACHE_CHANNELS} | {'is_test': np.uint8}
 CACHE_VERSION = 'finetune-cache-v2'
 
-# Data-entry caps: a 5-min carb row above this is an entry error, not a meal
-# (train.parquet max 855 g), and a workout row above this is not a session
-# (max 8218 min; unbounded it peaks the disposal curve at 367 g/step, z=+32).
+# Carb entry error above this, not a meal (train.parquet max 855 g).
 CARB_EVENT_MAX_G = 300.0
+# Workout row above this isn't a session (max 8218 min; unbounded peaks at 367 g/step, z=+32).
 EXERCISE_SESSION_MAX_MIN = 240.0
-# Workout rows closer than this to the previous bout's end join one session:
-# T1D-UOM logs per-bout wearable activity (~14 isolated rows/day), and per-row
-# expansion made its disposal channel 40x every other source's.
+# Bouts within this of the prior bout's end join one session, else disposal runs 40x too high.
 EXERCISE_SESSION_JOIN_MIN = 30.0
-# An "MDI" basal row below this is a per-slot pump-style rate, not an injection
-# (HUPA-UCM records 0.02-0.15 U slots under the MDI label); at or above it, a
-# long-acting injection. Merged-insulin-only rows at or above the same bound are
-# boluses and take the dose-scaled bolus PK rather than the unit basal kernel.
+# Below this, an MDI-labeled row is a per-slot pump rate; at/above, a long-acting injection.
 MDI_INJECTION_MIN_U = 1.5
 
-# Curves ramp from an empty pre-record dose history, so a subject's first two
-# days carry no residual IOB; training windows start past them when room allows.
+# No residual IOB in the first two days (empty pre-record history); windows start past them.
 LEAD_IN_STEPS = 48 * 60 // DT_MINUTES
 
 EVAL_GAP_BUDGET = 0.2  # gap-patch cap over the trailing MIN_CONTEXT_PATCHES
@@ -173,10 +134,8 @@ def _events_to_curves(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(carb_curve, insulin_curve, exercise_curve), each (n,) float32 amount/step.
 
-    ``is_mdi`` is PER ROW — ShanghaiT1DM subjects mix MDI injections with pump
-    slots in one record, and a 20 U injection through the 4 h rapid kernel peaks
-    10x too high while reconciling against every daily total.
-    """
+    ``is_mdi`` is PER ROW: ShanghaiT1DM mixes MDI injections with pump slots in one
+    record; a 20 U injection through the rapid kernel would peak 10x too high."""
     carb_out = np.zeros(n, dtype=np.float64)
     ins_out = np.zeros(n, dtype=np.float64)
     ex_out = np.zeros(n, dtype=np.float64)
@@ -196,9 +155,7 @@ def _events_to_curves(
 
     b = np.nan_to_num(basal)
     av = basal_variant(basal_type)
-    # Injection = MDI label AND injection-sized dose. Label alone misroutes the
-    # HUPA-UCM per-slot rates through a 26 h Bateman each, spreading the same
-    # units twice; magnitude alone misroutes a pump's priming bolus.
+    # Both MDI label and dose size required: label alone double-spreads HUPA-UCM per-slot rates.
     inj = (b >= MDI_INJECTION_MIN_U) & is_mdi
     for j in np.flatnonzero(inj):
         _add_curve(
@@ -210,8 +167,7 @@ def _events_to_curves(
     basal_slot = np.zeros(n, dtype=np.float64)
     sel = (b > 0.0) & ~inj
     np.add.at(basal_slot, idx[sel], b[sel])
-    # Rows carrying only the merged ``insulin`` column: injection-sized impulses
-    # take the dose-scaled bolus PK, the rest per-slot pump delivery.
+    # Merged-``insulin``-only rows: injection-sized doses take bolus PK, rest per-slot pump.
     only_total = np.isnan(basal) & np.isnan(bolus) & (np.nan_to_num(insulin) > 0.0)
     for j in np.flatnonzero(only_total & (np.nan_to_num(insulin) >= MDI_INJECTION_MIN_U)):
         k, theta, dur = bolus_pk_for_dose(
@@ -224,9 +180,7 @@ def _events_to_curves(
                            bv['dia_base_hours'] * 60.0)
         ins_out += np.convolve(basal_slot, kern)[:n]
 
-    # Bouts joined into sessions before the gamma: idx is sorted, so a bout
-    # starting within EXERCISE_SESSION_JOIN_MIN of the running session's end
-    # extends it; each session then spreads per SPEC §5.
+    # Bouts joined into sessions (idx sorted) before the gamma spread, per SPEC §5.
     sessions: list[list[float]] = []  # [start_slot, duration_min, end_min]
     for j in np.flatnonzero(np.nan_to_num(workout) > 0.0):
         t_min = float(idx[j]) * DT_MINUTES
@@ -312,13 +266,11 @@ def _process_metabonet_subject(
         bolus_type, basal_type,
     )
 
-    # Per-STEP test flag: some CTR3 subjects interleave train and test rows in
-    # time, so a single boundary index cannot say which rows are scoreable.
+    # Per-step test flag: CTR3 rows interleave train/test; one boundary index can't say which.
     is_test_grid = np.zeros(n, dtype=np.uint8)
     trow = cols['is_test'].astype(bool)
     is_test_grid[idx[trow]] = 1
-    # Off the SORTED grid: chunk heads are ordered only while the parquet is,
-    # and train.parquet's ShanghaiT1DM blocks already violate that.
+    # Off the sorted grid: parquet chunk order isn't preserved; ShanghaiT1DM blocks violate it.
     test_start = int(idx[trow].min()) if trow.any() else -1
 
     start = app.append({'bg': bg, 'carb': carb, 'insulin': ins, 'exercise': ex,
@@ -342,10 +294,8 @@ def _collect_parquet(path: str, keep: dict[tuple[str, str], dict] | None,
                      is_test: bool) -> None:
     """Stream a MetaboNet parquet grouped by contiguous source blocks.
 
-    ``keep`` not None: accumulate every subject into it (test pass, held in RAM).
-    ``on_source_end(source, subjects)``: called per finished source (train pass).
-    ``is_test`` stamps every collected row's is_test flag.
-    """
+    ``keep``: accumulate every subject (test pass, in RAM). ``on_source_end(source,
+    subjects)``: called per finished source (train pass). ``is_test`` stamps each row."""
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(path)
     cur_source: str | None = None
@@ -366,8 +316,7 @@ def _collect_parquet(path: str, keep: dict[tuple[str, str], dict] | None,
             dtype=bool, na_value=False).astype(np.uint8)
         srcs = df['source_file'].to_numpy(dtype=object)
         ids = df['id'].to_numpy(dtype=object)
-        # \x1f, not \x00: a trailing NUL is silently stripped by the <U dtype,
-        # which would let ('Loop','2x') and ('Loop2','x') share one block.
+        # \x1f not \x00: <U dtype strips trailing NUL, so ('Loop','2x')/('Loop2','x') would collide.
         group_key = np.char.add(np.char.add(srcs.astype(str), '\x1f'), ids.astype(str))
         boundaries = np.flatnonzero(group_key[1:] != group_key[:-1]) + 1
         starts = np.concatenate([[0], boundaries])
@@ -532,10 +481,6 @@ def fit_cache_stats(cache_dir: str) -> None:
     save_normalization_stats(stats, os.path.join(cache_dir, 'normalization_stats.json'))
 
 
-# ---------------------------------------------------------------------------
-# Datasets over the cache
-# ---------------------------------------------------------------------------
-
 class FinetuneCache:
     """Memmapped view of a built cache. Opened lazily so DataLoader forks re-open."""
 
@@ -551,8 +496,7 @@ class FinetuneCache:
         self._mm: dict[str, np.memmap] | None = None
 
     def __getstate__(self) -> dict[str, Any]:
-        # A memmap pickles as a MATERIALIZED ndarray — the whole channel file per
-        # worker. Drop the handles; each DataLoader worker re-opens lazily.
+        # memmap pickles as a materialized ndarray (whole file); drop handles, re-open lazily.
         return {**self.__dict__, '_mm': None}
 
     def _maps(self) -> dict[str, np.memmap]:
@@ -578,23 +522,16 @@ class FinetuneCache:
 _STATS_CHANNEL = dict(zip(CHANNEL_NAMES, ('bg', 'carb', 'insulin', 'exercise')))
 STATS_FIT_WINDOWS = 2000
 STATS_FIT_SEED = 0
-# Floor on a sparse channel's fitted std: near-always-zero data fits a std that
-# sends one real event to z > +40. The floor caps the channel's own cache-wide
-# maximum at this many sigma.
+# Std floor: near-zero data else pushes one event past z=+40; caps channel max at this sigma.
 STATS_SPARSE_Z_MAX = 12.0
 
 
 def compute_cache_stats(cache: 'FinetuneCache') -> dict[str, dict[str, float]]:
     """Per-channel mean/std fit over SAMPLER-DRAWN training windows.
 
-    A raw-step fit weighs each source by its row count — 43% of the cache's
-    steps are DiaData zero-dose rows against the sampler's ~20% draw — so the
-    fit replays the training draw law itself (STATS_FIT_WINDOWS windows at the
-    default pool/source/gap knobs) and pools their steps. Space per channel is
-    ``_normalize_features``'s: bg as ``kovatchev_f`` of the clamped MEASURED
-    steps (gaps excluded), the sparse three as log1p, zeros included.
-    Test-period steps never enter (windows end before ``test_start``).
-    """
+    Raw-step fit overweighs DiaData (43% of steps vs ~20% sampler draw), so this
+    replays the training draw law (STATS_FIT_WINDOWS windows) and pools steps in
+    ``_normalize_features`` space; test-period steps never enter."""
     ds = FinetuneTrainDataset(cache, stats=None, seed=STATS_FIT_SEED,
                               total_steps=1, batch_size=1)
     rng = np.random.default_rng(STATS_FIT_SEED)
@@ -710,14 +647,9 @@ def _assemble_sample(feats: np.ndarray, bg: np.ndarray, spans: list[tuple[int, i
 class FinetuneTrainDataset(torch.utils.data.Dataset):
     """Tempered-source sampling over the cache's train-period steps.
 
-    Draw per index: pool (diadata with prob ``diadata_frac``), source with
-    ``p ∝ n_subjects^source_alpha`` within the pool, subject uniform, window
-    rejection-sampled under the gap budget. Window rejection retries WITHIN the
-    drawn (pool, source) — redrawing the whole chain would reweight the mixture
-    by each source's CGM density — and a subject that cannot yield any window
-    under the budget (ShanghaiT1DM's 15-min CGM sub-grid, most of RT-CGM) is
-    excluded up front and logged. Deterministic in ``(seed, idx)``.
-    """
+    Draw per index: pool (diadata w.p. ``diadata_frac``), source ``p ∝
+    n_subjects^source_alpha``, subject uniform, window rejection-sampled under the
+    gap budget, retried WITHIN the drawn (pool, source). Deterministic in ``(seed, idx)``."""
 
     def __init__(self, cache: FinetuneCache, stats: dict[str, dict[str, float]] | None,
                  seed: int, total_steps: int, batch_size: int,
@@ -741,8 +673,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
             tl = cache.train_len(rec)
             if tl < min_len:
                 continue
-            # Some minimum-length window must clear the gap budget, or every
-            # draw on this subject rejects and the retry loop pays for it.
+            # Some min-length window must clear the gap budget, else every draw here retries.
             bg = _interp_short_gaps(
                 np.asarray(cache.channels(rec, 0, tl)['bg'], dtype=np.float32),
                 max_interp_steps)
@@ -826,8 +757,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
             np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
             carb, ch['insulin'], ch['exercise'], self.stats)
         sample = _assemble_sample(feats, bg, spans, gap_patches, seq_len, n_ctx)
-        # True hour of day per head slot, for the time-probe CE: slot j reads
-        # patch mask_idx[j], whose first step sits at start + mask_idx[j]*PATCH_SIZE.
+        # Time-probe hour/slot: slot j reads patch mask_idx[j], step start+mask_idx[j]*PATCH_SIZE.
         abs_s = int(rec['t0']) + (start + sample['mask_idx'] * PATCH_SIZE) * STEP_S
         sample['slot_hour'] = ((abs_s % 86400) / 3600.0).astype(np.float32)
         return sample
@@ -840,8 +770,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
             names, p = self.pool_sources[pool]
             source = names[int(rng.choice(len(names), p=p))]
             subs = self.subjects_by_source[(pool, source)]
-            # Retries stay inside the drawn (pool, source): a global redraw
-            # would hand sparse sources' share to dense ones.
+            # Retries stay inside the drawn (pool, source): a global redraw favors dense sources.
             for _ in range(32):
                 rec = self.cache.subjects[subs[int(rng.integers(len(subs)))]]
                 s = self._draw_window(rng, rec, raw=raw)
@@ -903,19 +832,9 @@ def build_eval_windows(cache: FinetuneCache, n_windows: int,
                        seed: int) -> list[tuple[int, int]]:
     """(subject_index, origin_step) pairs over the test-period steps.
 
-    An origin must: be a test-flagged step (``is_test`` — for the CTR3 subjects
-    whose train and test rows interleave in time, ``test_start`` alone would score
-    train rows); have >= MIN_CONTEXT_PATCHES * PATCH_SIZE of history (the model's
-    context floor); have its ANCHOR PATCH — the six steps before it — fully
-    measured (the anchor and the span's left spline node must come from a visible
-    patch); have measured truth at >= 1 of the four horizon steps; and carry at
-    most EVAL_GAP_BUDGET gap patches over the trailing MIN_CONTEXT_PATCHES
-    patches. Sampled uniformly over the candidates. A leaderboard template scores
-    more rows than these filters admit — post-gap and short-history origins are
-    deliberately excluded here, so this metric is for selection, not submission.
-    The window's patch grid is relative to its own start, so origins need no
-    patch alignment.
-    """
+    Origin must: be ``is_test``-flagged, have >= MIN_CONTEXT_PATCHES history with
+    its anchor patch fully measured, truth at >= 1 of the four horizon steps, and
+    clear EVAL_GAP_BUDGET over trailing context. Stricter than the leaderboard template."""
     assert n_windows > 0, 'n_windows must be positive (0 would score millions)'
     cands_subj: list[np.ndarray] = []
     cands_step: list[np.ndarray] = []
@@ -940,10 +859,7 @@ def build_eval_windows(cache: FinetuneCache, n_windows: int,
         for hs in HORIZON_STEPS:
             any_target |= finite[origins + hs]
         keep &= any_target
-        # Gap budget over the trailing MIN_CONTEXT_PATCHES patches at each
-        # origin's own phase: patch k back covers steps o-6k..o-6k+5, so the
-        # positions share o's residue mod PATCH_SIZE — count fin6 along each
-        # residue chain by prefix sum.
+        # Gap budget per phase: patch k covers o-6k..o-6k+5; count fin6 by residue prefix sum.
         gap_ok = np.zeros(len(origins), dtype=bool)
         fin6_i = fin6.astype(np.int64)
         for r in range(PATCH_SIZE):
@@ -1006,9 +922,7 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
         feats = _normalize_features(
             np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
             carb, ch['insulin'], ch['exercise'], self.stats)
-        # Zone gaps filled so the (unused) targets stay finite; context keeps its
-        # NaNs so the last-visible/anchor reads stay honest. The zone's bg input is
-        # withheld by the masked span either way; metrics score ``true_bg_horizon``.
+        # Zone gaps filled so targets stay finite; context keeps NaNs for honest anchor reads.
         bg_for_sample = bg.copy()
         zone_lo = n_ctx * PATCH_SIZE
         bg_for_sample[zone_lo:] = np.nan_to_num(bg[zone_lo:], nan=_BG_GAP_FILL_MGDL)

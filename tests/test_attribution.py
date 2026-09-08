@@ -1,12 +1,8 @@
 """Tests for attribution.py — the attention tap, the rollout, the saliency fold.
 
-The whole module is read-only diagnostics, so the load-bearing property is that
-it changes nothing: arming the tap must leave the forward bit-identical, and the
-grad-enabled build must produce the same numbers as the ``no_grad`` one.  The
-rest pins the maths — the tap reproduces what SDPA computes internally, the
-attention mask's blocks survive into the captured weights, and the step-major
-stride fold matches an explicit per-column loop.
-"""
+Read-only diagnostics: the load-bearing property is that arming the tap changes
+nothing — forward stays bit-identical, grad-enabled matches ``no_grad``. The rest
+pins the maths: tap vs SDPA, mask blocks in captured weights, stride-fold vs loop."""
 
 import numpy as np
 import pytest
@@ -17,13 +13,9 @@ import torch.nn.functional as F
 def _make_context(n_ctx: int | None = None, flat_bg: bool = False) -> torch.Tensor:
     """Random normalized context with a slow, in-band bg trajectory.
 
-    bg (feat 0) is NOT held at z=0. A channel pinned at its normalized mean has a
-    saliency column of exactly zero whatever the gradient is — ``grad ⊙ input``
-    with a zero input — so a z=0 bg fixture would run every attribution test with
-    the channel that matters most silently dead. The sinusoid stays well inside
-    the risk band, so the anchor's ``f_inv`` round trip never clamps.
-    ``flat_bg=True`` asks for the degenerate case on purpose.
-    """
+    bg (feat 0) is NOT held at z=0: a channel at its mean has zero saliency
+    (``grad ⊙ input`` with zero input), silently killing the channel that matters
+    most. ``flat_bg=True`` asks for that degenerate case on purpose."""
     from config import PATCH_SIZE, N_INPUT_FEATURES, MIN_CONTEXT_PATCHES
     if n_ctx is None:
         n_ctx = MIN_CONTEXT_PATCHES
@@ -90,8 +82,7 @@ def test_captured_weights_are_row_stochastic_and_respect_the_mask():
         layers = [calls[0].detach().clone() for calls in captured]
 
     assert len(layers) == len(model.blocks)
-    # Rebuild the same mask the forward used: visible everywhere but the masked
-    # set, no padding on the inference path.
+    # Rebuild the forward's mask: visible everywhere but the masked set, no padding on inference.
     visible = torch.ones(1, n_ctx + PREDICTION_PATCHES, dtype=torch.bool)
     for start, length in spans:
         visible[0, start:start + length] = False
@@ -203,8 +194,7 @@ def test_channel_saliency_folds_the_step_major_stride():
             expected[:, feat] += grad[:, col] * patches[:, col]
     torch.testing.assert_close(saliency, expected, rtol=1e-6, atol=1e-6)
 
-    # Feat 4 is an announcement, not a channel: moving it alone must not move
-    # any saliency column.
+    # Feat 4 is an announcement, not a channel; moving it alone must not move any saliency column.
     from data import BG_MASKED_FEAT
     bumped = grad.clone()
     bumped[:, BG_MASKED_FEAT::N_INPUT_FEATURES] += 100.0
@@ -262,13 +252,9 @@ def test_explain_reads_an_interior_span():
 def test_bg_saliency_matches_the_true_response_of_the_forecast():
     """The BG column is the forecast's real sensitivity, anchor included.
 
-    A masked span's median is ``f(anchor) + delta`` and the anchor is most of it,
-    but ``model.forward`` detaches it and ``inference`` builds it from
-    ``context`` rather than from the ``patches`` leaf. Without the anchor term
-    restored this column reports the head's delta alone — and its SIGN disagrees
-    with the forecast's actual response on most patients. A finite difference is
-    the only check that catches that, so this is the gate on it.
-    """
+    median = ``f(anchor) + delta``, but forward detaches the anchor; unrestored,
+    this column is delta alone, whose SIGN disagrees with the forecast's actual
+    response on most patients — a finite difference is the only check that catches it."""
     from attribution import explain
     from inference import _resolve_mask_spans, _run_forward, PREDICTION_PATCHES
 
@@ -386,11 +372,9 @@ def test_return_rolls_records_every_forward_without_changing_one():
 def test_roll_windows_slide_with_the_saturated_context():
     """Once the context is at its cap every roll's window slides, and says so.
 
-    A roll past saturation no longer starts at the caller's patch 0, so its
-    ``offset`` is the only thing that puts its maps under the right stretch of
-    trace. Below the cap the offset stays 0 and this never fires, which is why
-    the fixture starts saturated.
-    """
+    Past saturation a roll no longer starts at the caller's patch 0, so ``offset``
+    is the only thing that puts its maps under the right trace stretch. Below the
+    cap offset stays 0 and this never fires — why the fixture starts saturated."""
     from inference import predict_rolling, PREDICTION_PATCHES
     from config import MAX_CONTEXT_PATCHES
 
@@ -430,8 +414,7 @@ def test_explain_reads_one_roll_of_a_rolling_forecast():
         assert result.span == (n_ctx, PREDICTION_PATCHES)
         assert result.window_offset == entry['offset']
         assert result.where.shape == (n_ctx + PREDICTION_PATCHES,)
-        # Where the maps land once the offset is applied: this roll's own
-        # prediction zone, in the caller's patch numbering.
+        # Where maps land once offset applies: this roll's zone, caller's patch numbering.
         absolute_start = result.span[0] + result.window_offset
         assert absolute_start == int(context.shape[0]) + k * PREDICTION_PATCHES
 
@@ -456,12 +439,9 @@ def test_window_offset_is_bookkeeping_only():
 def test_masked_patches_are_reported_as_withheld_not_as_zero():
     """A masked patch carries no BG to attribute, and the result must say so.
 
-    The builder writes a literal 0.0 into feat 0 there, so ``grad ⊙ input`` is
-    zero whatever the gradient is. Drawn as a zero contribution that reads as
-    "the model ignores this patch", which is the opposite of true — the mask bit
-    is set and the model plainly conditions on it. ``masked_patches`` is what
-    lets a reader tell the two apart.
-    """
+    feat 0 there is a literal 0.0, so saliency reads zero — "ignored", the opposite
+    of true: the mask bit is set and the model conditions on it. ``masked_patches``
+    is what lets a reader tell the two apart."""
     from attribution import explain
     from inference import PREDICTION_PATCHES
 
@@ -508,11 +488,9 @@ def test_attention_to_a_masked_patch_survives_the_ink_floor():
 def test_share_ramp_shows_the_window_below_an_even_share():
     """The ramp must not collapse everything under an even share to one value.
 
-    That is what a linear ramp on the excess does, and on a composed attention
-    row roughly nine patches in ten sit at or below their share — so the whole
-    of that would render identically black and the strip would show only the
-    handful of peaks.
-    """
+    A linear ramp on the excess does exactly that, and ~9 patches in 10 on a
+    composed row sit at or below their share — rendering identically black and
+    showing only the handful of peaks."""
     from attribution import share_ramp
 
     T = 200
@@ -540,8 +518,7 @@ def test_share_ramp_keeps_an_even_share_on_scale():
     mass[0] = 10.0 / T
     mass /= mass.sum()
 
-    # A view over the faint tail alone: the top of the scale stays at an even
-    # share rather than dropping to the tail's own peak.
+    # Tail view: the scale's top stays at an even share, not the tail's own peak.
     tail = share_ramp(mass, 50, T)
     full = share_ramp(mass, 0, T)
     assert tail[60] < 1.0

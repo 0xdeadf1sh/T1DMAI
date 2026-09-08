@@ -1,13 +1,7 @@
-"""The exact ``d`` histogram of the masked-BG sampler.
+"""The exact ``d`` histogram of the masked-BG sampler; both placement branches enumerated.
 
-``d``: a masked patch's distance in patches to the nearest visible evidence on
-either side; the only axis a masked-BG metric bins on.
-Both of ``data.sample_mask_spans``' placement branches are enumerated. Uniform
-placement alone leaves the deployed one-sided forecast case at ~3% of masked
-slots — what ``config.MASK_RIGHT_EDGE_QUOTA`` corrects. A sampler change not
-mirrored here moves every ``d``-binned figure's reference.
-``metrics.protocols.SAMPLER_REFERENCE`` is produced from this and checked
-against it. Tail POOLED: ``d = 1, 2, 3`` and ``d >= 4``.
+Feeds ``metrics.protocols.SAMPLER_REFERENCE``; a sampler change not mirrored here moves
+every ``d``-binned figure's reference. Tail POOLED: ``d = 1, 2, 3`` and ``d >= 4``.
 """
 
 from __future__ import annotations
@@ -65,10 +59,8 @@ def d_distribution(
 ) -> tuple[float, ...]:
     """Exact share of masked patches in each ``d`` group — ``N_D_GROUPS`` shares summing to 1.
 
-    Enumerated, not sampled: at 1e5 draws the per-position 1-sigma is ~0.99 % of
-    the mean, several times the effect measured.
-    Both branches draw ``n_spans`` and the lengths identically, so the right-edge
-    quota moves this histogram and nothing else.
+    Enumerated, not sampled: at 1e5 draws the per-position 1-sigma is ~0.99% of the mean. Both
+    branches draw ``n_spans`` and lengths identically, so the quota moves only this histogram.
     """
     vecs: list[tuple[float, tuple[int, ...]]] = []
     for n in range(1, max_spans + 1):

@@ -1,32 +1,7 @@
-"""Blind training loop — the UNCONDITIONED fork of ``train.py``.
-
-A masked patch withholds bg AND carb/insulin/exercise, which take
-``data.zero_dose_fill``'s per-channel ``normalize(0)``; ``train.py`` withholds bg alone
-and lets the announced doses ride through. Feat 4 announces the withholding under both.
-Architecture, loss, sampler, EMA and ``val_loss_total`` selection are identical, so the
-two runs' validation tables are directly comparable.
-
-NOT kept in sync with ``train.py``; nothing checks. The whole intended divergence:
-
-1. self-identification — this docstring, ``--help``, the resolved-config banner, the
-   validation table's subtitle;
-2. every ``T1DMDataset`` is ``blind=True``, train and val alike;
-3. the FORECAST and INFILL protocol forwards blind their own masked doses
-   (``data.blind_masked_doses``), so validation scores the trained task;
-4. no counterfactual probe — a blind model cannot see a dose perturbation, so every
-   ``cf_*`` row would read zero by construction;
-5. long-horizon rolling is UNCONDITIONED (no ``overrides_fn``): ``predict_rolling``'s
-   zero-RAW no-dose baseline IS this model's training distribution, so the conditioned
-   trainer's OOD-runaway concern does not apply;
-6. ``masked_channel_policy`` stamped ``'blind'`` into ``training_config`` and onto the
-   banner — ``calibrate_conformal.py`` refuses to mix it with a conditioned band fit;
-7. output goes to ``checkpoints_blind/`` and ``logs_blind/``, so a conditioned run may
-   be live in the same checkout.
-
-``diff train.py train_blind.py`` is the check: nothing outside the seven appears in it.
-
-fp32-native, no autocast. A non-finite loss or gradient norm skips the optimizer step and
-halves the momentum buffers rather than poisoning state (soft-DTW at low γ can still Inf).
+"""Blind training loop — unconditioned fork of train.py: masks bg AND doses together
+(data.zero_dose_fill), no counterfactual probe, unconditioned rolling, stamps
+masked_channel_policy='blind', writes to checkpoints_blind/logs_blind/. Not
+auto-synced with train.py — `diff train.py train_blind.py` is the check.
 """
 
 import argparse
@@ -79,21 +54,16 @@ from utils import (
 
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
-# q_tau sits on the ascending QUANTILE_LEVELS axis, index for index; these locate the
-# band edges the coverage and pinball diagnostics read.
+# q_tau's τ axis matches QUANTILE_LEVELS order, index for index.
 _TAU_LO_IDX = QUANTILE_LEVELS.index(0.05)
 _TAU_HI_IDX = QUANTILE_LEVELS.index(0.95)
 _TAU_INNER_LO_IDX = QUANTILE_LEVELS.index(0.25)
 _TAU_INNER_HI_IDX = QUANTILE_LEVELS.index(0.75)
-# Clinical hypo/hyper detection keys off the BAND EDGES, not the median: hypo off the
-# lower τ edge, hyper off the upper. Indices via .index of the config taus, never a literal.
+# Hypo/hyper detection keys off the band edges, not the median (hypo=lower τ, hyper=upper).
 _HYPO_BAND_IDX = QUANTILE_LEVELS.index(HYPO_ALARM_QUANTILE_TAU)
 _HYPER_BAND_IDX = QUANTILE_LEVELS.index(HYPER_ALARM_QUANTILE_TAU)
 
-# ``(base@30min, slope_per_30min, floor)`` — DISPLAY ONLY: row colour and Target text,
-# never the loss, the CSV or checkpoint selection, hence here and not config.py. The bar
-# declines with horizon: near-term detection is fixed by insulin-on-board, the far one is
-# information-limited.
+# (base@30min, slope_per_30min, floor) — display only, never the loss, CSV or selection.
 EXCURSION_TARGET_HYPO_RECALL = (90.0, 10.0, 50.0)
 EXCURSION_TARGET_HYPO_PRECISION = (75.0, 8.0, 45.0)
 EXCURSION_TARGET_HYPER_RECALL = (85.0, 8.0, 55.0)
@@ -116,10 +86,8 @@ class _OffsetSampler(Sampler):
 
 def setup_determinism(seed: int) -> None:
     """Pin every RNG and disable nondeterministic kernels. Gated on ``config.DETERMINISTIC``.
-
-    ``warn_only``: the SDPA flash / memory-efficient BACKWARD has no deterministic CUDA
-    kernel, so GPU training is reproducible to within numerical noise, not bit-exact. The
-    data stream is fully reproducible, and it is the dominant source of run-to-run variance.
+    warn_only: SDPA backward has no deterministic kernel, so GPU runs match to noise not
+    bit-exact; the data stream is exact and dominates run-to-run variance.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -135,10 +103,8 @@ def setup_determinism(seed: int) -> None:
 
 def _worker_init_fn(worker_id: int) -> None:
     """Seed a DataLoader worker's global numpy + random RNGs.
-
-    The per-sample simulator RNG is already keyed on ``compute_patient_seed``; this closes
-    the incidental global gap. ``torch.initial_seed()`` is PyTorch's per-worker base, so
-    deriving from it keeps workers distinct.
+    Per-sample simulator RNG is already keyed on compute_patient_seed; this closes the
+    incidental global gap. torch.initial_seed() is the per-worker base, kept distinct.
     """
     s = torch.initial_seed() % 2 ** 31
     np.random.seed(s + worker_id)
@@ -162,8 +128,7 @@ import dts_grid
 # Loss-trend smoothing; higher = slower.
 LOSS_EMA_ALPHA = 0.98
 
-# One patch (PATCH_SIZE steps) spans 30 min, so a step is 5 min. The fallback wherever
-# ``bg_formula_data`` carries no ``dt_minutes`` — collate_fn does not pack one.
+# One patch = PATCH_SIZE steps = 30 min; fallback when bg_formula_data has no dt_minutes.
 STEP_MINUTES = 30.0 / PATCH_SIZE  # == 5.0
 
 
@@ -180,17 +145,13 @@ _PATCH_HOURS = PATCH_SIZE * STEP_MINUTES / 60.0
 BG_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120, 180, 360, 480)
 # Un-pooled Clarke-A and MARD, readable against the single-horizon published bars.
 EVALFIX_CLARKE_MARD_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120)
-# MARGINAL per-(h, τ) coverage of the central 90% band — per step, NOT joint over the
-# horizon. One entry per masked patch of the forecast protocol, so these line up with its
-# own d = 1..4.
+# Marginal per-(h, τ) coverage of the central 90% band — per step, NOT joint; lines up with d=1..4.
 COVERAGE_HORIZONS_MIN: tuple[int, ...] = (30, 60, 90, 120)
 
 BG_TARGET_LO = 70.0
 BG_TARGET_HI = 180.0
 
-# bg sits at the same index in the feature stack and in CHANNEL_NAMES (data.py builds the
-# stack in CHANNEL_NAMES order), so one index serves both the ``f::N_INPUT_FEATURES``
-# stride and the normalize / denormalize channel lookup.
+# bg shares one index across the feature stack, CHANNEL_NAMES, and normalize/denormalize.
 _BG_FEAT = 0
 _BG_CHANNEL = CHANNEL_NAMES[_BG_FEAT]
 assert tuple(NON_MASKABLE_FEATS) == (_BG_FEAT,), (
@@ -202,11 +163,9 @@ assert tuple(NON_MASKABLE_FEATS) == (_BG_FEAT,), (
 def _assert_mask_is_this_window(patches: torch.Tensor, attn_mask: torch.Tensor,
                                 where: str) -> None:
     """The mask a forward runs under must be the one built from THAT input's masked set.
-
-    patches ``(B, T, PATCH_DIM)``; attn_mask ``(B, T, T)`` bool, True = attend. Feat 4 is
-    the input's own announcement and a visible row never attends a masked column, so the
-    pair is checkable. The paired-window forwards need it: window k and k+1 share n_ctx and
-    so the mask SHAPE, and the swap raises nothing.
+    patches (B, T, PATCH_DIM); attn_mask (B, T, T) bool, True=attend. A visible row never
+    attends a masked column, so the pair is checkable; paired windows share n_ctx and mask
+    shape, and a swap raises nothing.
     """
     masked = patches[..., BG_MASKED_FEAT::N_INPUT_FEATURES][..., 0] > 0.5   # (B, T)
     assert not bool((attn_mask & masked.unsqueeze(1) & ~masked.unsqueeze(2)).any()), (
@@ -215,15 +174,10 @@ def _assert_mask_is_this_window(patches: torch.Tensor, attn_mask: torch.Tensor,
     )
 
 
-# Fixed, so every validation of every run scores the same sequence of masked sets and a
-# moving infill_* column is the model rather than the draw. Placement itself is
-# data.sample_mask_spans through metrics.protocols.infill_masked_set, never re-derived here.
+# Fixed so every run scores the same masked-set sequence; placement is data.sample_mask_spans.
 INFILL_PROTOCOL_SEED = 0
 
-# Excursion-amplitude diagnostic: NET peak deviation from last_bg at the TRUE peak index.
-# A window counts only above EXC_AMP_MIN_MGDL — below it the peak ratio blows up on a small
-# denominator. exc_amp_ratio = std(pred)/std(true), target 1.0; the over/undershoot
-# fractions count windows whose pred/true peak ratio sits beyond these bounds.
+# Excursion amplitude: net peak deviation from last_bg; below EXC_AMP_MIN_MGDL the ratio blows up.
 EXC_AMP_MIN_MGDL = 15.0
 EXC_AMP_OVERSHOOT_RATIO = 1.25
 EXC_AMP_UNDERSHOOT_RATIO = 0.75
@@ -269,11 +223,8 @@ def compute_learning_metrics(
     hyper_threshold: float = BG_HYPER_THRESHOLD,
 ) -> dict[str, float]:
     """Diagnostic BG metrics in mg/dL as sums + counts, finalized in ``_run_validation``.
-
-    Everything comes off the single headline ``pred_bg = f_inv(median)``, ``(B, P*S)``.
-    ``q_mgdl`` carries the mg/dL band edges: lo/hi = central 90% (τ.05/.95), inner_lo/hi =
-    τ.25/.75, hypo_lo / hyper_hi = the edges the clinical detectors key off, NOT the
-    median. ``{}`` skips the coverage diagnostics.
+    pred_bg = f_inv(median), (B, P*S). q_mgdl: lo/hi = central 90% (τ.05/.95), inner_lo/hi
+    = τ.25/.75, hypo_lo/hyper_hi = clinical detector edges, NOT median. {} skips coverage.
     """
     assert pred_bg.ndim == 2, f"pred_bg must be (B, P*S), got {tuple(pred_bg.shape)}"
     B = pred_bg.shape[0]
@@ -287,9 +238,7 @@ def compute_learning_metrics(
 
     out: dict[str, float] = {}
 
-    # Every on-device reduction is staged 0-dim here and flushed in ONE stack().tolist()
-    # sync — one D2H transfer instead of ~90 ``.item()`` calls, bit-identical since only
-    # the transfer is batched. Counts cast to fp32 (<< 2**24, so exact) to stack with them.
+    # Reductions stage 0-dim here, flushed in one stack().tolist() D2H sync; counts cast fp32.
     _g: dict[str, torch.Tensor] = {}
 
     def _stage(key: str, t: torch.Tensor) -> None:
@@ -329,9 +278,7 @@ def compute_learning_metrics(
     _stage('tbr_err_sum', (pred_below - true_below).abs().sum())
     _stage('tar_err_sum', (pred_above - true_above).abs().sum())
 
-    # Detection keys off the BAND EDGES, not the median: hypo fires when the lower τ edge
-    # dips below the threshold, hyper when the upper τ edge rises above it — the
-    # conservative call on each side. Truth stays off the TRUE bg.
+    # Detection keys off band edges, not median (hypo=lower τ, hyper=upper); truth = true bg.
     pred_lo = q_mgdl['hypo_lo']    # (B, P*S) mg/dL, τ=HYPO_ALARM_QUANTILE_TAU lower band edge
     pred_hi = q_mgdl['hyper_hi']   # (B, P*S) mg/dL, τ=HYPER_ALARM_QUANTILE_TAU upper band edge
     assert bool(((pred_lo >= BG_CLAMP_MIN - 1e-3) & (pred_lo <= BG_CLAMP_MAX + 1e-3)).all()), (
@@ -341,9 +288,7 @@ def compute_learning_metrics(
         f"pred_hi out of physical clamp band [{BG_CLAMP_MIN}, {BG_CLAMP_MAX}]"
     )
 
-    # RECALL is strict TP. PRECISION forgives a predicted excursion whose band edge is
-    # within EXCURSION_PRECISION_TOLERANCE_MGDL of truth — near-threshold CGM noise is not
-    # a false alarm; tolerance 0.0 recovers the strict count.
+    # Recall is strict TP; precision forgives a band edge within EXCURSION_PRECISION_TOLERANCE_MGDL.
     true_hypo = true_bg < hypo_threshold
     pred_hypo = pred_lo < hypo_threshold
     hypo_tp = true_hypo & pred_hypo
@@ -377,9 +322,7 @@ def compute_learning_metrics(
         _stage(f'hyper_recall_hit@{_h}', (_yt & _yp).sum())
         _stage(f'hyper_prec_hit@{_h}', (_yp & (_yt | _cpy)).sum())
 
-    # CG-EGA (dotXem's grid, Kovatchev 2004 adapted to prediction; cg_ega.py has the
-    # departures). Per-region AP/BE/EP counts, finalized to fractions later. true_bg FIRST:
-    # the reference on every axis, including the rate-dependent mod widening.
+    # CG-EGA (Kovatchev 2004, adapted; cg_ega.py has departures); true_bg passed FIRST as reference.
     _true_np = true_bg.detach().cpu().numpy()
     _pred_np = pred_bg.detach().cpu().numpy()
     cg = cg_ega.cg_ega_counts(
@@ -391,11 +334,7 @@ def compute_learning_metrics(
     for _ck, _cv in cg.items():
         out[f'cgega_{_ck}'] = float(_cv)
 
-    # DTS Error Grid (Klonoff et al. 2024) — a SECOND point grid beside Clarke, not a
-    # replacement: its zones are contours of an elicited risk function, asymmetric where
-    # Clarke's A band is symmetric. Per zone, never as A+B, which the paper calls
-    # inappropriate. true_bg FIRST, and NOTHING CATCHES A TRANSPOSE — both arguments are
-    # legal mg/dL either way, so a swap scores a well-formed table of a different statistic.
+    # DTS Error Grid (Klonoff 2024), separate from Clarke; true_bg FIRST — nothing catches a swap.
     _dts_zones = dts_grid.dts_zones(_true_np, _pred_np)          # (B, P*S) 0..4
     for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
         out[f'dts_{_zn}'] = float((_dts_zones == _zi).sum())
@@ -421,10 +360,7 @@ def compute_learning_metrics(
         _stage(f'clarke_{_z}', _m.sum())
     out['clarke_total'] = float(in_A.numel())
 
-    # Per-horizon zone shares for both grids, and MARD. The pooled shares above are over
-    # every scored step, mixing a 5-minute error with a 2-hour one; a ``@{h}`` share is the
-    # SINGLE step at that horizon. Every zone, not just A: a run trading A for B at 30 min
-    # while pushing D at 120 min holds both pooled figures still.
+    # Per-horizon zone shares/MARD; pooled mixes 5-min with 2-hour error, @{h} is the single step.
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         h_idx = (h_min // int(dt)) - 1
         _live = 0 <= h_idx < total_steps_h
@@ -449,8 +385,7 @@ def compute_learning_metrics(
             out[f'evalfix_mard@{h_min}_sum'] = 0.0
             out[f'evalfix_mard@{h_min}_cnt'] = 0.0
 
-    # roc_* / trend_* on the per-PATCH (30-min) ΔBG — the mean-collapse detectors.
-    # Five-sum accumulation, finalized in _run_validation.
+    # roc_*/trend_* on per-patch ΔBG (mean-collapse detectors); five-sum, finalized later.
     pred_patch_end = pred_bg.reshape(B, P, S)[:, :, -1]      # (B, P)
     true_patch_end = true_bg.reshape(B, P, S)[:, :, -1]      # (B, P)
     pred_patch_anchored = torch.cat([last_bg_col, pred_patch_end], dim=1)  # (B, P+1)
@@ -465,10 +400,7 @@ def compute_learning_metrics(
     _stage('roc_sum_yy', (y * y).sum())
     _stage('roc_sum_xy', (x * y).sum())
 
-    # NET peak deviation from last_bg over the whole horizon: the over/under-dispersion the
-    # per-PATCH trend_amp_ratio structurally misses, since the global-basis median can damp
-    # per-step slope while overshooting the net excursion. Peak index = argmax|true - last_bg|;
-    # real excursions only (|true_exc| > EXC_AMP_MIN_MGDL).
+    # Net peak deviation from last_bg; peak=argmax|true-last_bg|, real excursions only.
     pred_dev_h = pred_bg - last_bg_col              # (B, P*S)
     true_dev_h = true_bg - last_bg_col              # (B, P*S)
     peak_idx = true_dev_h.abs().argmax(dim=1, keepdim=True)  # (B, 1)
@@ -517,8 +449,7 @@ def compute_learning_metrics(
                 out[f'coverage90@{h_min}_hit'] = 0.0
                 out[f'coverage90@{h_min}_cnt'] = 0.0
 
-    # sign_balance@h: fraction of true BG below the median, target 0.5 — the directional
-    # bias witness. inner50_cov@h: coverage of [τ.25, τ.75], target 0.5.
+    # sign_balance@h: frac true BG below median (target 0.5); inner50_cov@h: cov of [τ.25,τ.75].
     inner_lo = q_mgdl.get('inner_lo') if q_mgdl else None
     inner_hi = q_mgdl.get('inner_hi') if q_mgdl else None
     for h_min in COVERAGE_HORIZONS_MIN:
@@ -595,14 +526,10 @@ def _render_validation_table(
     val_metrics: dict[str, Any],
     prev_metrics: dict[str, Any] | None = None,
 ) -> str:
-    """``Metric | Value | Prev``, tier-coloured with a trend arrow against the last validation.
-
-    The tiers are ``train.py``'s and are NOT re-cut for the blind regime: a row amber here
-    against a conditioned model's green is the measurement this file exists to take.
-
-    A READING surface, not the record — ``validation_log.csv`` carries every metric
-    unchanged, and rows are dropped from here wherever the console cost outweighs what they
-    say at a 1000-step cadence. Each ``target=`` string is kept and simply not rendered.
+    """Metric | Value | Prev, tier-coloured with a trend arrow vs the last validation.
+    Tiers are train.py's, NOT re-cut for blind — an amber row here vs a conditioned
+    model's green is the measurement this file exists to take. A reading surface only:
+    validation_log.csv carries every metric unchanged; dropped rows just aren't rendered.
     """
 
     def _fmt(fmt: str, val: float, suffix: str = '') -> str:
@@ -655,8 +582,7 @@ def _render_validation_table(
             return _colored(sym, _ANSI_GREEN) if improved else _colored(sym, _ANSI_RED)
         return _colored('—', _ANSI_GRAY)
 
-    # (metric, value, prev, trend, target, unit) — the value carries NO unit; the layout
-    # appends it once, after value + trend.
+    # (metric, value, prev, trend, target, unit); value carries NO unit, layout appends it once.
     rows: list[tuple[str, str, str, str, str, str]] = []
 
 
@@ -678,10 +604,8 @@ def _render_validation_table(
     def _absent_row(metric: str, prev_key: str | None, prev_scale: float,
                     fmt: str, unit: str, target: str) -> None:
         """An empty bin, rendered ``—`` rather than dropped.
-
-        A vanished row reads as a metric nobody computes and 0 reads as a measurement;
-        both are wrong about a bin the run reached and found empty. The previous
-        validation's figure renders beside it — that is what says the bin has just emptied.
+        A vanished row reads as a metric nobody computes; 0 reads as a measurement, both wrong.
+        The previous validation's figure renders beside it, marking the bin as just-emptied.
         """
         rows.append((metric, _absent_cell(),
                      _prev_cell(prev_key, prev_scale, fmt, unit),
@@ -773,15 +697,10 @@ def _render_validation_table(
                       target: str | None = None,
                       trend: str = 'band') -> None:
         """Coverage AND the width that bought it, one line, always together.
-
-        Any band widens to any coverage, so the pair is the measurement; an empty bin is
-        absent on both halves, never 0.
-
-        ``trend`` is separate from the colour band: a MARGINAL coverage has its nominal
-        INSIDE the band, so ``'band'`` (toward the midpoint) is improvement, while a JOINT
-        coverage is bounded above by the smallest marginal in scope and wants ``'higher'``
-        — scored against the midpoint, a rise toward that bound reads as a regression.
-        """
+        Any band widens to any coverage; an empty bin is absent on both halves, never 0.
+        trend differs from color: MARGINAL's nominal sits inside the band, so 'band'
+        improves toward it; JOINT is bounded by the smallest marginal, so use 'higher' —
+        a rise toward that bound off the midpoint is a regression."""
         label = f"{metric}({int(n)}{n_unit})" if n is not None else metric
         tgt = target if target is not None else f"{lo:.0f}–{hi:.0f}% + width"
         prev_cell = _prev_cell(prev_key, 100.0, '{:.2f}', '%')
@@ -807,10 +726,7 @@ def _render_validation_table(
              prev_key='val_loss_total')
     info_row('val_loss_Q', val_metrics.get('val_loss_Q'),
              prev_key='val_loss_Q')
-    # val_loss_total is the SELECTION scalar, on each sample's own mask — 97% two-sided
-    # under uniform placement — so it is not a proxy for forecast calibration: it improved
-    # monotonically across a whole run while the one-sided band decayed. The calibration
-    # section below carries that. Pinball, dilate, the log-sigmas and train_ema are CSV-only.
+    # val_loss_total selects checkpoints but isn't a forecast-calibration proxy; see section below.
     band_row('overfit_ratio', val_metrics.get('overfit_ratio'),
              0.400, 0.600, fmt='{:.3f}', warn_pad=0.10,
              prev_key='overfit_ratio')
@@ -818,9 +734,7 @@ def _render_validation_table(
 
     _section('BG Forecast (RMSE / MAE)')
     bg_rmse_sota = {30: 15.0, 60: 25.0, 120: 36.0}
-    # MAE targets are 0.8·RMSE — E|e| = sqrt(2/pi)·sigma for a roughly-Gaussian error. A
-    # reading aid, not a published figure: the literature quotes RMSE, so a run missing one
-    # while hitting its RMSE has a heavier tail, not a worse model.
+    # MAE targets = 0.8·RMSE (Gaussian E|e|); a reading aid, not published — literature quotes RMSE.
     night_bg_rmse_sota = {180: 50.0, 360: 62.0, 480: 72.0}
     for h_min in (30, 60, 120):
         lower_row(f'bg_rmse @{h_min}m', val_metrics.get(f'bg_rmse_{h_min}'),
@@ -832,14 +746,7 @@ def _render_validation_table(
                   warn_mult=1.5, prev_key=f'bg_mae_{h_min}', show_absent=True)
     _blank()
 
-    # The only rows whose context is not n_ctx: the roll starts from the visible patch run
-    # reaching the forecast origin, so a reader would otherwise take a 3-patch-context
-    # figure for a full-context one — and these are the nocturnal-hypo rows.
-    #
-    # TWO sample sets: the night RMSEs are scored on the NOCTURNAL subset of the roll, the
-    # mean context and the roll pair on every rolled sample. Hence a count per row — an
-    # all-sample denominator over a night row reads several times the true one, and stays
-    # nonzero on a validation whose night subset is empty.
+    # Roll context isn't n_ctx (starts at forecast origin); night rows score a nocturnal subset.
     _roll_ctx = val_metrics.get('roll_ctx_patches')
     _roll_n = int(val_metrics.get('roll_n', 0) or 0)
     _roll_skipped = int(val_metrics.get('roll_skipped', 0) or 0)
@@ -855,16 +762,7 @@ def _render_validation_table(
                   night_bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
                   prev_key=f'night_bg_rmse_{h_min}', show_absent=True)
     if _roll_seen:
-        # show_absent: an all-skipped validation has no mean context and renders ``—``,
-        # which is the state that most needs saying — dropping the row would leave the
-        # three absent RMSEs above it unexplained. The night pair renders on the same
-        # condition, so an empty night subset prints ``0 of 0``.
-        #
-        # A skip means the window itself was short. Both skip counters stay on the page so
-        # a return to mask-driven skipping is visible rather than silent.
-        #
-        # Each denominator rides in the row LABEL, not the target column: that column is
-        # not rendered, and a skip count over no denominator is not a rate.
+        # show_absent surfaces an all-skipped run as '—'; each denominator rides in the row label.
         info_row(f'roll context (mean of {_roll_n} rolled)', _roll_ctx,
                  fmt='{:.1f}', unit=' patches',
                  target=f'{MIN_CONTEXT_PATCHES}–{MAX_CONTEXT_PATCHES} at full n_ctx',
@@ -880,14 +778,7 @@ def _render_validation_table(
                  prev_key='roll_skipped', direction='lower', show_absent=True)
     _blank()
 
-    # Every coverage carries its band width beside it (``sharp90``/``sharp50``, the mean
-    # width over that horizon's patch): coverage on its own is bought by widening.
-    #
-    # Everything below is binned on ``d``, the patch distance to the nearest visible
-    # evidence, and NOTHING is pooled over it — the sampler concentrates supervision at
-    # small d, so a pooled figure averages over a mask distribution rather than a difficulty
-    # and improves for free. The forecast protocol masks the trailing PREDICTION_PATCHES,
-    # so @30/@60/@90/@120 IS d = 1..4 one-sided.
+    # Coverage carries its width (sharp90/sharp50); binned on d, never pooled — @30..120 IS d=1..4.
     _fan_eh = _excursion_bucket_horizons(PREDICTION_PATCHES)
 
     def _fan_n(h: int, key: str = '_fan_n') -> float | None:
@@ -918,14 +809,7 @@ def _render_validation_table(
              fmt='{:.2f}', unit='%', target='≈ 50% (diag)',
              prev_key=f'sign_balance@{_sb_h}', prev_scale=100.0, direction='none')
 
-    # ONE-SIDED vs TWO-SIDED at matched d — the axis the sampler starves: uniform placement
-    # leaves 0.82% of masked slots one-sided at d = 1, and the band there decays with
-    # training while every pooled figure holds.
-    #
-    # BOTH ARMS ARE THE SAME ESTIMATOR: one call to coverage_sharpness_by_d over each
-    # protocol's own fan, over EVERY step of the d-th masked patch. ``coverage90@h`` above
-    # is a different quantity — a single step — so reading the one-sided arm off it would
-    # compare sidedness and step position at once.
+    # One-sided vs two-sided at matched d=1; both use coverage_sharpness_by_d over the whole fan.
     _os = val_metrics.get(f'_fan_cov90@{_fan_eh[0]}') if _fan_eh else None
     _ts = val_metrics.get(_infill_column('marginal90_cov', 1))
     info_row('  ↳ one-sided cov90 @d1', (_os * 100.0) if _os is not None else None,
@@ -938,19 +822,11 @@ def _render_validation_table(
              prev_key=_infill_column('marginal90_cov', 1), prev_scale=100.0,
              direction='none', show_absent=True)
 
-    # CRPS, Winkler and the per-d cov/sharpness pairs are CSV-only: a band 20% too narrow at
-    # one horizon barely moves a proper score — correcting the measured d=1 deficit moves
-    # Winkler -1.7% and CRPS -0.3%, the sharpness saved offsetting the misses paid.
-    #
-    # joint90 stays because it is a different CLAIM: every step of the path inside the band
-    # AT ONCE. Bounded above by the smallest marginal in scope, it fell 0.69 -> 0.58 over
-    # 6k steps while the marginal held — the one row here that catches a path-level failure.
+    # CRPS/Winkler/per-d cov are CSV-only; joint90 stays — a whole-path claim, bounded by marginal.
     _joint_h = _fan_eh[-1] if _fan_eh else None
     if _joint_h is not None:
         _j = val_metrics.get(f'joint_cov90@{_joint_h}')
-        # trend='higher', alone on the page: 70–92 is where a joint figure is acceptable,
-        # but its midpoint 81 is not a level this metric aims at, so scoring a rise from
-        # 82 to 88 against 81 would render the band recovering as a red arrow.
+        # trend='higher': midpoint 81 isn't this metric's target, so scoring vs it misreads a rise.
         cov_sharp_row(f'joint90 whole path ≤{_joint_h}m',
                       (_j * 100.0) if _j is not None else None,
                       val_metrics.get(f'_fan_joint_width@{_joint_h}'),
@@ -980,8 +856,7 @@ def _render_validation_table(
               0.010, fmt='{:.6f}', warn_mult=2.0, prev_key='median_roughness_far')
     _blank()
 
-    # Not selection metrics — the mean-collapse detectors. A model that forecasts the mean
-    # scores well on RMSE and reports an amplitude ratio near zero, which shows only here.
+    # Not selection metrics: mean-collapse detectors — a mean-forecasting model scores well on RMSE.
     _section('Amplitude & Excursion Shape')
     band_row('trend_amp_ratio', val_metrics.get('trend_amp_ratio'),
              0.80, 1.20, fmt='{:.3f}', warn_pad=0.30, prev_key='trend_amp_ratio')
@@ -997,8 +872,7 @@ def _render_validation_table(
              0.80, 1.20, fmt='{:.3f}', warn_pad=0.30, prev_key='exc_gain_beta')
     higher_row('exc_corr', val_metrics.get('exc_corr'),
                0.700, fmt='{:+.3f}', warn_gap=0.20, prev_key='exc_corr')
-    # The two halves the ratio alone cannot separate: overshooting as often as
-    # undershooting reports a ratio near 1.
+    # The two halves the ratio alone can't separate: equal over/undershoot reports a ratio near 1.
     _eo = val_metrics.get('exc_overshoot_frac')
     info_row('exc_overshoot_frac', (_eo * 100.0) if _eo is not None else None,
              fmt='{:.2f}', unit='%', target='≈ 50% against undershoot',
@@ -1009,10 +883,7 @@ def _render_validation_table(
              prev_key='exc_undershoot_frac', prev_scale=100.0, direction='none')
     _blank()
 
-    # Raw against region-binned split-conformal at excursion PEAKS, on a held-out 40% of the
-    # val windows. Read every coverage WITH its width: conf_hypo_esc reads as calibration
-    # while being a WIDTH figure — one global half-width factor over a fixed model takes it
-    # 0.250 -> 0.079 as coverage goes 0.888 -> 0.981. ~100 windows, so directional only.
+    # Raw vs region-binned conformal at excursion peaks, held-out 40%; read coverage WITH width.
     _conf_n = val_metrics.get('conf_n')
     _section(f"Conformal Probe @ excursion peaks"
              f"{f' ({int(_conf_n)} windows)' if _conf_n else ''}")
@@ -1030,9 +901,7 @@ def _render_validation_table(
              prev_key='conf_hypo_esc_cal', prev_scale=100.0)
     _blank()
 
-    # Every zone, then the A+B the literature quotes. A+B alone hides which side moved: a
-    # run trading A for B holds it flat while point accuracy decays, and D and E are the
-    # two that are dangerous rather than merely wrong.
+    # A+B alone hides which side moved; D and E are the two zones dangerous, not just wrong.
     _section('Clinical Error Grid Analysis (Clarke)')
     higher_row('clarke_A', val_metrics.get('clarke_A_pct'),
                90.0, fmt='{:.2f}', unit='%', warn_gap=5.0, prev_key='clarke_A_pct')
@@ -1048,9 +917,7 @@ def _render_validation_table(
     higher_row('clarke_A+B', val_metrics.get('clarke_AB_pct'),
                98.0, fmt='{:.2f}', unit='%', warn_gap=2.0,
                prev_key='clarke_AB_pct')
-    # Every zone at every horizon, not A alone: the pooled shares average the decay with
-    # distance away, so a run pushing mass into D at the far horizon while holding A at the
-    # near one moves neither pooled figure.
+    # Every zone at every horizon, not A alone: pooled shares average the decay with distance away.
     for _h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         for _z, _lo, _hi in (('A', 90.0, None), ('B', None, None), ('C', None, 1.0),
                              ('D', None, 1.0), ('E', None, 0.1)):
@@ -1070,12 +937,7 @@ def _render_validation_table(
                          show_absent=True)
     _blank()
 
-    # Klonoff et al. 2024, kept whole: the zones are contours of an elicited risk function,
-    # so the SHAPE across them is the reading and mass moving B -> D says what no summary of
-    # it does. UNCOLOURED deliberately — no ISO or FDA criterion references this grid, so a
-    # tier would be an invented pass mark; the paper's one anchor (pZA 90% ≈ MARD 10%, fit
-    # over 31 studies) rides in zone A's target column. No A+B row: the paper calls
-    # presenting one inappropriate and pZA alone the measure of performance.
+    # Klonoff 2024, uncoloured (no ISO/FDA threshold); pZA 90% ≈ MARD 10% anchors zone A, no A+B.
     _section('Clinical Error Grid Analysis (DTS)')
     _DTS_ROWS = (
         ('a', 'pZA — no risk', 'pZA 90% ≈ MARD 10% (no threshold published)'),
@@ -1097,10 +959,7 @@ def _render_validation_table(
                      prev_key=f'dts_{_zn}@{_h}', direction='none', show_absent=True)
     _blank()
 
-    # The only block that scores RATE OF CHANGE jointly with value, binned by glycemic
-    # region: Clarke A+B is point accuracy and roc_corr is rate correlation with no clinical
-    # binning, so neither can say the model gets DIRECTION wrong in the hypo region. At
-    # VALIDATION_N_PATIENTS = 100 that bin held ~11 units, one of which moved ap_hypo by 0.09.
+    # The only block scoring rate-of-change jointly with value, binned by glycemic region.
     _section('Clinical Accuracy (CG-EGA)')
     for _reg, _ap_sota in (('hypo', 80.0), ('eu', 90.0), ('hyper', 85.0)):
         _ap = val_metrics.get(f'cgega_ap_{_reg}')
@@ -1108,8 +967,7 @@ def _render_validation_table(
                    (_ap * 100.0) if _ap is not None else None,
                    _ap_sota, fmt='{:.2f}', unit='%', warn_gap=10.0,
                    prev_key=f'cgega_ap_{_reg}', prev_scale=100.0, show_absent=True)
-    # AP + BE + EP is 1, so a rising BE against a flat AP is error moving into the harmless
-    # bucket rather than accuracy improving.
+    # AP+BE+EP=1, so a rising BE against flat AP is error moving into the harmless bucket.
     for _reg in ('hypo', 'eu', 'hyper'):
         _be = val_metrics.get(f'cgega_be_{_reg}')
         info_row(f'cgega_BE @{_reg}',
@@ -1155,13 +1013,7 @@ def _render_validation_table(
                85.0, fmt='{:.2f}', unit='%', warn_gap=10.0,
                prev_key='hyper_precision', prev_scale=100.0)
 
-    # DISJOINT 30-min buckets. Detection is not horizon-flat: a model that calls the
-    # 30-minute hypo and misses the 120-minute one reads as one healthy pooled number. Each
-    # row carries its bucket count — an empty bucket has no rate and renders absent, not 0.
-    #
-    # The bar DECLINES with horizon (``_excursion_target``): near-term detection is fixed by
-    # insulin-on-board, the far horizon is information-limited, so holding the 30-minute bar
-    # up at 120 paints every far bucket red on every run and the colour stops carrying anything.
+    # Disjoint 30-min buckets, empty=absent not 0; bar declines with horizon (IOB fixes near-term).
     for _h in _excursion_bucket_horizons(PREDICTION_PATCHES):
         _hn = val_metrics.get(f'hypo_n_steps@{_h}')
         higher_row(f'  ↳ hypo_recall @{_h}m'
@@ -1190,10 +1042,7 @@ def _render_validation_table(
                    prev_key=f'hyper_precision@{_h}', prev_scale=100.0, show_absent=True)
     _blank()
 
-    # BOTH sides: the nocturnal hypo is what the long-horizon roll exists for, but a model
-    # that calls it by predicting low everywhere at night trades hyper detection for it, and
-    # the hypo pair alone cannot show that. The night RMSEs are in the rolled @180+ section;
-    # night_clarke / night_mard / night_cgega are CSV-only.
+    # Both sides: predicting low everywhere at night trades hyper for hypo; RMSEs are in @180+.
     _section('Nocturnal Validation Metrics')
     night_hr = val_metrics.get('night_hypo_recall')
     higher_row(f"night_hypo_recall({val_metrics.get('night_hypo_n_steps', 0)}st)",
@@ -1217,23 +1066,13 @@ def _render_validation_table(
                prev_key='night_hyper_precision', prev_scale=100.0)
     _blank()
 
-    # ``train.py``'s counterfactual section has no subject here: it perturbs announced
-    # doses, which this model does not read.
-    #
-    # The time probe feeds neither loss nor selection but co-trains the trunk. Thresholds
-    # are clock-usability judgements, NOT external SOTA; random-phase chance is mae 6 h,
-    # ±1h 8%, ±2h 17%, 4-bin 25%. MAE alone cannot separate the three ways a clock fails —
-    # constant offset (bias), wide but centred spread (std), and rare gross misses (p90,
-    # gross_rate), the one that matters, since a confidently wrong hour beats a vague right one.
+    # No counterfactual (blind reads no doses); time-probe thresholds are usability, not SOTA.
     _section('Time-of-day probe (diagnostic)')
     lower_row('tod mae', val_metrics.get('tod_mae_h'), 1.5,
               fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_h')
     lower_row('  ↳ mae @high confidence', val_metrics.get('tod_mae_hiconf'), 1.0,
               fmt='{:.2f}', unit=' h', warn_mult=2.0, prev_key='tod_mae_hiconf')
-    # ALREADY PERCENTAGES: ``_run_validation`` scales these four by 100 itself, and the CSV,
-    # the model card and ``compare.py`` all read them as percent — so no ``_pct`` and no
-    # ``prev_scale``. Either would scale twice: a 16.3% clock renders 1630.00% and, being
-    # above the 60% bar, tiers GREEN.
+    # Already percentages (scaled by _run_validation); no _pct/prev_scale here or it double-scales.
     higher_row('tod acc ±1h', val_metrics.get('tod_acc_1h'),
                60.0, fmt='{:.2f}', unit='%', warn_gap=20.0,
                prev_key='tod_acc_1h')
@@ -1256,8 +1095,7 @@ def _render_validation_table(
     info_row('tod confidence (R)', val_metrics.get('tod_conf'),
              fmt='{:.3f}', target='resultant length, 0–1',
              prev_key='tod_conf', direction='none')
-    # Within one window's slots, and across the paired windows. Both are deviations from the
-    # EXPECTED advance, so zero is right and either sign is wrong.
+    # Within- and cross-window jump; both are deviation from expected advance, zero is right.
     lower_row('tod jump (within window)', val_metrics.get('tod_jump_h'), 1.0,
               fmt='{:.3f}', unit=' h', warn_mult=2.0, prev_key='tod_jump_h')
     lower_row('tod jump (cross-window)', val_metrics.get('tod_xwin_jump_h'), 1.0,
@@ -1366,16 +1204,11 @@ def _build_optimizers(
     muon_momentum: float,
     adam_weight_decay: float = ADAM_WEIGHT_DECAY,
 ) -> tuple[Muon, torch.optim.AdamW]:
-    """Muon takes the ndim >= 2 matrices, AdamW the rest.
-
-    Muon's are split again: a normalized group, which gets the AdamC
-    ``gamma_t/gamma_max`` schedule-aware weight-decay correction, and an output group at
-    constant decay. The two Kendall-Gal log-σ get their OWN AdamW group at
-    ``weight_decay=0`` — scalars, never Muon, since a log-variance must not decay toward 0.
-    """
-    # An output projection is not followed by a normalization, so AdamC's steady-state
-    # analysis (<g, x> = 0) does not hold for it — paper section 6 excludes it. Identified
-    # by object identity; everything else 2D is a normalized matrix.
+    """Muon takes ndim>=2 matrices, AdamW the rest.
+    Muon splits again: a normalized group (AdamC gamma_t/gamma_max decay correction) and an
+    output group at constant decay. Kendall-Gal log-σ get their own AdamW group at wd=0 —
+    scalars, never Muon, since a log-variance must not decay toward 0."""
+    # Output projection has no following normalization, so AdamC's <g,x>=0 doesn't hold; excluded.
     output_weight_ids = {id(model.bg_head[-1].weight)}
     if getattr(model, "time_head", None) is not None:
         output_weight_ids.add(id(model.time_head[-1].weight))
@@ -1400,10 +1233,7 @@ def _build_optimizers(
         )
         kendall_params.append(param)
 
-    # wd_corrected + base_weight_decay is what lets _update_lr rescale the normalized
-    # group's decay per step. At WEIGHT_DECAY_SCHEDULE_CORRECTION=False both groups sit at
-    # the constant MUON_WEIGHT_DECAY, which is numerically one group — momentum buffers are
-    # per-parameter, not per-group.
+    # wd_corrected/base_weight_decay let _update_lr rescale decay per step; momentum is per-param.
     muon_groups = [
         {"params": muon_normalized, "weight_decay": MUON_WEIGHT_DECAY,
          "base_weight_decay": MUON_WEIGHT_DECAY, "wd_corrected": True},
@@ -1437,12 +1267,9 @@ def _update_lr(
     wd_correction: bool = WEIGHT_DECAY_SCHEDULE_CORRECTION,
 ) -> None:
     """Warmup + cosine LR on both optimizers.
-
-    Under ``wd_correction`` (AdamC, arXiv 2506.02285) each ``wd_corrected`` Muon group also
-    takes ``base_weight_decay * ratio``, ratio being the LR's own schedule multiplier; with
-    the optimizer's ``p*(1 - lr*wd)`` that realizes Algorithm 1's gamma_t²/gamma_max decay.
-    The output group and AdamW keep constant decay.
-    """
+    Under wd_correction (AdamC, arXiv 2506.02285) each wd_corrected Muon group also takes
+    base_weight_decay*ratio; with p*(1-lr*wd) that realizes Algorithm 1's gamma_t²/gamma_max
+    decay. Output group and AdamW keep constant decay."""
     if step < warmup_steps:
         ratio = step / max(warmup_steps, 1)
     else:
@@ -1451,8 +1278,7 @@ def _update_lr(
     for group in muon_opt.param_groups:
         group['lr'] = peak_muon_lr * ratio
         if group.get('wd_corrected', False):
-            # Written in BOTH branches, so a corrected group never keeps a stale scaled
-            # decay if wd_correction is toggled on a live optimizer.
+            # Written in both branches so a toggled wd_correction never leaves a stale decay.
             group['weight_decay'] = (
                 group['base_weight_decay'] * ratio if wd_correction
                 else group['base_weight_decay']
@@ -1547,8 +1373,7 @@ def _write_training_summary(
 
 VAL_BATCH_SIZE = 8
 
-# ``train.py``'s ``_ANNOUNCE_CHANNELS`` has no subject here: no evaluation path announces
-# a dose, so there is no announced set to check. The blind fill IS the un-announced value.
+# No _ANNOUNCE_CHANNELS here: no eval path announces a dose; blind fill IS the un-announced value.
 
 
 def _reconstruct_context_from_patch(
@@ -1558,26 +1383,11 @@ def _reconstruct_context_from_patch(
     valid: "np.ndarray | torch.Tensor",
     min_patches: int = MIN_CONTEXT_PATCHES,
 ) -> "torch.Tensor | None":
-    """The longest run of VISIBLE patches ending at the forecast origin ``n_ctx - 1``.
-
-    Returns ``(C, PATCH_SIZE, N_INPUT_FEATURES)`` with ``min_patches <= C <= n_ctx``, from
-    one UN-COLLATED sample's ``(T, PATCH_DIM)`` rows; ``mask_idx``/``valid`` are ``(M,)``.
-
-    A run, not a gather: the inference builders lay the forecast zone straight after the
-    last context patch and mark every context patch visible, so a masked patch inside the
-    context would be attended as evidence. A positional ``patches[:n_ctx]`` prefix would
-    instead hand ``predict_rolling`` a FABRICATED reading — a masked patch carries z = 0 in
-    all bg columns, which decodes to ~142 mg/dL under the balanced pool, not a sentinel —
-    and the alarm rates and long-horizon RMSE would still come out plausible.
-
-    ``None`` when the run is under ``min_patches`` (zero when the origin patch is itself
-    masked): ``inference.predict`` / ``predict_rolling`` state ``n_ctx >=
-    MIN_CONTEXT_PATCHES`` as their precondition, and a metric rolled from a few patches is
-    not the metric its row name claims. The caller MUST report the skip — the denominator moved.
-
-    Feat 4 is zeroed, every returned patch being visible; the column stays, since
-    ``inference._build_patches_tensor`` asserts the shape and writes the bit itself.
-    """
+    """Longest run of VISIBLE patches ending at the forecast origin n_ctx-1.
+    Returns (C, PATCH_SIZE, N_INPUT_FEATURES), min_patches <= C <= n_ctx, from one
+    UN-COLLATED sample; mask_idx/valid are (M,). A run not a gather: a masked patch's
+    z=0 bg decodes to ~142 mg/dL, not a sentinel, so a positional prefix would fabricate
+    context. None below min_patches — caller MUST report the skip; feat 4 is zeroed."""
     feat_cols = PATCH_SIZE * N_INPUT_FEATURES
     assert patches.shape[1] == feat_cols, (
         f"patches must be (T, {feat_cols}), got {tuple(patches.shape)}"
@@ -1597,25 +1407,11 @@ def _reconstruct_context_from_patch(
 
 
 def _observed_patches(sample: dict[str, Any], norm_stats: dict) -> torch.Tensor:
-    """One un-collated sample's ``(T, PATCH_DIM)`` with every withheld BG written back.
-
-    A rolling context is the patient's OBSERVED CGM history; the training mask is a
-    property of the objective, not of the data. Rolling on a holed context measures a case
-    that is never deployed and, since the roll needs a contiguous visible run of
-    MIN_CONTEXT_PATCHES reaching the origin, throws most of the sample away: 526 of 600
-    windows and 171 of 203 nocturnal ones on the live nano run.
-
-    Not leakage — every restored patch precedes the forecast origin and the scored horizon
-    is untouched. Paired on the windows the masked path kept, RMSE is unchanged (52.66 vs
-    51.94 at 360 min): it moves the denominator, not the number.
-
-    Under the BLIND policy feats 1-3 are restored on the withheld patches too. Restoring bg
-    alone is worse than restoring neither: the roll would read a history saying a half-hour
-    WAS observed and carried no carbs and no insulin, over spans that carried a meal or a
-    bolus. ``data._build_sample`` keeps the pre-fill rows in ``unblinded_dose_rows`` /
-    ``unblinded_dose_patches``; both are absent under the announced policy, where there is
-    nothing to undo. Feat 4 is left as found — ``_reconstruct_context_from_patch`` zeroes it.
-    """
+    """One un-collated sample's (T, PATCH_DIM) with every withheld BG written back.
+    Rolling context is OBSERVED CGM history, not the training mask; a holed context
+    measures an undeployed case and drops most samples (526/600 windows, live nano run).
+    Not leakage — restored patches precede the forecast origin. Under BLIND, feats 1-3
+    are restored too (unblinded_dose_rows/patches); feat 4 stays, zeroed downstream."""
     bf = sample['bg_formula_data']
     patches = sample['patches']
     if not torch.is_tensor(patches):
@@ -1655,22 +1451,11 @@ def _accumulate_long_horizon_bg_metrics(
     agg: dict[str, float],
     night_agg: dict[str, float] | None = None,
 ) -> None:
-    """Rolling prediction per sample, accumulating ``bg_rmse_{h}_*`` / ``bg_mae_{h}_*`` for
-    the horizons one forward cannot reach. ``predict_rolling`` is BG-autoregressive:
-    ``pred_bg = f_inv(median)`` carried across rolls, no physics constants.
-
-    UNCONDITIONED — no ``overrides_fn``, so every future dose slot stays at its zero-RAW
-    ``normalize(0)`` baseline, which is exactly what a masked patch carries under the blind
-    policy. ``train.py`` announces the plan here to tame a zero-basal OOD runaway; that
-    concern does not apply to a model whose training distribution this IS.
-
-    Each roll runs on the OBSERVED context, so the run reaching the origin is the whole
-    ``n_ctx`` and only a genuinely short window falls under MIN_CONTEXT_PATCHES. The
-    counters travel with the metrics: ``roll_ctx_patches`` / ``roll_n`` / ``roll_skipped``
-    over every sample, and ``night_roll_cnt`` / ``night_roll_skipped`` over the nocturnal
-    subset the ``night_bg_rmse_*`` family is scored on. Nothing else on the page says which
-    sample set either figure was measured over.
-    """
+    """Rolling prediction per sample, accumulating bg_rmse_{h}_* / bg_mae_{h}_* for horizons
+    one forward can't reach. predict_rolling is BG-autoregressive: f_inv(median) carried
+    across rolls. UNCONDITIONED — no overrides_fn, so future doses stay at zero-RAW
+    normalize(0), matching the blind masked-patch baseline. Counters travel with the
+    metrics: roll_ctx_patches/roll_n/roll_skipped, night_roll_cnt/night_roll_skipped."""
     from inference import predict_rolling
 
     if n_rolls <= 0:
@@ -1682,12 +1467,9 @@ def _accumulate_long_horizon_bg_metrics(
     for sample in samples:
         n_ctx = int(sample['n_context_patches'])
         bf = sample['bg_formula_data']
-        # Read BEFORE the floor: a nocturnal sample the floor drops is one the night rows
-        # lost, and counting only survivors leaves the night family with no denominator.
+        # Read before the floor, else a dropped nocturnal sample loses the night denominator.
         is_night = _is_nocturnal(float(bf.get('pred_start_hour', 0.0)))
-        # The roll re-feeds its own median from the context edge, so the context must be a
-        # run of REAL readings reaching it — never the positional prefix, whose masked
-        # patches would roll off a fabricated value.
+        # The roll re-feeds its own median, so context must be real readings, not a positional cut.
         context = _reconstruct_context_from_patch(
             _observed_patches(sample, norm_stats), n_ctx,
             np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool))
@@ -1745,22 +1527,11 @@ _CONF_HYPO_IDX = QUANTILE_LEVELS.index(0.10)
 
 
 def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) -> dict:
-    """Raw vs region-binned split-conformal coverage at excursion peaks. bands ``(M, H, K)``
-    mg/dL, true ``(M, H)``, last ``(M,)``; ``{}`` when too few excursion windows.
-
-    Fits on a deterministic 60% of the collected val windows, measures on the disjoint 40%.
-    The DEPLOYABLE delta is fit on the reserved partition by ``calibrate_conformal.py``;
-    this is the in-training signal only, ~100 windows, so directional.
-
-    Both arms are measured on the same windows in the same call, never compared across runs.
-    ``fit_mondrian`` also returns the MARGINAL fit — a bin under ``mondrian.MIN_N_OWN_FIT``
-    falls back to it — but it is not scored as a third arm and has no column.
-
-    Every coverage carries the mean band width that bought it: raw and calibrated move
-    together, so reading the drop without the width reads a narrowing as lost calibration.
-    Every val window is one ``val_dataset`` index with its own patient seed, so a subset's
-    distinct-patient count IS its size.
-    """
+    """Raw vs region-binned split-conformal coverage at excursion peaks. bands (M, H, K)
+    mg/dL, true (M, H), last (M,); {} when too few excursion windows.
+    Fits on 60% of val windows, measures on the disjoint 40%; the deployable delta is fit
+    separately by calibrate_conformal.py — this is in-training only, ~100 windows.
+    Both arms measured on the same windows in the same call; every coverage carries its width."""
     import mondrian
     M = bands.shape[0]
     if M < 50:
@@ -1768,8 +1539,7 @@ def _conformal_val_probe(bands: np.ndarray, true: np.ndarray, last: np.ndarray) 
     perm = np.random.default_rng(0).permutation(M)
     ncal = int(0.6 * M)
     ci, ti = perm[:ncal], perm[ncal:]
-    # The region reads off the median, which conformal holds fixed, so a window's bin does
-    # not move when the correction is applied.
+    # Region reads off the median, which conformal holds fixed, so a window's bin never moves.
     cal_bin = mondrian.region_bin(
         mondrian.forecast_destination(bands[ci], _CONF_MEDIAN_IDX))
     delta, _, _ = mondrian.fit_mondrian(
@@ -1808,28 +1578,11 @@ def _forecast_protocol(
     n_context_patches: torch.Tensor,
     blind_fill: dict[int, float],
 ) -> "dict[str, torch.Tensor] | None":
-    """The FORECAST protocol rebuilt from a collated batch: the trailing PREDICTION_PATCHES
-    masked and scored, which is what the deployed 2 h forecast is.
-
-    A batch's own masked set is not a forecast — slot ``j`` is patch ``mask_idx[j]``, not
-    ``j`` ahead of the context edge — and every horizon-keyed name (``bg_rmse_{30,...}``,
-    ``coverage90@h``, ``evalfix_*@h``, the excursion buckets, the conformal probe) is
-    defined against a right-edge zone, so the training mask would read a different patch on
-    every row. Left-padding puts the last patch at ``T - 1``, so the zone is
-    ``[T - PREDICTION_PATCHES, T)`` whatever ``n_ctx`` is; patches the sample already masked
-    stay masked and announced, their BG not being in the tensor to restore.
-
-    Rows whose context-edge patch — ``T - PREDICTION_PATCHES - 1``, where the anchor is read
-    — is itself masked are DROPPED: ``last_bg`` comes off the raw mg/dL array either way, so
-    anchoring there hands the head the true value of a withheld reading. Placement is
-    independent of BG, so the survivors are unbiased; ``fc_n`` counts them.
-
-    patches ``(B, T, PATCH_DIM)``; mask_idx / valid ``(B, M)`` PADDED axis; n_context_patches
-    ``(B,)``; blind_fill is ``data.zero_dose_fill``'s ``{feat: z}``. Returns
-    ``{rows, patches, attn_mask, mask_idx}`` with mask_idx ``(len(rows), PREDICTION_PATCHES)``
-    — dense, no padded slots, so the slot axis is the horizon and every slot anchors on
-    ``last_bg``. None when no row is eligible.
-    """
+    """The FORECAST protocol rebuilt from a batch: trailing PREDICTION_PATCHES masked/scored.
+    A batch's own mask isn't a forecast (slot j = mask_idx[j], not context-edge-relative);
+    zone is [T-PREDICTION_PATCHES, T). Rows whose context-edge patch (anchor) is masked are
+    DROPPED — anchoring there would leak a withheld true value; fc_n counts survivors.
+    patches (B,T,PATCH_DIM); mask_idx/valid (B,M) padded; returns dense mask_idx (rows, P)."""
     B, T, _ = patches.shape
     P = PREDICTION_PATCHES
     device = patches.device
@@ -1852,9 +1605,7 @@ def _forecast_protocol(
 
     fc_masked = masked[rows].clone()
     fc_masked[:, T - P:] = True
-    # The whole masked set, not just the zone this protocol adds: idempotent on the
-    # sample's own masked patches, and the invariant — no masked patch carries a dose —
-    # then holds over the built window rather than over the part built here.
+    # Runs over the whole masked set, not just the added zone, so the no-dose invariant holds.
     blind_masked_doses(fc_patches, fc_masked, blind_fill)
     lens = n_context_patches.to(device).reshape(-1) + P
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
@@ -1874,20 +1625,11 @@ def _window_bg_mgdl(
     targets: torch.Tensor,
     norm_stats: dict,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """The whole window's bg with masked patches filled: ``(bg_mgdl, bg_z)``, both
-    ``(B, T, PATCH_SIZE)``. Pad columns hold whatever the pad rows do and are never scored.
-
-    A masked patch carries z = 0 in all bg columns — a legal ~142 mg/dL under the balanced
-    pool, not a sentinel — so the tensor alone does not carry the window's BG. The withheld
-    values are in ``targets`` ``(B, M, PATCH_SIZE)`` raw mg/dL, one row per head slot;
-    writing them back reconstitutes the fully-observed window the INFILL protocol is
-    defined on.
-
-    Two space crossings, each through its only bridge: ``normalize`` for (b)->(a),
-    ``denormalize`` for (a)->(b). The masked patches' mg/dL is then overwritten with
-    ``targets`` again rather than left as the round trip's output, so the scored truth is
-    the raw value exactly.
-    """
+    """Whole window's bg with masked patches filled: (bg_mgdl, bg_z), both (B, T, PATCH_SIZE).
+    Pad columns hold whatever pad rows do, never scored. A masked patch's z=0 decodes to a
+    legal ~142 mg/dL, not a sentinel, so targets (B, M, S) raw mg/dL are written back — the
+    INFILL protocol's fully-observed window. Two crossings via normalize/denormalize; masked
+    mg/dL is overwritten with targets again so scored truth is the raw value exactly."""
     device = patches.device
     bg_z = patches[:, :, _BG_FEAT::N_INPUT_FEATURES].clone()          # (B, T, S)
     z_fill = torch.from_numpy(
@@ -1913,23 +1655,11 @@ def _infill_protocol(
     rng: "np.random.Generator",
     blind_fill: dict[int, float],
 ) -> "dict[str, Any] | None":
-    """The INFILL protocol rebuilt from a collated batch — ``metrics.protocols``' second
-    fixed protocol: sampled INTERIOR spans plus the mandatory trailing forecast span, of
-    which only the interior spans are scored (a right-edge span is one-sided and belongs to
-    the forecast namespace, so it rides along unscored). Spans, slot layout, the ``d`` rule
-    and the anchor rule all come from ``infill_masked_set``; nothing here re-derives one.
-
-    The sample's own training mask is REPLACED, not kept: a protocol has to place its own
-    spans to mean anything across runs, and an interior span abutting a training-masked
-    patch would not be two-sided at the ``d`` the slot layout reports. ``_window_bg_mgdl``
-    writes the withheld BG back first.
-
-    ``n_ctx`` varies per row, so each row draws its own masked set and a row whose context
-    cannot hold the protocol is DROPPED. Left-padding puts window patch ``p`` at column
-    ``p + n_pad``. Returns ``{patches, attn_mask, mask_idx, anchor_bg, sets, bg_mgdl}``,
-    ``sets`` one ``(row, MaskedSet, window_bg_mgdl)`` per kept row in batch-axis order;
-    None when no row is eligible.
-    """
+    """The INFILL protocol from a batch — metrics.protocols' second fixed protocol: sampled
+    INTERIOR spans plus a mandatory trailing forecast span (unscored). Spans/slot layout/d/
+    anchor come from infill_masked_set. Training mask is REPLACED so a protocol means the
+    same across runs; n_ctx varies per row, a row too short is DROPPED. Returns {patches,
+    attn_mask, mask_idx, anchor_bg, sets, bg_mgdl}, sets = (row, MaskedSet, window_bg_mgdl)."""
     from metrics.protocols import infill_masked_set
 
     B, T, _ = patches.shape
@@ -1947,8 +1677,7 @@ def _infill_protocol(
         try:
             ms = infill_masked_set(n_ctx, rng)
         except ValueError:
-            # The context cannot hold MASK_MAX_SPANS spans totalling MAX_MASKED_PATCHES
-            # with their separators; the protocol has no masked set here, not a smaller one.
+            # Context too short for MASK_MAX_SPANS spans + separators; no masked set here.
             continue
         n_pad = T - ms.seq_len
         assert n_pad >= 0, f"row {b}: n_ctx={n_ctx} exceeds the collated width {T}"
@@ -1961,8 +1690,7 @@ def _infill_protocol(
     rows = torch.tensor(keep, device=device, dtype=torch.long)
     n = len(keep)
 
-    # Every patch starts VISIBLE with its true bg restored; feat 4 is rewritten wholesale,
-    # the training mask's announcement not being this protocol's.
+    # Every patch starts VISIBLE with true bg restored; feat 4 is rewritten wholesale here.
     inf_patches = patches[rows].clone()
     inf_patches[:, :, _BG_FEAT::N_INPUT_FEATURES] = bg_z[rows]
     inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] = 0.0
@@ -1976,8 +1704,7 @@ def _infill_protocol(
         live = torch.from_numpy(ms.valid).to(device)                     # (M,)
         inf_mask_idx[i] = patch_cols
         inf_masked[i, patch_cols[live]] = True
-        # A padded slot gathers patch 0 and takes a legal mg/dL anchor from it, as
-        # data._build_sample does; ``valid`` on the MaskedSet discards them downstream.
+        # A padded slot gets patch 0's legal anchor, as data._build_sample does; valid discards it.
         anchor = np.full(M, float(cgm[ms.anchor_step[0]]), dtype=np.float32)
         anchor[ms.valid] = cgm[ms.anchor_step[ms.valid]]
         inf_anchor[i] = torch.from_numpy(anchor).to(device)
@@ -1989,13 +1716,11 @@ def _infill_protocol(
     announce = inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES]
     inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] = announce.masked_fill(
         withheld, 1.0)
-    # Masking is not inferable from position and z = 0 decodes to an ordinary reading, so
-    # feat 4 IS the announcement: check it before the forward, not after.
+    # Masking isn't inferable from position, z=0 decodes plausibly, so feat 4 IS the announcement.
     assert bool(((inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] > 0.5)
                  == withheld).all()), (
         "feat 4 does not reproduce the infill protocol's masked set")
-    # The doses go with the bg, against THIS protocol's masked set: a patch it reveals keeps
-    # whatever the sample left there, a patch it masks is blinded either way.
+    # Doses go with bg against THIS protocol's masked set, not the sample's original one.
     blind_masked_doses(inf_patches, inf_masked, blind_fill)
 
     lens = n_context_patches.to(device).reshape(-1)[rows] + P
@@ -2006,13 +1731,9 @@ def _infill_protocol(
             'anchor_bg': inf_anchor, 'sets': sets, 'bg_mgdl': bg_mgdl}
 
 
-# The five scoring rules and the two protocols, mapped onto the column names the header
-# declares. Every number is computed in ``metrics.scoring`` / ``metrics.protocols``; this
-# section names them and nothing else, so no rule grows a second definition here.
+# Names the header's columns; every number is computed in metrics.scoring/metrics.protocols.
 
-# One tuple each, read by the log header, the checkpoint record and this mapping alike: a
-# family added to the header and forgotten here is an always-empty column, which reads as
-# an unmeasured metric.
+# Read by the log header and checkpoint alike; a family missing here is an always-empty column.
 FAN_SCORE_FAMILIES: tuple[str, ...] = (
     'crps', 'winkler90', 'sharp90', 'sharp50', 'joint_cov90')
 INFILL_FAMILIES: tuple[str, ...] = (
@@ -2048,8 +1769,7 @@ def _nominal_for(lo_idx: int) -> float:
     """The nominal central level whose LOWER edge is fan node ``lo_idx``, off
     ``central_levels`` so ``1 - 2τ`` stays in one place.
     """
-    # ``metrics.scoring``, not ``from metrics import scoring``: the package's lazy
-    # ``__getattr__`` recurses on itself and that form dies with a RecursionError.
+    # metrics.scoring, not `from metrics import scoring` — lazy __getattr__ recurses on that form.
     from metrics.scoring import central_levels
     for nominal, lo, _hi in central_levels():
         if lo == lo_idx:
@@ -2059,15 +1779,10 @@ def _nominal_for(lo_idx: int) -> float:
 
 def _alarm_point_at_tau(curve, tau: float):
     """The swept operating point whose firing set IS the τ band-edge alarm.
-
-    The deployed alarm fires when the fan's lower edge ``F⁻¹(τ)`` dips below the threshold,
-    so ``q(τ) < thr`` exactly when ``P(BG <= thr) > τ`` under the same piecewise-linear
-    quantile law ``scoring.predictive_cdf`` reads. The sweep cuts at REALISED scores under
-    ``score >= c``, so the smallest cut above τ selects exactly ``{score > τ}``.
-
-    None when no group's score clears τ: the alarm never fires there and the sweep carries
-    no point for an empty firing set.
-    """
+    Deployed alarm fires when the fan's lower edge F⁻¹(τ) dips below threshold, i.e. q(τ)<thr
+    exactly when P(BG<=thr)>τ under scoring.predictive_cdf's quantile law. Sweep cuts at
+    REALISED scores (score>=c), so the smallest cut above τ selects {score>τ}. None when no
+    group's score clears τ — the alarm never fires there, so the sweep has no point for it."""
     above = [p for p in curve.points
              if p.score_threshold is not None and p.score_threshold > tau]
     return min(above, key=lambda p: p.score_threshold) if above else None
@@ -2080,23 +1795,11 @@ def _forecast_fan_columns(
     group: np.ndarray,
     observed_days: "float | None",
 ) -> dict[str, Any]:
-    """The forecast protocol's scoring-rule columns, per ``d``.
-
-    q ``(N, PATCH_SIZE, N_QUANTILES)`` and true ``(N, PATCH_SIZE)`` are (b) mg/dL — the
-    caller has already crossed out of risk space. The protocol masks the trailing
-    PREDICTION_PATCHES, so patch ``p`` sits at ``d = p + 1`` one-sided and @30/@60/@90/@120
-    IS d = 1..4. Nothing pooled over ``d`` is emitted: the pooled figure every rule also
-    returns averages over a mask distribution rather than a difficulty.
-
-    The alarm carries both. One decision per forecast origin over the whole zone IS the
-    deployed rule, so its pooled curve is an operating point, not an average — but its score
-    is a ``max`` over the scanned steps, so losing every d = 4 detection while keeping d = 1
-    leaves pooled ``det`` unchanged. Each per-``d`` curve carries its own event count: the
-    denominators are different event sets, so a per-``d`` rate is not a share of the pooled one.
-
-    ``joint_cov90@h`` is the SIMULTANEOUS coverage of the whole path to ``h``, which is what
-    a trajectory claim means; ``coverage90@h`` is the per-step marginal — never interchangeable.
-    """
+    """The forecast protocol's scoring-rule columns, per d.
+    q (N,PATCH_SIZE,N_QUANTILES) and true (N,PATCH_SIZE) are mg/dL; patch p sits at d=p+1
+    one-sided, @30/60/90/120 IS d=1..4. Nothing pooled over d is emitted (mixes a mask
+    distribution, not difficulty). Alarm's pooled curve is an operating point (max over
+    steps), not an average; joint_cov90@h is SIMULTANEOUS path coverage, coverage90@h marginal."""
     from metrics.protocols import FORECAST, reachable_d
     from metrics.scoring import (
         AlarmCurve, alarm_operating_curve, coverage_sharpness_by_d, crps_by_d,
@@ -2128,8 +1831,7 @@ def _forecast_fan_columns(
         out[f'sharp50@{h}'] = _absent_if_nan(cs50.mean_width if cs50 else None)
         jt = joint[n90].joint_path_to_d.get(dd)
         out[f'joint_cov90@{h}'] = _absent_if_nan(jt.coverage if jt else None)
-        # Table only: coverage never travels without its width, and a bin's size decides
-        # how far to trust it.
+        # Table only: coverage never travels without its width; bin size decides trust.
         out[f'_fan_cov90@{h}'] = _absent_if_nan(cs90.coverage if cs90 else None)
         out[f'_fan_n@{h}'] = float(crps.n_by_d.get(dd, 0))
         out[f'_fan_joint_width@{h}'] = _absent_if_nan(jt.mean_width if jt else None)
@@ -2148,9 +1850,7 @@ def _forecast_fan_columns(
             if curve is not None:
                 point = _alarm_point_at_tau(curve, tau)
                 if point is None:
-                    # The τ edge never dipped below the threshold. Zero detections and zero
-                    # false alarms are measurements; the lead time of an alarm that never
-                    # fired is not, and stays absent.
+                    # τ never dipped below threshold: zero det/fa measured, lead stays absent.
                     det = 0.0 if curve.deployed.n_events > 0 else None
                     fa = 0.0 if observed_days else None
                 else:
@@ -2186,13 +1886,10 @@ def _infill_baseline(masked_set, cgm: np.ndarray) -> np.ndarray:
 
 
 def _infill_fan_columns(scores) -> dict[str, Any]:
-    """The infill protocol's columns, every one named with its ``d``.
-
-    Point errors come from ``InfillScores``, scored against LINEAR INTERPOLATION between the
-    bracketing visible readings — never persistence, a forecasting baseline and a strawman
-    against a two-sided span. The fan figures come from ``metrics.scoring`` over the same
-    fan. ``metrics.protocols.column`` builds every name, and refuses one without a ``d``.
-    """
+    """The infill protocol's columns, every one named with its d.
+    Point errors come from InfillScores, scored against LINEAR INTERPOLATION between
+    bracketing visible readings — never persistence, a strawman against a two-sided span.
+    Fan figures come from metrics.scoring; metrics.protocols.column refuses a name without a d."""
     from metrics.protocols import INFILL, column, reachable_d
     from metrics.scoring import (
         coverage_sharpness_by_d, crps_by_d, winkler_by_d,
@@ -2232,18 +1929,11 @@ def _slot_jump_hours(
     valid: torch.Tensor,
     adv_per_patch: float,
 ) -> torch.Tensor:
-    """Per-sample inter-SLOT clock-advance deviation in hours: ``(hours, has_pair)``, both ``(B,)``.
-
-    logits ``(B, M, n_bins)``, mask_idx / valid ``(B, M)``, adv_per_patch hours per patch.
-    The expected advance is per PAIR — ``mask_idx[j+1] - mask_idx[j]`` patches, not a
-    constant one — because the ``M`` slots are an arbitrary masked set; pairs touching a
-    padded slot are dropped.
-
-    ``has_pair`` IS NOT OPTIONAL: a row with one valid slot has no pair, and the
-    ``clamp(min=1.0)`` keeping 0/0 finite hands it back 0.0 — the best attainable value on a
-    lower-is-better row. Averaged in it measures how often the sampler drew one span of one
-    patch, so the flag rides out with the value.
-    """
+    """Per-sample inter-slot clock-advance deviation in hours: (hours, has_pair), both (B,).
+    logits (B,M,n_bins), mask_idx/valid (B,M), adv_per_patch hours/patch. Expected advance is
+    per PAIR (mask_idx[j+1]-mask_idx[j] patches, not constant); pairs touching a padded slot
+    are dropped. has_pair IS NOT OPTIONAL: a one-slot row's clamp(min=1.0) hands back 0.0, the
+    best value on a lower-is-better row — the flag rides with the value."""
     if logits.shape[1] < 2:
         return (logits.new_zeros(logits.shape[0]),
                 torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device))
@@ -2262,14 +1952,10 @@ def _slot_cross_window_loss(
     advance_hours: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Paired-window phase-advance penalty at a PER-SAMPLE advance; scalar, exact 0 when no
-    row is valid.
-
-    Rotate window k's slot-0 resultant by ``advance_hours`` ``(B,)`` and match window k+1's
-    in the raw (cos, sin) plane. The advance is per sample, not the one horizon:
-    window k's slot 0 is its first masked patch, wherever the sampler put it, while k+1
-    carries the right-edge forecast span. The gap comes off the shipped per-slot true hours.
-    """
+    """Paired-window phase-advance penalty at a PER-SAMPLE advance; scalar, exact 0 if no row valid.
+    Rotates window k's slot-0 resultant by advance_hours (B,), matches k+1's in the raw
+    (cos,sin) plane. Advance is per sample (k's slot 0 = first masked patch, wherever the
+    sampler put it; k+1 carries the right-edge forecast span), off the shipped true hours."""
     pk = torch.softmax(logits_k[:, 0, :], dim=-1)
     pn = torch.softmax(logits_next[:, 0, :], dim=-1)
     rk = time_of_day_resultant(pk, TIME_PROBE_N_BINS)                      # (B, 2)
@@ -2292,24 +1978,11 @@ def _run_validation(
     bg_hypo_threshold: float = BG_HYPO_THRESHOLD,
     bg_hyper_threshold: float = BG_HYPER_THRESHOLD,
 ) -> dict[str, Any]:
-    """Validation over a fixed patient set, in batches. THREE forwards per batch:
-
-    * OBJECTIVE, on each sample's own masked set — ``val_loss_total`` / ``_Q`` / ``_D`` and
-      the time probe read off this one, and it is literally ``risk_total_loss``, which is
-      what makes it a legitimate selection scalar;
-    * FORECAST protocol, trailing ``PREDICTION_PATCHES`` — the whole horizon-keyed clinical
-      suite. Those names are defined against a right-edge zone and training placement is
-      uniform, so scoring them over the objective slots reads a different patch on every
-      row with every shape still matching;
-    * INFILL protocol, sampled interior spans — the ``infill_*`` columns, scored against
-      LINEAR INTERPOLATION, never persistence.
-
-    Both fans are decoded to mg/dL once for ``metrics.scoring``. Every figure is binned on
-    ``d`` and NO pooled masked-BG scalar is emitted — the sampler concentrates supervision
-    at small ``d``, so a pooled average improves for free and a column for one would
-    eventually be selected on. ``pred_bg = f_inv(median)`` is the SOLE BG forecast into the
-    metric suite.
-    """
+    """Validation over a fixed patient set, in batches: THREE forwards per batch — OBJECTIVE
+    (own masked set, val_loss_total/_Q/_D = risk_total_loss, the selection scalar), FORECAST
+    (trailing PREDICTION_PATCHES, the horizon-keyed clinical suite), INFILL (interior spans,
+    infill_* columns vs LINEAR INTERPOLATION, never persistence). Fans decode to mg/dL once;
+    every figure bins on d, no pooled masked-BG scalar; pred_bg=f_inv(median) is the only one."""
     model.eval()
     totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0, 'pinball': 0.0}
     n_samples = 0
@@ -2329,11 +2002,7 @@ def _run_validation(
     infill_rng = np.random.default_rng(INFILL_PROTOCOL_SEED)
     infill_windows = 0
 
-    # Per-sample decoded hour + confidence over the WHOLE val set: the clock-reliability
-    # stats need the full residual distribution, not the running sums the point metrics get
-    # away with. The headline tod_* decode SLOT 0 against that slot's own true hour — slot 0
-    # is patch mask_idx[0], not the prediction origin, so pred_start_hour is off by
-    # (mask_idx[0] - n_ctx) * tod_adv hours with every shape matching.
+    # Clock stats need the full residual distribution; tod_* decodes slot 0 vs its own true hour.
     tod_adv = _PATCH_HOURS                            # phase advance per patch
     tod_pred_hours: list[torch.Tensor] = []
     tod_true_hours: list[torch.Tensor] = []
@@ -2341,8 +2010,7 @@ def _run_validation(
     tod_jump_vals: list[torch.Tensor] = []
     tod_xwin_vals: list[torch.Tensor] = []
 
-    # Derived once from the run's own stats. Both protocols place their own masked sets, so
-    # both write the fill themselves — the dataset's blinding covers the sample's mask only.
+    # Both protocols place their own masked sets, so both write the fill themselves.
     blind_fill = zero_dose_fill(norm_stats)
 
     with torch.no_grad():
@@ -2366,9 +2034,7 @@ def _run_validation(
                 patches, attn_mask, anchor_bg, mask_idx, return_time=True)
             B_batch = median_obj.shape[0]
 
-            # ``valid`` is what keeps the padded slots — 41.8% of head output on the
-            # average sample — from being supervised against patch 0 behind a plausible
-            # neighbouring anchor.
+            # valid keeps padded slots (41.8% of head output) from training against patch 0.
             loss_total, parts = risk_total_loss(
                 q_tau_obj.float(), median_obj.float(), targets, weighting,
                 valid=slot_valid, mask_idx=mask_idx,
@@ -2380,28 +2046,18 @@ def _run_validation(
             totals['loss_M'] += float(parts.get('loss_M', float('nan'))) * B_batch
             totals['pinball'] += float(parts.get('pinball', parts.get('loss_Q', float('nan')))) * B_batch
 
-            # Diagnostic only — never enters the loss totals or checkpoint selection. Slot
-            # 0's logits decode to a wall-clock hour + resultant-length confidence R, scored
-            # against SLOT 0's own true hour: slot j is patch mask_idx[j], so
-            # pred_start_hour is that clock only when the first masked patch is the origin.
-            # Slot 0 is valid on every sample, so no validity filter is needed.
+            # Diagnostic only, never in loss/selection; slot 0 decodes to hour+confidence R.
             if time_pred is not None:
                 hours0, R0 = time_of_day_decode_bins(time_pred[:, 0, :], TIME_PROBE_N_BINS)  # (B,)
                 tod_pred_hours.append(hours0.detach().cpu())
                 tod_true_hours.append(slot_hour[:, 0].detach().cpu())
                 tod_conf_vals.append(R0.detach().cpu())
-                # Only rows that HAVE a consecutive-slot pair: ``_slot_jump_hours`` returns
-                # the flag so this mean cannot be taken over its own 0/0 guard. At the
-                # shipped VALIDATION_N_PATIENTS that is 45 of 1000 samples, -4.5% on the
-                # rendered figure.
+                # Only rows with a consecutive-slot pair; the flag avoids meaning its own 0/0 guard.
                 _jump, _jump_pair = _slot_jump_hours(
                     time_pred, mask_idx, slot_valid, tod_adv)
                 if bool(_jump_pair.any()):
                     tod_jump_vals.append(_jump[_jump_pair].detach().cpu())
-                # Cross-window no-jump witness: a 2nd forward on window k+1, measuring
-                # |clock_{k+1,slot0} - clock_{k,slot0} - true gap| per valid sample, over the
-                # full batch. The two windows share n_ctx and so the padding geometry but not
-                # the masked set, so this runs under window k+1's OWN mask.
+                # Cross-window no-jump witness: 2nd forward on k+1, under k+1's OWN mask.
                 if TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0:
                     _nw = batch.get('next_window')
                     if _nw is not None and bool(_nw['valid'].any()):
@@ -2417,15 +2073,7 @@ def _run_validation(
                             _nw_patches, _nw_attn, _nw_anchor, _nw_mask_idx,
                             return_time=True,
                         )
-                        # The two slots are not one horizon apart in general — window k's
-                        # slot 0 is its first masked patch, k+1's is its forecast origin —
-                        # so the true gap comes off the shipped per-slot clocks.
-                        #
-                        # BOTH terms are clock differences, so their difference takes a
-                        # SECOND wrap: subtracting two values already folded into (-12, 12]
-                        # straddles the seam, and +11.9 h against a true -11.9 h is a 0.2 h
-                        # deviation that reads as 23.8 h without it. ``_slot_jump_hours``
-                        # wraps the same way; the pair is comparable only while both do.
+                        # Slots aren't one horizon apart; both are clock diffs, needs a SECOND wrap.
                         _adv = circular_hour_residual(_nw_hour[:, 0], slot_hour[:, 0])
                         _hk, _ = time_of_day_decode_bins(time_pred[:, 0, :], TIME_PROBE_N_BINS)
                         _hn, _ = time_of_day_decode_bins(_time_pred_next[:, 0, :], TIME_PROBE_N_BINS)
@@ -2466,19 +2114,17 @@ def _run_validation(
 
             pred_bg = _median_to_mgdl(median)                            # (B_fc, P*S)
 
-            # Risk-space mean |Δ²median|, pooled and over the last patch — the
-            # anti-oscillation witness the headline RMSE structurally masks.
+            # Risk-space mean |Δ²median|, pooled and over the last patch; RMSE misses this witness.
             m_flat = median.reshape(B_fc, -1)                           # (B_fc, P*S) patch-major
             d2 = m_flat[:, 2:] - 2.0 * m_flat[:, 1:-1] + m_flat[:, :-2]  # (B, P*S-2)
             agg['median_rough_abs_sum'] = agg.get('median_rough_abs_sum', 0.0) + float(d2.abs().sum())
             agg['median_rough_cnt'] = agg.get('median_rough_cnt', 0.0) + float(d2.numel())
-            _far0 = (PREDICTION_PATCHES - 1) * PATCH_SIZE - 1            # first Δ² centred in the last patch
+            _far0 = (PREDICTION_PATCHES - 1) * PATCH_SIZE - 1            # first Δ² in last patch
             d2_far = d2[:, _far0:]
             agg['median_rough_far_abs_sum'] = agg.get('median_rough_far_abs_sum', 0.0) + float(d2_far.abs().sum())
             agg['median_rough_far_cnt'] = agg.get('median_rough_far_cnt', 0.0) + float(d2_far.numel())
 
-            # f_inv is elementwise, so invert the whole fan ONCE and index the edges out —
-            # identical to inverting each slice, one pass instead of five.
+            # f_inv is elementwise: invert the whole fan ONCE, index edges out — one pass not five.
             conf_full = kovatchev_f_inv(q_tau)                           # (B_fc, P, S, 7) mg/dL
             q_lo = conf_full[..., _TAU_LO_IDX].reshape(B_fc, -1)
             q_hi = conf_full[..., _TAU_HI_IDX].reshape(B_fc, -1)
@@ -2504,10 +2150,7 @@ def _run_validation(
             for k, v in learn.items():
                 agg[k] = agg.get(k, 0.0) + v
 
-            # Infill-protocol forward: interior, two-sided, so scored against LINEAR
-            # INTERPOLATION between the bracketing visible readings. The right-edge span the
-            # inference builder requires rides along masked and UNSCORED — that patch is the
-            # forecast protocol's business.
+            # Infill forward: interior, two-sided, vs LINEAR INTERPOLATION; right-edge unscored.
             infill = _infill_protocol(
                 patches, mask_idx, slot_valid, targets,
                 batch['n_context_patches'], norm_stats, infill_rng, blind_fill)
@@ -2531,10 +2174,7 @@ def _run_validation(
                     )
                     infill_windows += 1
 
-            # Capped at VALIDATION_PROBE_N_PATIENTS: this is the one metric whose cost is
-            # per SAMPLE rather than per batch. The cap is on the window index, not a
-            # truncated loop, so the windows read stay the leading prefix of the same
-            # ordered val set every run.
+            # Capped at VALIDATION_PROBE_N_PATIENTS (per-sample cost); a fixed window-index prefix.
             n_rolls = math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
             probe_end = min(batch_end, VALIDATION_PROBE_N_PATIENTS)
             if n_rolls > 1 and batch_start < probe_end:
@@ -2583,9 +2223,7 @@ def _run_validation(
         'log_sigma_D': float(weighting.log_sigma_D.detach()),
     }
 
-    # Point accuracy plus clock reliability over the full val distribution: bias/precision,
-    # the p90 tail, the gross-error rate, and the confidence-selective MAE — whether R is
-    # usable as a trust gate. Diagnostic; in no loss total.
+    # Point accuracy + clock reliability, full val set: bias, p90 tail, gross-error, hiconf MAE.
     if tod_pred_hours:
         _ph = torch.cat(tod_pred_hours)
         _th = torch.cat(tod_true_hours)
@@ -2607,22 +2245,19 @@ def _run_validation(
         result['tod_mae_hiconf'] = (
             float(_ae[_hi].mean()) if bool(_hi.any()) else float(_ae.mean())
         )
-        # Mean |inter-patch advance deviation|, hours; ~0 means the clock marches one
-        # patch = tod_adv hours per step.
+        # Mean |inter-patch advance deviation|, hours; ~0 means the clock marches tod_adv/step.
         if tod_jump_vals:
             result['tod_jump_h'] = float(torch.cat(tod_jump_vals).mean())
         if tod_xwin_vals:
             result['tod_xwin_jump_h'] = float(torch.cat(tod_xwin_vals).mean())
 
-    # What each protocol ran on, so a shrinking sample shows in the log rather than only in
-    # the metric it moves.
+    # What each protocol ran on, so a shrinking sample shows in the log, not just the metric.
     result['fc_n'] = agg.get('fc_n', 0.0)
     _rcc = agg.get('roll_ctx_cnt', 0.0)
     result['roll_ctx_patches'] = (agg.get('roll_ctx_sum', 0.0) / _rcc) if _rcc > 0 else None
     result['roll_n'] = _rcc
     result['roll_skipped'] = agg.get('roll_skipped', 0.0)
-    # The same split over the nocturnal samples alone: the pair above counts the whole val
-    # set and is NOT the ``night_bg_rmse_*`` denominator.
+    # Nocturnal-only split; the pair above is NOT the night_bg_rmse_* denominator.
     result['night_roll_n'] = night_agg.get('night_roll_cnt', 0.0)
     result['night_roll_skipped'] = night_agg.get('night_roll_skipped', 0.0)
 
@@ -2634,9 +2269,7 @@ def _run_validation(
         else:
             result[f'bg_rmse_{h_min}'] = None
             result[f'bg_mae_{h_min}'] = None
-        # Horizons past the single forward come off the rolling probe, which reads
-        # VALIDATION_PROBE_N_PATIENTS windows rather than VALIDATION_N_PATIENTS, so this
-        # column separates a whole-val-set horizon from a probe-share one.
+        # Far horizons come off the rolling probe (VALIDATION_PROBE_N_PATIENTS, not _N_PATIENTS).
         result[f'bg_rmse_{h_min}_n'] = cnt
 
     _rc = agg.get('median_rough_cnt', 0.0)
@@ -2685,14 +2318,12 @@ def _run_validation(
         result[f'cgega_{_k}'] = _v
 
     clarke_total = max(agg.get('clarke_total', 0.0), 1.0)
-    # A+B is kept because the Clarke literature quotes it, not because A and B are
-    # interchangeable: B is a clinically benign error, A is no error at all.
+    # A+B is kept for the Clarke literature; B is a benign error, A is no error at all.
     for _z in ('A', 'B', 'C', 'D', 'E'):
         result[f'clarke_{_z}_pct'] = 100.0 * agg.get(f'clarke_{_z}', 0.0) / clarke_total
     result['clarke_AB_pct'] = 100.0 * (agg.get('clarke_A', 0.0) + agg.get('clarke_B', 0.0)) / clarke_total
 
-    # Every DTS zone and no dts_AB_pct: the paper holds that pZA alone is the measure of
-    # clinical performance and that presenting A+B as acceptable is not.
+    # Every DTS zone, no dts_AB_pct: the paper holds pZA alone as the measure of performance.
     _dts_fr = dts_grid.dts_zone_fractions(
         {k: agg.get(f'dts_{k}', 0.0) for k in (*dts_grid.ZONE_NAMES, 'total')})
     for _zn, _fr in _dts_fr.items():
@@ -2746,10 +2377,7 @@ def _run_validation(
         result['trend_gain_beta'] = None
         result['trend_amp_ratio'] = None
 
-    # exc_amp_ratio = std(pred)/std(true) at the true peak, target 1.0; exc_gain_beta =
-    # slope of pred on true, target 1.0; exc_corr their correlation. The over/under
-    # fractions are the per-window witnesses: re-centring trades one for the other,
-    # variance reduction lowers both.
+    # exc_amp_ratio=std(pred)/std(true) at peak; exc_gain_beta=slope; exc_corr=correlation.
     exc_n = agg.get('exc_cnt', 0.0)
     if exc_n > 0:
         s_pe = agg.get('exc_sum_pe', 0.0)
@@ -2782,18 +2410,12 @@ def _run_validation(
         result.update(_conformal_val_probe(
             fan_mgdl, fan_true, np.concatenate(conf_last_list, axis=0)))
 
-        # The same fan on the scoring unit ``metrics.scoring`` takes: one row per MASKED
-        # PATCH, (N, S, K), with its ``d`` and its window. The protocol lays exactly one
-        # patch at each d = 1..PREDICTION_PATCHES per window, so every bin is populated by
-        # construction and nothing has to be pooled to fill one.
+        # Reshaped to metrics.scoring's unit: one row per masked patch (N,S,K), its d and window.
         P, S, K = PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES
         q_fan = fan_mgdl.reshape(-1, P, S, K)
         t_fan = fan_true.reshape(-1, P, S)
         n_win = q_fan.shape[0]
-        # The false-alarms-per-day denominator, never a default: one alarm decision per
-        # window over that window's whole zone, so the exposure is exactly ``n_win`` zones
-        # of PREDICTION_HORIZON_HOURS. An ISSUANCE rate at this cadence — a deployment
-        # alarming every 5 min issues more.
+        # False-alarms/day denominator: one decision per window over its whole zone, n_win zones.
         observed_days = n_win * PREDICTION_HORIZON_HOURS / 24.0
         result.update(_forecast_fan_columns(
             q_fan.reshape(n_win * P, S, K),
@@ -2819,9 +2441,7 @@ def _run_validation(
         return cov_xy / denom if denom > 1e-9 else None
     result['bg_curve_corr'] = _curve_corr('bgcurve')
 
-    # Two families reach this row: the rolled one past a single forward, and the
-    # single-pass one under it. ``_n`` is the count behind whichever supplied the value, so
-    # the row and its denominator cannot come from different sets.
+    # Two families reach this row (rolled and single-pass); _n is the count behind whichever value.
     for h_min in BG_HORIZONS_MIN:
         cnt = night_agg.get(f'night_bg_rmse_{h_min}_cnt', 0.0)
         if cnt > 0:
@@ -2915,22 +2535,13 @@ def _build_checkpoint(
     return ckpt
 
 
-# ONE column list per log, shared by the header and the row writer: as two mirrored
-# literals, a metric added to one alone shifted every column after it with no error and no
-# shape to check. The rounding is in the spec because it differs per column.
-#
-# The checkpoint's ``val_record`` is a THIRD surface, NOT built from this list — it carries
-# keys no CSV column has and misses columns the CSV writes, so an equality assert between
-# them fails on the first run. It is extended by hand.
+# One column list per log, shared by header/writer; val_record is a THIRD surface, built by hand.
 
 
 def _alarm_curve_taus() -> "list[float]":
     """The hypo alarm's operating points: the lower-half τ plus the median.
-
-    The alarm fires off a band edge, so sweeping τ IS the operating curve — a lower τ buys
-    detection with false alarms. The ladder is ``QUANTILE_LEVELS``, so it cannot name a τ
-    the head does not emit.
-    """
+    The alarm fires off a band edge, so sweeping τ IS the operating curve. The ladder is
+    QUANTILE_LEVELS, so it cannot name a τ the head does not emit."""
     return [t for t in QUANTILE_LEVELS if t <= 0.5]
 
 
@@ -2940,13 +2551,10 @@ def _tau_tag(tau: float) -> str:
 
 
 def _train_log_columns() -> "list[tuple[str, int]]":
-    """``logs_blind/training_log.csv`` columns as ``(name, decimals)``.
-
-    DILATE is not scale-free in ``H = L * PATCH_SIZE``, so ``alpha`` weights a different
-    mixture in each span-length bucket and ``log_sigma_D`` absorbs that silently — hence
-    ``loss_D_L{L}``, ``n_spans_L{L}`` and the mean masked-patch count beside the combined
-    value. Two runs are comparable only at an equal span-length mixture.
-    """
+    """logs_blind/training_log.csv columns as (name, decimals).
+    DILATE isn't scale-free in H=L*PATCH_SIZE, so alpha weights differ per bucket and
+    log_sigma_D absorbs that silently — hence loss_D_L{L}/n_spans_L{L} beside the combined
+    value. Two runs are comparable only at an equal span-length mixture."""
     return [
         ('step', 0), ('loss_total', 6), ('loss_ema', 6),
         ('loss_Q', 6), ('loss_D', 6), ('loss_D_shape', 6), ('loss_D_tdi', 6), ('loss_M', 6),
@@ -2961,27 +2569,11 @@ def _train_log_columns() -> "list[tuple[str, int]]":
 
 
 def _val_log_columns() -> "list[tuple[str, int]]":
-    """``logs_blind/validation_log.csv`` columns as ``(name, decimals)``. Three axes, not
-    interchangeable.
-
-    ``BG_HORIZONS_MIN`` runs past the model's own 2 h zone — those columns come off the
-    ROLLING pass. ``eh`` is the forecast protocol's per-patch end-horizon, [30, 60, 90, 120]
-    at a 2 h zone, and that axis IS the ``d`` axis: the protocol masks the trailing
-    PREDICTION_PATCHES, so patch ``p`` is one-sided with its nearest evidence ``p + 1``
-    patches away.
-
-    Both ``d`` axes and every infill column name come from ``metrics.protocols``
-    (``reachable_d``, ``column``), never a local range. The reachable infill set is narrower
-    than the span-length knob suggests — the inference builder needs the whole trailing
-    forecast zone masked, leaving MAX_MASKED_PATCHES - PREDICTION_PATCHES slots for interior
-    spans, and a two-sided span of length ``L`` caps at ``d = ceil(L/2)``.
-
-    Sharpness is emitted beside coverage at every horizon coverage is reported at, so a band
-    cannot post a coverage figure without the width that bought it. No scoring-rule column
-    pools over ``d``; the alarm alone also carries a pooled set, because one decision per
-    forecast origin over the whole zone IS the deployed rule, with its per-``d`` set beside
-    it since the pooled score is a max over the zone.
-    """
+    """logs_blind/validation_log.csv columns as (name, decimals). Three axes, not interchangeable.
+    BG_HORIZONS_MIN past the 2h zone come off the ROLLING pass; eh is the forecast protocol's
+    per-patch end-horizon [30,60,90,120], which IS the d axis. Both d axes and every infill
+    column name come from metrics.protocols (reachable_d, column), never a local range —
+    reachable infill is narrower than the span knob suggests (two-sided L caps at d=ceil(L/2))."""
     from metrics.protocols import FORECAST, INFILL, column, reachable_d
 
     eh = _excursion_bucket_horizons(PREDICTION_PATCHES)
@@ -3007,15 +2599,13 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('tbr_err', 4), ('tar_err', 4),
         ('hypo_recall', 4), ('hypo_precision', 4), ('hypo_n_steps', 4),
         ('hyper_recall', 4), ('hyper_precision', 4), ('hyper_n_steps', 4),
-        # All three verdicts per region: AP + BE + EP is 1, so AP and EP alone leave the
-        # benign share derivable but never stated.
+        # All three verdicts per region: AP+BE+EP=1, so AP/EP alone leave BE derivable but unstated.
         *[(f'cgega_{m}_{r}', 4) for r in ('hypo', 'eu', 'hyper') for m in ('ap', 'be', 'ep')],
         *[(f'evalfix_clarke_{z}@{h}', 4)
           for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN for z in ('A', 'B', 'C', 'D', 'E')],
         *[(f'clarke_{z}_pct', 4) for z in ('A', 'B', 'C', 'D', 'E')],
         ('clarke_AB_pct', 4),
-        # Every zone plus pZA per horizon. No A+B column — the paper is explicit that
-        # presenting one is inappropriate.
+        # Every zone plus pZA per horizon; no A+B column — the paper says presenting one is wrong.
         *[(f'dts_{z}_pct', 4) for z in dts_grid.ZONE_NAMES],
         *[(f'dts_{z}@{h}', 4)
           for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN for z in dts_grid.ZONE_NAMES],
@@ -3024,45 +2614,23 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         # NET peak deviation vs last_bg — the over/under-dispersion trend_amp_ratio misses.
         ('exc_amp_ratio', 4), ('exc_gain_beta', 4), ('exc_corr', 4),
         ('exc_overshoot_frac', 4), ('exc_undershoot_frac', 4), ('exc_n', 4),
-        # Raw vs calibrated band coverage at excursion peaks, each with the mean band
-        # width, mg/dL, that bought it.
+        # Raw vs calibrated band coverage at excursion peaks, each with the mean band width, mg/dL.
         ('conf_cov90_raw', 4), ('conf_cov90_cal', 4),
         ('conf_width_raw', 4), ('conf_width_cal', 4),
         ('conf_hypo_esc_raw', 4), ('conf_hypo_esc_cal', 4), ('conf_n', 4),
-        # Risk-space mean |Δ²median|, pooled and over the last patch where the zigzag
-        # concentrated — the anti-oscillation witness the headline RMSE masks.
+        # Risk-space mean |Δ²median|, pooled and over the last patch; anti-oscillation witness.
         ('median_roughness', 6), ('median_roughness_far', 6),
-        # ``train.py``'s cf_* block is absent: a dose perturbation is invisible to a blind
-        # model by construction.
+        # train.py's cf_* block is absent: a dose perturbation is invisible to a blind model.
         ('tod_mae_h', 4), ('tod_acc_1h', 4), ('tod_acc_2h', 4), ('tod_acc_bin', 4), ('tod_conf', 4),
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),
         ('tod_mae_hiconf', 4),
         ('tod_jump_h', 4), ('tod_xwin_jump_h', 4),
-        # How much of the val set each protocol saw. fc_n counts forecast-protocol windows
-        # (a row whose context-edge patch is masked has no visible anchor and is dropped);
-        # roll_ctx_patches is the mean VISIBLE context the rolls ran on. roll_n /
-        # roll_skipped split the windows the roll was OFFERED — the leading
-        # VALIDATION_PROBE_N_PATIENTS, not the whole val set — and night_roll_n /
-        # night_roll_skipped are that split over the several-times-smaller nocturnal subset
-        # the night_bg_rmse_* family is scored on. Without both pairs two runs' night rows
-        # are compared over different sample sets with nothing to show it.
+        # How much of the val set each protocol saw: fc_n, roll_ctx_patches, roll_n/skipped, night.
         ('fc_n', 4), ('roll_ctx_patches', 3), ('roll_n', 4), ('roll_skipped', 4),
         ('night_roll_n', 4), ('night_roll_skipped', 4),
-        # Strictly-proper scoring on the forecast protocol, per d (= eh). crps: quantile
-        # -decomposition CRPS over QUANTILE_LEVELS, mg/dL. winkler90: interval score of the
-        # central 90% band at alpha = 0.10, mg/dL — width plus miss penalty, so a band
-        # cannot buy coverage with width. sharp90 / sharp50: mean band width, mg/dL.
-        # joint_cov90: SIMULTANEOUS coverage of every step through h, strictly below the
-        # marginal figure.
+        # Strictly-proper per d: crps, winkler90 (width+miss), sharp90/50 (width), joint_cov90.
         *[(f'{fam}@{h}', 4) for fam in FAN_SCORE_FAMILIES for h in eh],
-        # Hypo alarm curve, swept over τ. det = fraction of true hypo events alarmed,
-        # fa_day = false alarms per patient-day, lead_min = MEDIAN lead in minutes on the
-        # detected events (a mean lead is dominated by the long tail of early warnings).
-        #
-        # Twice: pooled over the zone, which is the deployed decision, and per ``d`` under
-        # the ``@{h}`` suffix. The pooled score is a max over the zone's steps, so it
-        # survives the loss of every detection at one ``d``. Each ``d`` carries its own
-        # event count — different event sets, so a per-``d`` rate is not a share of the pooled.
+        # Hypo alarm curve swept over τ: det, fa_day, lead_min (median); pooled (zone max), per-d.
         ('alarm_hypo_n_events', 4),
         *[(f'alarm_hypo_det@{_tau_tag(t)}', 4) for t in at],
         *[(f'alarm_hypo_fa_day@{_tau_tag(t)}', 4) for t in at],
@@ -3071,9 +2639,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         *[(f'alarm_hypo_det@{_tau_tag(t)}@{h}', 4) for t in at for h in eh],
         *[(f'alarm_hypo_fa_day@{_tau_tag(t)}@{h}', 4) for t in at for h in eh],
         *[(f'alarm_hypo_lead_min@{_tau_tag(t)}@{h}', 2) for t in at for h in eh],
-        # Infill, per d, named through metrics.protocols.column so the namespace and the
-        # reachable d set have one definition. rmse_interp is the linear-interpolation
-        # baseline the same rows are scored against.
+        # Infill, per d, named via metrics.protocols.column; rmse_interp is the linear-interp base.
         *[(column(INFILL, base, d), 4)
           for base in INFILL_FAMILIES for d in inf_d],
         *[(f'hypo_recall@{h}', 4) for h in eh],
@@ -3082,8 +2648,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         *[(f'hyper_recall@{h}', 4) for h in eh],
         *[(f'hyper_precision@{h}', 4) for h in eh],
         *[(f'hyper_n_steps@{h}', 4) for h in eh],
-        # Each night RMSE carries its window count: the roll's night subset is small enough
-        # that one window entering or leaving it moves the figure as far as the model does.
+        # Each night RMSE carries its window count; the night subset is small enough to swing on it.
         *[(f'night_bg_rmse_{h}', 4) for h in BG_HORIZONS_MIN],
         *[(f'night_bg_rmse_{h}_n', 4) for h in BG_HORIZONS_MIN],
         ('night_hypo_recall', 4), ('night_hypo_precision', 4), ('night_hypo_n_steps', 4),
@@ -3136,8 +2701,7 @@ def train(
     cache_path: str | None = None,
 ) -> list[float]:
     """Run the training loop; returns the per-step total-loss history."""
-    # Before any model / optimizer / dataloader is built, so every downstream draw is
-    # reproducible.
+    # Before any model/optimizer/dataloader is built, so every downstream draw is reproducible.
     if DETERMINISTIC:
         setup_determinism(master_seed)
         print(f"Determinism enabled (seed={master_seed}; TF32 off, cuDNN deterministic)")
@@ -3174,8 +2738,7 @@ def train(
         )
         save_normalization_stats(norm_stats)
 
-    # setup_determinism() already seeded torch and every CUDA device; seed here only on the
-    # non-deterministic path, so model init is reproducible without double-seeding.
+    # setup_determinism already seeded torch/CUDA; seed here only on the non-deterministic path.
     if not DETERMINISTIC:
         torch.manual_seed(master_seed)
         if torch.cuda.is_available():
@@ -3183,8 +2746,7 @@ def train(
 
     model = T1DMAI().to(device)
 
-    # Off ``model``, so the weight EMA never touches the two log-σ; their own
-    # weight_decay=0 AdamW group comes from _build_optimizers.
+    # Off model, so the weight EMA never touches the two log-σ (own AdamW group, wd=0).
     weighting = KendallGalWeighting().to(device)
 
     muon_opt, adam_opt = _build_optimizers(
@@ -3222,8 +2784,7 @@ def train(
         total_steps=VALIDATION_N_PATIENTS,
         batch_size=1,
         normalization_stats=norm_stats,
-        # Nothing announced, here as in training: validating on announced windows would
-        # score a task this model was never given.
+        # Nothing announced, as in training: an announced window would score an untrained task.
         patient_uniform_sample_prob=patient_uniform_sample_prob,
         simulator_warmup_hours=simulator_warmup_hours,
         cache_path=cache_path,
@@ -3239,9 +2800,7 @@ def train(
         num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         persistent_workers=True if num_workers > 0 else False,
-        # prefetch_factor * num_workers batches sit buffered in anonymous RAM — ~10 GB at
-        # 8*20=160 on the shared unified-memory pool, each refill a page-cache burst.
-        # 2*20=40 keeps the GPU fed without hoarding it.
+        # prefetch_factor*num_workers buffers in RAM (~10GB at 8*20=160); 2*20=40 avoids hoarding.
         prefetch_factor=2 if num_workers > 0 else None,
         collate_fn=collate_fn,
         drop_last=True,
@@ -3254,15 +2813,11 @@ def train(
     )
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
-        # The sampler constants the run trained under: what a loader compares its live
-        # config against.
+        # Sampler constants the run trained under, for a loader to compare its live config against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
         'mask_right_edge_quota': MASK_RIGHT_EDGE_QUOTA,
-        # What a masked patch withheld — bg AND the three dose channels here. No parameter
-        # shape records the supervision regime, so a strict state-dict load accepts these
-        # weights anywhere; this stamp is what keeps them un-confusable with a conditioned
-        # run's, and calibrate_conformal.py refuses to mix the two.
+        # What a masked patch withheld (bg+doses); un-confusable with a conditioned run.
         'masked_channel_policy': masked_channel_policy(blind=True),
         'master_seed': master_seed, 'total_steps': total_steps, 'batch_size': batch_size,
         'num_workers': num_workers,
@@ -3340,16 +2895,14 @@ def train(
             k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             for k, v in batch['bg_formula_data'].items()
         }
-        # The masked set and everything keyed to it, all (B, M) on the PADDED patch axis.
-        # ``targets`` is raw mg/dL per head slot, not a trailing trajectory.
+        # The masked set and everything keyed to it, (B, M) padded; targets is raw mg/dL per slot.
         mask_idx = bg_formula['mask_idx'].long()                      # (B, M)
         slot_valid = bg_formula['valid']                              # (B, M) bool
         anchor_bg = bg_formula['anchor_bg'].float()                   # (B, M) mg/dL
         slot_hour = bg_formula['slot_hour'].float()                   # (B, M) hours
         targets = batch['targets'].to(device, non_blocking=True).float()   # (B, M, S)
 
-        # Window k+1 — time-probe-only overhead, fully skipped when the penalty is off
-        # (data.py ships the key iff enabled and weight > 0).
+        # Window k+1 — time-probe-only overhead, fully skipped when the penalty is off.
         next_window = None
         if TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0:
             _nw = batch.get('next_window')
@@ -3379,9 +2932,7 @@ def train(
             nonlocal consecutive_nan
             if consecutive_nan >= 10 and ema is not None:
                 model.load_state_dict(ema.state_dict(), strict=False)
-                # The restored weights are not the ones the moments were accumulated
-                # against; keeping them re-applies stale moments to rolled-back weights and
-                # can re-diverge on the first post-recovery step.
+                # Stale moments against rolled-back weights can re-diverge post-recovery.
                 muon_opt.state.clear()
                 adam_opt.state.clear()
                 print(f"  [RECOVERY] {consecutive_nan} consecutive {reason} — restored model from EMA shadow weights (optimizer state cleared)")
@@ -3408,34 +2959,20 @@ def train(
             else:
                 loss_ema = 0.98 * loss_ema + 0.02 * 1.0
 
-        # Wrapped so a non-finite loss AND an exception raised inside forward/loss/backward
-        # (a CUDA fault from propagated NaN) both route to the same skip / EMA-restore path
-        # instead of aborting the run.
+        # Wrapped so a non-finite loss AND a raised exception both route to the same skip/EMA path.
         try:
             q_tau, median, time_pred = model(
                 patches, attn_mask, anchor_bg, mask_idx, return_time=True)
             q_tau = q_tau.float()
             median = median.float()
 
-            # ``valid`` discards the padded slots, which gather patch 0 and would otherwise
-            # be supervised against its BG behind a plausible neighbouring anchor;
-            # ``mask_idx`` groups the slots into spans for the DILATE buckets and the
-            # spline nodes.
+            # valid discards padded slots (gather patch 0); mask_idx groups slots for DILATE/spline.
             loss_total, parts = risk_total_loss(
                 q_tau, median, targets, weighting,
                 valid=slot_valid, mask_idx=mask_idx,
             )
 
-            # Added to the BACKWARD tensor ONLY — never to loss_total or parts, so logging,
-            # EMA, CSV and checkpoint selection stay on BG accuracy — but at
-            # TIME_PROBE_DETACH=False its gradient does shape the shared trunk. Soft
-            # circular CE over the VALID slots, plus the teacher-forced cross-window
-            # phase-advance penalty coupling two INDEPENDENT forwards.
-            #
-            # The target is the per-slot TRUE hour data.py ships. Derived as
-            # ``pred_start_hour + 0.5*j`` instead it is off by ``(mask_idx[j] - n_ctx - j)
-            # * 0.5`` h with every shape matching, and the only witness is loss_tod, which
-            # nothing gates on. Padded slots are dropped, not trained against patch 0's clock.
+            # Added to BACKWARD only, never loss_total/parts; target = per-slot true hour.
             _tod_extra = loss_total.new_zeros(())
             _tod_loss_val = float('nan')    # per-slot CE (logged as loss_tod)
             _tod_xwin_val = float('nan')    # cross-window penalty alone (logged as loss_tod_xwin)
@@ -3446,12 +2983,7 @@ def train(
                 )
                 _tod_loss_val = float(_tod_ce.detach())
                 _tod_loss = _tod_ce
-                # A SECOND forward on window k+1 couples the two INDEPENDENT clocks. The
-                # advance is per SAMPLE: k+1 carries the right-edge forecast span while
-                # window k's slot 0 is wherever the sampler put its first masked patch, so
-                # the two slot 0s are one horizon apart only by coincidence. Rides
-                # _tod_extra, so it co-trains the trunk and never reaches selection. INSIDE
-                # this try, so a non-finite value propagates to the guard.
+                # 2nd forward on k+1 couples clocks; rides _tod_extra, trunk-only.
                 if (next_window is not None
                         and TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0
                         and bool(next_window['valid'].any())):
@@ -3460,10 +2992,7 @@ def train(
                              else max(1, math.ceil(TIME_PROBE_CROSS_WINDOW_FRACTION * B_nw)))
                     nw_valid_s = next_window['valid'][:n_sub]
                     if bool(nw_valid_s.any()):
-                        # Window k+1's OWN mask: the two share n_ctx and so the mask SHAPE,
-                        # and this forward's gradient reaches the trunk, so the wrong
-                        # window's mask trains it to read patches this input announces as
-                        # withheld.
+                        # Window k+1 OWN mask; a wrong one trains reading withheld patches.
                         nw_mask = next_window['attn_mask'][:n_sub]
                         _assert_mask_is_this_window(
                             next_window['patches'][:n_sub], nw_mask,
@@ -3565,8 +3094,7 @@ def train(
                 'loss_total': loss_val, 'loss_ema': loss_ema,
                 'loss_Q': loss_q, 'loss_D': loss_d,
                 'loss_D_shape': loss_d_shape, 'loss_D_tdi': loss_d_tdi, 'loss_M': loss_m,
-                # Per-bucket DILATE and the span-length histogram: the effective Q:D
-                # balance moves with the span mixture even though both log-σ are pinned.
+                # Per-bucket DILATE/histogram: effective Q:D balance moves with span mixture.
                 **{k: float(v) for k, v in parts.items()
                    if k.startswith('loss_D_L') or k.startswith('n_spans_L')},
                 'n_masked_mean': float(parts.get('n_masked_mean', float('nan'))),
@@ -3609,10 +3137,7 @@ def train(
             def _r(x: float | None, n: int = 4) -> float | None:
                 return round(x, n) if isinstance(x, (int, float)) else None
 
-            # THIRD SURFACE: written into every checkpoint's ``val_history``, NOT built
-            # from ``_val_log_columns()`` and never asserted against the CSV — the two round
-            # differently and this record keeps native ints, so an equality assert fails on
-            # the first run. A metric added to the CSV must be added here in the same edit.
+            # THIRD SURFACE (val_history), not from _val_log_columns(); add CSV metrics here too.
             val_record = {
                 'step': step,
                 'val_loss_total': round(val_total, 6),
@@ -3689,19 +3214,16 @@ def train(
             for h in BG_HORIZONS_MIN:
                 val_record[f'bg_rmse_{h}'] = _r(val_metrics.get(f'bg_rmse_{h}'))
                 val_record[f'bg_mae_{h}'] = _r(val_metrics.get(f'bg_mae_{h}'))
-                # Past the single forward these come off VALIDATION_PROBE_N_PATIENTS
-                # windows, and this record is the only copy once logs_blind/ is overwritten.
+                # Past the single forward these come off VALIDATION_PROBE_N_PATIENTS windows.
                 val_record[f'bg_rmse_{h}_n'] = val_metrics.get(f'bg_rmse_{h}_n')
             for h in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
                 val_record[f'evalfix_clarke_A@{h}'] = _r(val_metrics.get(f'evalfix_clarke_A@{h}'))
                 val_record[f'dts_a@{h}'] = _r(val_metrics.get(f'dts_a@{h}'))
 
-            # Namespaces and d axes from metrics.protocols, the source _val_log_columns
-            # builds the header from. Imported here so this file keeps importing without it.
+            # Namespaces/d axes from metrics.protocols; imported so the file imports without it.
             from metrics import protocols as _protocols
 
-            # A checkpoint is the only surviving copy of a validation once logs_blind/ is
-            # overwritten, so the per-horizon and nocturnal families are recorded too.
+            # A checkpoint outlives logs_blind/, so per-horizon/nocturnal families are recorded too.
             _eh_rec = _excursion_bucket_horizons(PREDICTION_PATCHES)
             for h in _eh_rec:
                 for _k in ('hypo_recall', 'hypo_precision', 'hypo_n_steps',
@@ -3717,15 +3239,11 @@ def train(
                 val_record[f'night_clarke_A@{h}'] = _r(val_metrics.get(f'night_clarke_A@{h}'))
                 val_record[f'night_mard@{h}'] = _r(val_metrics.get(f'night_mard@{h}'))
 
-            # eh is the forecast protocol's d = 1..PREDICTION_PATCHES one-sided; the infill
-            # axis and its names come from metrics.protocols. Nothing pooled over d is
-            # stored, so no reader can pick one up as a selection scalar.
+            # eh is forecast d=1..PREDICTION_PATCHES one-sided; nothing pooled over d is stored.
             for h in _eh_rec:
                 for _k in FAN_SCORE_FAMILIES:
                     val_record[f'{_k}@{h}'] = _r(val_metrics.get(f'{_k}@{h}'))
-            # The pooled operating point, which is the deployed decision, and the per-d
-            # curves under it: the pooled score is a max over the zone and does not move
-            # when one d stops detecting.
+            # Pooled operating point (deployed decision) and per-d curves; pooled = max over zone.
             val_record['alarm_hypo_n_events'] = val_metrics.get('alarm_hypo_n_events')
             for _sfx in ('', *[f'@{h}' for h in _eh_rec]):
                 for _t in _alarm_curve_taus():
@@ -3933,21 +3451,18 @@ if __name__ == '__main__':
             resolved[key] = cli_val
             sources[key] = 'CLI'
 
-    # The horizon is fixed at config import, so model / data / inference already hold the
-    # right PREDICTION_PATCHES — nothing to propagate at runtime.
+    # Horizon is fixed at config import; nothing to propagate at runtime.
 
     rows = [(key, str(value), sources[key]) for key, value in resolved.items()]
     rows.append(('prediction_patches', str(PREDICTION_PATCHES), 'derived'))
     rows.append(('arch_version', str(ARCH_VERSION), 'config.py'))
     rows.append(('loss_schema', str(LOSS_SCHEMA), 'config.py'))
     rows.append(('mse_alpha', str(MSE_ALPHA), 'config.py'))
-    # Read back off ``config``: what the run trains with is what config published, and what
-    # the checkpoint records.
+    # Read back off config: what the run trains with matches what the checkpoint records.
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
     rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))
     rows.append(('mask_right_edge_quota', str(MASK_RIGHT_EDGE_QUOTA), 'config.py'))
-    # The one thing separating this run from train.py's, on the page read before launching
-    # rather than in the checkpoint afterwards.
+    # The one thing separating this run from train.py's, read here before launching.
     rows.append(('masked_channel_policy', masked_channel_policy(blind=True), 'train_blind.py'))
     key_w = max(len(k) for k, _, _ in rows)
     val_w = max(len(v) for _, v, _ in rows)

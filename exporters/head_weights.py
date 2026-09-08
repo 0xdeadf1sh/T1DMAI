@@ -15,8 +15,7 @@ import torch
 import config as cfg
 
 
-# bg_head = Sequential(Linear, SiLU, Linear, SiLU, Linear): 0/2/4 weights, 1/3 activation.
-# Renamed l0/l1/l2 so the file format does not inherit nn.Sequential's indices.
+# bg_head = Sequential(Linear,SiLU,Linear,SiLU,Linear): 0/2/4 weights, renamed l0/l1/l2 in file.
 _LINEARS = (("l0", 0), ("l1", 2), ("l2", 4))
 
 

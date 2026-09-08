@@ -1,21 +1,7 @@
-"""Engine-agnostic export pieces: the modified forward, the struct-mask and slot-selection builders, load.
-
-The MODIFIED forward differs from ``T1DMAI.forward`` in exactly three ways, all forced by the on-device contract:
-
-1. Its ONLY mask input is the external additive-float struct mask — 0.0 attend, ``NEG_FILL = -30000.0`` block.
-   Not ``-inf``, so an fp16 NPU softmax stays finite; in fp32/fp64 ``exp(-30000)`` underflows to 0.0, leaving
-   the blocked positions bit-identical to ``-inf``. It reaches SDPA as the sole additive term on the logits —
-   position enters through RoPE alone.
-2. The head reads its ``M = MAX_MASKED_PATCHES`` slots through an external one-hot ``(M, T)`` matrix instead of
-   gathering by ``mask_idx``: the same permutation as a float matmul, so no int64 index crosses the runtime
-   boundary. The masked set is arbitrary — trailing forecast, leading backcast, or an infill span between.
-3. The graph is cut at ``head_raw`` (B, M, S, 1+2*N_SPREADS), risk space: no ``anchor_bg``, no ``q_tau`` /
-   ``median``. Everything downstream is Rust.
-
-``hidden`` — the final-normed state of EVERY patch — rides alongside as the LoRA seam. The decode reads a
-span's masked patches and its visible neighbours as spline nodes, so the seam carries the whole window
-rather than the slot rows: the consumer gathers the nodes from ``hidden``, builds the step weights and
-re-runs ``bg_head`` from the exported weights, and with no adapter attached the two paths agree.
+"""Engine-agnostic export pieces: modified forward, struct-mask/slot-selection builders, load.
+Differs from T1DMAI.forward in 3 ways: additive-float struct mask (NEG_FILL=-30000.0 block,
+0.0 attend, no int64); one-hot (M,T) slot_sel instead of mask_idx gather; graph cut at
+head_raw (B,M,S,1+2*N_SPREADS) risk space. hidden (B,T,D_MODEL) rides as the LoRA seam.
 """
 
 from __future__ import annotations
@@ -53,11 +39,10 @@ class HeadRawForward(nn.Module):
     def forward(
         self, patches: torch.Tensor, struct: torch.Tensor, slot_sel: torch.Tensor,
     ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
-        """``patches`` (B, T, PATCH_DIM) normalized, step-major; ``struct`` (T, T) additive, 0.0 attend /
-        NEG_FILL block; ``slot_sel`` (M, T) one-hot, row j names the patch slot j reads.
+        """patches (B,T,PATCH_DIM) normalized, step-major; struct (T,T) additive, 0.0 attend/
+        NEG_FILL block; slot_sel (M,T) one-hot, row j names the patch slot j reads.
 
-        -> ``head_raw`` (B, M, PATCH_SIZE, 1 + 2*N_SPREADS) risk space, ``time_logits``
-        (B, M, TIME_PROBE_N_BINS), ``hidden`` (B, T, D_MODEL).
+        -> head_raw (B,M,PATCH_SIZE,1+2*N_SPREADS) risk space, time_logits (B,M,N_BINS), hidden.
         """
         m = self.model
         B = patches.shape[0]
@@ -76,8 +61,7 @@ class HeadRawForward(nn.Module):
         # one-hot rows make this exactly the stock forward's gather
         slot_states = torch.einsum('mt,btd->bmd', slot_sel, hidden)  # (B, M, D_MODEL)
 
-        # slot_sel's rows are one-hot and struct is the additive form of the bool mask, so both of
-        # the stock forward's arguments are recoverable — which keeps ONE node rule, step_states'.
+        # slot_sel's rows are one-hot and struct is additive bool mask; both stock args recoverable.
         mask_idx = slot_sel.argmax(dim=-1).unsqueeze(0).expand(B, -1)
         h_steps = step_states(hidden, mask_idx, struct == 0.0)
         head_raw = m.bg_head(h_steps)
@@ -94,10 +78,10 @@ def build_slot_selection(
     m_slots: int = MAX_MASKED_PATCHES,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """The ``(M, T)`` one-hot selection matrix — one 1.0 per row — naming the patch each head slot reads.
+    """The (M,T) one-hot selection matrix, one 1.0 per row, naming the patch each slot reads.
 
-    ``mask_idx`` is the masked set in ascending patch order. Surplus slots repeat patch 0, the eager forward's
-    padding convention: a legal anchor, and the output discarded by ``valid``.
+    mask_idx is the masked set in ascending patch order. Surplus slots repeat patch 0 (eager
+    forward's padding convention, a legal anchor) and are discarded by valid.
     """
     assert 1 <= len(mask_idx) <= m_slots, (
         f"masked set of {len(mask_idx)} patches does not fit {m_slots} head slots"
@@ -115,11 +99,10 @@ def build_struct_mask_from_visible(
     neg_fill: float = NEG_FILL,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """The additive form of :func:`utils.create_attention_mask_from_visible` -> ``(T, T)``, 0.0 attend / ``neg_fill``.
+    """Additive form of create_attention_mask_from_visible -> (T,T), 0.0 attend / neg_fill.
 
-    The training-time function builds the bool mask; only the representation changes here. A second
-    transcription of the rule is the duplicate that drifts.
-    ``visible`` ``(T,)`` bool, True where the patch's BG is observed; ``is_pad`` ``(T,)`` bool, None = no padding.
+    visible (T,) bool, True where BG observed; is_pad (T,) bool, None = no padding. Only the
+    representation changes here — a second transcription of the rule is the duplicate that drifts.
     """
     assert visible.ndim == 1 and visible.dtype == torch.bool, (
         f"visible must be (T,) bool, got {tuple(visible.shape)} {visible.dtype}"
@@ -137,12 +120,10 @@ def window_labels(
     T: int = MAX_SEQ_LEN,
     p: int = PREDICTION_PATCHES,
 ) -> "tuple[torch.Tensor, torch.Tensor, list[int]]":
-    """Label a left-padded fixed-``T`` window -> ``(visible, is_pad, mask_idx)``.
-
-    Layout: ``[0, pad0)`` padding, ``[pad0, T - p)`` the ``n_ctx`` real context patches right-aligned,
-    ``[T - p, T)`` the ``p`` future patches, never observed and so always masked.
-    ``mask_idx`` names EXTRA masked patches by absolute position; the trailing forecast is added
-    unconditionally and the union comes back ascending.
+    """Label a left-padded fixed-T window -> (visible, is_pad, mask_idx).
+    Layout: [0,pad0) padding, [pad0,T-p) the n_ctx real context right-aligned, [T-p,T) future,
+    always masked. mask_idx names EXTRA masked patches by position; trailing forecast is added
+    unconditionally, union returned ascending.
     """
     c = T - p
     assert 1 <= n_ctx <= c, f"n_ctx must be in [1, {c}], got {n_ctx}"
@@ -173,19 +154,17 @@ def build_struct_mask(
 
 
 def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
-    """A checkpoint's EMA weights into a fresh ``T1DMAI``, eval and frozen -> ``(model, checkpoint_dict)``.
+    """A checkpoint's EMA weights into a fresh T1DMAI, eval and frozen -> (model, checkpoint_dict).
 
-    The EMA shadow merges over the live weights (INFERENCE.md §2.2): every reported metric was produced
-    under EMA. ``strict=False`` tolerates a ``time_head`` on one side only — the probe is a build-time
-    switch — and the assert below rejects every other mismatch.
+    EMA shadow merges over live weights (INFERENCE.md §2.2): every metric was under EMA.
+    strict=False tolerates a time_head mismatch only (build-time switch); else asserts.
     """
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ck["model_state_dict"]
     ema = ck.get("model_ema_state_dict")
     merged = {k: ema.get(k, v) for k, v in sd.items()} if ema else dict(sd)
 
-    # T1DMAI reads its dims from config globals at construction, so config.py drifting from the
-    # checkpoint would otherwise surface as an opaque load_state_dict shape error
+    # T1DMAI reads dims from config globals; a drift else surfaces as an opaque shape error.
     tc = ck.get("training_config") or {}
     import config as _cfg
     assert ck.get("arch_version") in (None, _cfg.ARCH_VERSION), (

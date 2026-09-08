@@ -1,7 +1,7 @@
 """48 h BG day figures (2 h and 8 h forecasts, conditioned) on fresh T1DMSIM patients.
 
 No event markers — the simulator's combined insulin carries no discrete events.
-Reuses ``day_curves.plot_day``; sim bridge is metrics/sim/sim_data.py. Writes metrics/sim/figures/sim_day{k}.png.
+Reuses day_curves.plot_day; sim bridge metrics/sim/sim_data.py; writes sim/figures/sim_day{k}.png.
 """
 from __future__ import annotations
 import os, sys
@@ -24,15 +24,14 @@ from day_curves import _pick_day_start
 from inference import predict, predict_rolling
 from utils import time_of_day_decode_bins
 
-# Every forecast runs the FORECAST protocol, masked set from ``metrics.protocols``.
-# ``hp // CV.PREDICTION_PATCHES`` is a tile's roll count; past roll 0 the evidence is the previous roll's output.
+# hp // CV.PREDICTION_PATCHES rolls; past roll 0, evidence is the previous roll's output.
 N_DAYS = 10
 SEEDS = list(SD.TEST_SEEDS)[:14]          # held-out sim test patients (≥N_DAYS, one day each)
 
 
 def sim_bg_sigma(model, stats, runs, horizon_patches,
                  stride_steps=8 * CV.PATCH_SIZE, max_windows=200, report=None):
-    """Per-horizon-step ±1σ envelope, mg/dL; each window announces its true future carb/insulin/exercise."""
+    """Per-horizon ±1σ envelope, mg/dL; each window announces its future carb/insulin/exercise."""
     H = horizon_patches * CV.PATCH_SIZE
     acc = {'se': np.zeros(H), 'n': np.zeros(H), 'count': 0}
     for pid, d in runs:
@@ -95,8 +94,8 @@ def sim_day_curves(model, stats, d, ds, pid, sig2=None, sig8=None):
 def _attach_tod_probe(model, stats, feats, d, ds, spec):
     """Per-2 h-tile time-of-day probe arrays into ``spec``, aligned with ``spec['tile2_h']``.
 
-    Per-patch ``(P, TIME_PROBE_N_BINS)`` softmax belief; the origin hour decodes the FIRST MASKED patch's row.
-    Under ``TIME_PROBE_ENABLED = False`` the keys stay absent and the renderer drops the clock overlay.
+    Per-patch ``(P, TIME_PROBE_N_BINS)`` softmax belief; origin hour decodes FIRST MASKED patch row.
+    Under ``TIME_PROBE_ENABLED = False`` the keys stay absent; the renderer drops the clock overlay.
     """
     if not TIME_PROBE_ENABLED:
         return
@@ -106,8 +105,7 @@ def _attach_tod_probe(model, stats, feats, d, ds, spec):
     for c in range(CV.DAY_PATCHES // CV.PREDICTION_PATCHES):
         ts = ds + c * hsteps
         ctx = context_window(feats, ts, CV.MAX_CONTEXT_PATCHES)
-        # Announced, like every other forward here: an un-announced maskable slot takes
-        # normalize(0), a legal "no event", so the probe would read a regime the figure never runs.
+        # Announced: an unannounced maskable slot is normalize(0), a regime this figure never runs.
         ov = _future_overrides(feats, ts, CV.ANNOUNCE)
         out = predict(model, ctx, normalization_stats=stats, overrides=ov,
                       return_time=True, mask_spans=ms.spans)

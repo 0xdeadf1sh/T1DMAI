@@ -1,9 +1,7 @@
 """The B-spline step decoder: the weight matrix, the node rule, and the seam statistics.
-
 Every masked patch's PATCH_SIZE steps are read off one uniform cubic B-spline over the
 span's node states, so a patch edge is an ordinary interior point of the curve. These
-tests pin the matrix numerically and then measure the edges against the interior.
-"""
+tests pin the matrix numerically and then measure the edges against the interior."""
 
 import pytest
 import torch
@@ -17,12 +15,9 @@ L = 4              # three interior patch edges, the seam statistics' subject
 N_CTX = 40
 ROWS = 24          # rows per span kind: the seam ratios are batch means, not per-row
 
-# Row (i-1)*S + j is step j of masked patch i. For L=4 with a left node only, step j=0
-# of patch i=1 sits at c = 1 - 2.5/6, so k=0, u=c, and the o=-1 node clamps onto node 0:
-# its weight (1-u)^3/6 adds to node 0's (3u^3-6u^2+4)/6.
+# Row (i-1)*S+j = step j of patch i. L=4 left-only: j=0,i=1 at u=1-2.5/6, o=-1 clamps onto node0.
 PIN_LEFT_END = (0.4376929012345679, 0.5292245370370370, 0.0330825617283950, 0.0, 0.0)
-# the mirror: no left node, so lo=1 and hi=L+1; step j=S-1 of patch i=L sits at u=2.5/6
-# and the o=+2 node clamps onto the right node L+1
+# Mirror: no left node (lo=1, hi=L+1); j=S-1 of i=L at u=2.5/6, o=+2 clamps onto right node L+1.
 PIN_RIGHT_END = (0.0, 0.0, 0.0330825617283950, 0.5292245370370370, 0.4376929012345679)
 
 _SEAM_STEP = [p * S + S - 1 for p in range(L - 1)]

@@ -6,8 +6,7 @@ ndim >= 2 only — 1D parameters (norms, biases, embeddings) go to AdamW.
 
 import torch
 
-# Keller Jordan's quintic X <- a·X + b·(X Xᵀ)X + c·(X Xᵀ)²X. f'(0) = 3.44 pulls
-# near-zero singular values to 1 in ~5 iterations; a cubic (f'(0) = 1.5) needs ~30.
+# Keller Jordan's quintic; f'(0)=3.44 pulls singular values to 1 in ~5 iters (cubic needs ~30).
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
 
@@ -91,9 +90,7 @@ class Muon(torch.optim.Optimizer):
 
                 update_2d = newton_schulz(nesterov_dir, n_iter=ns_iter)
 
-                # Newton-Schulz leaves the spectral norm at ≈1 whatever the shape, so
-                # sqrt(max(1, fan_out/fan_in)) is what makes one ``lr`` mean the same
-                # applied step across aspect ratios.
+                # sqrt(max(1, fan_out/fan_in)) makes one lr mean the same step across aspect ratios.
                 m_dim, n_dim = grad_2d.shape
                 # Exactly 1.0 when square; skipping is bit-identical and preserves NaN/Inf.
                 scale = max(1.0, m_dim / n_dim) ** 0.5

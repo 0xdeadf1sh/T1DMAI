@@ -1,9 +1,7 @@
 """inference.py — standard, what-if and rolling prediction.
-
 ``predict`` returns risk-space ``q_tau`` / ``median`` plus mg/dL
 ``median_bg = f_inv(median)`` and ``bands = f_inv(q_tau)``. ``predict_rolling``
-re-feeds BG autoregressively only.
-"""
+re-feeds BG autoregressively only."""
 
 import numpy as np
 import torch
@@ -97,8 +95,7 @@ def test_what_if_prediction():
     diff = (result_whatif['median'] - result_standard['median']).abs().mean()
     print(f"\n[DUMP] what_if | mean median (risk) difference: {diff:.4f}")
     assert not torch.isnan(result_whatif['median']).any()
-    # the override writes real features into the carb slot, so even an untrained
-    # model must move
+    # the override writes real features into the carb slot, so even an untrained model must move
     assert diff > 1e-4, (
         f"what-if override had no effect on the forecast (diff={diff:.2e}) — "
         f"overrides likely ignored")
@@ -142,9 +139,7 @@ def test_rolling_prediction():
         f"rolled pred_bg out of band: [{pb.min():.2f}, {pb.max():.2f}]")
     assert not torch.isnan(result['q_tau']).any()
 
-    # the risk-space fan carries across roll boundaries rather than resetting narrow,
-    # so a later roll's central-90% half-width at the terminal step (P-1, S-1) is >=
-    # the first roll's
+    # risk-space fan carries across rolls: later roll's terminal-step half-width >= first's.
     bands = result['bands'].reshape(
         n_rolls, PREDICTION_PATCHES, PATCH_SIZE, N_QUANTILES)
     roll_end_halfwidth = [
@@ -159,9 +154,7 @@ def test_rolling_prediction():
         f"final-roll fan narrower than first roll — carry_spread lost: "
         f"{roll_end_halfwidth}")
 
-    # a roll with no overrides seeds the maskable feats from ``normalize(0)`` per
-    # sparse channel, NOT z=0: that baseline decodes back to ~0 g / ~0 U / ~0 g,
-    # where z=0 decodes to a phantom ~0.39 g / ~0.14 U / ~0.025 g per step
+    # No-override roll seeds feats from normalize(0), not z=0: z=0 -> phantom ~0.39g/0.14U/0.025g.
     from normalization import normalize, denormalize
     import numpy as np
     from config import N_INPUT_FEATURES, CHANNEL_TO_FEAT

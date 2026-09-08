@@ -1,42 +1,8 @@
 #!/usr/bin/env python3
-"""Capacity audit of a trained T1DMAI checkpoint, keyed to ``resize_model.py``'s knobs.
+"""Capacity audit of a trained T1DMAI checkpoint, keyed to resize_model.py's knobs.
 
-Per knob — ``D_MODEL``, ``N_LAYERS``, ``N_HEADS``, ``FFN_DIM``, ``BG_HEAD_HIDDEN``,
-``PATCH_SIZE`` and the context window — the report says whether that part of the network
-is under-used (shrinkable) or saturated (a candidate to grow), lists the evidence behind
-the call, and prints the ``resize_model.py`` command each verdict implies.
-
-Every dimension is read from the checkpoint's tensor shapes, never from ``config.py``.
-
-Weight-only evidence (always):
-  * optimizer staleness — Muon ``momentum_buffer`` / AdamW ``exp_avg_sq`` mapped back to
-    parameter names by replaying ``train._build_optimizers``' two-group partition;
-  * drift from init against ``model._init_weights``'s analytic std;
-  * spectral rank utilization per weight matrix;
-  * per-(layer, head) value×output pathway strength, per-(layer, unit) FFN strength,
-    per-unit BG-head and time-head strength.
-
-Activation evidence (``--data N``) — N cached windows, built under the checkpoint's own
-``masked_channel_policy``:
-  * dead / hot units in every FFN, BG-head and time-head layer; residual-dim variance;
-  * per-(layer, head) attention entropy, self-mass, masked-column mass, lag reach;
-  * per-block residual write size, in/out cosine, adjacent-layer CKA;
-  * the spline's per-step departure from the own-patch state;
-  * one-at-a-time ablation of every head, attention sublayer, FFN sublayer and whole
-    block, and a context-truncation ladder, each scored by Δ pinball on the same windows.
-
-Usage::
-
-    python model_health.py                       # audit checkpoints/t1dmai_best.pt
-    python model_health.py --checkpoint X.pt     # a specific checkpoint
-    python model_health.py --ema                 # audit the EMA shadow weights
-    python model_health.py --data 128            # add the activation + ablation pass
-    python model_health.py --data 128 --device cuda
-    python model_health.py --json out.json       # also dump machine-readable findings
-    python model_health.py --top 40              # more rows in the per-param table
-
-Verdicts are heuristic capacity signals. SHRINK means the evidence says the width is
-under-used at this checkpoint, not that quality is invariant to the cut.
+Per knob, says whether that part is under-used (shrink) or saturated (grow).
+python model_health.py                       # audit checkpoints/t1dmai_best.pt
 """
 from __future__ import annotations
 
@@ -59,10 +25,9 @@ from data import (
 from resize_model import VALID_HEAD_DIMS
 
 
-# model._init_weights, mirrored: base_std = 0.02 * sqrt(512 / D_MODEL); residual writes
-# (attn.w_o, ffn.w2) use base_std / sqrt(2 * N_LAYERS); the BG-head and time-head final
-# layers use their INIT_SCALE. The model exposes none of these, so the drift metric
-# reconstructs them here.
+# Mirrors model._init_weights: base_std = 0.02*sqrt(512/D_MODEL), residual /sqrt(2*N_LAYERS).
+
+# BG-head/time-head finals use their own INIT_SCALE; the model exposes none, drift rebuilds it.
 INIT_BASE_STD_ANCHOR = 0.02
 INIT_BASE_STD_ANCHOR_DMODEL = 512.0
 RESIDUAL_WRITES_PER_BLOCK = 2
@@ -113,7 +78,7 @@ LEGEND = (
     ('colours', 'green = in range / load-bearing; yellow = under-used, removable, stale, weak; '
                 f'red = over-used, dominant, binding, or a part whose ablation costs > {50.0:.0f}%'),
 )
-ABLATE_LOAD_BEARING_PCT = 50.0   # ablation Δ above this % ⇒ the part is a single point of failure (red)
+ABLATE_LOAD_BEARING_PCT = 50.0   # ablation Δ above this % ⇒ single point of failure (red)
 
 
 class _Palette:
@@ -297,16 +262,8 @@ def map_optimizer_activity(
 ) -> tuple[dict[str, dict[str, float]], list[str]]:
     """Parameter name → optimizer-state gradient-activity scalars, plus any mapping notes.
 
-    Replays ``train._build_optimizers``: Muon owns every ``ndim >= 2`` tensor in TWO
-    groups — group 0 the normalized matrices, group 1 the output projections
-    (``bg_head[-1].weight``, ``time_head[-1].weight``); AdamW group 0 owns the 1-D
-    tensors (its group 1 is the Kendall-Gal pair, outside the model). PyTorch numbers
-    ``state`` keys across groups in group order, in each group's parameter order, which
-    is ``named_parameters()`` order == state-dict order (the model has no buffers).
-
-    ``activity`` is the RMS of the momentum buffer (Muon) or of ``exp_avg_sq`` (AdamW):
-    the gradient energy that has reached the parameter. ``snr`` (AdamW only) is
-    ``|exp_avg| / sqrt(exp_avg_sq)`` — near 0 when the gradient is pure noise.
+    Replays train._build_optimizers: Muon owns ndim>=2 tensors, AdamW the 1-D ones. activity is
+    the RMS of the momentum buffer (Muon) or exp_avg_sq (AdamW); snr (AdamW) is near 0 for noise.
     """
     names = list(sd.keys())
     output_names = {arch.bg_head_linears[-1]}
@@ -473,8 +430,7 @@ def analyze_params(
             o, act, snr = info['opt'], info['activity'], info['snr']
             rel = act / med[o] if med[o] > 0 else float('inf')
             stale = (act < STALE_OPT_ABS) or (rel < STALE_OPT_REL)
-            # near-init means UNTRAINED only when the optimizer also shows little
-            # gradient energy: a high-activity tensor near init rotated in place.
+            # near-init means UNTRAINED only when the optimizer also shows little gradient energy.
             near = near and rel < 0.5
         else:
             o, act, rel, snr, stale = '-', float('nan'), float('nan'), float('nan'), False
@@ -632,9 +588,7 @@ def build_verdicts(
     tc = ckpt.get('training_config', {})
     ph = arch.patch_hours
 
-    # Training-progress gate: random init is full rank, so a barely trained checkpoint
-    # reads as "saturated → GROW". Suppress resize advice when the main matrices sit
-    # at their init std.
+    # Training-progress gate: random init is full rank, else a barely trained checkpoint reads GROW.
     main_drifts = [abs(r.drift - 1.0) for r in rows
                    if r.kind in ('linear', 'residual', 'head_final') and not math.isnan(r.drift)]
     undertrained = bool(main_drifts) and float(np.median(main_drifts)) < DRIFT_NEAR_INIT
@@ -1044,8 +998,7 @@ def run_data_pass(
     arch: Arch, ckpt: dict[str, Any], state_dict: dict[str, torch.Tensor],
     n_samples: int, device: torch.device,
 ) -> dict[str, Any] | None:
-    """Stream cached windows through the model; collect activation, attention, block,
-    spline and ablation evidence.
+    """Stream cached windows; collect activation, attention, block, spline, ablation evidence.
 
     Patches the in-process ``config`` to the checkpoint's dims and re-imports ``model``
     and ``data`` against them (both bind config constants at import).
@@ -1301,10 +1254,7 @@ def run_data_pass(
                     abl_ffn[i] += pin([blk.ffn.register_forward_hook(zero_out)])
                     abl_block[i] += pin([blk.register_forward_hook(skip_block)])
 
-                # -- context truncation ladder --------------------------------------
-                # Scored on the forecast-zone slots only (the trailing PRED patches), so
-                # every rung compares the same slot set; a rung skips windows whose
-                # context is already shorter than it.
+                # Scored on the forecast-zone slots only, so every rung compares the same slot set.
                 keep_slot = valid & (mask_idx >= T - PRED)
                 for rung in ladder:
                     k = rung['patches']
@@ -1334,11 +1284,9 @@ def run_data_pass(
         for hk in hooks:
             hk.remove()
 
-    # ---- pass 2: width ladders on the same windows ----------------------------------
-    # D_MODEL: every block output (and the embedding) projected onto the top-k principal
-    # components of its own activations — a proxy for a k-wide residual stream, fit on
-    # the streamed windows. FFN / BG head: only the top-k units by mean |activation| kept
-    # in every layer. Each rung is one forward per window; Δ is against the full model.
+    # D_MODEL: block outputs projected onto top-k principal components, a k-wide residual proxy.
+
+    # FFN/BG head: top-k units by mean |activation| kept per layer; delta is against the full model.
     mu = (mean_sum / max(n_tok, 1))
     projectors: dict[int, list[torch.Tensor]] = {}
     pca_dims = {}

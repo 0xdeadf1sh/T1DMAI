@@ -1,10 +1,7 @@
-"""model.py — ``forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)``
-in RISK space.
+"""model.py — ``forward(patches, attn_mask, anchor_bg, mask_idx) -> (q_tau, median)`` in RISK space.
 
-The head GATHERS ``M`` masked patches by index with one anchor per slot, never a
-trailing slice against a broadcast ``last_bg``. ``T`` is the batch's longest sample,
-``<= MAX_SEQ_LEN`` and never asserted equal to it.
-"""
+The head GATHERS ``M`` masked patches by index, one anchor per slot, never a
+trailing slice. ``T`` is the batch's longest sample, ``<= MAX_SEQ_LEN``."""
 
 import math
 
@@ -126,8 +123,7 @@ def test_forward_gathers_an_arbitrary_masked_set():
     assert median.shape == (B, MAX_MASKED_PATCHES, PATCH_SIZE)
     assert torch.isfinite(q_tau).all() and torch.isfinite(median).all()
 
-    # only the gather index moves: ``patches`` and ``attn_mask`` are held fixed and the
-    # span keeps its length, so a positional slice would return the same numbers
+    # Only gather index moves; patches/mask/span length fixed, positional slice would match.
     moved = mask_idx.clone()
     moved[1, :2] = torch.tensor([6, 7])   # still ascending, still separated from 9
     with torch.no_grad():

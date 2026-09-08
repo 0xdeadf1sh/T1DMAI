@@ -1,9 +1,7 @@
 """One announcement bit; no conditioned/unconditioned dichotomy.
 
-A masked patch withholds bg (feat 0) and nothing else. ``z = 0`` in a withheld bg
-slot decodes to an ordinary reading (~142 mg/dL on the balanced pool), not a
-sentinel, so the masked set is ANNOUNCED rather than inferred from position.
-"""
+``z=0`` in a withheld bg slot decodes to an ordinary reading (~142 mg/dL), not a
+sentinel — so the masked set is ANNOUNCED, never inferred from position."""
 
 import numpy as np
 import torch
@@ -92,8 +90,7 @@ def test_masked_patches_withhold_bg_and_announce_the_bit():
     exercise_feat = CHANNEL_TO_FEAT[2]
     assert (carb_feat, insulin_feat, exercise_feat) == (1, 2, 3)
 
-    # exercise's zero-RAW baseline: log1p(0) z-scored, which is NOT 0 for a sparse
-    # log1p channel — a no-session cell carries this, never a literal 0.0
+    # exercise zero-RAW baseline = log1p(0) z-scored, NOT 0; a no-session cell carries this value.
     zero_raw_z = normalize(
         np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats)[0]
     exercise_baseline = float(zero_raw_z[exercise_feat])
@@ -123,8 +120,7 @@ def test_masked_patches_withhold_bg_and_announce_the_bit():
 
         assert (feat_grid[masked, :, 0] == 0.0).all(), \
             f"bg feat 0 must be zeroed on every masked patch (sample {idx})"
-        # z = 0 on a visible patch is an ordinary reading, so withholding there
-        # would be undetectable
+        # z=0 on a visible patch is an ordinary reading, so withholding there would be undetectable.
         assert not (feat_grid[~masked, :, 0] == 0.0).all(), \
             f"bg feat 0 zeroed on a VISIBLE patch (sample {idx})"
 

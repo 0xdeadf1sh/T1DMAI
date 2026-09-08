@@ -1,32 +1,8 @@
-"""
-Shared figure chrome for the top-level ``metrics/`` probes.
-
-One copy of the palette and the chrome, so a cohort carries the same hue in every
-figure under ``metrics/figures/`` and a reader learns the mapping once. Each probe
-owns its own panels; only the look lives here.
-
-Colour jobs, kept deliberately apart — a mark encodes exactly one of them:
-
-``COHORT``     identity. A source's hue never changes and is never reassigned by
-               rank, so it survives a figure that drops one.
-``DOSE_CARB``  ordinal. A dose ladder is an ordered magnitude, so it rides one hue
-``DOSE_INS``   light→dark rather than three categorical hues.
-``PAIR``       before→after (base→shifted, logged→reconstructed):
-               one hue in two shades. Identity there is carried by the row label,
-               so the two jobs never collide on one mark.
-
-Palette provenance: the categorical trio and the blue ramp are the data-viz
-reference palette; the orange ramp was stepped against it. All three were run
-through the palette validator on this surface. The trio passes every all-pairs
-gate (worst CVD ΔE 9.2, worst normal-vision ΔE 24.0); both ordinal ramps pass
-lightness-monotonicity, the adjacent-step gap and the light-end contrast floor.
-Aqua measures 2.74:1 against the surface, under the 3:1 gate, so every figure
-using it carries direct value labels — the documented relief for that warning.
-
-Thresholds are drawn as labelled dashed rules in muted ink rather than in status
-red: they mark a clinical boundary on the axis, not the state of any series, and
-a status colour that appears without an icon-and-label pairing reads as one.
-"""
+"""Shared figure chrome for the top-level ``metrics/`` probes: one palette, one look.
+COHORT = identity, never reassigned; DOSE_CARB/DOSE_INS = ordinal, light→dark; PAIR =
+before→after, one hue two shades. Palette passes the dataviz validator's CVD/contrast
+gates (trio worst CVD ΔE 9.2; Aqua 2.74:1 needs direct value labels). Thresholds are
+dashed muted rules, not status red — a clinical boundary, not series state."""
 from __future__ import annotations
 
 import os
@@ -52,8 +28,7 @@ COHORT_LABEL = {'sim': 'T1DMSIM', 'T1DMSIM': 'T1DMSIM'}
 
 DOSE_CARB = ('#86b6ef', '#5598e7', '#2a78d6', '#1c5cab', '#104281')
 DOSE_INS = ('#f2905f', '#eb6834', '#cc5321', '#a03f18', '#752d11')
-# Continuous magnitude (density) may recede into the surface at its light end, as
-# an ordinal ladder may not — hence the extra pale step this ramp opens on.
+# Density may recede into the surface at its light end, unlike an ordinal ladder — extra pale step.
 SEQ = ('#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#104281')
 PAIR = ('#5598e7', '#104281')                  # before → after, one hue two shades
 REFERENCE = MUTED                              # the simulator, drawn as a reference rule
@@ -110,8 +85,7 @@ def label(ds: str) -> str:
 def threshold(ax, y: float, text: str, side: str = 'right') -> None:
     """A labelled clinical boundary: dashed muted rule, never a status colour."""
     ax.axhline(y, color=MUTED, lw=1.0, ls=(0, (4, 3)), zorder=1)
-    # The rule can land anywhere, including across a bar, so the label carries a
-    # surface-coloured backing rather than relying on whatever is behind it.
+    # Rule can land across a bar, so the label carries a surface-coloured backing.
     ax.annotate(text, xy=(1.0 if side == 'right' else 0.0, y),
                 xycoords=('axes fraction', 'data'), xytext=(-2 if side == 'right' else 2, 3),
                 textcoords='offset points', ha=side, va='bottom', fontsize=7.5, color=MUTED,
@@ -191,10 +165,8 @@ def dumbbell_rows(ax, labels: list[str], before: list[float], after: list[float]
     """Before→after rows: one hue in two shades, joined, values direct-labelled.
 
     A row whose two ends nearly coincide gets ONE combined ``a → b`` label past the
-    outer end instead of two labels that would overprint each other — the span the
-    decision reads is the whole panel's, so it is taken once, here, rather than
-    guessed per row.
-    """
+    outer end instead of two overprinting labels — decided once, on the panel's span,
+    not guessed per row."""
     vals = [v for v in list(before) + list(after) if v is not None]
     span = (max(vals) - min(vals)) or 1.0
     for y, (a, b) in enumerate(zip(before, after)):

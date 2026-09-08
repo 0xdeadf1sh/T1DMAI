@@ -48,10 +48,8 @@ def test_forecast_bands_shape_and_none():
 def test_evaluate_from_windows_cqr_and_additivity():
     """``conformal_cqr`` is additive: present with bands, None without.
 
-    With bands the suite scores the band-projected forecast, so it is not
-    basis-invariant; the median-line numbers move to ``metrics[h]['median_line']``.
-    Cal and test must share one basis or the residuals stop being exchangeable.
-    """
+    With bands the median-line numbers move to ``metrics[h]['median_line']``.
+    Cal/test must share one basis or residuals stop being exchangeable."""
     rng = np.random.default_rng(7)
     # half=6 is deliberately too narrow: raw cov90 well under 0.90, so CQR must widen
     cal_b = [_make_window(rng, f"c{i%3}", with_bands=True, half=6.0) for i in range(120)]
@@ -154,8 +152,7 @@ def test_sim_collect_rows_band_capture(delta_none):
     if not ckpts:
         pytest.skip("no checkpoint available")
     device = torch.device('cpu')
-    # PATCH_DIM is ``patch_embed``'s fan-in, so a checkpoint trained at another
-    # input layout cannot be lifted: skip it rather than fail the code under test
+    # PATCH_DIM is patch_embed's fan-in; a mismatched checkpoint is skipped, not failed.
     from config import PATCH_DIM
     sd = torch.load(ckpts[-1], map_location='cpu',
                     weights_only=True)['model_state_dict']
