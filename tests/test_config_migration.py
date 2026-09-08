@@ -1,7 +1,7 @@
 def test_active_config_migrated_values():
     """NUM_WORKERS not pinned: host property, not recipe. Range-checked below."""
     import config
-    assert config.BATCH_SIZE == 64
+    assert config.BATCH_SIZE == 512
     assert config.PATIENT_UNIFORM_SAMPLE_PROB == 0.0
     assert config.PREDICTION_HORIZON_HOURS == 2
     assert config.NIGHT_LONG_HORIZON_HOURS == 8
@@ -21,7 +21,7 @@ def test_migrated_values_in_sane_ranges():
 
 def test_redesign_provenance_and_knobs_migrated():
     import config
-    assert config.ARCH_VERSION == 'risk-v6'
+    assert config.ARCH_VERSION == 'risk-v5'
     assert config.LOSS_SCHEMA == 'kendall-pinball-dilate-mse-v4'
     assert config.ROPE_BASE == 1000
     assert (hasattr(config, 'DILATE_ALPHA') and hasattr(config, 'DILATE_GAMMA')

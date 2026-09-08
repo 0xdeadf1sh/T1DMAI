@@ -23,13 +23,6 @@ from utils import _KOVATCHEV_SCALE, _KOVATCHEV_POWER, _KOVATCHEV_OFFSET
 from T1DMSIM.simulator import BG_CLAMP_MIN as _BG_CLAMP_MIN, BG_CLAMP_MAX as _BG_CLAMP_MAX
 
 
-def checkpoint_crossing_thresholds(ck: dict[str, Any]) -> tuple[float, float]:
-    """The hypo/hyper cutoffs the crossing head was TRAINED on; cfg only if the run stored none."""
-    tc = ck.get("training_config") or {}
-    return (float(tc.get("bg_hypo_threshold", cfg.BG_HYPO_THRESHOLD)),
-            float(tc.get("bg_hyper_threshold", cfg.BG_HYPER_THRESHOLD)))
-
-
 def build_descriptor(
     *,
     model_id: str,
@@ -41,7 +34,6 @@ def build_descriptor(
     model_card: dict[str, Any] | None = None,
     head: dict[str, Any] | None = None,
     seq_len: int | None = None,
-    crossing_thresholds: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Assemble the descriptor dict. Pure data, no I/O.
     seq_len is the graph's fixed T (default cfg.MAX_SEQ_LEN); MAX_CONTEXT_PATCHES = T - P.
@@ -50,9 +42,6 @@ def build_descriptor(
     """
     risk_lo = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     risk_hi = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
-
-    # The head learned the CHECKPOINT's cutoffs; cfg is only a fallback for a caller with none.
-    xh_hypo, xh_hyper = crossing_thresholds or (cfg.BG_HYPO_THRESHOLD, cfg.BG_HYPER_THRESHOLD)
 
     T = int(seq_len or cfg.MAX_SEQ_LEN)
     P = cfg.PREDICTION_PATCHES
@@ -126,28 +115,6 @@ def build_descriptor(
                         "and feed the head block's weights to reproduce head_raw, with "
                         "or without a low-rank adapter.",
             },
-            "output_crossing_logits": {
-                "name": "crossing_logits", "output_index": 3,
-                "shape": [1, M, cfg.PATCH_SIZE, cfg.N_CROSSING],
-                "dtype": precision, "space": "raw-logits",
-                "note": "(B, M, S, 2): per-step cumulative crossing logits off the same "
-                        "step states as head_raw; sigmoid downstream. Thresholds and "
-                        "column order in the crossing section below (SPEC/inference.md §8.5).",
-            },
-        },
-
-        # Crossing head (SPEC/inference.md §8.5): the thresholds are the checkpoint's own.
-        "crossing": {
-            "output_index": 3,
-            "output_name": "crossing_logits",
-            "shape": [1, M, cfg.PATCH_SIZE, cfg.N_CROSSING],
-            "columns": ["hypo", "hyper"],
-            "hypo_mgdl": float(xh_hypo),
-            "hyper_mgdl": float(xh_hyper),
-            "cumulative": True,
-            "value_kind": "raw logits; sigmoid gives the probability",
-            "detach": cfg.CROSSING_HEAD_DETACH,
-            "co_trains_trunk": not cfg.CROSSING_HEAD_DETACH,
         },
 
         # Time-of-day probe (PLAN §7): hour-of-day per patch, no clock input, head_raw unchanged.

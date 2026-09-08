@@ -4,9 +4,7 @@ import os
 import torch
 import torch.nn as nn
 
-from exporters.descriptor import (
-    build_descriptor, build_model_card, checkpoint_crossing_thresholds, deploy_to_server,
-)
+from exporters.descriptor import build_descriptor, build_model_card, deploy_to_server
 
 
 class _TinyModel(nn.Module):
@@ -133,31 +131,3 @@ def test_descriptor_drops_the_retired_head_constants_and_names_the_decoder(tmp_p
         "l0.weight", "l0.bias", "l1.weight", "l1.bias", "l2.weight", "l2.bias"]
     assert desc["io"]["output_hidden"]["name"] == "hidden"
     assert desc["arch_version"] == cfg.ARCH_VERSION
-    xo = desc["io"]["output_crossing_logits"]
-    xs = desc["crossing"]
-    assert xo["output_index"] == 3 and xs["output_index"] == 3
-    assert xo["shape"] == [1, cfg.MAX_MASKED_PATCHES, cfg.PATCH_SIZE, cfg.N_CROSSING]
-    assert xs["columns"] == ["hypo", "hyper"] and xs["cumulative"] is True
-    assert xs["hypo_mgdl"] == cfg.BG_HYPO_THRESHOLD and xs["hyper_mgdl"] == cfg.BG_HYPER_THRESHOLD
-
-
-def test_crossing_thresholds_come_from_the_checkpoint_not_this_checkout():
-    """The head learned the RUN's cutoffs; a later config.py edit must not restamp them."""
-    import config as cfg
-
-    stats = {c: {"mean": 0.0, "std": 1.0}
-             for c in ("bg_absolute", "carb_intake", "insulin_combined")}
-    ck = {"training_config": {"bg_hypo_threshold": 60.0, "bg_hyper_threshold": 200.0}}
-    assert checkpoint_crossing_thresholds(ck) == (60.0, 200.0)
-    xs = build_descriptor(
-        model_id="m", engine="e", executorch_version="1.3.1",
-        artifact_filename="m.pte", normalization_stats=stats,
-        crossing_thresholds=checkpoint_crossing_thresholds(ck),
-    )["crossing"]
-    print(f"[DUMP] crossing thresholds from ckpt: {xs['hypo_mgdl']}/{xs['hyper_mgdl']} "
-          f"(cfg says {cfg.BG_HYPO_THRESHOLD}/{cfg.BG_HYPER_THRESHOLD})")
-
-    assert xs["hypo_mgdl"] == 60.0 and xs["hyper_mgdl"] == 200.0
-    # a checkpoint that stored neither falls back to this checkout
-    assert checkpoint_crossing_thresholds({}) == (
-        float(cfg.BG_HYPO_THRESHOLD), float(cfg.BG_HYPER_THRESHOLD))

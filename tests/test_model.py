@@ -46,29 +46,6 @@ def test_old_heads_removed():
     assert hasattr(m, 'bg_head'), "the quantile bg_head must exist"
 
 
-def test_forward_return_crossing_contract():
-    """``return_crossing`` adds a 4th output and leaves the fan bit-identical."""
-    from model import T1DMAI
-    from config import PREDICTION_PATCHES, PATCH_SIZE, N_CROSSING, CROSSING_HEAD_ENABLED
-    model = T1DMAI().eval()
-    B = 2
-    patches, attn_mask, anchor_bg, mask_idx = right_edge_inputs(B, seed=0)
-    with torch.no_grad():
-        q_tau, median = model(patches, attn_mask, anchor_bg, mask_idx)
-        out = model(patches, attn_mask, anchor_bg, mask_idx, return_crossing=True)
-    assert len(out) == 4, "return_crossing must return (q_tau, median, time_pred, crossing)"
-    assert torch.equal(out[0], q_tau) and torch.equal(out[1], median)
-    assert out[2] is None, "time_pred is None unless return_time is set"
-    crossing = out[3]
-    if CROSSING_HEAD_ENABLED:
-        assert crossing.shape == (B, PREDICTION_PATCHES, PATCH_SIZE, N_CROSSING)
-        assert torch.isfinite(crossing).all()
-        print(f"\n[DUMP] crossing | shape {tuple(crossing.shape)} "
-              f"logit range [{crossing.min():.3f}, {crossing.max():.3f}]")
-    else:
-        assert crossing is None
-
-
 def test_forward_shape():
     """The slot axis is ``M``, the width of ``mask_idx``; a right-edge forecast sets it
     to ``PREDICTION_PATCHES``."""
@@ -322,7 +299,7 @@ def test_gradient_flow():
 
     no_grad_params = []
     for name, param in model.named_parameters():
-        if name.startswith(('time_head.', 'crossing_head.')):
+        if name.startswith('time_head.'):
             continue
         if param.grad is None:
             no_grad_params.append(name)

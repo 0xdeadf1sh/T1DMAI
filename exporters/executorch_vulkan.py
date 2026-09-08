@@ -157,7 +157,7 @@ def cpu_faithful_deltas(wrapper, patches, struct, slot_sel) -> dict:
     hr_shape = (1, _cfg.MAX_MASKED_PATCHES, _cfg.PATCH_SIZE, 1 + 2 * _cfg.N_SPREADS)
     tl_shape = (1, _cfg.MAX_MASKED_PATCHES, _cfg.TIME_PROBE_N_BINS)
     with torch.no_grad():
-        hr_e, tl_e, _hd_e, _xh_e = wrapper(patches, struct, slot_sel)
+        hr_e, tl_e, _hd_e = wrapper(patches, struct, slot_sel)
         ep = torch.export.export(wrapper, (patches, struct, slot_sel), strict=False)
     lowered_cpu = to_edge_transform_and_lower(ep, partitioner=[])
     et_cpu = lowered_cpu.to_executorch()
@@ -388,14 +388,12 @@ def main() -> None:
               "on-device against the fp32 XNNPACK authority (BackendInfo.agreementOk).")
 
         from exporters.descriptor import (
-            build_descriptor, build_model_card, checkpoint_crossing_thresholds,
-            deploy_to_server, write_descriptor,
+            build_descriptor, build_model_card, deploy_to_server, write_descriptor,
         )
         desc = build_descriptor(
             model_id=args.model_id, engine=engine, executorch_version=et_ver,
             artifact_filename=os.path.basename(pte_path), normalization_stats=stats,
             precision=precision, model_card=build_model_card(model, ck),
-            crossing_thresholds=checkpoint_crossing_thresholds(ck),
         )
         desc_path = os.path.join(args.out_dir, f"{args.model_id}.vulkan.descriptor.json")
         write_descriptor(desc, desc_path)

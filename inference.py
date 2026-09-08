@@ -208,7 +208,6 @@ def _run_forward(
     device: torch.device | None = None,
     return_time: bool = False,
     grad: bool = False,
-    return_crossing: bool = False,
 ) -> dict[str, Any]:
     """Build one sample, announce its masked set, check it, then forward.
     Sole chokepoint for every forward here: the feat-4 assert always runs, and anchors cross
@@ -247,24 +246,20 @@ def _run_forward(
     if grad:
         patches.requires_grad_(True)
         out = model(
-            patches, attn_mask, anchor_bg, mask_idx_t,
-            return_time=return_time, return_crossing=return_crossing,
+            patches, attn_mask, anchor_bg, mask_idx_t, return_time=return_time,
         )
     else:
         with torch.no_grad():
             out = model(
-                patches, attn_mask, anchor_bg, mask_idx_t,
-                return_time=return_time, return_crossing=return_crossing,
+                patches, attn_mask, anchor_bg, mask_idx_t, return_time=return_time,
             )
     q_tau, median = out[0], out[1]
     time_pred = out[2] if return_time else None
-    crossing = out[3] if return_crossing else None
 
     return {
         'q_tau': q_tau.squeeze(0),                          # (M, PATCH_SIZE, N_QUANTILES)
         'median': median.squeeze(0),                        # (M, PATCH_SIZE)
         'time_pred': None if time_pred is None else time_pred.squeeze(0),
-        'crossing': None if crossing is None else crossing.squeeze(0),  # (M, S, 2) logits
         'mask_idx': mask_idx_t.squeeze(0),                  # (M,) patch index per slot
         'valid': valid_t.squeeze(0),                        # (M,) bool
         'anchor_bg': anchor_bg.squeeze(0),                  # (M,) mg/dL
@@ -285,7 +280,6 @@ def predict(
     conformal_delta: np.ndarray | None = None,
     return_time: bool = False,
     mask_spans: MaskSpans | None = None,
-    return_crossing: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Standard prediction: one forward pass over one masked set.
     RISK-space quantiles/median, inverted to mg/dL via kovatchev_f_inv. Default masked set
@@ -314,7 +308,6 @@ def predict(
     out = _run_forward(
         model, context, anchor_stats, overrides=overrides,
         mask_spans=mask_spans, device=device, return_time=return_time,
-        return_crossing=return_crossing,
     )
 
     # Keep VALID slots only — padded slots gather patch 0, a plausible forecast nobody asked for.
@@ -339,11 +332,6 @@ def predict(
         # (P, TIME_PROBE_N_BINS) raw logits or None; decode/softmax stays in utils, emit raw here.
         time_pred = out['time_pred']
         result['time_pred'] = None if time_pred is None else time_pred[valid]
-
-    if return_crossing:
-        # (P, PATCH_SIZE, 2) cumulative crossing PROBABILITIES: col 0 hypo, col 1 hyper; None off.
-        crossing = out['crossing']
-        result['crossing'] = None if crossing is None else torch.sigmoid(crossing[valid].float())
 
     if normalization_stats is not None:
         # (c)->(b): f_inv is the SOLE risk->mg/dL bridge, clamped to [BG_CLAMP_MIN, BG_CLAMP_MAX].
@@ -412,7 +400,6 @@ def predict_what_if(
     normalization_stats: dict[str, dict[str, float]] | None = None,
     device: torch.device | None = None,
     return_time: bool = False,
-    return_crossing: bool = False,
 ) -> dict[str, torch.Tensor]:
     """What-if prediction: announce carb / insulin / exercise in the prediction zone.
     overrides must already be NORMALIZED (normalization.normalize), routed to feat 1/2/3 via
@@ -427,7 +414,6 @@ def predict_what_if(
         device=device,
         overrides=overrides,
         return_time=return_time,
-        return_crossing=return_crossing,
     )
 
 

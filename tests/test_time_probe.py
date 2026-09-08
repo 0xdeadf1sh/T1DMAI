@@ -235,30 +235,6 @@ def test_probe_construction_preserves_forecast_init_rng(monkeypatch):
     assert not mismatched, f"probe construction shifted forecast init for: {mismatched[:6]}"
 
 
-def test_crossing_head_construction_preserves_forecast_init_rng(monkeypatch):
-    """Same discipline for the crossing head: built under a saved RNG state, inited last."""
-    import model as model_mod
-
-    if not model_mod.CROSSING_HEAD_ENABLED:
-        pytest.skip("crossing head disabled")
-
-    torch.manual_seed(0)
-    m_with = model_mod.T1DMAI()
-    others_with = {n: p.detach().clone()
-                   for n, p in m_with.named_parameters()
-                   if not n.startswith('crossing_head.')}
-
-    monkeypatch.setattr(model_mod, 'CROSSING_HEAD_ENABLED', False)
-    torch.manual_seed(0)
-    m_without = model_mod.T1DMAI()
-
-    assert m_with.crossing_head is not None and m_without.crossing_head is None
-    mismatched = [n for n, p in m_without.named_parameters()
-                  if not torch.equal(p, others_with[n])]
-    print(f"\n[DUMP] crossing RNG | {len(others_with)} tensors, {len(mismatched)} shifted (want 0)")
-    assert not mismatched, f"crossing head shifted init for: {mismatched[:6]}"
-
-
 def _stats():
     import os
     from normalization import (compute_normalization_stats,

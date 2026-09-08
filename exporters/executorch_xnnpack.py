@@ -28,8 +28,7 @@ from exporters.modified_forward import (
     build_struct_mask_from_visible, load_model, window_labels, NEG_FILL,
 )
 from exporters.descriptor import (
-    build_descriptor, build_model_card, checkpoint_crossing_thresholds, deploy_to_server,
-    write_descriptor,
+    build_descriptor, build_model_card, deploy_to_server, write_descriptor,
 )
 from exporters.head_weights import write_head_weights
 
@@ -202,16 +201,6 @@ def eager_time_logits(model, w: Window) -> torch.Tensor:
         )
     assert time_pred is not None, "eager forward returned time_pred=None (probe absent)"
     return time_pred
-
-
-def eager_crossing_logits(model, w: Window) -> torch.Tensor:
-    """Stock forward's crossing logits, the reference for the exported ``crossing_logits``."""
-    with torch.no_grad():
-        _q, _m, _t, crossing = model(
-            w.patches, w.bool_mask, w.anchors, w.mask_idx, return_crossing=True,
-        )
-    assert crossing is not None, "eager forward returned crossing=None (head absent)"
-    return crossing
 
 
 def head_from_hidden(
@@ -442,17 +431,15 @@ def main() -> None:
     hr_shape = (1, m, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
     tl_shape = (1, m, cfg.TIME_PROBE_N_BINS)
     hd_shape = (1, T, cfg.D_MODEL)
-    xl_shape = (1, m, cfg.PATCH_SIZE, cfg.N_CROSSING)
 
     # (1) modified (struct + slot_sel) vs stock (bool + gather)
     deltas: dict[str, float] = {}
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         with torch.no_grad():
-            hr_mod, tl_mod, hd_mod, xl_mod = wrapper(w.patches, w.struct, w.slot_sel)
+            hr_mod, tl_mod, hd_mod = wrapper(w.patches, w.struct, w.slot_sel)
         assert hr_mod.shape == hr_shape, f"{name}: head_raw {tuple(hr_mod.shape)} != {hr_shape}"
         assert tl_mod.shape == tl_shape, f"{name}: time_logits {tuple(tl_mod.shape)} != {tl_shape}"
         assert hd_mod.shape == hd_shape, f"{name}: hidden {tuple(hd_mod.shape)} != {hd_shape}"
-        assert xl_mod.shape == xl_shape, f"{name}: crossing_logits {tuple(xl_mod.shape)} != {xl_shape}"
         hr_stock = stock_head_raw(model, w)
         # REAL slots only: a padded slot repeats patch 0 on both paths, unread downstream
         n = w.n_masked
@@ -480,20 +467,15 @@ def main() -> None:
     # (2) .pte vs eager modified, on BOTH masked sets
     for name, w in (("forecast", w_fc), ("infill", w_inf)):
         outs = run_pte_outputs(pte_work, w.patches, w.struct, w.slot_sel)
-        assert len(outs) == 4, (
-            f"expected 4 .pte outputs (head_raw, time_logits, hidden, crossing_logits), got {len(outs)}"
+        assert len(outs) == 3, (
+            f"expected 3 .pte outputs (head_raw, time_logits, hidden), got {len(outs)}"
         )
         hr_pte = outs[0].reshape(hr_shape)
         tl_pte = outs[1].reshape(tl_shape)
         hd_pte = outs[2].reshape(hd_shape)
-        xl_pte = outs[3].reshape(xl_shape)
         with torch.no_grad():
-            hr_mod, _tl_mod, _hd_mod, _xl_mod = wrapper(w.patches, w.struct, w.slot_sel)
+            hr_mod, _tl_mod, _hd_mod = wrapper(w.patches, w.struct, w.slot_sel)
         n = w.n_masked
-        xl_eager = eager_crossing_logits(model, w)
-        deltas[f"crossing_{name}"] = float((xl_pte[:, :n] - xl_eager[:, :n]).abs().max())
-        print(f"[verify] pte vs eager crossing     ({name:8s})     max|Δ| = "
-              f"{deltas[f'crossing_{name}']:.3e}")
         deltas[f"pte_{name}"] = float((hr_pte[:, :n] - hr_mod[:, :n]).abs().max())
         print(f"[verify] pte vs eager head_raw     ({name:8s})     max|Δ| = "
               f"{deltas[f'pte_{name}']:.3e}")
@@ -526,7 +508,6 @@ def main() -> None:
         model_id=args.model_id, engine=ENGINE, executorch_version=et_ver,
         artifact_filename=pte_name, normalization_stats=stats, precision="fp32",
         model_card=build_model_card(model, ck), head=head_block, seq_len=T,
-        crossing_thresholds=checkpoint_crossing_thresholds(ck),
     )
     # named after the artifact: several models share one out-dir; ModelStore globs *.descriptor.json
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.xnnpack.descriptor.json")

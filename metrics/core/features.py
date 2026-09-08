@@ -16,7 +16,7 @@ from T1DMSIM.simulator import (
     MIXED_MEAL_SLOW_K_RANGE, MIXED_MEAL_SLOW_THETA_RANGE,
     MIXED_MEAL_MED_WEIGHT_BASE, SLOW_CARB_PREFERENCE_BASE,
     PROTEIN_FAT_GAMMA_K, PROTEIN_FAT_GAMMA_THETA, PROTEIN_FAT_FRACTION_OF_CARBS,
-    exercise_curve, EXERCISE_DURATION_MEAN_MIN,
+    EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA,
 )
 from config import PATCH_SIZE, N_INPUT_FEATURES
 from data import BG_MASKED_FEAT
@@ -26,7 +26,7 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 from .schema import Segment, GRID_MIN
 
-# Truncation horizon, min, renormalized: holds 0.99314 of the meal mixture and 0.99616 of the bolus.
+# Truncation, min; 240 holds 0.99314 of the meal mixture, 0.99616 of the bolus, 0.99998 of exercise.
 _CARB_KERNEL_MIN = 240
 _BOLUS_KERNEL_MIN = 240
 _EXERCISE_KERNEL_MIN = 240
@@ -56,14 +56,11 @@ def _bolus_kernel() -> np.ndarray:
 
 
 def _exercise_kernel() -> np.ndarray:
-    """Unit-area shape of one mean-length session: ``T1DMSIM.simulator.exercise_curve`` (SPEC §5).
+    """Unit-area exercise gamma (k=3, θ=15), truncated at 240 min and renormalized.
 
-    Ramp, plateau over ``EXERCISE_DURATION_MEAN_MIN``, 90-min tail; padded or cut to
-    ``_EXERCISE_KERNEL_MIN`` MINUTES and renormalized. Shape only — the caller supplies the grams.
+    Shape only; caller supplies grams. NOT ``CARB_KERNEL``: 0.854 of its mass inside 2 h vs 0.986.
     """
-    _n = _EXERCISE_KERNEL_MIN // DT_MINUTES
-    k = np.asarray(exercise_curve(1.0, float(EXERCISE_DURATION_MEAN_MIN)), dtype=np.float64)
-    k = np.concatenate([k, np.zeros(max(0, _n - len(k)))])[:_n]
+    k = gamma_curve(1.0, EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, _EXERCISE_KERNEL_MIN)
     return k / k.sum()
 
 

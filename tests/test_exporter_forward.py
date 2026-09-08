@@ -24,7 +24,6 @@ M = cfg.MAX_MASKED_PATCHES
 HEAD_RAW_SHAPE = (1, M, cfg.PATCH_SIZE, 1 + 2 * cfg.N_SPREADS)
 TIME_LOGITS_SHAPE = (1, M, cfg.TIME_PROBE_N_BINS)
 HIDDEN_SHAPE = (1, T, cfg.D_MODEL)
-CROSSING_SHAPE = (1, M, cfg.PATCH_SIZE, cfg.N_CROSSING)
 
 
 @pytest.fixture(scope="module")
@@ -69,34 +68,19 @@ def head_file(model, tmp_path_factory):
     return path, write_head_weights(model, path)
 
 
-def test_wrapper_runs_and_emits_the_four_declared_outputs(model, forecast):
+def test_wrapper_runs_and_emits_the_three_declared_outputs(model, forecast):
     wrapper = HeadRawForward(model).eval()
 
     with torch.no_grad():
-        head_raw, time_logits, hidden, crossing = wrapper(
+        head_raw, time_logits, hidden = wrapper(
             forecast.patches, forecast.struct, forecast.slot_sel)
     print(f"[DUMP] head_raw={tuple(head_raw.shape)} time_logits={tuple(time_logits.shape)} "
-          f"hidden={tuple(hidden.shape)} crossing={tuple(crossing.shape)}")
+          f"hidden={tuple(hidden.shape)}")
 
     assert head_raw.shape == HEAD_RAW_SHAPE
     assert time_logits.shape == TIME_LOGITS_SHAPE
     assert hidden.shape == HIDDEN_SHAPE
-    assert crossing.shape == CROSSING_SHAPE
-    assert all(torch.isfinite(t).all() for t in (head_raw, time_logits, hidden, crossing))
-
-
-def test_crossing_logits_match_the_stock_forward(model, forecast):
-    """The graph's 4th output equals the eager ``return_crossing`` path on the real slots."""
-    wrapper = HeadRawForward(model).eval()
-    w = forecast
-    with torch.no_grad():
-        crossing_mod = wrapper(w.patches, w.struct, w.slot_sel)[3]
-        _q, _m, _t, crossing_stock = model(
-            w.patches, w.bool_mask, w.anchors, w.mask_idx, return_crossing=True)
-    n = w.n_masked
-    d = float((crossing_mod[:, :n] - crossing_stock[:, :n]).abs().max())
-    print(f"[DUMP] crossing modified vs stock max|d| = {d:.3e}")
-    assert d < 1e-5
+    assert all(torch.isfinite(t).all() for t in (head_raw, time_logits, hidden))
 
 
 @pytest.mark.parametrize("name", ["forecast", "infill"])
@@ -107,7 +91,7 @@ def test_head_raw_matches_the_stock_forward_on_the_same_masked_set(
     wrapper = HeadRawForward(model).eval()
 
     with torch.no_grad():
-        head_raw, _tl, _h, _x = wrapper(w.patches, w.struct, w.slot_sel)
+        head_raw, _tl, _h = wrapper(w.patches, w.struct, w.slot_sel)
     stock = stock_head_raw(model, w)
     n = w.n_masked
     delta = float((head_raw[:, :n] - stock[:, :n]).abs().max())
@@ -122,7 +106,7 @@ def test_time_logits_match_the_stock_probe(model, forecast):
     wrapper = HeadRawForward(model).eval()
 
     with torch.no_grad():
-        _hr, time_logits, _h, _x = wrapper(
+        _hr, time_logits, _h = wrapper(
             forecast.patches, forecast.struct, forecast.slot_sel)
     stock = eager_time_logits(model, forecast)
     n = forecast.n_masked
@@ -143,7 +127,7 @@ def test_head_file_reproduces_head_raw_from_the_graph_hidden(
     wrapper = HeadRawForward(model).eval()
 
     with torch.no_grad():
-        head_raw, _tl, hidden, _x = wrapper(w.patches, w.struct, w.slot_sel)
+        head_raw, _tl, hidden = wrapper(w.patches, w.struct, w.slot_sel)
     rebuilt = head_from_hidden(path, block, hidden, w)
     n = w.n_masked
     delta = float((rebuilt[:, :n] - head_raw[:, :n]).abs().max())
@@ -161,7 +145,7 @@ def test_head_raw_reads_the_patches_slot_sel_names(model, forecast):
     wrapper = HeadRawForward(model).eval()
 
     with torch.no_grad():
-        head_raw, _tl, hidden, _x = wrapper(w.patches, w.struct, w.slot_sel)
+        head_raw, _tl, hidden = wrapper(w.patches, w.struct, w.slot_sel)
         named = model.bg_head(step_states(hidden, w.mask_idx, w.bool_mask))
         shifted = model.bg_head(
             step_states(hidden, (w.mask_idx - 1).clamp(min=0), w.bool_mask))
@@ -199,10 +183,10 @@ def test_padding_never_reaches_a_prediction_token(model, stats):
     wrapper = HeadRawForward(model).eval()
 
     with torch.no_grad():
-        head_raw, time_logits, _h, _x = wrapper(w.patches, w.struct, w.slot_sel)
+        head_raw, time_logits, _h = wrapper(w.patches, w.struct, w.slot_sel)
         perturbed = w.patches.clone()
         perturbed[:, :pad0, :] += 37.0
-        head_raw_p, time_logits_p, _hp, _xp = wrapper(perturbed, w.struct, w.slot_sel)
+        head_raw_p, time_logits_p, _hp = wrapper(perturbed, w.struct, w.slot_sel)
     n = w.n_masked
     d_head = float((head_raw[:, :n] - head_raw_p[:, :n]).abs().max())
     d_time = float((time_logits[:, :n] - time_logits_p[:, :n]).abs().max())
@@ -225,10 +209,9 @@ def test_wrapper_is_torch_exportable(model, forecast):
     deltas = [float((t - e).abs().max()) for t, e in zip(traced, eager)]
     print(f"[DUMP] traced vs eager max|d| = {deltas}")
 
-    assert len(traced) == 4, (
-        "the graph must emit (head_raw, time_logits, hidden, crossing_logits), in that order")
+    assert len(traced) == 3, (
+        "the graph must emit (head_raw, time_logits, hidden), in that order")
     assert traced[0].shape == HEAD_RAW_SHAPE
     assert traced[1].shape == TIME_LOGITS_SHAPE
     assert traced[2].shape == HIDDEN_SHAPE
-    assert traced[3].shape == CROSSING_SHAPE
     assert all(d < 1e-6 for d in deltas)

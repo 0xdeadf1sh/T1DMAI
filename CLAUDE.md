@@ -55,7 +55,7 @@ forecast *protocol*; it is not a region of a training sample.
   each `L_i ~ U(MASK_SPAN_LENGTHS)` independently; `sum(L) > MAX_MASKED_PATCHES` resamples the
   **whole length vector**, never one element (per-element redrawing yields a different length
   distribution and so a different `d` histogram); placement is stars-and-bars over the `n_spans + 1`
-  gaps, **except** that with probability `MASK_RIGHT_EDGE_QUOTA` (0.50) the LAST span is pinned
+  gaps, **except** that with probability `MASK_RIGHT_EDGE_QUOTA` (0.35) the LAST span is pinned
   flush against patch `T-1` and the rest composed over the prefix, which holds the same slack. That
   is the one departure from uniform placement: `n_spans` and the length law are drawn identically in
   both branches, so only the `d` histogram moves. There is no curriculum, no annealing and no
@@ -89,9 +89,9 @@ forecast *protocol*; it is not a region of a training sample.
 
 ## Architecture gotchas
 
-- **Capacity.** `D_MODEL = 32`, `N_LAYERS = 32`, `N_HEADS = 1`, `FFN_DIM = 1×D_MODEL`,
-  `BG_HEAD_HIDDEN = 1×D_MODEL`, no buffers.
-  `ARCH_VERSION = 'risk-v6'` (risk-v5 plus the crossing output). Don't bake those numbers into other code or comments: `resize_model.py`
+- **Capacity.** `D_MODEL = 128`, `N_LAYERS = 8`, `N_HEADS = 8`, `FFN_DIM = 4×D_MODEL`,
+  `BG_HEAD_HIDDEN = 1×D_MODEL` — 2,155,539 parameters and no buffers.
+  `ARCH_VERSION = 'risk-v5'`. Don't bake those numbers into other code or comments: `resize_model.py`
   rewrites them, preserving `HEAD_DIM = D_MODEL // N_HEADS` and the symbolic `FFN_DIM = k·D_MODEL` /
   `BG_HEAD_HIDDEN = k·D_MODEL` relations.
 - **Patch = 6 timesteps = 30 min.** Patches are the attention/loss unit; the BG head emits
@@ -119,10 +119,8 @@ forecast *protocol*; it is not a region of a training sample.
     `inference.py`'s override-write — never two independent `+offset` literals.
   - Feats 1–3 are **plan** channels: nothing but what the patient announced is ever written into
     them, masked patches included. There is no conditioned/unconditioned dichotomy and no reveal.
-- **Forward signature (FROZEN): `forward(patches, attn_mask, anchor_bg, mask_idx, return_time=False,
-  return_crossing=False) -> (q_tau, median)`.** `return_crossing=True` returns
-  `(q_tau, median, time_pred, crossing)`, `time_pred` `None` unless `return_time`; `crossing` is
-  `(B, M, S, 2)` raw cumulative-crossing logits off the BG head's step states (SPEC/inference.md §8.5).
+- **Forward signature (FROZEN): `forward(patches, attn_mask, anchor_bg, mask_idx, return_time=False)
+  -> (q_tau, median)`.**
   - `patches` `(B, T, PATCH_DIM)`; `T <= MAX_SEQ_LEN` and is never asserted equal to it — the collate
     left-pads to the BATCH maximum, so `T` varies batch to batch.
   - `attn_mask` `(T, T)` or `(B, T, T)` **bool**, True = attend.
@@ -268,10 +266,8 @@ forecast *protocol*; it is not a region of a training sample.
 3. the graph is **cut at `head_raw`** `(B, M, S, 1 + 2·N_SPREADS)` in risk space — no `anchor_bg`, no
    `assemble_quantiles`. Everything downstream is the consumer's.
 
-It emits four outputs in a fixed order: `head_raw`, `time_logits`, `hidden` — the
-final-normed hidden state of EVERY patch — and `crossing_logits` `(B, M, S, 2)`, the crossing
-head over the same step states as `head_raw`, whose thresholds travel in the descriptor's
-`crossing` block. `exporters/head_weights.py` writes `bg_head` beside the
+It emits three outputs in a fixed order: `head_raw`, `time_logits`, and `hidden` — the
+final-normed hidden state of EVERY patch. `exporters/head_weights.py` writes `bg_head` beside the
 artifact as a flat fp32 file with a sha256, so a consumer gathers each span's nodes out of `hidden`,
 rebuilds the step states and reproduces `head_raw`, with an adapter free to act on the node states
 ahead of the spline; the export checks that reproduction on every run.
