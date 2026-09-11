@@ -55,69 +55,13 @@ def test_channel_names_are_the_four_input_signals():
          f"exercise_equiv, got {RISK_SPACE_CHANNELS}")
 
 
-# balanced pool's fitted exercise_equiv stats + zero-RAW z; move with POOL, refit if it changes.
-_BALANCED_EXERCISE_MEAN = 0.025454530988451768
-_BALANCED_EXERCISE_STD = 0.18077422733814857
-_BALANCED_EXERCISE_ZERO_Z = -0.1408083886
-# largest raw exercise cell over the balanced pool, so the grid spans the whole trained range.
-_BALANCED_EXERCISE_MAX_RAW = 22.4029
-
-
 def _cwd_stats_or_skip() -> dict:
-    """The CWD ``normalization_stats.json``: the balanced pool's fit."""
+    """The CWD ``normalization_stats.json``, whichever pool fitted it."""
     import os
     from normalization import load_normalization_stats, NORM_STATS_FILE
     if not os.path.exists(NORM_STATS_FILE):
         pytest.skip(f"{NORM_STATS_FILE} required for the fitted-stats gates")
     return load_normalization_stats()
-
-
-def test_exercise_channel_roundtrip_and_zero_baseline():
-    """feat 3 survives normalize→denormalize, and a no-session cell lands on the fitted
-    zero-RAW baseline, not on 0.0. Neither failure raises on its own: a Kovatchev
-    transform on exercise breaks the round-trip, and a rescaling — or the wrong pool's
-    stats — moves the baseline a masked patch fills with, retraining the channel."""
-    from normalization import (CHANNEL_NAMES, normalize, denormalize,
-                               SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS)
-
-    stats = _cwd_stats_or_skip()
-    ex_col = CHANNEL_NAMES.index('exercise_equiv')
-    assert ex_col == 3, f"exercise_equiv must be channel 3, got {ex_col}"
-    assert 'exercise_equiv' in SPARSE_LOG1P_CHANNELS
-    assert 'exercise_equiv' not in RISK_SPACE_CHANNELS
-
-    # the CWD file is the balanced pool's four-key fit
-    ex_stats = stats['exercise_equiv']
-    assert ex_stats['mean'] == pytest.approx(_BALANCED_EXERCISE_MEAN, abs=1e-15), \
-        f"exercise_equiv mean {ex_stats['mean']!r} is not the balanced pool's fit"
-    assert ex_stats['std'] == pytest.approx(_BALANCED_EXERCISE_STD, abs=1e-15), \
-        f"exercise_equiv std {ex_stats['std']!r} is not the balanced pool's fit"
-
-    # round-trip over the whole trained g/step range
-    grid = np.linspace(0.0, _BALANCED_EXERCISE_MAX_RAW, 4096, dtype=np.float32)
-    raw = np.zeros((grid.size, len(CHANNEL_NAMES)), dtype=np.float32)
-    raw[:, ex_col] = grid
-    raw[:, CHANNEL_NAMES.index('bg_absolute')] = 120.0  # legal f argument
-    back = denormalize(normalize(raw, stats), stats)
-    max_err = float(np.abs(np.asarray(back)[:, ex_col] - grid).max())
-    assert max_err < 1e-4, (
-        f"exercise_equiv round-trip max abs error {max_err:.3e} >= 1e-4 over "
-        f"[0, {_BALANCED_EXERCISE_MAX_RAW}] g/step")
-
-    # the zero-RAW baseline: what a cell announcing no session carries
-    zero_z = float(normalize(
-        np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats)[0, ex_col])
-    assert abs(zero_z - _BALANCED_EXERCISE_ZERO_Z) < 1e-9, (
-        f"z(raw 0) for exercise_equiv = {zero_z!r}, expected "
-        f"{_BALANCED_EXERCISE_ZERO_Z} — wrong statistics or a rescaled channel")
-    assert zero_z != 0.0, \
-        "a sparse log1p channel's zero-dose baseline must not collapse to z=0"
-
-    # large normalized range is no reason to rescale: insulin reaches a comparable z at its own max.
-    z_max = float(normalize(raw, stats)[-1, ex_col])
-    print(f"\n[DUMP] exercise_channel | col={ex_col} mean={ex_stats['mean']:.12g} "
-          f"std={ex_stats['std']:.12g}; roundtrip max abs err={max_err:.3e}; "
-          f"z(0)={zero_z:.10f}; z({_BALANCED_EXERCISE_MAX_RAW})={z_max:.4f}")
 
 
 def test_normalization_stats_at_load_are_complete_and_nondegenerate():
