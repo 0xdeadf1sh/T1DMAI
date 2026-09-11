@@ -69,18 +69,35 @@ def _apply_checkpoint_dims(ckpt: dict) -> None:
         sys.modules.pop(m, None)
 
 
+def _cache_sources(cache: str) -> list[str]:
+    """Sub-dataset names in a built cache; empty if it is missing or unreadable."""
+    try:
+        with open(os.path.join(cache, 'index.json')) as f:
+            return sorted({r['source'] for r in json.load(f)['subjects']})
+    except (OSError, ValueError, KeyError):
+        return []
+
+
 def parse_args() -> argparse.Namespace:
+    default_cache = 'metabonet/cache_finetune'
+    # Only for --help: index.json runs to ~500 kB, too big to parse on an ordinary run.
+    names = []
+    if any(a in ('-h', '--help') for a in sys.argv[1:]):
+        pre = argparse.ArgumentParser(add_help=False)
+        pre.add_argument('--cache', default=default_cache)
+        names = _cache_sources(pre.parse_known_args()[0].cache)
+    known = f'; this cache has {", ".join(names)}' if names else ''
     p = argparse.ArgumentParser(
         description='Finetune a pretrained checkpoint on the merged cache.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--checkpoint', default=None,
                    help='pretrained .pt to start from; omitted = random init at '
                         "config.py's architecture, stats fit on the cache itself")
-    p.add_argument('--cache', default='metabonet/cache_finetune')
+    p.add_argument('--cache', default=default_cache)
     p.add_argument('--train-dataset', default=None, metavar='A,B',
-                   help='comma-separated sub-datasets to train on; omitted = all')
+                   help=f'comma-separated sub-datasets to train on; omitted = all{known}')
     p.add_argument('--test-dataset', default=None, metavar='A,B',
-                   help='comma-separated sub-datasets to validate on; omitted = all')
+                   help=f'comma-separated sub-datasets to validate on; omitted = all{known}')
     p.add_argument('--out-dir', default='checkpoints_finetune')
     p.add_argument('--total-steps', type=int, default=10000)
     p.add_argument('--batch-size', type=int, default=64)
