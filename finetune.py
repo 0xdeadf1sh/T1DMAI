@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
                    help='pretrained .pt to start from; omitted = random init at '
                         "config.py's architecture, stats fit on the cache itself")
     p.add_argument('--cache', default='metabonet/cache_finetune')
+    p.add_argument('--train-dataset', default=None, metavar='A,B',
+                   help='comma-separated sub-datasets to train on; omitted = all')
+    p.add_argument('--test-dataset', default=None, metavar='A,B',
+                   help='comma-separated sub-datasets to validate on; omitted = all')
     p.add_argument('--out-dir', default='checkpoints_finetune')
     p.add_argument('--total-steps', type=int, default=10000)
     p.add_argument('--batch-size', type=int, default=64)
@@ -189,7 +193,30 @@ def main() -> None:
     if ckpt is not None and 'weighting_state_dict' in ckpt:
         weighting.load_state_dict(ckpt['weighting_state_dict'])
 
-    cache = FinetuneCache(args.cache)
+    all_sources = sorted({r['source'] for r in FinetuneCache(args.cache).subjects})
+
+    def pick(spec: str | None, what: str) -> list[str] | None:
+        """Sub-datasets named by a comma-separated spec; None is every one."""
+        if spec is None:
+            return None
+        want = [s.strip() for s in spec.split(',') if s.strip()]
+        bad = [s for s in want if s not in all_sources]
+        if bad:
+            raise SystemExit(f'--{what}-dataset: unknown {bad}; cache has {all_sources}')
+        return want
+
+    def view(sources: list[str] | None) -> 'FinetuneCache':
+        """A cache over `sources` only; rec['start'] is absolute, so dropping rows is safe."""
+        c = FinetuneCache(args.cache)
+        if sources is not None:
+            c.subjects = [r for r in c.subjects if r['source'] in sources]
+            assert c.subjects, f'no subject in the cache belongs to {sources}'
+        return c
+
+    train_sources = pick(args.train_dataset, 'train')
+    test_sources = pick(args.test_dataset, 'test')
+    cache = view(train_sources)
+    eval_cache = view(test_sources)
     train_ds = FinetuneTrainDataset(
         cache, stats, seed=args.seed, total_steps=args.total_steps,
         batch_size=args.batch_size, source_alpha=args.source_alpha,
@@ -201,29 +228,77 @@ def main() -> None:
         num_workers=args.num_workers, collate_fn=finetune_collate_fn,
         worker_init_fn=_worker_init_fn, pin_memory=(device.type == 'cuda'))
 
-    windows = build_eval_windows(cache, args.eval_windows, args.eval_seed)
-    eval_ds = FinetuneEvalDataset(cache, stats, windows,
+    windows = build_eval_windows(eval_cache, args.eval_windows, args.eval_seed)
+    eval_ds = FinetuneEvalDataset(eval_cache, stats, windows,
                                   max_interp_steps=args.max_interp_steps,
                                   no_carbs=args.no_carbs)
     # Workerless: eval forks would copy the CUDA-holding parent on a RAM-tight box.
     eval_loader = DataLoader(
         eval_ds, batch_size=args.eval_batch_size, shuffle=False,
         num_workers=0, collate_fn=finetune_collate_fn)
-    print(f'cache: {len(cache.subjects)} subjects; eval windows: {len(windows)}; '
+    # shuffle=False, num_workers=0: batches walk `windows` in order, so position gives the source.
+    eval_sources = [eval_cache.subjects[s]['source'] for s, _ in windows]
+    eval_source_names = sorted(set(eval_sources))
+    print(f'cache: {len(cache.subjects)} train subjects '
+          f'({",".join(train_sources) if train_sources else "all"}); '
+          f'{len(eval_cache.subjects)} eval subjects '
+          f'({",".join(test_sources) if test_sources else "all"}); '
+          f'eval windows: {len(windows)} over {len(eval_source_names)} sub-datasets; '
           f'device: {device}', flush=True)
 
     # A level resolved to a position by lookup, never a literal index.
     band_lo_idx = QUANTILE_LEVELS.index(METRIC_BAND_TAU_LO)
     band_hi_idx = QUANTILE_LEVELS.index(METRIC_BAND_TAU_HI)
 
+    def horizon_metrics(p_, lo_, hi_, t_) -> dict:
+        """DTS-A / RMSE / MARD at one horizon, median line and band projection, mg/dL."""
+        if not len(t_):
+            return {'n': 0, 'dts_a': None, 'rmse': None, 'mard': None,
+                    'dts_a_band': None, 'rmse_band': None, 'mard_band': None,
+                    'band_cov': None, 'band_width': None}
+        rmse = float(np.sqrt(np.mean((p_ - t_) ** 2)))
+        mard = float(100.0 * np.mean(np.abs(p_ - t_) / t_))
+        # Floor-only: the ceiling half would collapse truth above 400 and score it zone A.
+        t_c = np.clip(t_, BG_CLAMP_MIN, None)
+        frac = dts_grid.dts_zone_fractions(dts_grid.dts_zone_counts(t_c, p_))
+        dts_a = float(frac['a'] * 100.0) if frac['a'] is not None else None
+        # Projected twice: each basis onto the truth vector its own metric scores.
+        eff = band_project(t_, lo_, hi_)
+        eff_c = band_project(t_c, lo_, hi_)
+        rmse_b = float(np.sqrt(np.mean((eff - t_) ** 2)))
+        mard_b = float(100.0 * np.mean(np.abs(eff - t_) / t_))
+        frac_b = dts_grid.dts_zone_fractions(dts_grid.dts_zone_counts(t_c, eff_c))
+        dts_a_b = float(frac_b['a'] * 100.0) if frac_b['a'] is not None else None
+        # A band figure means nothing without these two: widen enough and its errors go to zero.
+        cov = float(100.0 * np.mean((t_ >= lo_) & (t_ <= hi_)))
+        width = float(np.mean(hi_ - lo_))
+        return {'n': int(len(t_)), 'dts_a': dts_a, 'rmse': rmse, 'mard': mard,
+                'dts_a_band': dts_a_b, 'rmse_band': rmse_b, 'mard_band': mard_b,
+                'band_cov': cov, 'band_width': width}
+
+    def summarize(cols: dict, source: str | None = None) -> dict:
+        """Every horizon plus the two mean DTS-A figures, over one sub-dataset or all."""
+        out: dict = {}
+        dts_a_vals, dts_a_band_vals = [], []
+        for m in HORIZON_MINUTES:
+            p_, lo_, hi_, t_, s_ = cols[m]
+            sel = np.ones(len(t_), dtype=bool) if source is None else (s_ == source)
+            out[m] = horizon_metrics(p_[sel], lo_[sel], hi_[sel], t_[sel])
+            if out[m]['dts_a'] is not None:
+                dts_a_vals.append(out[m]['dts_a'])
+            if out[m]['dts_a_band'] is not None:
+                dts_a_band_vals.append(out[m]['dts_a_band'])
+        out['mean_dts_a'] = float(np.mean(dts_a_vals)) if dts_a_vals else float('-inf')
+        out['mean_dts_a_band'] = (float(np.mean(dts_a_band_vals))
+                                  if dts_a_band_vals else float('-inf'))
+        return out
+
     @torch.no_grad()
     def evaluate() -> dict:
-        """DTS-A / RMSE / MARD per horizon, median line and band projection, mg/dL."""
+        """Pooled metrics, with the same metrics per sub-dataset under 'by_source'."""
         model.eval()
-        preds = {m: [] for m in HORIZON_MINUTES}
-        los = {m: [] for m in HORIZON_MINUTES}
-        his = {m: [] for m in HORIZON_MINUTES}
-        trues = {m: [] for m in HORIZON_MINUTES}
+        acc = {m: ([], [], [], [], []) for m in HORIZON_MINUTES}
+        pos = 0
         for batch in eval_loader:
             q_tau, median = model(
                 batch['patches'].to(device), batch['attn_mask'].to(device),
@@ -240,54 +315,23 @@ def main() -> None:
             hi_mgdl = kovatchev_f_inv(
                 fan[..., band_hi_idx]).reshape(B, -1).cpu().numpy()
             true = batch['true_bg_horizon'].numpy()
+            src = np.asarray(eval_sources[pos:pos + B])
+            pos += B
             for m, hs in zip(HORIZON_MINUTES, HORIZON_STEPS):
                 t = true[:, hs]
                 ok = np.isfinite(t)
-                preds[m].append(pred_mgdl[ok, hs])
-                los[m].append(lo_mgdl[ok, hs])
-                his[m].append(hi_mgdl[ok, hs])
-                trues[m].append(t[ok])
+                a = acc[m]
+                a[0].append(pred_mgdl[ok, hs])
+                a[1].append(lo_mgdl[ok, hs])
+                a[2].append(hi_mgdl[ok, hs])
+                a[3].append(t[ok])
+                a[4].append(src[ok])
+        assert pos == len(windows), f'eval loader covered {pos} of {len(windows)} windows'
         model.train()
-
-        out: dict = {}
-        dts_a_vals = []
-        dts_a_band_vals = []
-        for m in HORIZON_MINUTES:
-            p_ = np.concatenate(preds[m]) if preds[m] else np.empty(0)
-            lo_ = np.concatenate(los[m]) if los[m] else np.empty(0)
-            hi_ = np.concatenate(his[m]) if his[m] else np.empty(0)
-            t_ = np.concatenate(trues[m]) if trues[m] else np.empty(0)
-            if not len(t_):
-                out[m] = {'n': 0, 'dts_a': None, 'rmse': None, 'mard': None,
-                          'dts_a_band': None, 'rmse_band': None, 'mard_band': None,
-                          'band_cov': None, 'band_width': None}
-                continue
-            rmse = float(np.sqrt(np.mean((p_ - t_) ** 2)))
-            mard = float(100.0 * np.mean(np.abs(p_ - t_) / t_))
-            # Floor-only: the ceiling half would collapse truth above 400 and score it zone A.
-            t_c = np.clip(t_, BG_CLAMP_MIN, None)
-            frac = dts_grid.dts_zone_fractions(dts_grid.dts_zone_counts(t_c, p_))
-            dts_a = float(frac['a'] * 100.0) if frac['a'] is not None else None
-            # Projected twice: each basis onto the truth vector its own metric scores.
-            eff = band_project(t_, lo_, hi_)
-            eff_c = band_project(t_c, lo_, hi_)
-            rmse_b = float(np.sqrt(np.mean((eff - t_) ** 2)))
-            mard_b = float(100.0 * np.mean(np.abs(eff - t_) / t_))
-            frac_b = dts_grid.dts_zone_fractions(dts_grid.dts_zone_counts(t_c, eff_c))
-            dts_a_b = float(frac_b['a'] * 100.0) if frac_b['a'] is not None else None
-            # A band figure means nothing without these two: widen enough and its errors go to zero.
-            cov = float(100.0 * np.mean((t_ >= lo_) & (t_ <= hi_)))
-            width = float(np.mean(hi_ - lo_))
-            out[m] = {'n': int(len(t_)), 'dts_a': dts_a, 'rmse': rmse, 'mard': mard,
-                      'dts_a_band': dts_a_b, 'rmse_band': rmse_b, 'mard_band': mard_b,
-                      'band_cov': cov, 'band_width': width}
-            if dts_a is not None:
-                dts_a_vals.append(dts_a)
-            if dts_a_b is not None:
-                dts_a_band_vals.append(dts_a_b)
-        out['mean_dts_a'] = float(np.mean(dts_a_vals)) if dts_a_vals else float('-inf')
-        out['mean_dts_a_band'] = (float(np.mean(dts_a_band_vals))
-                                  if dts_a_band_vals else float('-inf'))
+        cols = {m: tuple(np.concatenate(v) if v else np.empty(0) for v in acc[m])
+                for m in HORIZON_MINUTES}
+        out = summarize(cols)
+        out['by_source'] = {s: summarize(cols, s) for s in eval_source_names}
         return out
 
     def print_table(metrics: dict, best: float, best_step: int) -> None:
@@ -306,6 +350,25 @@ def main() -> None:
         print(f"  mean DTS-A {metrics['mean_dts_a']:.3f}  "
               f"(best {best:.3f} @ step {best_step})   band "
               f"{metrics['mean_dts_a_band']:.3f}", flush=True)
+        print_by_source(metrics.get('by_source') or {})
+
+    def print_by_source(by: dict) -> None:
+        """Median-line DTS-A / RMSE / MARD per sub-dataset; one source repeats the pooled table."""
+        if len(by) < 2:
+            return
+        groups = (('DTS-A%', 'dts_a'), ('RMSE', 'rmse'), ('MARD%', 'mard'))
+        w, first = 7, HORIZON_MINUTES[0]
+        gw = w * len(HORIZON_MINUTES)
+        print(f"  {'':<16}{'':>7} " + ' '.join(f'{g:^{gw}}' for g, _ in groups))
+        print(f"  {'sub-dataset':<16}{'n':>7} " + ' '.join(
+            ''.join(f'{m:>{w}}' for m in HORIZON_MINUTES) for _ in groups))
+        for s in sorted(by, key=lambda k: -by[k][first]['n']):
+            r = by[s]
+            cells = ' '.join(''.join(
+                (f"{r[m][k]:>{w}.2f}" if r[m][k] is not None else f"{'—':>{w}}")
+                for m in HORIZON_MINUTES) for _, k in groups)
+            print(f'  {s:<16}{r[first]["n"]:>7} {cells}')
+        print('', flush=True)
 
     muon_opt, adam_opt = _build_optimizers(
         model, weighting, args.muon_lr, args.adam_lr, MUON_MOMENTUM,
