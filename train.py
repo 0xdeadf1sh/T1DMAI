@@ -219,6 +219,7 @@ def compute_learning_metrics(
     active_patches: int,
     hypo_threshold: float = BG_HYPO_THRESHOLD,
     hyper_threshold: float = BG_HYPER_THRESHOLD,
+    step_mask: torch.Tensor | None = None,  # (B, P*S) bool; None scores every step
 ) -> dict[str, float]:
     """Diagnostic BG metrics in mg/dL, sums+counts for batch aggregation, off pred_bg=f_inv(median).
 
@@ -235,6 +236,25 @@ def compute_learning_metrics(
     last_bg_col = last_bg.unsqueeze(1)                                  # (B, 1)
     total_steps_h = P * S
 
+    # tir/tbr/tar, roc, excursion, bgcurve and CG-EGA reduce over a whole forecast: no step subset.
+    _m = step_mask
+    if _m is not None:
+        assert _m.shape == true_bg.shape, f"step_mask {tuple(_m.shape)} != {tuple(true_bg.shape)}"
+        _m = _m.bool()
+    _mf = None if _m is None else _m.float()
+
+    def _wsum(t: torch.Tensor) -> torch.Tensor:
+        """Sum of a (B, P*S) float tensor over masked steps."""
+        return t.sum() if _mf is None else (t * _mf).sum()
+
+    def _bsum(t: torch.Tensor) -> torch.Tensor:
+        """Count of a (B, P*S) bool tensor over masked steps."""
+        return t.sum() if _m is None else (t & _m).sum()
+
+    def _col_n(h_idx: int) -> float:
+        """Scored windows at one horizon step."""
+        return float(B) if _m is None else float(_m[:, h_idx].sum())
+
     out: dict[str, float] = {}
 
     # Stage every reduction as 0-dim, flush with ONE torch.stack.tolist(), not ~90 .item() calls.
@@ -250,10 +270,13 @@ def compute_learning_metrics(
         h_idx = (h_min // int(dt)) - 1
         if 0 <= h_idx < total_steps_h:
             diff = pred_bg[:, h_idx] - true_bg[:, h_idx]
-            _stage(f'bg_rmse_{h_min}_sq_sum', diff.pow(2).sum())
-            out[f'bg_rmse_{h_min}_cnt'] = float(B)
-            _stage(f'bg_mae_{h_min}_abs_sum', diff.abs().sum())
-            out[f'bg_mae_{h_min}_cnt'] = float(B)
+            _w = None if _mf is None else _mf[:, h_idx]
+            _sq = diff.pow(2) if _w is None else diff.pow(2) * _w
+            _ab = diff.abs() if _w is None else diff.abs() * _w
+            _stage(f'bg_rmse_{h_min}_sq_sum', _sq.sum())
+            out[f'bg_rmse_{h_min}_cnt'] = _col_n(h_idx)
+            _stage(f'bg_mae_{h_min}_abs_sum', _ab.sum())
+            out[f'bg_mae_{h_min}_cnt'] = _col_n(h_idx)
         else:
             out[f'bg_rmse_{h_min}_sq_sum'] = 0.0
             out[f'bg_rmse_{h_min}_cnt'] = 0.0
@@ -261,8 +284,8 @@ def compute_learning_metrics(
             out[f'bg_mae_{h_min}_cnt'] = 0.0
 
     abs_rel = (pred_bg - true_bg).abs() / true_bg.clamp(min=1.0)
-    _stage('mard_sum', abs_rel.sum())
-    out['mard_cnt'] = float(abs_rel.numel())
+    _stage('mard_sum', _wsum(abs_rel))
+    out['mard_cnt'] = float(abs_rel.numel()) if _m is None else float(_m.sum())
 
     pred_in = ((pred_bg >= BG_TARGET_LO) & (pred_bg <= BG_TARGET_HI)).float()
     true_in = ((true_bg >= BG_TARGET_LO) & (true_bg <= BG_TARGET_HI)).float()
@@ -295,35 +318,40 @@ def compute_learning_metrics(
     pred_hypo = pred_lo < hypo_threshold
     hypo_tp = true_hypo & pred_hypo
     close_prec_hypo = (pred_lo - true_bg).abs() <= EXCURSION_PRECISION_TOLERANCE_MGDL
-    _stage('hypo_true', true_hypo.sum())
-    _stage('hypo_pred', pred_hypo.sum())
-    _stage('hypo_recall_hit', hypo_tp.sum())
-    _stage('hypo_prec_hit', (pred_hypo & (true_hypo | close_prec_hypo)).sum())
+    _stage('hypo_true', _bsum(true_hypo))
+    _stage('hypo_pred', _bsum(pred_hypo))
+    _stage('hypo_recall_hit', _bsum(hypo_tp))
+    _stage('hypo_prec_hit', _bsum(pred_hypo & (true_hypo | close_prec_hypo)))
 
     true_hyper = true_bg > hyper_threshold
     pred_hyper = pred_hi > hyper_threshold
     hyper_tp = true_hyper & pred_hyper
     close_prec_hyper = (pred_hi - true_bg).abs() <= EXCURSION_PRECISION_TOLERANCE_MGDL
-    _stage('hyper_true', true_hyper.sum())
-    _stage('hyper_pred', pred_hyper.sum())
-    _stage('hyper_recall_hit', hyper_tp.sum())
-    _stage('hyper_prec_hit', (pred_hyper & (true_hyper | close_prec_hyper)).sum())
+    _stage('hyper_true', _bsum(true_hyper))
+    _stage('hyper_pred', _bsum(pred_hyper))
+    _stage('hyper_recall_hit', _bsum(hyper_tp))
+    _stage('hyper_prec_hit', _bsum(pred_hyper & (true_hyper | close_prec_hyper)))
 
     # Per-horizon (disjoint 30-min patch buckets) excursion counts.
     for _p, _h in enumerate(_excursion_bucket_horizons(P)):
         _s0, _s1 = _p * S, (_p + 1) * S
+        _bm = None if _m is None else _m[:, _s0:_s1]
+
+        def _bk(t: torch.Tensor, _bm: torch.Tensor | None = _bm) -> torch.Tensor:
+            return t.sum() if _bm is None else (t & _bm).sum()
+
         _th, _ph = true_hypo[:, _s0:_s1], pred_hypo[:, _s0:_s1]
         _cph = close_prec_hypo[:, _s0:_s1]
-        _stage(f'hypo_true@{_h}', _th.sum())
-        _stage(f'hypo_pred@{_h}', _ph.sum())
-        _stage(f'hypo_recall_hit@{_h}', (_th & _ph).sum())
-        _stage(f'hypo_prec_hit@{_h}', (_ph & (_th | _cph)).sum())
+        _stage(f'hypo_true@{_h}', _bk(_th))
+        _stage(f'hypo_pred@{_h}', _bk(_ph))
+        _stage(f'hypo_recall_hit@{_h}', _bk(_th & _ph))
+        _stage(f'hypo_prec_hit@{_h}', _bk(_ph & (_th | _cph)))
         _yt, _yp = true_hyper[:, _s0:_s1], pred_hyper[:, _s0:_s1]
         _cpy = close_prec_hyper[:, _s0:_s1]
-        _stage(f'hyper_true@{_h}', _yt.sum())
-        _stage(f'hyper_pred@{_h}', _yp.sum())
-        _stage(f'hyper_recall_hit@{_h}', (_yt & _yp).sum())
-        _stage(f'hyper_prec_hit@{_h}', (_yp & (_yt | _cpy)).sum())
+        _stage(f'hyper_true@{_h}', _bk(_yt))
+        _stage(f'hyper_pred@{_h}', _bk(_yp))
+        _stage(f'hyper_recall_hit@{_h}', _bk(_yt & _yp))
+        _stage(f'hyper_prec_hit@{_h}', _bk(_yp & (_yt | _cpy)))
 
     # CG-EGA (Kovatchev 2004); true_bg FIRST, the reference on every axis.
     _true_np = true_bg.detach().cpu().numpy()
@@ -341,9 +369,11 @@ def compute_learning_metrics(
 
     # true_bg FIRST — nothing catches a transpose, both args are legal mg/dL; per zone, never A+B.
     _dts_zones = dts_grid.dts_zones(_true_np, _pred_np)          # (B, P*S) 0..4
+    _m_np = None if _m is None else _m.detach().cpu().numpy()
     for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
-        out[f'dts_{_zn}'] = float((_dts_zones == _zi).sum())
-    out['dts_total'] = float(_dts_zones.size)
+        _hit = (_dts_zones == _zi)
+        out[f'dts_{_zn}'] = float(_hit.sum() if _m_np is None else (_hit & _m_np).sum())
+    out['dts_total'] = float(_dts_zones.size if _m_np is None else _m_np.sum())
 
     # Clarke Error Grid (Clarke et al. 1987), reference = true_bg, pred = pred_bg.
     pb = pred_bg.clamp(min=1.0)
@@ -361,9 +391,9 @@ def compute_learning_metrics(
     )
     zone_B = (~in_A) & (~zone_E) & (~zone_C) & (~zone_D)
     _clarke_masks = {'A': in_A, 'B': zone_B, 'C': zone_C, 'D': zone_D, 'E': zone_E}
-    for _z, _m in _clarke_masks.items():
-        _stage(f'clarke_{_z}', _m.sum())
-    out['clarke_total'] = float(in_A.numel())
+    for _z, _zm in _clarke_masks.items():
+        _stage(f'clarke_{_z}', _bsum(_zm))
+    out['clarke_total'] = float(in_A.numel()) if _m is None else float(_m.sum())
 
     # Per-horizon zone shares (both grids, MARD): pooled mixes a 5-min error with a 2-hour one.
 
@@ -371,23 +401,28 @@ def compute_learning_metrics(
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
         h_idx = (h_min // int(dt)) - 1
         _live = 0 <= h_idx < total_steps_h
-        for _z, _m in _clarke_masks.items():
+        _cw = None if _m is None else _m[:, h_idx]
+        for _z, _zm in _clarke_masks.items():
             if _live:
-                _stage(f'evalfix_clarke_{_z}@{h_min}', _m[:, h_idx].sum())
-                out[f'evalfix_clarke_{_z}@{h_min}_cnt'] = float(B)
+                _hit = _zm[:, h_idx] if _cw is None else (_zm[:, h_idx] & _cw)
+                _stage(f'evalfix_clarke_{_z}@{h_min}', _hit.sum())
+                out[f'evalfix_clarke_{_z}@{h_min}_cnt'] = _col_n(h_idx)
             else:
                 out[f'evalfix_clarke_{_z}@{h_min}'] = 0.0
                 out[f'evalfix_clarke_{_z}@{h_min}_cnt'] = 0.0
+        _dw = None if _m_np is None else _m_np[:, h_idx]
         for _zi, _zn in enumerate(dts_grid.ZONE_NAMES):
             if _live:
-                out[f'dts_{_zn}@{h_min}'] = float((_dts_zones[:, h_idx] == _zi).sum())
-                out[f'dts_{_zn}@{h_min}_cnt'] = float(B)
+                _dh = (_dts_zones[:, h_idx] == _zi)
+                out[f'dts_{_zn}@{h_min}'] = float(_dh.sum() if _dw is None else (_dh & _dw).sum())
+                out[f'dts_{_zn}@{h_min}_cnt'] = _col_n(h_idx)
             else:
                 out[f'dts_{_zn}@{h_min}'] = 0.0
                 out[f'dts_{_zn}@{h_min}_cnt'] = 0.0
         if _live:
-            _stage(f'evalfix_mard@{h_min}_sum', abs_rel[:, h_idx].sum())
-            out[f'evalfix_mard@{h_min}_cnt'] = float(B)
+            _ar = abs_rel[:, h_idx] if _cw is None else abs_rel[:, h_idx] * _cw.float()
+            _stage(f'evalfix_mard@{h_min}_sum', _ar.sum())
+            out[f'evalfix_mard@{h_min}_cnt'] = _col_n(h_idx)
         else:
             out[f'evalfix_mard@{h_min}_sum'] = 0.0
             out[f'evalfix_mard@{h_min}_cnt'] = 0.0
@@ -452,8 +487,10 @@ def compute_learning_metrics(
             if 0 <= h_idx < total_steps_h:
                 covered = ((true_bg[:, h_idx] >= lo[:, h_idx])
                            & (true_bg[:, h_idx] <= hi[:, h_idx])).float()
+                if _mf is not None:
+                    covered = covered * _mf[:, h_idx]
                 _stage(f'coverage90@{h_min}_hit', covered.sum())
-                out[f'coverage90@{h_min}_cnt'] = float(B)
+                out[f'coverage90@{h_min}_cnt'] = _col_n(h_idx)
             else:
                 out[f'coverage90@{h_min}_hit'] = 0.0
                 out[f'coverage90@{h_min}_cnt'] = 0.0
@@ -465,13 +502,17 @@ def compute_learning_metrics(
         h_idx = (h_min // int(dt)) - 1
         if 0 <= h_idx < total_steps_h:
             below = (true_bg[:, h_idx] < pred_bg[:, h_idx]).float()
+            if _mf is not None:
+                below = below * _mf[:, h_idx]
             _stage(f'sign_balance@{h_min}_below', below.sum())
-            out[f'sign_balance@{h_min}_cnt'] = float(B)
+            out[f'sign_balance@{h_min}_cnt'] = _col_n(h_idx)
             if inner_lo is not None and inner_hi is not None:
                 in_inner = ((true_bg[:, h_idx] >= inner_lo[:, h_idx])
                             & (true_bg[:, h_idx] <= inner_hi[:, h_idx])).float()
+                if _mf is not None:
+                    in_inner = in_inner * _mf[:, h_idx]
                 _stage(f'inner50_cov@{h_min}_hit', in_inner.sum())
-                out[f'inner50_cov@{h_min}_cnt'] = float(B)
+                out[f'inner50_cov@{h_min}_cnt'] = _col_n(h_idx)
             else:
                 out[f'inner50_cov@{h_min}_hit'] = 0.0
                 out[f'inner50_cov@{h_min}_cnt'] = 0.0
