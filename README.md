@@ -35,7 +35,7 @@ on-device in [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID).
 - [Inputs and outputs](#inputs-and-outputs)
 - [Training](#training)
 - [Inference modes](#inference-modes)
-- [Capacity ladder](#capacity-ladder)
+- [Capacity](#capacity)
 - [Scoring rules and protocols](#scoring-rules-and-protocols)
 - [Other tools](#other-tools)
 - [Simulator cache](#simulator-cache)
@@ -91,8 +91,7 @@ reads to encode circadian phase.
 The model is patient-agnostic. There is no learned per-patient vector; identity
 is whatever the 84–168 hour context window implies.
 
-Every dimension lives in `config.py`, and `resize_model.py` rewrites it. The
-capacities on the ladder run from 39 k to 2.2 M parameters on the same code.
+Every dimension lives in `config.py`, and `resize_model.py` rewrites it.
 
 
 ## Masked-BG objective
@@ -307,21 +306,15 @@ quadrature, so uncertainty grows monotonically instead of resetting
 at each seam.
 
 
-## Capacity ladder
+## Capacity
 
-Three capacities. Each is set by `D_MODEL`, `N_LAYERS` and `N_HEADS` alone:
-`FFN_DIM`, `BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are multiples of `D_MODEL`
-and follow it.
+Capacity is set by `D_MODEL`, `N_LAYERS` and `N_HEADS` alone: `FFN_DIM`,
+`BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are multiples of `D_MODEL` and follow
+it.
 
-| Model | Architecture | Parameters |
-| --- | --- | ---: |
-| nano | D=32, 2L, 2H, FFN=128 | 37,779 |
-| small | D=64, 4L, 4H, FFN=256 | 278,547 |
-| medium | D=128, 8L, 8H, FFN=512 | 2,155,539 |
-
-Trainable parameters at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 30`; the
-model carries no buffers. `resize_model.py` instantiates a capacity and prints its
-exact count, computed from the architecture rather than targeted.
+`resize_model.py` instantiates a capacity and prints its exact trainable
+parameter count at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 30`, computed
+from the architecture rather than targeted; the model carries no buffers.
 
 Accuracy, wall-clock and peak-memory figures are not listed: none has been
 measured against this architecture, and this repository publishes no checkpoint
@@ -534,7 +527,7 @@ python3.11 -m venv .venv-export
 
 ```bash
 python gui.py --seed 42
-python gui.py --checkpoint models/medium/checkpoints/t1dmai_best.pt --seed 42
+python gui.py --checkpoint checkpoints/t1dmai_best.pt --seed 42
 ```
 
 A pygame front end for inspecting a checkpoint one patient at a time: the median
