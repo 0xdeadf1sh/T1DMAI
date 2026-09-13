@@ -953,7 +953,7 @@ train on divergent data. The per-channel shape check against
 `pool_size × n_timesteps` happens later, in `_load_cache`, on the first row read
 inside a DataLoader worker — the open is deliberately lazy so open cache handles
 are not pickled across the fork. The generation parameters under
-`params` — hypoglycemia oversampling, the rail filter, the seed salt — are **not**
+`params` — hypoglycemia oversampling and the seed salt — are **not**
 checked at all, so two pools with different glycemic mixes are both accepted.
 
 **Compression.** Each `.b2nd` is chunked `(rows_per_chunk, T)` with byte-shuffle
