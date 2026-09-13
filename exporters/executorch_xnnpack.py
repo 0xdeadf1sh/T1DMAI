@@ -27,9 +27,7 @@ from exporters.modified_forward import (
     HeadRawForward, build_slot_selection, build_struct_mask,
     build_struct_mask_from_visible, load_model, window_labels, NEG_FILL,
 )
-from exporters.descriptor import (
-    build_descriptor, build_model_card, deploy_to_server, write_descriptor,
-)
+from exporters.descriptor import build_descriptor, build_model_card, write_descriptor
 from exporters.head_weights import write_head_weights
 
 ENGINE = "executorch_xnnpack_fp32"
@@ -390,9 +388,6 @@ def main() -> None:
                     help="fixed graph length T (default MAX_CONTEXT_PATCHES + "
                          "PREDICTION_PATCHES). A shorter T is a cheaper artifact with "
                          "a shorter memory; its descriptor reports the context it accepts.")
-    ap.add_argument("--deploy-dir", default=None,
-                    help="also copy the artifact + a <stem>.json sidecar into a T1DMSERVER "
-                         "models directory (e.g. ../T1DMSERVER/data/models)")
     ap.add_argument("--golden", default=None,
                     help="write the Rust time-probe decode golden to this path "
                          "(default: skip — the golden is per-ARCHITECTURE, not per-model, "
@@ -519,10 +514,6 @@ def main() -> None:
     if os.path.abspath(pte_work) != os.path.abspath(pte_final):
         shutil.copy2(pte_work, pte_final)
     print(f"[artifact] {pte_final}")
-
-    if args.deploy_dir:
-        art, side = deploy_to_server(pte_final, desc, args.deploy_dir)
-        print(f"[deploy] {art}\n[deploy] {side}")
 
     ok = finite16 and all(
         v < (HEAD_TOL if k.startswith("head_") else VERIFY_TOL) for k, v in deltas.items()

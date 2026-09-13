@@ -478,8 +478,7 @@ against the fp32 reference.
 | ExecuTorch Vulkan (GPU) | `exporters.executorch_vulkan --write-pte --fp16` | `.vulkan.pte` + descriptor |
 
 Run them as modules from the repository root. All three take `--checkpoint`,
-`--model-id` and `--out-dir`; `--deploy-dir` exists on the two ExecuTorch paths
-only, and on Vulkan only takes effect with `--write-pte`. CPU fp32 is the
+`--model-id` and `--out-dir`. CPU fp32 is the
 reference every other engine is measured against; the Vulkan module also reports
 how much of the graph the backend delegates versus falls back to CPU.
 
@@ -498,16 +497,6 @@ quantile assembly all run outside it — and the descriptor is the sole contract
 post-processing. **An artifact and its descriptor are one unit**: a graph served
 against a descriptor from a different architecture decodes risk space with the
 wrong constants, and nothing downstream can detect it.
-
-On the ExecuTorch paths `--deploy-dir` places both into a
-[T1DMSERVER](https://github.com/0xdeadf1sh/T1DMSERVER) models directory in one
-step, named so the server's registry pairs them:
-
-```bash
-python -m exporters.executorch_xnnpack \
-    --checkpoint checkpoints/t1dmai_best.pt \
-    --out-dir exported --deploy-dir ../T1DMSERVER/data/models
-```
 
 The exporters need packages beyond `requirements.txt`: `executorch`, pinned to
 the version the consuming runtime bundles (currently 1.3.1, which requires
@@ -738,11 +727,8 @@ alone.
   simulator that generates this model's pretraining corpus.
 - **[T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID)** — the Android app that
   runs the exported artifact on-device against a live CGM feed.
-- **[T1DMSERVER](https://github.com/0xdeadf1sh/T1DMSERVER)** — the self-hosted
-  sync backend and terminal dashboard for that app, and the registry the
-  exporters deploy into.
 - **[T1DMCOMMON](https://github.com/0xdeadf1sh/T1DMCOMMON)** — the shared
-  specification the four projects are built against.
+  specification the three projects are built against.
 
 
 ## License

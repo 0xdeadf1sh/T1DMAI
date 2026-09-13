@@ -1,10 +1,7 @@
-import json
-import os
-
 import torch
 import torch.nn as nn
 
-from exporters.descriptor import build_descriptor, build_model_card, deploy_to_server
+from exporters.descriptor import build_descriptor, build_model_card
 
 
 class _TinyModel(nn.Module):
@@ -49,36 +46,6 @@ def test_model_card_reads_last_val_history_entry():
 
 
 
-
-
-def test_deploy_to_server_pairs_artifact_with_stem_json_sidecar(tmp_path):
-    """t1dm-store::refresh_models pairs an artifact with a sibling <stem>.json."""
-    src = tmp_path / "build"
-    src.mkdir()
-    pte = src / "large-sim.xnnpack.pte"
-    pte.write_bytes(b"\x00pte-bytes")
-    stats = {
-        "bg_absolute": {"mean": 0.4285, "std": 1.0598},
-        "carb_intake": {"mean": 0.3687, "std": 0.4765},
-        "insulin_combined": {"mean": 0.1471, "std": 0.1180},
-    }
-    desc = build_descriptor(
-        model_id="large-sim", engine="executorch_xnnpack_fp32", executorch_version="1.3.1",
-        artifact_filename=pte.name, normalization_stats=stats,
-    )
-
-    deploy_dir = tmp_path / "data" / "models"
-    art, side = deploy_to_server(str(pte), desc, str(deploy_dir))
-    print(f"[DUMP] deployed {os.path.basename(art)} + {os.path.basename(side)}")
-
-    assert os.path.basename(art) == "large-sim.xnnpack.pte"
-    assert os.path.basename(side) == "large-sim.xnnpack.json"
-    assert os.path.splitext(art)[0] + ".json" == side, "sidecar must be the stem-paired json"
-    assert open(art, "rb").read() == b"\x00pte-bytes"
-    with open(side) as f:
-        written = json.load(f)
-    assert written["artifact"] == "large-sim.xnnpack.pte"
-    assert written["normalization_stats"] == stats
 
 
 def test_descriptor_kovatchev_block_tracks_the_live_transform():

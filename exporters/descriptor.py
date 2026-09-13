@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import shutil
 from typing import Any
 
 import config as cfg
@@ -279,19 +277,3 @@ def write_descriptor(descriptor: dict[str, Any], path: str) -> None:
     with open(path, "w") as f:
         json.dump(descriptor, f, indent=2)
         f.write("\n")
-
-
-def deploy_to_server(pte_path: str, descriptor: dict[str, Any], deploy_dir: str) -> "tuple[str, str]":
-    """Copy pte_path and descriptor into a T1DMSERVER models dir -> (artifact, sidecar).
-
-    t1dm-store::refresh_models pairs each non-.json artifact with a SIBLING <stem>.json;
-    large-sim.xnnpack.pte -> large-sim.xnnpack.json. Phone strips engine infix for the id.
-    """
-    os.makedirs(deploy_dir, exist_ok=True)
-    artifact = os.path.join(deploy_dir, os.path.basename(pte_path))
-    sidecar = os.path.splitext(artifact)[0] + ".json"
-    shutil.copy2(pte_path, artifact)
-    # head side file doesn't travel; registry pairs ONE artifact with ONE sidecar, not head.bin.
-    deployed = {k: v for k, v in descriptor.items() if k != "head"}
-    write_descriptor(deployed, sidecar)
-    return artifact, sidecar

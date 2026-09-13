@@ -250,7 +250,7 @@ venv/bin/python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt
 
 venv/bin/python -m exporters.executorch_xnnpack \
     --checkpoint checkpoints/t1dmai_best.pt \
-    --out-dir exported --deploy-dir ../T1DMSERVER/data/models
+    --out-dir exported
 ```
 
 A delta fitted on a different checkpoint is not transferable: the correction is a

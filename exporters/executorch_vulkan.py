@@ -306,9 +306,6 @@ def main() -> None:
     ap.add_argument("--fp16", action="store_true",
                     help="build the Vulkan delegate with force_fp16 (fp16 GPU storage+compute); "
                          "engine id -> executorch_vulkan_fp16, precision -> fp16")
-    ap.add_argument("--deploy-dir", default=None,
-                    help="with --write-pte, also copy the artifact + a <stem>.json sidecar "
-                         "into a T1DMSERVER models directory (e.g. ../T1DMSERVER/data/models)")
     ap.add_argument("--report-json", default=None, help="write the partition report as JSON here")
     args = ap.parse_args()
 
@@ -387,9 +384,7 @@ def main() -> None:
               "GPU-executed numerics delta is a DEVICE measurement (custom AAR), gated "
               "on-device against the fp32 XNNPACK authority (BackendInfo.agreementOk).")
 
-        from exporters.descriptor import (
-            build_descriptor, build_model_card, deploy_to_server, write_descriptor,
-        )
+        from exporters.descriptor import build_descriptor, build_model_card, write_descriptor
         desc = build_descriptor(
             model_id=args.model_id, engine=engine, executorch_version=et_ver,
             artifact_filename=os.path.basename(pte_path), normalization_stats=stats,
@@ -399,9 +394,6 @@ def main() -> None:
         write_descriptor(desc, desc_path)
         print(f"[descriptor] wrote {desc_path}")
 
-        if args.deploy_dir:
-            art, side = deploy_to_server(pte_path, desc, args.deploy_dir)
-            print(f"[deploy] {art}\n[deploy] {side}")
         if not faithful:
             raise SystemExit(1)
 
