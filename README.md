@@ -482,6 +482,9 @@ Run them as modules from the repository root. All three take `--checkpoint`,
 reference every other engine is measured against; the Vulkan module also reports
 how much of the graph the backend delegates versus falls back to CPU.
 
+`./deploy_model.sh <checkpoint> [model-id]` runs the XNNPACK export and pushes
+the artifact, head file and descriptor to an attached T1DMDROID phone over `adb`.
+
 The exported graph takes the masked set as an input: a one-hot matrix naming the
 patch each head slot reads, at one fixed sequence length, with the attention mask
 arriving as an additive float built outside the graph. Forecast, backcast and
