@@ -17,7 +17,7 @@ from exporters.modified_forward import NEG_FILL
 from normalization import CHANNEL_NAMES
 
 # Kovatchev constants imported, not hardcoded, so Rust f/f_inv can't drift; checkpoint stores none.
-from utils import _KOVATCHEV_SCALE, _KOVATCHEV_POWER, _KOVATCHEV_OFFSET
+from utils import _KOVATCHEV_SCALE, _KOVATCHEV_POWER, _KOVATCHEV_OFFSET, _KOVATCHEV_BG_SHIFT
 from T1DMSIM.simulator import BG_CLAMP_MIN as _BG_CLAMP_MIN, BG_CLAMP_MAX as _BG_CLAMP_MAX
 
 
@@ -38,8 +38,10 @@ def build_descriptor(
     head is write_head_weights's block; absent, no adapter seam. model_card is display-only,
     outside the Rust contract — parse_descriptor ignores it.
     """
-    risk_lo = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
-    risk_hi = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
+    risk_lo = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MIN + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
+                                  - _KOVATCHEV_OFFSET)
+    risk_hi = _KOVATCHEV_SCALE * (math.log(_BG_CLAMP_MAX + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
+                                  - _KOVATCHEV_OFFSET)
 
     T = int(seq_len or cfg.MAX_SEQ_LEN)
     P = cfg.PREDICTION_PATCHES
