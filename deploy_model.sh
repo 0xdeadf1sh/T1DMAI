@@ -6,8 +6,15 @@ set -euo pipefail
 
 ckpt=$(realpath "$1")
 [[ -f $ckpt ]] || { echo "no checkpoint: $1" >&2; exit 1; }
-# models/<capacity>/checkpoints/*.pt -> id <capacity>; a repeat push overwrites it on the phone
-id=${2:-$(basename "$(dirname "$(dirname "$ckpt")")")}
+# a push overwrites its id on the phone, so only models/<capacity>/checkpoints/ implies an id
+if [[ -n ${2:-} ]]; then
+    id=$2
+elif [[ $ckpt =~ /models/([^/]+)/checkpoints/[^/]+$ ]]; then
+    id=${BASH_REMATCH[1]}
+else
+    echo "$1 is outside models/<capacity>/checkpoints/; pass a model-id" >&2
+    exit 2
+fi
 
 root=$(cd "$(dirname "$0")" && pwd)
 out=$root/exported/$id
