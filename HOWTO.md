@@ -239,18 +239,14 @@ missing checkpoint is the visible symptom of a NaN reaching validation, since
 
 ## 6. Release
 
-A checkpoint is not shippable until its band has been re-fitted. The bands the
-model emits raw are not calibrated, and `calibrate_conformal.py` is the only thing
-that writes `conformal_delta` — the correction `inference.predict` applies when
-given one and the one the descriptor carries. Fit it on the checkpoint that is about to
-ship, then export:
+The export ships raw bands. The descriptor's `conformal` block is disabled, and
+T1DMDROID fits its own correction per patient
+([T1DMCOMMON/SPEC/inference.md](https://github.com/0xdeadf1sh/T1DMCOMMON/blob/main/SPEC/inference.md) §8.4).
+`calibrate_conformal.py` writes `conformal_delta` into the checkpoint for host-side
+inference, and `inference.predict` applies it when given one:
 
 ```bash
 venv/bin/python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt
-
-venv/bin/python -m exporters.executorch_xnnpack \
-    --checkpoint checkpoints/t1dmai_best.pt \
-    --out-dir exported
 ```
 
 A delta fitted on a different checkpoint is not transferable: the correction is a
@@ -258,8 +254,19 @@ property of those weights on that partition, and applying one to another set of
 weights gives a band that is finite, plausible and wrong. `--no-write` reports the
 fit without touching the checkpoint.
 
-The exporters need `executorch` and `litert-torch`, which `requirements.txt` does
-not pin; `README.md` has the separate export venv.
+The exporters run under `.venv-export`, not `venv`: they need `executorch` and
+`litert-torch`, which `requirements.txt` does not pin, and `README.md` has the
+venv. `deploy_model.sh` exports and pushes the result to an attached phone. Its
+model id defaults to the capacity directory of a checkpoint under `models/`; a
+checkpoint outside that tree names the id explicitly:
+
+```bash
+.venv-export/bin/python -m exporters.executorch_xnnpack \
+    --checkpoint checkpoints/t1dmai_best.pt \
+    --out-dir exported
+
+./deploy_model.sh checkpoints/t1dmai_best.pt d16_dilate
+```
 
 ---
 
