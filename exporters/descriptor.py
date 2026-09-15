@@ -207,6 +207,7 @@ def build_descriptor(
             "OFFSET": _KOVATCHEV_OFFSET,
             "BG_CLAMP_MIN": _BG_CLAMP_MIN,
             "BG_CLAMP_MAX": _BG_CLAMP_MAX,
+            "BG_SHIFT": _KOVATCHEV_BG_SHIFT,
             "RISK_CLAMP_MIN": risk_lo,
             "RISK_CLAMP_MAX": risk_hi,
         },

@@ -50,7 +50,8 @@ def test_model_card_reads_last_val_history_entry():
 
 def test_descriptor_kovatchev_block_tracks_the_live_transform():
     """Descriptor is the Rust runtime's only source for f/f_inv; stale = wrong decode."""
-    from utils import _KOVATCHEV_SCALE, _KOVATCHEV_OFFSET, _KOVATCHEV_POWER, kovatchev_f
+    from utils import (_KOVATCHEV_SCALE, _KOVATCHEV_OFFSET, _KOVATCHEV_POWER,
+                       _KOVATCHEV_BG_SHIFT, kovatchev_f)
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
     stats = {c: {"mean": 0.0, "std": 1.0}
@@ -65,6 +66,7 @@ def test_descriptor_kovatchev_block_tracks_the_live_transform():
     assert kov["POWER"] == _KOVATCHEV_POWER
     assert kov["OFFSET"] == _KOVATCHEV_OFFSET
     assert kov["BG_CLAMP_MIN"] == BG_CLAMP_MIN and kov["BG_CLAMP_MAX"] == BG_CLAMP_MAX
+    assert kov["BG_SHIFT"] == _KOVATCHEV_BG_SHIFT
     f_lo = float(kovatchev_f(torch.tensor([float(BG_CLAMP_MIN)])).item())
     f_hi = float(kovatchev_f(torch.tensor([float(BG_CLAMP_MAX)])).item())
     assert abs(kov["RISK_CLAMP_MIN"] - f_lo) < 1e-6
