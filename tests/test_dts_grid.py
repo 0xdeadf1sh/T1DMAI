@@ -3,11 +3,13 @@
 They agree to 1.11 mg/dL, not exactly, consistent with the paper's rounded coefficients.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
 from dts_grid import (
-    DTS_LOW_CLAMP_MGDL, DTS_OVERESTIMATE_COEFF, DTS_UNDERESTIMATE_COEFF,
+    DTS_BG_FLOOR_MGDL, DTS_LOW_CLAMP_MGDL, DTS_OVERESTIMATE_COEFF, DTS_UNDERESTIMATE_COEFF,
     DTS_ZONE_EDGES, ZONE_NAMES, dts_risk, dts_zone_counts, dts_zone_fractions,
     dts_zones,
 )
@@ -160,14 +162,27 @@ def test_the_clamp_governs_the_low_glucose_corner():
     assert ZONE_NAMES[int(dts_zones(np.array([200.0]), np.array([10.0]))[0])] == 'd'
 
 
-def test_a_risk_space_array_trips_the_units_tripwire():
-    """The clamp's own failure mode: z-scores are all under 50, so an unguarded pair
-    clamps to 50/50, scores 0 risk and reports a flawless 100% zone A."""
-    z = np.array([-1.2, 0.3, 2.1])
-    with pytest.raises(AssertionError, match='units tripwire'):
-        dts_zones(z, z)
-    with pytest.raises(AssertionError, match='units tripwire'):
-        dts_zones(np.array([120.0, 90.0, 200.0]), z)
+def test_below_the_bg_floor_trips_the_range_check():
+    below = np.array([DTS_BG_FLOOR_MGDL - 1.0, 90.0, 200.0])
+    legal = np.array([120.0, 90.0, 200.0])
+    with pytest.raises(AssertionError, match='below the BG floor'):
+        dts_zones(below, legal)
+    with pytest.raises(AssertionError, match='below the BG floor'):
+        dts_zones(legal, below)
+
+
+def test_negative_bg_folds_into_the_clamp_without_warning():
+    """The training floor sits below zero; the grid scores those values as 50 mg/dL, silently."""
+    true = np.array([DTS_BG_FLOOR_MGDL, -30.0, 45.0, 200.0])
+    pred = np.array([40.0, 200.0, DTS_BG_FLOOR_MGDL, -10.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        risk = dts_risk(true, pred)
+        zones = dts_zones(true, pred)
+    clamped = dts_risk(np.maximum(true, DTS_LOW_CLAMP_MGDL), np.maximum(pred, DTS_LOW_CLAMP_MGDL))
+    np.testing.assert_array_equal(risk, clamped)
+    print(f"\n[DUMP] zones {[ZONE_NAMES[z].upper() for z in zones]}")
+    assert [ZONE_NAMES[z] for z in zones] == ['a', 'e', 'a', 'd']
 
 
 def test_counts_and_fractions_round_trip():
