@@ -60,6 +60,7 @@ datasets/
 *.db-shm
 *.sqlite
 *.sqlite3
+*.t1dmbak
 
 # --- Generated figures / cards / screenshots ---
 figures/
