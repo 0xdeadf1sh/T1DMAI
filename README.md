@@ -370,6 +370,7 @@ python metrics/protocols.py    # sampler audit and both protocols' d histograms
 ```bash
 python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt
 python model_health.py --data 128
+python validate.py checkpoints/t1dmai_best.pt [--backup record.t1dmbak]
 python make_figures.py && python make_card.py
 ```
 
@@ -392,6 +393,13 @@ verdict implies. With `--data N` it streams cached windows through the model and
 scores every head, sublayer and block by ablation, the context by truncation and
 every width by a keep-top-k ladder, each as the change in pinball loss on the
 same windows.
+
+`validate.py` prints the training-time validation table for one checkpoint, at
+its own architecture, masked-channel policy and normalization statistics.
+Without `--backup` it scores the validation patients training draws for the
+checkpoint's master seed, simulated live or read from `--cache-path`. With
+`--backup` it scores the trailing `--test-days` of a T1DMDROID backup, the days
+`t1dmdroid_converter.py` holds out; no window crosses a missing reading.
 
 
 ## Simulator cache

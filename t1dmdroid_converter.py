@@ -19,6 +19,12 @@ from T1DMSIM.simulator import basal_curve, gamma_curve
 ARCHIVE_FORMAT = 't1dm.archive'
 STEP_MS = fd.STEP_S * 1000
 STEPS_PER_DAY = 24 * 60 // fd.DT_MINUTES
+TEST_DAYS = 7
+
+
+def held_out_start(n: int, test_days: int) -> int:
+    """First held-out step of an ``n``-step record; negative when the record is shorter."""
+    return n - test_days * STEPS_PER_DAY
 
 
 def read_archive(path: str) -> dict[str, list[dict]]:
@@ -113,7 +119,7 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> N
         raise SystemExit('--test-days must be at least 1')
     r = record_channels(read_archive(path))
     n = len(r['bg'])
-    test_start = n - test_days * STEPS_PER_DAY
+    test_start = held_out_start(n, test_days)
     min_train = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
     if test_start < min_train:
         raise SystemExit(f'{test_days} test days leave {max(test_start, 0)} train steps; '
@@ -143,7 +149,8 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> N
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('backup', help='.t1dmbak file exported by T1DMDROID')
-    p.add_argument('--test-days', type=int, default=7, help='trailing days held out as test')
+    p.add_argument('--test-days', type=int, default=TEST_DAYS,
+                   help='trailing days held out as test')
     p.add_argument('--out', default=None, help='cache directory; default datasets/t1dmdroid/<stem>')
     p.add_argument('--source', default='t1dmdroid', help='sub-dataset name in the cache')
     p.add_argument('--sid', default=None, help='subject id; default the backup file stem')

@@ -562,7 +562,7 @@ def _render_validation_table(
 
     def _trend_cell(curr: float | None, prev: float | None,
                     direction: str, band_mid: float | None = None) -> str:
-        if direction == 'none':
+        if direction == 'none' or prev_metrics is None:
             return ''
         if curr is None or prev is None:
             return _colored('—', _ANSI_GRAY)
@@ -593,6 +593,8 @@ def _render_validation_table(
         rows.append(('', '', '', '', '', ''))
 
     def _prev_cell(prev_key: str | None, prev_scale: float, fmt: str, unit: str) -> str:
+        if prev_metrics is None:
+            return ''
         prev = _prev_val(prev_key, prev_scale) if prev_key else None
         if prev is None:
             return _colored('—', _ANSI_GRAY)

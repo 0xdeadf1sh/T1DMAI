@@ -613,7 +613,7 @@ def _render_validation_table(
 
     def _trend_cell(curr: float | None, prev: float | None,
                     direction: str, band_mid: float | None = None) -> str:
-        if direction == 'none':
+        if direction == 'none' or prev_metrics is None:
             return ''
         if curr is None or prev is None:
             return _colored('—', _ANSI_GRAY)
@@ -644,6 +644,8 @@ def _render_validation_table(
         rows.append(('', '', '', '', '', ''))
 
     def _prev_cell(prev_key: str | None, prev_scale: float, fmt: str, unit: str) -> str:
+        if prev_metrics is None:
+            return ''
         prev = _prev_val(prev_key, prev_scale) if prev_key else None
         if prev is None:
             return _colored('—', _ANSI_GRAY)
@@ -3120,6 +3122,13 @@ def _csv_row(columns: "list[tuple[str, int]]", values: dict[str, Any]) -> list:
     return row
 
 
+VAL_SEED_OFFSET = 10_000_000
+
+
+def _overfit_ratio(val_total: float, train_ema: float) -> float:
+    return 1.0 / (1.0 + math.exp(-(val_total - train_ema)))
+
+
 def train(
     total_steps: int = TOTAL_STEPS,
     batch_size: int = BATCH_SIZE,
@@ -3238,7 +3247,7 @@ def train(
         cache_path=cache_path,
     )
     val_dataset = T1DMDataset(
-        master_seed=master_seed + 10_000_000,
+        master_seed=master_seed + VAL_SEED_OFFSET,
         total_steps=VALIDATION_N_PATIENTS,
         batch_size=1,
         normalization_stats=norm_stats,
@@ -3593,7 +3602,7 @@ def train(
 
             val_total = val_metrics['val_loss_total']
             train_ema = loss_ema if loss_ema is not None else loss_val
-            overfit_ratio = 1.0 / (1.0 + math.exp(-(val_total - train_ema)))
+            overfit_ratio = _overfit_ratio(val_total, train_ema)
             val_metrics['train_loss_ema'] = train_ema
             val_metrics['overfit_ratio'] = overfit_ratio
 
