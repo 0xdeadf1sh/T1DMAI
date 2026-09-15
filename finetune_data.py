@@ -458,6 +458,11 @@ def build_cache(metabonet_dir: str, out_dir: str, skip_diadata: bool = False,
         print('building diadata...', flush=True)
         _build_diadata(app, index, os.path.join(metabonet_dir, 'archive.zip'),
                        limit_subjects)
+    finish_cache(app, index, out_dir)
+
+
+def finish_cache(app: _ChannelAppender, index: list[dict[str, Any]], out_dir: str) -> None:
+    """Close the channel files, write ``index.json``, fit the cache's own stats."""
     app.close()
     keys = [r['key'] for r in index]
     assert len(keys) == len(set(keys)), (
@@ -647,7 +652,7 @@ def _assemble_sample(feats: np.ndarray, bg: np.ndarray, spans: list[tuple[int, i
 class FinetuneTrainDataset(torch.utils.data.Dataset):
     """Tempered-source sampling over the cache's train-period steps.
 
-    Draw per index: pool (diadata w.p. ``diadata_frac``), source ``p ∝
+    Draw per index: pool (diadata w.p. ``diadata_frac``, else metabonet or phone), source ``p ∝
     n_subjects^source_alpha``, subject uniform, window rejection-sampled under the
     gap budget, retried WITHIN the drawn (pool, source). Deterministic in ``(seed, idx)``."""
 
@@ -667,7 +672,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
         min_len = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
         w_patches = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
         need_vis = int(np.ceil((1.0 - gap_budget) * w_patches))
-        pools: dict[str, dict[str, list[int]]] = {'metabonet': {}, 'diadata': {}}
+        pools: dict[str, dict[str, list[int]]] = {'metabonet': {}, 'phone': {}, 'diadata': {}}
         excluded: dict[str, int] = {}
         for i, rec in enumerate(cache.subjects):
             tl = cache.train_len(rec)
@@ -699,7 +704,8 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
         self.subjects_by_source = {(p, s): v for p, srcs in pools.items()
                                    for s, v in srcs.items()}
         self.diadata_frac = diadata_frac if 'diadata' in self.pool_sources else 0.0
-        assert 'metabonet' in self.pool_sources, "no trainable metabonet subjects"
+        self.main_pools = [p for p in ('metabonet', 'phone') if p in self.pool_sources]
+        assert self.main_pools, "no trainable metabonet or phone subjects"
 
     def __len__(self) -> int:
         return self.total
@@ -766,7 +772,13 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
                    raw: bool = False) -> dict[str, Any]:
         """One accepted window under the documented draw law."""
         for _ in range(8):
-            pool = ('diadata' if rng.random() < self.diadata_frac else 'metabonet')
+            if rng.random() < self.diadata_frac:
+                pool = 'diadata'
+            elif len(self.main_pools) == 1:
+                # No draw spent: a MetaboNet-only cache samples exactly as it did before.
+                pool = self.main_pools[0]
+            else:
+                pool = self.main_pools[int(rng.integers(len(self.main_pools)))]
             names, p = self.pool_sources[pool]
             source = names[int(rng.choice(len(names), p=p))]
             subs = self.subjects_by_source[(pool, source)]
