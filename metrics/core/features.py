@@ -15,7 +15,6 @@ from T1DMSIM.simulator import (
     MIXED_MEAL_MED_K_RANGE, MIXED_MEAL_MED_THETA_RANGE,
     MIXED_MEAL_SLOW_K_RANGE, MIXED_MEAL_SLOW_THETA_RANGE,
     MIXED_MEAL_MED_WEIGHT_BASE, SLOW_CARB_PREFERENCE_BASE,
-    PROTEIN_FAT_GAMMA_K, PROTEIN_FAT_GAMMA_THETA, PROTEIN_FAT_FRACTION_OF_CARBS,
     EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA,
 )
 from config import PATCH_SIZE, N_INPUT_FEATURES
@@ -26,14 +25,14 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 from .schema import Segment, GRID_MIN
 
-# Truncation, min; 240 holds 0.99314 of the meal mixture, 0.99616 of the bolus, 0.99998 of exercise.
+# Truncation, min; 240 holds 0.99999 of the meal mixture, 0.98625 of the bolus, 0.99998 of exercise.
 _CARB_KERNEL_MIN = 240
 _BOLUS_KERNEL_MIN = 240
 _EXERCISE_KERNEL_MIN = 240
 
 
 def _carb_kernel() -> np.ndarray:
-    """Unit-area mean meal mixture: type-weighted gammas + protein/fat tail."""
+    """Unit-area mean meal mixture: type-weighted gammas."""
     fast = (np.mean(MIXED_MEAL_FAST_K_RANGE), np.mean(MIXED_MEAL_FAST_THETA_RANGE))
     med = (np.mean(MIXED_MEAL_MED_K_RANGE), np.mean(MIXED_MEAL_MED_THETA_RANGE))
     slow = (np.mean(MIXED_MEAL_SLOW_K_RANGE), np.mean(MIXED_MEAL_SLOW_THETA_RANGE))
@@ -44,9 +43,6 @@ def _carb_kernel() -> np.ndarray:
     for (kk, th), wt in zip((fast, med, slow), w):
         c = gamma_curve(wt, kk, th, _CARB_KERNEL_MIN)
         k[:len(c)] += c[:len(k)]
-    pf = gamma_curve(PROTEIN_FAT_FRACTION_OF_CARBS, PROTEIN_FAT_GAMMA_K,
-                     PROTEIN_FAT_GAMMA_THETA, _CARB_KERNEL_MIN)
-    k[:len(pf)] += pf[:len(k)]
     return k / k.sum()
 
 
