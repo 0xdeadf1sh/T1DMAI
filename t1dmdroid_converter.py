@@ -36,13 +36,13 @@ def read_archive(path: str) -> dict[str, list[dict]]:
     return kinds
 
 
-def _custom(o: dict) -> np.ndarray | None:
+def custom_curve(o: dict) -> np.ndarray | None:
     """The row's ``customCurve``: little-endian f64 per 5-min step."""
     return None if 'cc' not in o else np.frombuffer(base64.b64decode(o['cc']), dtype='<f8')
 
 
 def meal_curve(o: dict) -> np.ndarray:
-    cc = _custom(o)
+    cc = custom_curve(o)
     if cc is not None:
         return cc
     k, theta, _ = fd.gi_gamma_params(float(o.get('gi', fd.CARB_GI_DEFAULT)))
@@ -51,7 +51,7 @@ def meal_curve(o: dict) -> np.ndarray:
 
 
 def dose_curve(o: dict) -> np.ndarray:
-    cc = _custom(o)
+    cc = custom_curve(o)
     if cc is not None:
         return cc
     if o['kd'] == 'BASAL':
@@ -64,6 +64,15 @@ def dose_curve(o: dict) -> np.ndarray:
     raise SystemExit(f'bolus {o["cid"]} has neither a custom curve nor gamma parameters')
 
 
+def live_events(kinds: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], int]:
+    """Meals and doses a tombstone has not retired, and how many it did."""
+    retired = {t['cid']: t['ua'] for t in kinds.get('tombstone', [])}
+    events = {kind: [o for o in kinds.get(kind, [])
+                     if o['cid'] not in retired or o['ua'] > retired[o['cid']]]
+              for kind in ('meal', 'dose')}
+    return events, sum(len(kinds.get(k, [])) - len(v) for k, v in events.items())
+
+
 def _lay(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
     """Add ``curve`` from grid step ``start``; steps outside the grid fall away, as on the phone."""
     lo, hi = max(0, -start), min(len(curve), len(dst) - start)
@@ -71,19 +80,12 @@ def _lay(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
         dst[start + lo:start + hi] += curve[lo:hi]
 
 
-def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> None:
-    if test_days < 1:
-        raise SystemExit('--test-days must be at least 1')
-    kinds = read_archive(path)
+def record_channels(kinds: dict[str, list[dict]]) -> dict:
+    """Per 5-min step: bg mg/dL (NaN unmeasured), carb g, insulin U, exercise g."""
     samples = kinds.get('sample', [])
     if not samples:
-        raise SystemExit(f'{path}: no samples')
-    retired = {t['cid']: t['ua'] for t in kinds.get('tombstone', [])}
-    events = {kind: [o for o in kinds.get(kind, [])
-                     if o['cid'] not in retired or o['ua'] > retired[o['cid']]]
-              for kind in ('meal', 'dose')}
-    n_deleted = sum(len(kinds.get(k, [])) - len(v) for k, v in events.items())
-
+        raise SystemExit('the backup has no samples')
+    events, n_deleted = live_events(kinds)
     first = min(samples, key=lambda s: s['ts'])
     t0_ms = first['ts']
     n = (max(s['ts'] for s in samples) - t0_ms) // STEP_MS + 1
@@ -101,7 +103,16 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> N
         _lay(carb, meal_curve(o), at(o['ts']))
     for o in events['dose']:
         _lay(insulin, dose_curve(o), at(o['ts']))
+    return {'t0_ms': t0_ms, 'tz_min': int(first['tz']), 'bg': bg, 'carb': carb,
+            'insulin': insulin, 'exercise': np.nan_to_num(exercise),
+            'n_meals': len(events['meal']), 'n_doses': len(events['dose']), 'n_deleted': n_deleted}
 
+
+def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> None:
+    if test_days < 1:
+        raise SystemExit('--test-days must be at least 1')
+    r = record_channels(read_archive(path))
+    n = len(r['bg'])
     test_start = n - test_days * STEPS_PER_DAY
     min_train = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
     if test_start < min_train:
@@ -112,18 +123,19 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> N
 
     app = fd._ChannelAppender(out_dir)
     start = app.append({
-        'bg': bg, 'carb': carb.astype(np.float32), 'insulin': insulin.astype(np.float32),
-        'exercise': np.nan_to_num(exercise).astype(np.float32), 'is_test': is_test,
+        'bg': r['bg'], 'carb': r['carb'].astype(np.float32),
+        'insulin': r['insulin'].astype(np.float32),
+        'exercise': r['exercise'].astype(np.float32), 'is_test': is_test,
     })
     index = [{
         'key': f'phone:{source}:{sid}', 'pool': 'phone', 'source': source, 'sid': sid,
         'start': start, 'n': int(n),
         # Local wall-clock seconds: the time probe reads the hour straight off t0.
-        't0': t0_ms // 1000 + int(first['tz']) * 60,
+        't0': r['t0_ms'] // 1000 + r['tz_min'] * 60,
         'test_start': int(test_start),
     }]
-    print(f'{path}: {n / STEPS_PER_DAY:.1f} days, {int(np.isfinite(bg).sum())} measured BG over '
-          f'{n} steps; {len(events["meal"])} meals, {len(events["dose"])} doses, {n_deleted} deleted; '
+    print(f'{path}: {n / STEPS_PER_DAY:.1f} days, {int(np.isfinite(r["bg"]).sum())} measured BG '
+          f'over {n} steps; {r["n_meals"]} meals, {r["n_doses"]} doses, {r["n_deleted"]} deleted; '
           f'train {test_start} steps, test {n - test_start} ({test_days} days)', flush=True)
     fd.finish_cache(app, index, out_dir)
 
