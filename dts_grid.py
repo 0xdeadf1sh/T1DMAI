@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import numpy as np
 
+# the suite's physical BG floor, imported rather than restated; feeds the units tripwire below
 from T1DMSIM.simulator import BG_CLAMP_MIN
 
 __all__ = [
     "DTS_LOW_CLAMP_MGDL",
-    "DTS_BG_FLOOR_MGDL",
+    "DTS_UNITS_FLOOR_MGDL",
     "DTS_OVERESTIMATE_COEFF",
     "DTS_UNDERESTIMATE_COEFF",
     "DTS_ZONE_EDGES",
@@ -34,27 +35,30 @@ DTS_ZONE_EDGES: tuple[float, ...] = (0.5, 1.5, 2.5, 3.5)
 ZONE_NAMES: tuple[str, ...] = ("a", "b", "c", "d", "e")
 assert len(ZONE_NAMES) == len(DTS_ZONE_EDGES) + 1
 
-# published ceiling; above it the risk extrapolates. Below 50 the clamp defines every value.
+# published domain 1-600 mg/dL; both ends WARN only, extrapolation is undefined past it
+DTS_DOMAIN_MIN_MGDL: float = 1.0
 DTS_DOMAIN_MAX_MGDL: float = 600.0
 
-# Range check only: at -40 it overlaps z-space, so a normalized array passes and scores ~100% A.
-DTS_BG_FLOOR_MGDL: float = BG_CLAMP_MIN
+# UNITS TRIPWIRE, not the grid's domain floor: without it risk/z arrays clamp to 50, faking zone A
+DTS_UNITS_FLOOR_MGDL: float = BG_CLAMP_MIN
 
 
 def _as_mgdl(x: np.ndarray, name: str) -> np.ndarray:
     """Validate one side of the pair — glucose in mg/dL — and return it as float64."""
     a = np.asarray(x, dtype=np.float64)
     assert np.isfinite(a).all(), f"dts_grid: {name} carries non-finite values"
-    assert a.min() >= DTS_BG_FLOOR_MGDL, (
-        f"dts_grid: {name} has a minimum of {a.min():.4g}, below the BG floor of "
-        f"{DTS_BG_FLOOR_MGDL} mg/dL"
+    assert a.min() >= DTS_UNITS_FLOOR_MGDL, (
+        f"dts_grid: {name} has a minimum of {a.min():.4g}, below the physical BG "
+        f"floor of {DTS_UNITS_FLOOR_MGDL} mg/dL — this is the units tripwire, and "
+        "a risk-space or normalized array is what usually trips it"
     )
     import warnings
-    if a.max() > DTS_DOMAIN_MAX_MGDL:
-        # fixed text: a value-bearing message defeats the once-per-location dedup
+    if a.min() < DTS_DOMAIN_MIN_MGDL or a.max() > DTS_DOMAIN_MAX_MGDL:
         warnings.warn(
-            f"dts_grid: {name} exceeds the grid's published {DTS_DOMAIN_MAX_MGDL} mg/dL "
-            "ceiling; the risk function extrapolates past it",
+            f"dts_grid: {name} spans [{a.min():.4g}, {a.max():.4g}] mg/dL, outside "
+            f"the grid's published [{DTS_DOMAIN_MIN_MGDL}, {DTS_DOMAIN_MAX_MGDL}] "
+            "domain; the risk function extrapolates but the paper does not define "
+            "zones there",
             RuntimeWarning, stacklevel=3,
         )
     return a
