@@ -13,13 +13,12 @@ import torch.nn as nn
 from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 
-# f(g)=SCALE*(ln(g+SHIFT)^POWER-OFFSET); at SHIFT 0, f(40)=-sqrt(10) and f(400)=+sqrt(10).
+# f(g)=SCALE*(ln(g)^POWER-OFFSET); solved so f(40)=-sqrt(10), f(400)=+sqrt(10), risk 100 at both.
 
-# Anchors != clamp: [BG_CLAMP_MIN,BG_CLAMP_MAX]+SHIFT=[10,400] gives risk [-6.8198,+3.1623].
+# Anchors != clamp [BG_CLAMP_MIN,BG_CLAMP_MAX]=[10,400]; risk range [-6.8198,+3.1623] is asymmetric.
 _KOVATCHEV_SCALE = 2.2211457449985317
 _KOVATCHEV_POWER = 1.084
 _KOVATCHEV_OFFSET = 5.540076976170212
-_KOVATCHEV_BG_SHIFT = 50.0  # mg/dL added before ln: T1DMSIM's brake experiment clamps at -40.
 
 def compute_patient_seed(master_seed: int, step: int, position: int) -> int:
     """SHA-256 of (master_seed, step, position) to a 63-bit seed.
@@ -89,8 +88,7 @@ def kovatchev_f(g: torch.Tensor) -> torch.Tensor:
             f"({BG_CLAMP_MAX} mg/dL): max={float(g.max()):.4f}",
             RuntimeWarning, stacklevel=2,
         )
-    return _KOVATCHEV_SCALE * (torch.log(g + _KOVATCHEV_BG_SHIFT).pow(_KOVATCHEV_POWER)
-                               - _KOVATCHEV_OFFSET)
+    return _KOVATCHEV_SCALE * (torch.log(g).pow(_KOVATCHEV_POWER) - _KOVATCHEV_OFFSET)
 
 
 def kovatchev_f_target(g: torch.Tensor) -> torch.Tensor:
@@ -108,8 +106,7 @@ def kovatchev_f_target(g: torch.Tensor) -> torch.Tensor:
             RuntimeWarning, stacklevel=2,
         )
     g = g.clamp(BG_CLAMP_MIN, BG_CLAMP_MAX)
-    return _KOVATCHEV_SCALE * (torch.log(g + _KOVATCHEV_BG_SHIFT).pow(_KOVATCHEV_POWER)
-                               - _KOVATCHEV_OFFSET)
+    return _KOVATCHEV_SCALE * (torch.log(g).pow(_KOVATCHEV_POWER) - _KOVATCHEV_OFFSET)
 
 
 def kovatchev_f_inv(r: torch.Tensor) -> torch.Tensor:
@@ -119,14 +116,12 @@ def kovatchev_f_inv(r: torch.Tensor) -> torch.Tensor:
     can't overflow fp32, clamps mg/dL output to [BG_CLAMP_MIN, BG_CLAMP_MAX]. Never differentiated.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
-    r_lo = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MIN + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
-                               - _KOVATCHEV_OFFSET)
-    r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
-                               - _KOVATCHEV_OFFSET)
+    r_lo = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
+    r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     r = torch.nan_to_num(r, nan=r_lo, posinf=r_hi, neginf=r_lo)
     r = r.clamp(r_lo, r_hi)
     base = r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET  # >= 0 after the input clamp
-    g = torch.exp(base.pow(1.0 / _KOVATCHEV_POWER)) - _KOVATCHEV_BG_SHIFT
+    g = torch.exp(base.pow(1.0 / _KOVATCHEV_POWER))
     return g.clamp(BG_CLAMP_MIN, BG_CLAMP_MAX)
 
 
@@ -137,8 +132,7 @@ def kovatchev_f_np(g: "np.ndarray") -> "np.ndarray":
     kovatchev_f_target (not the tripwire), so the stat fit and input transform stay bit-consistent.
     """
     g = np.clip(g, BG_CLAMP_MIN, BG_CLAMP_MAX)
-    return _KOVATCHEV_SCALE * (np.log(g + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
-                               - _KOVATCHEV_OFFSET)
+    return _KOVATCHEV_SCALE * (np.log(g) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
 
 
 def kovatchev_f_inv_np(r: "np.ndarray") -> "np.ndarray":
@@ -148,14 +142,12 @@ def kovatchev_f_inv_np(r: "np.ndarray") -> "np.ndarray":
     """
     import numpy as np
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
-    r_lo = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MIN + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
-                               - _KOVATCHEV_OFFSET)
-    r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX + _KOVATCHEV_BG_SHIFT) ** _KOVATCHEV_POWER
-                               - _KOVATCHEV_OFFSET)
+    r_lo = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MIN) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
+    r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     r = np.nan_to_num(r, nan=r_lo, posinf=r_hi, neginf=r_lo)
     r = np.clip(r, r_lo, r_hi)
     base = r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET  # >= 0 after the input clamp
-    g = np.exp(base ** (1.0 / _KOVATCHEV_POWER)) - _KOVATCHEV_BG_SHIFT
+    g = np.exp(base ** (1.0 / _KOVATCHEV_POWER))
     return np.clip(g, BG_CLAMP_MIN, BG_CLAMP_MAX)
 
 
