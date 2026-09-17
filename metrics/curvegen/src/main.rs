@@ -1,24 +1,27 @@
-// Dump the insulin preset catalogue and each rapid preset's per-5-min action curve as JSON.
+// Dump the insulin preset catalogue and each preset's per-5-min action curve as JSON.
 use serde_json::json;
-use t1dm_core::{exp_action_curve, insulin_preset_catalog, InsulinFamily};
+use t1dm_core::{insulin_preset_catalog, preset_curve, InsulinFamily};
+
+/// A rapid curve's shape depends on the dose; this is SPEC/invariants.md §5's reference dose.
+const REFERENCE_UNITS: f64 = 5.0;
 
 fn main() {
     let mut out = Vec::new();
     for spec in insulin_preset_catalog() {
-        let rapid = matches!(spec.family, InsulinFamily::RapidExp);
-        let curve = if rapid {
-            exp_action_curve(1.0, spec.peak_min, spec.dia_min)
-        } else {
-            Vec::new()
-        };
+        let rapid = matches!(spec.family, InsulinFamily::RapidGamma);
+        let curve: Vec<f64> = preset_curve(REFERENCE_UNITS, spec.clone())
+            .iter()
+            .map(|v| v / REFERENCE_UNITS)
+            .collect();
         out.push(json!({
             "label": spec.label,
-            "family": if rapid { "rapid_exp" } else { "basal_bateman" },
-            "peak_min": spec.peak_min,
-            "dia_min": spec.dia_min,
+            "family": if rapid { "rapid_gamma" } else { "basal_bateman" },
+            "gamma_k": spec.gamma_k,
+            "gamma_theta": spec.gamma_theta,
+            "dia_base_hours": spec.dia_base_hours,
             "ka_per_hour": spec.ka_per_hour,
             "ke_per_hour": spec.ke_per_hour,
-            "off_distribution": spec.off_distribution,
+            "action_min": spec.action_min,
             "citation": spec.citation,
             "curve_per_5min_unit_total": curve,
         }));

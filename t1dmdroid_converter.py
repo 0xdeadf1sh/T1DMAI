@@ -18,7 +18,7 @@ import numpy as np
 
 import finetune_data as fd
 from config import MIN_CONTEXT_PATCHES, PATCH_SIZE, PREDICTION_PATCHES
-from T1DMSIM.simulator import basal_curve, gamma_curve
+from T1DMSIM.simulator import basal_curve, bolus_pk_for_dose, gamma_curve
 
 ARCHIVE_FORMAT = 't1dm.archive'
 STEP_MS = fd.STEP_S * 1000
@@ -70,8 +70,8 @@ def dose_curve(o: dict) -> np.ndarray:
         return basal_curve(float(o['u']), float(o['dm']), **rates)
     if 'k' in o and 'th' in o:
         return gamma_curve(float(o['u']), float(o['k']), float(o['th']), float(o['dm']))
-    # The phone's exponential fallback exists only in t1dm-core; skipping would drop insulin.
-    raise SystemExit(f'bolus {o["cid"]} has neither a custom curve nor gamma parameters')
+    # The phone's fallback: aspart, dose-scaled (SPEC/invariants.md §5).
+    return gamma_curve(float(o['u']), *bolus_pk_for_dose(float(o['u'])))
 
 
 def live_events(kinds: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], int]:

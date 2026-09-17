@@ -1,7 +1,7 @@
 """Model-input bridge: Segment -> normalized (N, N_INPUT_FEATURES) stack, [bg_absolute, carbs,
 insulin, exercise_equiv, bg_masked]. carb/insulin are the simulator's absorption/action CURVES: raw
-events convolved with kernels rebuilt from simulator constants (validated r=0.94 carb, 0.99 bolus
-against the simulator's own channels). Insulin combines bolus IU + basal IU/h into one rapid series;
+events convolved with kernels rebuilt from simulator constants: the mean-discipline meal GI and a
+5 U aspart bolus. Insulin combines bolus IU + basal IU/h into one rapid series;
 a 24h long-acting analogue is approximated as rapid. EXERCISE_KERNEL is for whatif.py only."""
 from __future__ import annotations
 
@@ -10,11 +10,8 @@ from datetime import datetime
 import numpy as np
 
 from T1DMSIM.simulator import (
-    gamma_curve, DT_MINUTES, BOLUS_GAMMA_K, BOLUS_GAMMA_THETA,
-    MIXED_MEAL_FAST_K_RANGE, MIXED_MEAL_FAST_THETA_RANGE,
-    MIXED_MEAL_MED_K_RANGE, MIXED_MEAL_MED_THETA_RANGE,
-    MIXED_MEAL_SLOW_K_RANGE, MIXED_MEAL_SLOW_THETA_RANGE,
-    MIXED_MEAL_MED_WEIGHT_BASE, SLOW_CARB_PREFERENCE_BASE,
+    gamma_curve, gi_gamma_params, DT_MINUTES, BOLUS_GAMMA_K, BOLUS_GAMMA_THETA, BOLUS_DIA_BASE_HOURS,
+    MEAL_GI_MEAN_MAX, MEAL_GI_DISCIPLINE_SPAN,
     EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA,
 )
 from config import PATCH_SIZE, N_INPUT_FEATURES
@@ -25,24 +22,15 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 from .schema import Segment, GRID_MIN
 
-# Truncation, min; 240 holds 0.99999 of the meal mixture, 0.98625 of the bolus, 0.99998 of exercise.
-_CARB_KERNEL_MIN = 240
-_BOLUS_KERNEL_MIN = 240
+# Truncation, min; the simulator's own curve lengths, so no kernel is cut short.
+_MEAN_MEAL_GI = MEAL_GI_MEAN_MAX - 0.5 * MEAL_GI_DISCIPLINE_SPAN
+_BOLUS_KERNEL_MIN = BOLUS_DIA_BASE_HOURS * 60.0
 _EXERCISE_KERNEL_MIN = 240
 
 
 def _carb_kernel() -> np.ndarray:
-    """Unit-area mean meal mixture: type-weighted gammas."""
-    fast = (np.mean(MIXED_MEAL_FAST_K_RANGE), np.mean(MIXED_MEAL_FAST_THETA_RANGE))
-    med = (np.mean(MIXED_MEAL_MED_K_RANGE), np.mean(MIXED_MEAL_MED_THETA_RANGE))
-    slow = (np.mean(MIXED_MEAL_SLOW_K_RANGE), np.mean(MIXED_MEAL_SLOW_THETA_RANGE))
-    w = np.array([1.0 - SLOW_CARB_PREFERENCE_BASE, MIXED_MEAL_MED_WEIGHT_BASE,
-                  SLOW_CARB_PREFERENCE_BASE])
-    w = w / w.sum()
-    k = np.zeros(_CARB_KERNEL_MIN // DT_MINUTES)
-    for (kk, th), wt in zip((fast, med, slow), w):
-        c = gamma_curve(wt, kk, th, _CARB_KERNEL_MIN)
-        k[:len(c)] += c[:len(k)]
+    """Unit-area meal at the mean-discipline patient's GI."""
+    k = gamma_curve(1.0, *gi_gamma_params(_MEAN_MEAL_GI))
     return k / k.sum()
 
 

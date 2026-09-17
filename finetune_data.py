@@ -32,7 +32,7 @@ import utils
 from utils import kovatchev_f_np
 from T1DMSIM.simulator import (
     DT_MINUTES, BG_CLAMP_MIN, BG_CLAMP_MAX,
-    gamma_curve, basal_curve, bolus_pk_for_dose,
+    gamma_curve, basal_curve, bolus_pk_for_dose, gi_gamma_params,
     BOLUS_VARIANTS, BASAL_VARIANTS,
     EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, EXERCISE_CARB_EQUIV_PER_MIN,
 )
@@ -40,7 +40,7 @@ from T1DMSIM.simulator import (
 STEP_S = DT_MINUTES * 60
 CACHE_CHANNELS = ('bg', 'carb', 'insulin', 'exercise', 'is_test')
 CHANNEL_DTYPES = {c: np.float32 for c in CACHE_CHANNELS} | {'is_test': np.uint8}
-CACHE_VERSION = 'finetune-cache-v2'
+CACHE_VERSION = 'finetune-cache-v3'
 
 # Carb entry error above this, not a meal (train.parquet max 855 g).
 CARB_EVENT_MAX_G = 300.0
@@ -74,15 +74,6 @@ METABONET_COLUMNS = [
 ]
 
 
-def gi_gamma_params(gi: float) -> tuple[float, float, float]:
-    """SPEC invariants.md §5 carb gamma: (k, theta, duration_minutes) for a GI."""
-    g = min(max(gi, 0.0), 100.0) / 100.0
-    k = 4.5 + (2.0 - 4.5) * g
-    theta = 30.0 + (15.0 - 30.0) * g
-    dur = min(max(k * theta * 4.0, 120.0), 360.0)
-    return k, theta, dur
-
-
 CARB_GI_DEFAULT = 50.0
 
 
@@ -94,15 +85,18 @@ def bolus_variant(name: str | None) -> dict[str, float]:
     s = (name or '').lower()
     if 'regular' in s or 'novolin' in s or 'humulin r' in s or 'gansulin' in s:
         return _REGULAR_VARIANT
-    if 'lispro' in s or 'humalog' in s:
+    if 'fiasp' in s or 'faster' in s:
+        return BOLUS_VARIANTS['faster_aspart']
+    if 'lyumjev' in s or 'urli' in s or 'ultra' in s:
+        return BOLUS_VARIANTS['ultra_rapid_lispro']
+    if 'lispro' in s or 'humalog' in s or 'admelog' in s:
         return BOLUS_VARIANTS['lispro']
-    # aspart, novolog/novalog, fiasp, apidra/glulisine, unknown -> aspart-shaped
+    # aspart, novolog/novalog, apidra/glulisine, unknown -> aspart-shaped
     return BOLUS_VARIANTS['aspart']
 
 
-# Detemir: half-life 5-7 h, duration 12-24 h — neither T1DMSIM analogue fits.
-_DETEMIR_VARIANT = {'ka': 0.30, 'ke': 0.09, 'action_hours': 20.0,
-                    'tail_clip_hours': 4.0}
+# Detemir: half-life 5-7 h, duration 12-24 h — no T1DMSIM analogue fits.
+_DETEMIR_VARIANT = {'ka': 0.30, 'ke': 0.09, 'action_hours': 20.0}
 
 
 def basal_variant(name: str | None) -> dict[str, float]:
@@ -111,7 +105,9 @@ def basal_variant(name: str | None) -> dict[str, float]:
         return BASAL_VARIANTS['degludec']
     if 'detemir' in s or 'levemir' in s:
         return _DETEMIR_VARIANT
-    return BASAL_VARIANTS['glargine']
+    if 'u300' in s or 'u-300' in s or 'toujeo' in s:
+        return BASAL_VARIANTS['glargine_u300']
+    return BASAL_VARIANTS['glargine_u100']
 
 
 def _add_curve(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
@@ -160,8 +156,7 @@ def _events_to_curves(
     for j in np.flatnonzero(inj):
         _add_curve(
             ins_out,
-            basal_curve(float(basal[j]), av['action_hours'] * 60.0,
-                        av['ka'], av['ke'], av['tail_clip_hours']),
+            basal_curve(float(basal[j]), av['action_hours'] * 60.0, av['ka'], av['ke']),
             int(idx[j]),
         )
     basal_slot = np.zeros(n, dtype=np.float64)

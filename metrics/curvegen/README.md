@@ -1,20 +1,16 @@
 # curvegen
 
-Reads `T1DMDROID`'s insulin preset catalogue and emits each rapid preset's
+Reads `T1DMDROID`'s insulin preset catalogue and emits each preset's
 per-five-minute action curve as JSON, for `metrics/whatif.py --insulin-curve-json`.
 
 ## Why it exists
 
-The what-if probe injects a bolus and asks whether the forecast falls. Which curve
-it injects decides what the answer means: models are pretrained on the simulator's
-**gamma** family and run on the phone's **Loop/OpenAPS exponential** presets, so a
-probe using the wrong family measures an insulin nobody takes
-(`../../../T1DMCOMMON/SPEC/invariants.md` §5).
+The what-if probe injects a bolus and asks whether the forecast falls. The curve
+it injects decides what the answer means. The catalogue is the insulin table of
+`../../../T1DMCOMMON/SPEC/invariants.md` §5, which `T1DMSIM` and the phone share.
 
-The exponential model is `exp_action_curve` in `t1dm-core`. Reimplementing it here
-would be a second copy of curve mathematics the whole suite shares. This binary
-links the real one instead and prints its output, so the probe consumes data and
-T1DMAI carries no formula.
+`preset_curve` in `t1dm-core` resolves a preset to its curve. This binary links it
+and prints its output, so the probe consumes data and T1DMAI carries no formula.
 
 ## Use
 
@@ -28,11 +24,10 @@ Then split it per preset, or hand the probe an object carrying a
 `curve_per_5min_unit_total` key. `presets/` and `target/` are gitignored — both are
 regenerable.
 
-Each record carries the preset's label, family, `peak_min`, `dia_min`, the Bateman
-rates (basal only), its `off_distribution` flag, and the citation the insulin panel
-renders. Rapid presets also carry the resolved curve, normalized to a unit total;
-basal presets carry an empty curve, since a Bateman needs a duration the caller
-chooses.
+Each record carries the preset's label, family, gamma parameters at 5 U (rapid),
+Bateman rates and action window (basal), the citation the insulin panel renders,
+and the resolved curve at 5 U, normalized to a unit total. A rapid curve's shape
+lengthens with dose, so it matches a 5 U bolus.
 
 ## Boundary
 

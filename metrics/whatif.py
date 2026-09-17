@@ -590,8 +590,8 @@ def _parse_args() -> "argparse.Namespace":
                    help="replace the population bolus kernel with a per-5-min unit-total "
                         "action curve read from JSON — either a bare array or an object with "
                         "a 'curve_per_5min_unit_total' key. Generate it with "
-                        "metrics/curvegen, which links the app's own t1dm-core; the Loop "
-                        "exponential model is NOT reimplemented here")
+                        "metrics/curvegen, which links the app's own t1dm-core; the curve "
+                        "mathematics is NOT reimplemented here")
     p.add_argument('--arm-label', default=None,
                    help="name recorded in _meta for this arm (e.g. 'Fiasp', 'GI-25')")
     p.add_argument('--stride-patches', type=int, default=STRIDE // PATCH_SIZE,
