@@ -38,43 +38,76 @@ def test_counterfactual_probe_smoke():
         hypo_threshold=BG_HYPO_THRESHOLD, hyper_threshold=BG_HYPER_THRESHOLD,
     )
 
-    expected_keys = {
-        'cf_carb_dbg', 'cf_carb_dir', 'cf_insulin_dbg', 'cf_insulin_dir',
-        'cf_carb_monotonic', 'cf_insulin_monotonic',
-        'cf_hypo_rescue', 'cf_hyper_rescue',
+    fractions = ('cf_carb_sign', 'cf_insulin_sign', 'cf_exercise_sign',
+                 'cf_carb_monotonic', 'cf_insulin_monotonic',
+                 'cf_carb_onset_frac', 'cf_insulin_onset_frac')
+    # Conditional on a response or a baseline excursion existing: None is a legal reading.
+    conditional = ('cf_carb_linearity', 'cf_insulin_linearity',
+                   'cf_carb_onset_lag_min', 'cf_insulin_onset_lag_min',
+                   'cf_meal_coverage', 'cf_meal_coverage_ref',
+                   'cf_hypo_rescue', 'cf_hyper_rescue')
+    expected_keys = set(fractions) | set(conditional) | {
+        'cf_carb_gain', 'cf_insulin_gain', 'cf_exercise_gain',
+        'cf_insulin_linearity_ref', 'cf_insulin_preaction_dbg',
         'cf_n', 'cf_hypo_n', 'cf_hyper_n',
     }
     assert set(result.keys()) == expected_keys, (
         f"cf_* key set mismatch: got {sorted(result.keys())}")
-    assert len(expected_keys) == 11
+    assert len(expected_keys) == 23
 
     assert isinstance(result['cf_n'], int) and result['cf_n'] >= 1, (
         f"cf_n must be a positive probe count, got {result['cf_n']!r}")
     assert isinstance(result['cf_hypo_n'], int) and result['cf_hypo_n'] >= 0
     assert isinstance(result['cf_hyper_n'], int) and result['cf_hyper_n'] >= 0
 
-    # None means no baseline hypo/hyper sample existed
     for k, v in result.items():
         if k in ('cf_n', 'cf_hypo_n', 'cf_hyper_n'):
             continue
         if v is None:
-            assert k in ('cf_hypo_rescue', 'cf_hyper_rescue'), (
-                f"{k} unexpectedly None (only rescue rates may be None)")
+            assert k in conditional, f"{k} unexpectedly None"
             continue
         assert math.isfinite(float(v)), f"cf key {k} is non-finite: {v}"
 
-    for k in ('cf_carb_dir', 'cf_insulin_dir',
-              'cf_carb_monotonic', 'cf_insulin_monotonic'):
+    for k in fractions:
         assert 0.0 <= float(result[k]) <= 1.0, f"{k}={result[k]} out of [0,1]"
+    # 4 U carries a longer DIA than 2 U, so less of it lands inside the horizon: below 2.
+    assert 1.0 < float(result['cf_insulin_linearity_ref']) < 2.0, result['cf_insulin_linearity_ref']
 
     print(f"\n[DUMP] cf_probe | n={result['cf_n']} "
           f"hypo_n={result['cf_hypo_n']} hyper_n={result['cf_hyper_n']}")
-    print(f"[DUMP] cf_probe | carb_dbg={result['cf_carb_dbg']:.3f} "
-          f"insulin_dbg={result['cf_insulin_dbg']:.3f} "
-          f"carb_dir={result['cf_carb_dir']:.2f} insulin_dir={result['cf_insulin_dir']:.2f} "
+    print(f"[DUMP] cf_probe | carb_gain={result['cf_carb_gain']:.3f} "
+          f"insulin_gain={result['cf_insulin_gain']:.3f} "
+          f"exercise_gain={result['cf_exercise_gain']:.3f} "
+          f"carb_sign={result['cf_carb_sign']:.2f} insulin_sign={result['cf_insulin_sign']:.2f} "
           f"carb_mono={result['cf_carb_monotonic']:.2f} "
-          f"insulin_mono={result['cf_insulin_monotonic']:.2f}")
-    print(f"[DUMP] cf_probe | all 11 cf_* keys present and finite/None ✓")
+          f"insulin_mono={result['cf_insulin_monotonic']:.2f} "
+          f"preaction={result['cf_insulin_preaction_dbg']:+.3f}")
+    print(f"[DUMP] cf_probe | all {len(expected_keys)} cf_* keys present and finite/None ✓")
+
+
+def test_cf_reference_response_is_the_sim_open_loop():
+    """A rung's reference is BG_SCALE_FACTOR × the curve's mass inside the horizon."""
+    from train import _cf_bolus_curve, _CF_LADDER
+    from config import CF_INSULIN_BOLUS_U, CF_EXERCISE_G, PREDICTION_PATCHES, PATCH_SIZE
+    from T1DMSIM.simulator import BG_SCALE_FACTOR, bolus_pk_for_dose
+
+    ps = PREDICTION_PATCHES * PATCH_SIZE
+    assert _CF_LADDER == (0.5, 1.0, 2.0)
+    # Each rung is its own dose-scaled PK, not the 1x shape rescaled: durations differ.
+    durations = [bolus_pk_for_dose(f * CF_INSULIN_BOLUS_U)[2] for f in _CF_LADDER]
+    assert durations[0] < durations[1] < durations[2], durations
+    half = _cf_bolus_curve('insulin', 0.5 * CF_INSULIN_BOLUS_U, ps)
+    full = _cf_bolus_curve('insulin', CF_INSULIN_BOLUS_U, ps)
+    assert not np.allclose(half, 0.5 * full)
+    assert float(half.sum()) / (0.5 * CF_INSULIN_BOLUS_U) > float(full.sum()) / CF_INSULIN_BOLUS_U
+
+    ex = _cf_bolus_curve('exercise', CF_EXERCISE_G, ps)
+    assert ex.shape == (ps,) and (ex >= 0.0).all()
+    assert 0.0 < float(ex.sum()) < CF_EXERCISE_G, float(ex.sum())
+    ref_terminal = BG_SCALE_FACTOR * float(ex.sum())
+    assert ref_terminal > 0.0
+    print(f"\n[DUMP] cf_ref | insulin DIA min by rung={durations} "
+          f"exercise mass in horizon={float(ex.sum()) / CF_EXERCISE_G:.3f}")
 
 
 def test_cf_bolus_curve_is_the_spec_curve_not_a_rectangle():

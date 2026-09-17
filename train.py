@@ -30,7 +30,7 @@ from config import (                                           # noqa: E402
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
-    CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
+    CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U, CF_EXERCISE_G,
     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
     HYPO_ALARM_QUANTILE_TAU, HYPER_ALARM_QUANTILE_TAU,
     EXCURSION_PRECISION_TOLERANCE_MGDL,
@@ -50,7 +50,7 @@ from utils import (
 )
 
 from T1DMSIM.simulator import (
-    BG_CLAMP_MIN, BG_CLAMP_MAX, bolus_pk_for_dose, gamma_curve,
+    BG_CLAMP_MIN, BG_CLAMP_MAX, BG_SCALE_FACTOR, DT_MINUTES, bolus_pk_for_dose, gamma_curve,
 )
 
 # Band-edge indices on the ascending QUANTILE_LEVELS axis, never a bare literal.
@@ -1145,22 +1145,53 @@ def _render_validation_table(
     _blank()
 
     _cf_n = int(val_metrics.get('cf_n', 0) or 0)
-    # Two directions + harder monotonicity check; magnitudes/carb-monotonicity/rescue are CSV-only.
+    _cf_hypo_n = int(val_metrics.get('cf_hypo_n', 0) or 0)
+    _cf_hyper_n = int(val_metrics.get('cf_hyper_n', 0) or 0)
+    _cf_horizon_min = PREDICTION_PATCHES * PATCH_SIZE * DT_MINUTES
 
-    # These check the model responds to dose AT ALL — risk-v3 scored 0.56 on insulin, a coin flip.
-    _section(f'Counterfactual Dose-Response ({_cf_n} samples)')
-    _ccd = val_metrics.get('cf_carb_dir')
-    info_row('carb→BG direction', (_ccd * 100.0) if _ccd is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_carb_dir', prev_scale=100.0, direction='none')
-    _cid = val_metrics.get('cf_insulin_dir')
-    info_row('insulin→BG direction', (_cid * 100.0) if _cid is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_insulin_dir', prev_scale=100.0, direction='none')
-    _cim = val_metrics.get('cf_insulin_monotonic')
-    info_row('insulin monotonic', (_cim * 100.0) if _cim is not None else None,
-             fmt='{:.1f}', unit='%', target='≈ 100% (diag)',
-             prev_key='cf_insulin_monotonic', prev_scale=100.0, direction='none')
+    def _pct_row(label: str, key: str) -> None:
+        v = val_metrics.get(key)
+        info_row(label, (v * 100.0) if v is not None else None, fmt='{:.1f}', unit='%',
+                 prev_key=key, prev_scale=100.0, direction='higher')
+
+    def _ratio_row(label: str, key: str) -> None:
+        info_row(label, val_metrics.get(key), fmt='{:.2f}', unit='×', prev_key=key,
+                 direction='none')
+
+    def _ref(v: float | None, fmt: str = '{:.2f}') -> str:
+        return fmt.format(v) if v is not None else '?'
+
+    # Terminal-step ΔBG against the baseline; the label carries the sim open-loop reference.
+    _section(f'Counterfactual Dose-Response ({_cf_n} samples, Δ @{_cf_horizon_min} min)')
+    _pct_row(f'carb sign (+{CF_CARB_BOLUS_G:g} g; ref 100%)', 'cf_carb_sign')
+    _pct_row(f'insulin sign (+{CF_INSULIN_BOLUS_U:g} U; ref 100%)', 'cf_insulin_sign')
+    _pct_row(f'exercise sign (+{CF_EXERCISE_G:g} g-eq; ref 100%)', 'cf_exercise_sign')
+    _pct_row('carb monotonic (0/½/1/2×; ref 100%)', 'cf_carb_monotonic')
+    _pct_row('insulin monotonic (0/½/1/2×; ref 100%)', 'cf_insulin_monotonic')
+    _ratio_row('carb gain (ref 1×, Sg pulls <1)', 'cf_carb_gain')
+    _ratio_row('insulin gain (ref 1×, ≈1/IR)', 'cf_insulin_gain')
+    _ratio_row('exercise gain (ref 1×)', 'cf_exercise_gain')
+    _ratio_row('carb linearity 2×/1× (ref 2.00×)', 'cf_carb_linearity')
+    _ratio_row(f"insulin linearity 2×/1× (ref {_ref(val_metrics.get('cf_insulin_linearity_ref'))}× PK)",
+               'cf_insulin_linearity')
+    info_row(f'insulin pre-action Δ 0–{_CF_PRE_ACTION_STEPS * DT_MINUTES} min (ref 0)',
+             val_metrics.get('cf_insulin_preaction_dbg'), fmt='{:+.2f}', unit=' mg/dL',
+             prev_key='cf_insulin_preaction_dbg', direction='none')
+    _cof = val_metrics.get('cf_carb_onset_frac')
+    info_row(f'carb onset lag to ±{_CF_ONSET_MGDL:g} mg/dL ({_ref(_cof, "{:.0%}")} reached; ref 0)',
+             val_metrics.get('cf_carb_onset_lag_min'), fmt='{:+.0f}', unit=' min',
+             prev_key='cf_carb_onset_lag_min', direction='none')
+    _iof = val_metrics.get('cf_insulin_onset_frac')
+    info_row(f'insulin onset lag to ±{_CF_ONSET_MGDL:g} mg/dL ({_ref(_iof, "{:.0%}")} reached; ref 0)',
+             val_metrics.get('cf_insulin_onset_lag_min'), fmt='{:+.0f}', unit=' min',
+             prev_key='cf_insulin_onset_lag_min', direction='none')
+    info_row(f"matched-bolus coverage (ref {_ref(val_metrics.get('cf_meal_coverage_ref'))} PK/ICR)",
+             val_metrics.get('cf_meal_coverage'), fmt='{:.2f}',
+             prev_key='cf_meal_coverage', direction='none')
+    _lag = _CF_RESCUE_LAG_STEPS * DT_MINUTES
+    _pct_row(f'hypo rescue by carb ({_cf_hypo_n} hypo; after {_lag} min)', 'cf_hypo_rescue')
+    _pct_row(f'hyper rescue by insulin ({_cf_hyper_n} hyper; after {_lag} min)',
+             'cf_hyper_rescue')
     _blank()
 
     # Diagnostic, co-trains trunk, feeds no loss; thresholds are clock-usability, not external SOTA.
@@ -1669,19 +1700,41 @@ def _accumulate_long_horizon_bg_metrics(
 
 def _cf_bolus_curve(channel: str, total: float, n_steps: int) -> np.ndarray:
     """Per-step curve for a counterfactual bolus of total, truncated to n_steps.
-    Carb at GI 100, insulin under dose-scaled PK (SPEC/invariants.md §5), so the probe injects
-    the shape the model was pretrained on, not a flat block no channel ever carries.
+    Carb at GI 100, insulin under dose-scaled PK (SPEC/invariants.md §5), exercise as one
+    population-mean session, so the probe injects the shape the model was pretrained on.
     """
     if channel == 'carb':
         curve = gamma_curve(total, 2.0, 15.0, 120.0)
     elif channel == 'insulin':
         curve = gamma_curve(total, *bolus_pk_for_dose(total))
+    elif channel == 'exercise':
+        from metrics.core.features import EXERCISE_KERNEL
+        curve = total * EXERCISE_KERNEL
     else:
         raise ValueError(f"unknown counterfactual channel {channel!r}")
     out = np.zeros(n_steps, dtype=np.float32)
     n = min(n_steps, int(curve.shape[0]))
     out[:n] = curve[:n]
     return out
+
+
+# Dose ladder, in multiples of the CF_* dose; every rung carries its own dose-scaled curve.
+_CF_LADDER = (0.5, 1.0, 2.0)
+_CF_REF_RUNG = _CF_LADDER.index(1.0)
+_CF_ONSET_MGDL = 5.0                                # response reached = |ΔBG| past this
+_CF_PRE_ACTION_STEPS = 15 // DT_MINUTES             # window in which a bolus cannot yet act
+_CF_RESCUE_LAG_STEPS = 30 // DT_MINUTES             # rescue scored only after a dose can act
+_CF_LINEARITY_FLOOR_MGDL = 5.0                      # |Δ| at the 1× rung below which no ratio
+
+
+def _cf_onset_step(signed: np.ndarray) -> int | None:
+    """First step where the intended-direction response reaches _CF_ONSET_MGDL, else None."""
+    hit = np.nonzero(signed >= _CF_ONSET_MGDL)[0]
+    return int(hit[0]) if hit.size else None
+
+
+def _cf_median(v: list[float]) -> float | None:
+    return float(np.median(v)) if v else None
 
 
 def _run_counterfactual_probe(
@@ -1694,21 +1747,33 @@ def _run_counterfactual_probe(
     samples: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Counterfactual dose-response probe over up to VALIDATION_PROBE_N_PATIENTS samples.
-    Perturbs one RAW bolus (carb: GI-100 gamma; insulin: dose-scaled PK gamma, SPEC/invariants.md
-    §5) from the first masked step, log1p-z renormalized; exercise held at its TRUE curve.
-    samples reuses val_dataset[i] dicts rather than re-indexing, which would re-run the simulator.
+    Nine arms on one context: baseline, carb and insulin at _CF_LADDER multiples of the CF_*
+    dose (each rung its own curve, SPEC/invariants.md §5), one exercise session, the carb dose
+    with its ICR-matched bolus. Terminal-step differences; gains divide by the sim's open loop.
     """
     from inference import predict
 
     _ps = PREDICTION_PATCHES * PATCH_SIZE
+    term = _ps - 1
     carb_m = float(norm_stats['carb_intake']['mean'])
     carb_s = float(norm_stats['carb_intake']['std'])
     ins_m = float(norm_stats['insulin_combined']['mean'])
     ins_s = float(norm_stats['insulin_combined']['std'])
+    ex_m = float(norm_stats['exercise_equiv']['mean'])
+    ex_s = float(norm_stats['exercise_equiv']['std'])
     carb_B = float(CF_CARB_BOLUS_G)
     ins_B = float(CF_INSULIN_BOLUS_U)
-    carb_curve = _cf_bolus_curve('carb', carb_B, _ps)
-    ins_curve = _cf_bolus_curve('insulin', ins_B, _ps)
+    ex_B = float(CF_EXERCISE_G)
+    carb_curves = [_cf_bolus_curve('carb', f * carb_B, _ps) for f in _CF_LADDER]
+    ins_curves = [_cf_bolus_curve('insulin', f * ins_B, _ps) for f in _CF_LADDER]
+    ex_curve = _cf_bolus_curve('exercise', ex_B, _ps)
+
+    # Open-loop sim response: BG_SCALE_FACTOR mg/dL per g; Sg pull-back sits on top, so gain < 1.
+    carb_ref = [BG_SCALE_FACTOR * np.cumsum(c) for c in carb_curves]         # (P*S,) mg/dL
+    ex_ref = BG_SCALE_FACTOR * np.cumsum(ex_curve)
+    ins_ref_per_icr = [BG_SCALE_FACTOR * np.cumsum(c) for c in ins_curves]  # × ICR → mg/dL
+    ins_linearity_ref = float(ins_ref_per_icr[-1][term] / ins_ref_per_icr[_CF_REF_RUNG][term])
+    carb_onset_ref = _cf_onset_step(carb_ref[_CF_REF_RUNG])
 
     def _renorm(raw: np.ndarray, m: float, s: float) -> torch.Tensor:
         """Raw per-step (P*S,) → normalized (P, S) torch tensor via log1p z."""
@@ -1725,19 +1790,22 @@ def _run_counterfactual_probe(
         )
         res = predict(model, context, normalization_stats=norm_stats,
                       device=device, overrides=overrides)
-        return res['median_bg'].detach().cpu().numpy()      # (P*S,) mg/dL
+        return res['median_bg'].detach().cpu().numpy().astype(np.float64)   # (P*S,) mg/dL
 
-    # Capped at VALIDATION_PROBE_N_PATIENTS, not VALIDATION_N_PATIENTS: 5 forwards per window.
+    # Capped at VALIDATION_PROBE_N_PATIENTS, not VALIDATION_N_PATIENTS: 9 forwards per window.
     n_val = min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS)
     if samples is not None:
         n_val = min(n_val, len(samples))
 
-    carb_dbg_sum = 0.0
-    carb_dir_hits = 0
-    ins_dbg_sum = 0.0
-    ins_dir_hits = 0
-    carb_mono_hits = 0
-    ins_mono_hits = 0
+    sign_hits = {'carb': 0, 'insulin': 0, 'exercise': 0}
+    mono_hits = {'carb': 0, 'insulin': 0}
+    gains: dict[str, list[float]] = {'carb': [], 'insulin': [], 'exercise': []}
+    linearity: dict[str, list[float]] = {'carb': [], 'insulin': []}
+    onset_lag: dict[str, list[float]] = {'carb': [], 'insulin': []}
+    onset_hits = {'carb': 0, 'insulin': 0}
+    preaction: list[float] = []
+    coverage: list[float] = []
+    coverage_ref: list[float] = []
     hypo_n = 0
     hypo_rescue_hits = 0
     hyper_n = 0
@@ -1751,6 +1819,7 @@ def _run_counterfactual_probe(
             sample = samples[i] if samples is not None else val_dataset[i]
             n_ctx = int(sample['n_context_patches'])
             bf = sample['bg_formula_data']
+            icr = float(sample['icr'])
             # Baseline/perturbed arms share context; a masked patch moves both by one fake value.
 
             # No length floor (unlike rolling): a two-arm diff shifts together, not compounding.
@@ -1772,6 +1841,7 @@ def _run_counterfactual_probe(
             ex_norm = np.asarray(bf['extended_exercise_norm'], dtype=np.float32)[:_ps]
             carb_raw = np.asarray(bf['extended_carb_raw'], dtype=np.float32)[:_ps]
             ins_raw = np.asarray(bf['extended_insulin_raw'], dtype=np.float32)[:_ps]
+            ex_raw = np.asarray(bf['extended_exercise_raw'], dtype=np.float32)[:_ps]
             if (carb_norm.shape[0] < _ps or ins_norm.shape[0] < _ps
                     or ex_norm.shape[0] < _ps):
                 continue
@@ -1780,69 +1850,102 @@ def _run_counterfactual_probe(
                 carb_norm.reshape(PREDICTION_PATCHES, PATCH_SIZE))
             ins_true_t = torch.from_numpy(
                 ins_norm.reshape(PREDICTION_PATCHES, PATCH_SIZE))
-            # Exercise never perturbed: held at truth every arm, so probed BG delta is dose alone.
             ex_true_t = torch.from_numpy(
                 ex_norm.reshape(PREDICTION_PATCHES, PATCH_SIZE))
 
             baseline = _forecast(carb_true_t, ins_true_t, ex_true_t)     # (P*S,)
 
-            # +full carb bolus, insulin at truth.
-            carb_full = _renorm(carb_raw + carb_curve, carb_m, carb_s)
-            carb_pert = _forecast(carb_full, ins_true_t, ex_true_t)
-            carb_dbg = float(np.mean(carb_pert - baseline))
-            carb_dbg_sum += carb_dbg
-            carb_dir_hits += int(carb_dbg > 0.0)
+            carb_d = [_forecast(_renorm(carb_raw + c, carb_m, carb_s), ins_true_t, ex_true_t)
+                      - baseline for c in carb_curves]
+            ins_d = [_forecast(carb_true_t, _renorm(ins_raw + c, ins_m, ins_s), ex_true_t)
+                     - baseline for c in ins_curves]
+            ex_d = _forecast(carb_true_t, ins_true_t,
+                             _renorm(ex_raw + ex_curve, ex_m, ex_s)) - baseline
 
-            # +full insulin bolus, carb at truth.
-            ins_full = _renorm(ins_raw + ins_curve, ins_m, ins_s)
-            ins_pert = _forecast(carb_true_t, ins_full, ex_true_t)
-            ins_dbg = float(np.mean(ins_pert - baseline))
-            ins_dbg_sum += ins_dbg
-            ins_dir_hits += int(ins_dbg < 0.0)
+            # The carb dose with the bolus this patient's ICR prescribes, under that dose's PK.
+            matched_u = carb_B / icr
+            matched_curve = _cf_bolus_curve('insulin', matched_u, _ps)
+            meal_d = _forecast(_renorm(carb_raw + carb_curves[_CF_REF_RUNG], carb_m, carb_s),
+                               _renorm(ins_raw + matched_curve, ins_m, ins_s),
+                               ex_true_t) - baseline
 
-            # Monotonicity across [0, B/2, B].
-            carb_half = _renorm(carb_raw + 0.5 * carb_curve, carb_m, carb_s)
-            carb_peaks = [
-                float(baseline.max()),
-                float(_forecast(carb_half, ins_true_t, ex_true_t).max()),
-                float(carb_pert.max()),
-            ]
-            carb_mono_hits += int(
-                carb_peaks[1] >= carb_peaks[0] - 1e-6
-                and carb_peaks[2] >= carb_peaks[1] - 1e-6)
+            carb_1 = carb_d[_CF_REF_RUNG]
+            ins_1 = ins_d[_CF_REF_RUNG]
 
-            ins_half = _renorm(ins_raw + 0.5 * ins_curve, ins_m, ins_s)
-            ins_mins = [
-                float(baseline.min()),
-                float(_forecast(carb_true_t, ins_half, ex_true_t).min()),
-                float(ins_pert.min()),
-            ]
-            ins_mono_hits += int(
-                ins_mins[1] <= ins_mins[0] + 1e-6
-                and ins_mins[2] <= ins_mins[1] + 1e-6)
+            sign_hits['carb'] += int(carb_1[term] > 0.0)
+            sign_hits['insulin'] += int(ins_1[term] < 0.0)
+            sign_hits['exercise'] += int(ex_d[term] < 0.0)
 
-            # Hypo rescue: baseline-hypo samples lifted out by +carb.
-            if float(baseline.min()) < hypo_threshold:
+            carb_terms = [0.0] + [float(d[term]) for d in carb_d]
+            ins_terms = [0.0] + [float(d[term]) for d in ins_d]
+            mono_hits['carb'] += int(all(np.diff(carb_terms) >= -1e-6))
+            mono_hits['insulin'] += int(all(np.diff(ins_terms) <= 1e-6))
+
+            gains['carb'].append(float(carb_1[term] / carb_ref[_CF_REF_RUNG][term]))
+            gains['insulin'].append(
+                float(-ins_1[term] / (icr * ins_ref_per_icr[_CF_REF_RUNG][term])))
+            gains['exercise'].append(float(-ex_d[term] / ex_ref[term]))
+
+            if abs(carb_1[term]) >= _CF_LINEARITY_FLOOR_MGDL:
+                linearity['carb'].append(float(carb_d[-1][term] / carb_1[term]))
+            if abs(ins_1[term]) >= _CF_LINEARITY_FLOOR_MGDL:
+                linearity['insulin'].append(float(ins_d[-1][term] / ins_1[term]))
+
+            ins_onset_ref = _cf_onset_step(icr * ins_ref_per_icr[_CF_REF_RUNG])
+            for name, signed, ref_step in (('carb', carb_1, carb_onset_ref),
+                                           ('insulin', -ins_1, ins_onset_ref)):
+                step = _cf_onset_step(signed)
+                if step is not None:
+                    onset_hits[name] += 1
+                    if ref_step is not None:
+                        onset_lag[name].append(float((step - ref_step) * DT_MINUTES))
+
+            preaction.append(float(ins_1[:_CF_PRE_ACTION_STEPS].mean()))
+
+            if carb_1[term] >= _CF_LINEARITY_FLOOR_MGDL:
+                coverage.append(float(1.0 - meal_d[term] / carb_1[term]))
+                coverage_ref.append(float(
+                    BG_SCALE_FACTOR * matched_curve.sum() * icr / carb_ref[_CF_REF_RUNG][term]))
+
+            # Rescue, scored after the lag: a dose cannot move the first half hour.
+            base_late = baseline[_CF_RESCUE_LAG_STEPS:]
+            if float(base_late.min()) < hypo_threshold:
                 hypo_n += 1
-                hypo_rescue_hits += int(float(carb_pert.min()) >= hypo_threshold)
-
-            # Hyper rescue: baseline-hyper samples brought down by +insulin.
-            if float(baseline.max()) > hyper_threshold:
+                hypo_rescue_hits += int(
+                    float((base_late + carb_1[_CF_RESCUE_LAG_STEPS:]).min()) >= hypo_threshold)
+            if float(base_late.max()) > hyper_threshold:
                 hyper_n += 1
-                hyper_rescue_hits += int(float(ins_pert.max()) <= hyper_threshold)
+                hyper_rescue_hits += int(
+                    float((base_late + ins_1[_CF_RESCUE_LAG_STEPS:]).max()) <= hyper_threshold)
 
             n_probed += 1
 
     model.train(was_training)
 
     nz = max(n_probed, 1)
+
+    def _frac(hits: int) -> float | None:
+        return hits / nz if n_probed else None
+
     return {
-        'cf_carb_dbg': carb_dbg_sum / nz if n_probed else None,
-        'cf_carb_dir': carb_dir_hits / nz if n_probed else None,
-        'cf_insulin_dbg': ins_dbg_sum / nz if n_probed else None,
-        'cf_insulin_dir': ins_dir_hits / nz if n_probed else None,
-        'cf_carb_monotonic': carb_mono_hits / nz if n_probed else None,
-        'cf_insulin_monotonic': ins_mono_hits / nz if n_probed else None,
+        'cf_carb_sign': _frac(sign_hits['carb']),
+        'cf_insulin_sign': _frac(sign_hits['insulin']),
+        'cf_exercise_sign': _frac(sign_hits['exercise']),
+        'cf_carb_monotonic': _frac(mono_hits['carb']),
+        'cf_insulin_monotonic': _frac(mono_hits['insulin']),
+        'cf_carb_gain': _cf_median(gains['carb']),
+        'cf_insulin_gain': _cf_median(gains['insulin']),
+        'cf_exercise_gain': _cf_median(gains['exercise']),
+        'cf_carb_linearity': _cf_median(linearity['carb']),
+        'cf_insulin_linearity': _cf_median(linearity['insulin']),
+        'cf_insulin_linearity_ref': ins_linearity_ref,
+        'cf_insulin_preaction_dbg': float(np.mean(preaction)) if preaction else None,
+        'cf_carb_onset_frac': _frac(onset_hits['carb']),
+        'cf_insulin_onset_frac': _frac(onset_hits['insulin']),
+        'cf_carb_onset_lag_min': _cf_median(onset_lag['carb']),
+        'cf_insulin_onset_lag_min': _cf_median(onset_lag['insulin']),
+        'cf_meal_coverage': _cf_median(coverage),
+        'cf_meal_coverage_ref': _cf_median(coverage_ref),
         'cf_hypo_rescue': (hypo_rescue_hits / hypo_n) if hypo_n > 0 else None,
         'cf_hyper_rescue': (hyper_rescue_hits / hyper_n) if hyper_n > 0 else None,
         'cf_n': n_probed,
@@ -3055,8 +3158,14 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         # Median forecast roughness (risk-space mean |delta^2|), pooled over horizon + last patch.
         ('median_roughness', 6), ('median_roughness_far', 6),
         # Counterfactual dose-response probe (diagnostic).
-        ('cf_carb_dbg', 4), ('cf_carb_dir', 4), ('cf_insulin_dbg', 4), ('cf_insulin_dir', 4),
+        ('cf_carb_sign', 4), ('cf_insulin_sign', 4), ('cf_exercise_sign', 4),
         ('cf_carb_monotonic', 4), ('cf_insulin_monotonic', 4),
+        ('cf_carb_gain', 4), ('cf_insulin_gain', 4), ('cf_exercise_gain', 4),
+        ('cf_carb_linearity', 4), ('cf_insulin_linearity', 4), ('cf_insulin_linearity_ref', 4),
+        ('cf_insulin_preaction_dbg', 4),
+        ('cf_carb_onset_frac', 4), ('cf_insulin_onset_frac', 4),
+        ('cf_carb_onset_lag_min', 4), ('cf_insulin_onset_lag_min', 4),
+        ('cf_meal_coverage', 4), ('cf_meal_coverage_ref', 4),
         ('cf_hypo_rescue', 4), ('cf_hyper_rescue', 4),
         ('cf_n', 4), ('cf_hypo_n', 4), ('cf_hyper_n', 4),
         # Time-of-day probe (point accuracy + clock reliability + no-jumping witness).
@@ -3674,14 +3783,16 @@ def train(
                 'conf_n': val_metrics.get('conf_n'),
                 'median_roughness': _r(val_metrics.get('median_roughness'), 6),
                 'median_roughness_far': _r(val_metrics.get('median_roughness_far'), 6),
-                'cf_carb_dbg': _r(val_metrics.get('cf_carb_dbg')),
-                'cf_carb_dir': _r(val_metrics.get('cf_carb_dir')),
-                'cf_insulin_dbg': _r(val_metrics.get('cf_insulin_dbg')),
-                'cf_insulin_dir': _r(val_metrics.get('cf_insulin_dir')),
-                'cf_carb_monotonic': _r(val_metrics.get('cf_carb_monotonic')),
-                'cf_insulin_monotonic': _r(val_metrics.get('cf_insulin_monotonic')),
-                'cf_hypo_rescue': _r(val_metrics.get('cf_hypo_rescue')),
-                'cf_hyper_rescue': _r(val_metrics.get('cf_hyper_rescue')),
+                **{k: _r(val_metrics.get(k)) for k in (
+                    'cf_carb_sign', 'cf_insulin_sign', 'cf_exercise_sign',
+                    'cf_carb_monotonic', 'cf_insulin_monotonic',
+                    'cf_carb_gain', 'cf_insulin_gain', 'cf_exercise_gain',
+                    'cf_carb_linearity', 'cf_insulin_linearity', 'cf_insulin_linearity_ref',
+                    'cf_insulin_preaction_dbg',
+                    'cf_carb_onset_frac', 'cf_insulin_onset_frac',
+                    'cf_carb_onset_lag_min', 'cf_insulin_onset_lag_min',
+                    'cf_meal_coverage', 'cf_meal_coverage_ref',
+                    'cf_hypo_rescue', 'cf_hyper_rescue')},
                 'cf_n': val_metrics.get('cf_n'),
                 'cf_hypo_n': val_metrics.get('cf_hypo_n'),
                 'cf_hyper_n': val_metrics.get('cf_hyper_n'),

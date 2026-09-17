@@ -246,15 +246,21 @@ def test_no_counterfactual_column_survives(blind_batch):
           "no duplicates")
 
     # feed the values that WOULD render, so the absence is evidence
-    synthetic = {'cf_n': 96, 'cf_carb_dir': 0.94, 'cf_insulin_dir': 0.88,
-                 'cf_insulin_monotonic': 0.71, 'cf_carb_dbg': 12.4,
-                 'cf_insulin_dbg': -9.1, 'cf_hypo_rescue': 0.5,
-                 'cf_hyper_rescue': 0.4, 'cf_carb_monotonic': 0.8,
-                 'cf_hypo_n': 20, 'cf_hyper_n': 18}
+    synthetic = {'cf_n': 96, 'cf_carb_sign': 0.94, 'cf_insulin_sign': 0.88,
+                 'cf_exercise_sign': 0.9, 'cf_insulin_monotonic': 0.71,
+                 'cf_carb_monotonic': 0.8, 'cf_carb_gain': 0.7, 'cf_insulin_gain': 0.6,
+                 'cf_exercise_gain': 0.5, 'cf_carb_linearity': 1.9,
+                 'cf_insulin_linearity': 1.7, 'cf_insulin_linearity_ref': 1.8,
+                 'cf_insulin_preaction_dbg': 0.3, 'cf_carb_onset_frac': 1.0,
+                 'cf_insulin_onset_frac': 0.9, 'cf_carb_onset_lag_min': 5.0,
+                 'cf_insulin_onset_lag_min': -5.0, 'cf_meal_coverage': 0.7,
+                 'cf_meal_coverage_ref': 0.8, 'cf_hypo_rescue': 0.5,
+                 'cf_hyper_rescue': 0.4, 'cf_hypo_n': 20, 'cf_hyper_n': 18}
     blind_page = train_blind._render_validation_table(1, dict(synthetic))
     plain_page = train._render_validation_table(1, dict(synthetic))
-    for label in ('Counterfactual', 'carb→BG direction', 'insulin→BG direction',
-                  'insulin monotonic'):
+    for label in ('Counterfactual', 'carb sign', 'insulin sign', 'exercise sign',
+                  'insulin monotonic', 'insulin gain', 'insulin pre-action',
+                  'matched-bolus coverage'):
         assert label in plain_page, (
             f"train.py's table does not render {label!r} — no subject")
         assert label not in blind_page, (

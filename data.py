@@ -698,8 +698,8 @@ def _build_sample(
 ) -> dict[str, Any]:
     """One training sample from a raw simulator output dict.
 
-    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``. ``icr`` is
-    accepted for caller compatibility and not consumed. Raw post-noise space, no smoothing.
+    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``, ``icr``
+    (g/U, the patient's, read only by the counterfactual probe). Raw post-noise, no smoothing.
     """
     # total_exercise is a carb-EQUIVALENT glucose-disposal curve in g/step; never rescaled.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
@@ -895,6 +895,7 @@ def _build_sample(
         'targets': targets_t.float(),
         'n_context_patches': n_ctx,
         'bg_formula_data': bg_formula_data,
+        'icr': float(icr),
     }
 
     # Cross-window time-of-day probe: window k+1, teacher-forced, one right-edge span; diagnostic.
