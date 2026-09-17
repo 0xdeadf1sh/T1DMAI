@@ -2,7 +2,11 @@
 
 Pool ``phone`` in ``finetune_data``'s format. BG: measured, NORMAL-flagged grid samples. Carb and
 insulin: rebuilt from logged events per ``SPEC/invariants.md`` §5, custom curves verbatim. Exercise:
-the grams the phone laid into each bucket."""
+the grams the phone laid into each bucket.
+
+The grid carries only the sensor that was authoritative at the time. Every sensor's own NORMAL
+readings form one more subject each, over that sensor's span cut at the held-out boundary, so the
+grid alone is scored; overlapping sensors are separate subjects, never merged."""
 
 import argparse
 import base64
@@ -79,6 +83,18 @@ def live_events(kinds: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], in
     return events, sum(len(kinds.get(k, [])) - len(v) for k, v in events.items())
 
 
+def sensor_traces(kinds: dict[str, list[dict]], t0_ms: int, n: int) -> list[tuple[str, np.ndarray]]:
+    """Per sensor, ordered by first reading: bg mg/dL per step (NaN unmeasured), newest rx wins."""
+    traces: dict[str, np.ndarray] = {}
+    for r in sorted(kinds.get('reading', []), key=lambda r: r['rx']):
+        if r.get('pv') != 'MEASURED' or r.get('fl') != 'NORMAL':
+            continue
+        i = int(round((r['ts'] - t0_ms) / STEP_MS))
+        if 0 <= i < n:
+            traces.setdefault(r['s'], np.full(n, np.nan, dtype=np.float32))[i] = r['bg']
+    return sorted(traces.items(), key=lambda kv: int(np.flatnonzero(np.isfinite(kv[1]))[0]))
+
+
 def _lay(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
     """Add ``curve`` from grid step ``start``; steps outside the grid fall away, as on the phone."""
     lo, hi = max(0, -start), min(len(curve), len(dst) - start)
@@ -114,10 +130,12 @@ def record_channels(kinds: dict[str, list[dict]]) -> dict:
             'n_meals': len(events['meal']), 'n_doses': len(events['dose']), 'n_deleted': n_deleted}
 
 
-def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> None:
+def convert(path: str, out_dir: str, test_days: int, source: str, sid: str,
+            grid_only: bool = False) -> None:
     if test_days < 1:
         raise SystemExit('--test-days must be at least 1')
-    r = record_channels(read_archive(path))
+    kinds = read_archive(path)
+    r = record_channels(kinds)
     n = len(r['bg'])
     test_start = held_out_start(n, test_days)
     min_train = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
@@ -128,21 +146,36 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str) -> N
     is_test[test_start:] = 1
 
     app = fd._ChannelAppender(out_dir)
-    start = app.append({
-        'bg': r['bg'], 'carb': r['carb'].astype(np.float32),
-        'insulin': r['insulin'].astype(np.float32),
-        'exercise': r['exercise'].astype(np.float32), 'is_test': is_test,
-    })
-    index = [{
-        'key': f'phone:{source}:{sid}', 'pool': 'phone', 'source': source, 'sid': sid,
-        'start': start, 'n': int(n),
-        # Local wall-clock seconds: the time probe reads the hour straight off t0.
-        't0': r['t0_ms'] // 1000 + r['tz_min'] * 60,
-        'test_start': int(test_start),
-    }]
+    index: list[dict] = []
+    # Local wall-clock seconds: the time probe reads the hour straight off t0.
+    t0 = r['t0_ms'] // 1000 + r['tz_min'] * 60
+    carb, insulin = r['carb'].astype(np.float32), r['insulin'].astype(np.float32)
+    exercise = r['exercise'].astype(np.float32)
+
+    def add(src: str, subject: str, bg: np.ndarray, lo: int, hi: int) -> None:
+        start = app.append({'bg': bg[lo:hi], 'carb': carb[lo:hi], 'insulin': insulin[lo:hi],
+                            'exercise': exercise[lo:hi], 'is_test': is_test[lo:hi]})
+        ts = test_start - lo
+        index.append({
+            'key': f'phone:{src}:{subject}', 'pool': 'phone', 'source': src, 'sid': subject,
+            'start': start, 'n': int(hi - lo), 't0': t0 + lo * fd.STEP_S,
+            'test_start': -1 if ts >= hi - lo else max(int(ts), 0),
+        })
+
+    add(source, sid, r['bg'], 0, n)
     print(f'{path}: {n / STEPS_PER_DAY:.1f} days, {int(np.isfinite(r["bg"]).sum())} measured BG '
           f'over {n} steps; {r["n_meals"]} meals, {r["n_doses"]} doses, {r["n_deleted"]} deleted; '
           f'train {test_start} steps, test {n - test_start} ({test_days} days)', flush=True)
+    if not grid_only:
+        for k, (sensor, bg) in enumerate(sensor_traces(kinds, r['t0_ms'], n), 1):
+            fin = np.flatnonzero(np.isfinite(bg))
+            lo, hi = int(fin[0]), min(int(fin[-1]) + 1, test_start)
+            if hi <= lo:
+                print(f'  {sid}-s{k}: {sensor}, held-out days only, skipped', flush=True)
+                continue
+            add(source, f'{sid}-s{k}', bg, lo, hi)
+            print(f'  {sid}-s{k}: {sensor}, steps {lo}-{hi}, '
+                  f'{int(np.isfinite(bg[lo:hi]).sum())} measured', flush=True)
     fd.finish_cache(app, index, out_dir)
 
 
@@ -154,10 +187,12 @@ def main() -> None:
     p.add_argument('--out', default=None, help='cache directory; default datasets/t1dmdroid/<stem>')
     p.add_argument('--source', default='t1dmdroid', help='sub-dataset name in the cache')
     p.add_argument('--sid', default=None, help='subject id; default the backup file stem')
+    p.add_argument('--grid-only', action='store_true',
+                   help='skip the per-sensor subjects; the authoritative grid alone')
     a = p.parse_args()
     stem = os.path.splitext(os.path.basename(a.backup))[0]
     convert(a.backup, a.out or os.path.join('datasets', 't1dmdroid', stem), a.test_days,
-            a.source, a.sid or stem)
+            a.source, a.sid or stem, a.grid_only)
 
 
 if __name__ == '__main__':
