@@ -88,7 +88,8 @@ def _plan(
         rec = cache.subjects[s]
         n = int(rec["n"])
         idx = np.asarray(rows, dtype=np.int64)
-        origin = np.rint((t_epoch[idx] - int(rec["t0"])) / 300.0).astype(np.int64)
+        # The zone opens one step AFTER the row: its reading is known, and pred_30 is 6 steps on.
+        origin = np.rint((t_epoch[idx] - int(rec["t0"])) / 300.0).astype(np.int64) + 1
         keep = (origin >= patch_size) & (origin <= n)
         idx, origin = idx[keep], origin[keep]
         if not len(idx):
@@ -207,7 +208,7 @@ def _apply_ladder(
     rows_by_subject: dict[int, list[int]],
     t_epoch: np.ndarray,
 ) -> None:
-    """Fill still-NaN rows: last measured bg before the timestamp, subject median, 120."""
+    """Fill still-NaN rows: last measured bg at or before the timestamp, subject median, 120."""
     for s, rows in rows_by_subject.items():
         idx = np.asarray(rows, dtype=np.int64)
         idx = idx[idx < len(pred)]
@@ -224,7 +225,7 @@ def _apply_ladder(
         origin = np.clip(
             np.rint((t_epoch[idx] - int(rec["t0"])) / 300.0).astype(np.int64), 0, n - 1
         )
-        src = src_of[np.maximum(origin - 1, 0)]
+        src = src_of[origin]
         val = np.where(src >= 0, bg[np.maximum(src, 0)], med)
         val = np.where(np.isfinite(val), val, _FALLBACK_BG_MGDL)
         for h in range(pred.shape[1]):
