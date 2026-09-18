@@ -41,16 +41,18 @@ def test_counterfactual_probe_smoke():
     fractions = ('cf_carb_sign', 'cf_insulin_sign', 'cf_exercise_sign',
                  'cf_carb_monotonic', 'cf_insulin_monotonic',
                  'cf_carb_onset_frac', 'cf_insulin_onset_frac')
-    # Conditional on a response or a baseline excursion existing: None is a legal reading.
+    # Conditional on a response, a baseline excursion or an ICR existing: None is a legal reading.
     conditional = ('cf_carb_linearity', 'cf_insulin_linearity',
                    'cf_carb_onset_lag_min', 'cf_insulin_onset_lag_min',
-                   'cf_meal_coverage', 'cf_meal_coverage_ref',
+                   'cf_insulin_gain', 'cf_meal_coverage', 'cf_meal_coverage_ref',
                    'cf_hypo_rescue', 'cf_hyper_rescue')
     expected_keys = set(fractions) | set(conditional) | {
-        'cf_carb_gain', 'cf_insulin_gain', 'cf_exercise_gain',
+        'cf_carb_gain', 'cf_exercise_gain',
         'cf_insulin_linearity_ref', 'cf_insulin_preaction_dbg',
         'cf_n', 'cf_hypo_n', 'cf_hyper_n',
     }
+    # Simulator samples carry an ICR, so the unconditional ICR-scaled reading is present.
+    assert result['cf_insulin_gain'] is not None
     assert set(result.keys()) == expected_keys, (
         f"cf_* key set mismatch: got {sorted(result.keys())}")
     assert len(expected_keys) == 23

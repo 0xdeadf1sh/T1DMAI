@@ -1868,13 +1868,6 @@ def _run_counterfactual_probe(
             ex_d = _forecast(carb_true_t, ins_true_t,
                              _renorm(ex_raw + ex_curve, ex_m, ex_s)) - baseline
 
-            # The carb dose with the bolus this patient's ICR prescribes, under that dose's PK.
-            matched_u = carb_B / icr
-            matched_curve = _cf_bolus_curve('insulin', matched_u, _ps)
-            meal_d = _forecast(_renorm(carb_raw + carb_curves[_CF_REF_RUNG], carb_m, carb_s),
-                               _renorm(ins_raw + matched_curve, ins_m, ins_s),
-                               ex_true_t) - baseline
-
             carb_1 = carb_d[_CF_REF_RUNG]
             ins_1 = ins_d[_CF_REF_RUNG]
 
@@ -1888,8 +1881,6 @@ def _run_counterfactual_probe(
             mono_hits['insulin'] += int(all(np.diff(ins_terms) <= 1e-6))
 
             gains['carb'].append(float(carb_1[term] / carb_ref[_CF_REF_RUNG][term]))
-            gains['insulin'].append(
-                float(-ins_1[term] / (icr * ins_ref_per_icr[_CF_REF_RUNG][term])))
             gains['exercise'].append(float(-ex_d[term] / ex_ref[term]))
 
             if abs(carb_1[term]) >= _CF_LINEARITY_FLOOR_MGDL:
@@ -1897,21 +1888,32 @@ def _run_counterfactual_probe(
             if abs(ins_1[term]) >= _CF_LINEARITY_FLOOR_MGDL:
                 linearity['insulin'].append(float(ins_d[-1][term] / ins_1[term]))
 
-            ins_onset_ref = _cf_onset_step(icr * ins_ref_per_icr[_CF_REF_RUNG])
-            for name, signed, ref_step in (('carb', carb_1, carb_onset_ref),
-                                           ('insulin', -ins_1, ins_onset_ref)):
-                step = _cf_onset_step(signed)
-                if step is not None:
-                    onset_hits[name] += 1
-                    if ref_step is not None:
-                        onset_lag[name].append(float((step - ref_step) * DT_MINUTES))
-
             preaction.append(float(ins_1[:_CF_PRE_ACTION_STEPS].mean()))
 
-            if carb_1[term] >= _CF_LINEARITY_FLOOR_MGDL:
-                coverage.append(float(1.0 - meal_d[term] / carb_1[term]))
-                coverage_ref.append(float(
-                    BG_SCALE_FACTOR * matched_curve.sum() * icr / carb_ref[_CF_REF_RUNG][term]))
+            carb_onset = _cf_onset_step(carb_1)
+            ins_onset = _cf_onset_step(-ins_1)
+            onset_hits['carb'] += int(carb_onset is not None)
+            onset_hits['insulin'] += int(ins_onset is not None)
+            if carb_onset is not None and carb_onset_ref is not None:
+                onset_lag['carb'].append(float((carb_onset - carb_onset_ref) * DT_MINUTES))
+
+            # A real backup carries icr 0 (unknown): every ICR-scaled reading stays absent.
+            if icr > 0.0:
+                gains['insulin'].append(
+                    float(-ins_1[term] / (icr * ins_ref_per_icr[_CF_REF_RUNG][term])))
+                ins_onset_ref = _cf_onset_step(icr * ins_ref_per_icr[_CF_REF_RUNG])
+                if ins_onset is not None and ins_onset_ref is not None:
+                    onset_lag['insulin'].append(float((ins_onset - ins_onset_ref) * DT_MINUTES))
+
+                # The carb dose with the bolus this ICR prescribes, under that dose's own PK.
+                matched_curve = _cf_bolus_curve('insulin', carb_B / icr, _ps)
+                meal_d = _forecast(
+                    _renorm(carb_raw + carb_curves[_CF_REF_RUNG], carb_m, carb_s),
+                    _renorm(ins_raw + matched_curve, ins_m, ins_s), ex_true_t) - baseline
+                if carb_1[term] >= _CF_LINEARITY_FLOOR_MGDL:
+                    coverage.append(float(1.0 - meal_d[term] / carb_1[term]))
+                    coverage_ref.append(float(BG_SCALE_FACTOR * matched_curve.sum() * icr
+                                              / carb_ref[_CF_REF_RUNG][term]))
 
             # Rescue, scored after the lag: a dose cannot move the first half hour.
             base_late = baseline[_CF_RESCUE_LAG_STEPS:]
