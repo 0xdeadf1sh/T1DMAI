@@ -5,6 +5,7 @@ is written all-null. Built at the CHECKPOINT's architecture, not config.py's.
 """
 
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -54,17 +55,48 @@ def parse_args() -> argparse.Namespace:
         "back to last measured bg, then subject median, then 120 mg/dL",
     )
     p.add_argument("--limit", type=int, default=None, help="first N template rows")
+    p.add_argument(
+        "--every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth template row; for scoring a thinned test.parquet, "
+        "never for a file to submit",
+    )
+    p.add_argument(
+        "--truth",
+        default=None,
+        metavar="test.parquet",
+        help="score the written file against it; default test.parquet beside --cache, "
+        "skipped when absent",
+    )
+    p.add_argument("--by-source", action="store_true", help="score per sub-dataset too")
     return p.parse_args()
 
 
-def _read_template(path: str) -> tuple[object, np.ndarray, np.ndarray, np.ndarray]:
-    """``(table, source_file, id, epoch_seconds)``; the table is written back into."""
+def _read_template(
+    path: str, every: int, horizons: tuple
+) -> tuple[object, np.ndarray, np.ndarray, np.ndarray]:
+    """``(table, source_file, id, epoch_seconds)``; the table is written back into.
+
+    A file with no ``pred_*`` column (``test.parquet`` itself) is read as its three key columns
+    and given empty ones, so it serves as its own template."""
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
-    table = pq.read_table(path)
-    missing = {"id", "source_file", "date"} - set(table.schema.names)
+    keys = ("id", "source_file", "date")
+    names = set(pq.read_schema(path).names)
+    missing = set(keys) - names
     if missing:
         sys.exit(f"--template {path}: missing column(s) {sorted(missing)}")
+    pred_cols = [f"pred_{m}" for m in horizons]
+    is_template = any(c in names for c in pred_cols)
+    table = pq.read_table(path, columns=None if is_template else list(keys))
+    if every > 1:
+        table = table.take(pa.array(np.arange(0, table.num_rows, every)))
+    if not is_template:
+        for c in pred_cols:
+            table = table.append_column(c, pa.nulls(table.num_rows, type=pa.float64()))
     src = np.asarray(table.column("source_file").to_pylist(), dtype=object)
     sid = np.asarray(table.column("id").to_pylist(), dtype=object)
     date = np.asarray(table.column("date").to_numpy(zero_copy_only=False))
@@ -300,7 +332,7 @@ def main() -> None:
         )
     stats = ckpt["normalization_stats"]
 
-    table, t_src, t_sid, t_epoch = _read_template(args.template)
+    table, t_src, t_sid, t_epoch = _read_template(args.template, args.every, HORIZON_MINUTES)
     n_rows = len(t_epoch) if args.limit is None else min(len(t_epoch), args.limit)
     print(f"template: {args.template}  {len(t_epoch)} rows, using {n_rows}", flush=True)
 
@@ -368,6 +400,19 @@ def main() -> None:
         _apply_ladder(pred, cache, rows_by_subject, t_epoch)
     np.clip(pred, BG_CLAMP_MIN, BG_CLAMP_MAX, out=pred)
     _write(table, pred, n_rows, HORIZON_MINUTES, args.out)
+
+    truth = args.truth or os.path.join(
+        os.path.dirname(os.path.abspath(args.cache)), "test.parquet"
+    )
+    if os.path.exists(truth):
+        import pyarrow.parquet as pq
+
+        from score_submission import score_table
+
+        # The written file, not `pred`: an all-null column must score as one.
+        score_table(pq.read_table(args.out), truth, args.by_source)
+    else:
+        print(f"no truth at {truth}; not scored", flush=True)
 
 
 if __name__ == "__main__":
