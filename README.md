@@ -39,6 +39,7 @@ on-device in [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID).
 - [Scoring rules and protocols](#scoring-rules-and-protocols)
 - [Other tools](#other-tools)
 - [Simulator cache](#simulator-cache)
+- [Real-world data: MetaboNet](#real-world-data-metabonet)
 - [Resizing the model](#resizing-the-model)
 - [Exporting for on-device inference](#exporting-for-on-device-inference)
 - [Interactive GUI](#interactive-gui)
@@ -186,6 +187,26 @@ sessions as their absorption, action and disposal curves, per step, in the units
 above. The model is therefore *always* conditioned on a declared plan, which is
 what makes the what-if mode a property of the forward pass rather than a separate
 mode.
+
+### Point-event layout
+
+`--inputs events` on `train.py` and `finetune.py` replaces the three curves with
+each dose at the step it was taken, eleven features per step:
+
+| Feature | Units | Transform |
+| --- | --- | --- |
+| CGM glucose | mg/dL | Kovatchev `f`, then z-score |
+| `carb_g`, `bolus_u`, `basal_u`, `exercise_min` | g, U, U, session minutes | `log1p`, then z-score |
+| `carb_gi` | glycaemic index | `ln(x / 50)` on a dosed step, 0 elsewhere |
+| `bolus_peak_min`, `basal_peak_min` | minutes to peak action | `ln(x / 60)` on a dosed step, 0 elsewhere |
+| `bolus_dur_h`, `basal_dur_h` | hours of action | `ln(x / 5)` on a dosed step, 0 elsewhere |
+| glucose withheld | bit | none |
+
+Doses sharing a step are summed and their descriptors dose-weighted. A pump's
+per-step basal carries its rapid insulin's descriptors; a long-acting injection
+carries its own. The channel list is `T1DMSIM/simulator.EVENT_CHANNELS`. A
+checkpoint is stamped with its layout and accepts only that one; the on-device
+export covers the curve layout only.
 
 The output is `(q_tau, median)` in risk space: a seven-level quantile fan at
 every 5-minute step of every masked patch, each anchored on its own span's
@@ -413,7 +434,15 @@ geometries, which `data.py` rejects at load against the accepted one.
 ```bash
 python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000 --sim-hours 199.5
 python train.py --cache-path simulator_cache --total-steps 100000
+
+# curves plus point events in one pool; either layout trains from it
+python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000 --sim-hours 199.5 --events
+python train.py --inputs events --cache-path simulator_cache --total-steps 100000
 ```
+
+`--events` appends the point-event channels after the curves and fits
+`normalization_stats_events.json` beside `normalization_stats.json`. The event
+layout reads its statistics from the pool, so it requires `--cache-path`.
 
 The geometry the dataset accepts is 2394 steps, 199.5 h at 5-minute resolution
 after a 48 h warmup; a pool at any other geometry is rejected at load. The
@@ -447,6 +476,68 @@ and refuses to train on divergent data. The generation parameters under `params`
 are not checked, so two pools built with different hypoglycemia oversampling are
 both accepted.
 
+
+## Real-world data: MetaboNet
+
+`finetune_data.py` merges MetaboNet's `train.parquet` and `test.parquet` (and,
+unless skipped, the DiaData archive) into one flat cache. Logged meals, doses and
+workouts become the suite's curves and, beside them, point events; the cache holds
+both layouts and both statistics files. It needs `pyarrow` and `pandas`.
+
+```bash
+# <dir> holds train.parquet, test.parquet and, for DiaData, archive.zip
+python finetune_data.py build --metabonet-dir <dir> --out <dir>/cache [--skip-diadata]
+python finetune_data.py fit-stats --cache <dir>/cache      # refit the statistics only
+```
+
+`finetune.py` trains on the cache's train-period steps and validates on windows
+drawn from its test period, printing DTS zone-A share, RMSE and MARD at 30, 60,
+90 and 120 minutes, pooled and per sub-dataset. It keeps the checkpoint with the
+highest mean zone-A share.
+
+```bash
+# fine-tune a pretrained checkpoint: architecture, statistics and layout come from it
+python finetune.py --checkpoint checkpoints/t1dmai_best.pt --cache <dir>/cache
+
+# train from random initialisation: architecture from config.py, statistics from the cache
+python finetune.py --inputs events --cache <dir>/cache --out-dir checkpoints_scratch \
+    --total-steps 20000 --warmup-steps 1000
+
+python finetune.py --cache <dir>/cache --train-dataset Loop,IOBP2 --test-dataset ReplaceBG
+```
+
+Without `--checkpoint` the learning rates default to `config.py`'s from-scratch
+values; with one they default ten times lower. `--inputs` must match a
+checkpoint's layout. `--no-carbs` blanks the carbohydrate input.
+
+`export_submission.py` renders the leaderboard's `predictions.parquet` from a
+checkpoint and then scores it. A row's forecast zone opens one step after its
+`date`, so `pred_30` is the reading thirty minutes later.
+
+```bash
+python export_submission.py --checkpoint checkpoints_finetune/finetune_best.pt \
+    --template template.parquet --cache <dir>/cache --out predictions.parquet --fill ladder
+
+# test.parquet as its own template, thinned, scored per sub-dataset
+python export_submission.py --checkpoint <ckpt> --template <dir>/test.parquet --every 400 \
+    --cache <dir>/cache --out predictions.parquet --fill ladder --by-source
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--fill none` | a horizon short of full row coverage is written all-null |
+| `--fill ladder` | unpredictable rows take the last reading, then the subject median, then 120 mg/dL |
+| `--future-doses zero` | blanks doses over the forecast zone; strictly causal |
+| `--every N` | keeps every Nth template row; for scoring, not for a file to submit |
+| `--truth PATH` | scores against it; defaults to `test.parquet` beside `--cache`, skipped when absent |
+
+`score_submission.py` scores any predictions file on its own: the median-line DTS
+zone-A share, RMSE and MARD per horizon, over the rows whose truth — the CGM
+reading nearest `date` plus the horizon, within half a step — was measured.
+
+```bash
+python score_submission.py predictions.parquet --truth <dir>/test.parquet --by-source
+```
 
 ## Resizing the model
 
