@@ -17,6 +17,19 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
 
+
+def _layout_from_argv() -> None:
+    """--inputs sets the layout env var before config binds it; workers inherit the env."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--inputs', choices=('curves', 'events'), default=None)
+    layout = pre.parse_known_args()[0].inputs
+    if layout is not None:
+        os.environ['T1DMAI_INPUT_LAYOUT'] = layout
+
+
+if __name__ == '__main__':
+    _layout_from_argv()
+
 from config import (                                           # noqa: E402
     MASTER_SEED, DETERMINISTIC, TOTAL_STEPS, BATCH_SIZE, NUM_WORKERS,
     MUON_LR, MUON_MOMENTUM, MUON_NS_ITERATIONS, MUON_WEIGHT_DECAY,
@@ -26,7 +39,7 @@ from config import (                                           # noqa: E402
     MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
     VALIDATION_N_PATIENTS, VALIDATION_PROBE_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
-    N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS,
+    N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, INPUT_LAYOUT,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
@@ -1578,26 +1591,19 @@ def _is_nocturnal(hour: float) -> bool:
 
 
 def _make_long_horizon_overrides_fn(bf: dict):
-    """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for predict_rolling.
+    """Per-roll announced overrides of every dose channel for predict_rolling.
     Long-horizon roll is KNOWN-PLAN: doses announced each roll while BG stays autoregressive.
     Announced set is exactly tuple(CHANNEL_TO_FEAT); a subset reads as normalize(0), "no session".
     Returns None past shipped future or when extended keys are absent (falls back unconditioned).
     """
-    keys = ('extended_carb_norm', 'extended_insulin_norm', 'extended_exercise_norm',
-            'extended_carb_raw', 'extended_insulin_raw', 'extended_exercise_raw')
-    if not all(k in bf for k in keys):
+    if 'extended_dose_norm' not in bf or 'extended_dose_raw' not in bf:
         return None
     _ps = PREDICTION_PATCHES * PATCH_SIZE
-    norm_ch = {
-        0: np.asarray(bf['extended_carb_norm'], dtype=np.float32),
-        1: np.asarray(bf['extended_insulin_norm'], dtype=np.float32),
-        2: np.asarray(bf['extended_exercise_norm'], dtype=np.float32),
-    }
-    raw_ch = {
-        0: np.asarray(bf['extended_carb_raw'], dtype=np.float32),
-        1: np.asarray(bf['extended_insulin_raw'], dtype=np.float32),
-        2: np.asarray(bf['extended_exercise_raw'], dtype=np.float32),
-    }
+    # Column i of the (steps, dose channels) blocks is dose channel i.
+    dose_norm = np.asarray(bf['extended_dose_norm'], dtype=np.float32)
+    dose_raw = np.asarray(bf['extended_dose_raw'], dtype=np.float32)
+    norm_ch = {ch: dose_norm[:, ch] for ch in range(dose_norm.shape[1])}
+    raw_ch = {ch: dose_raw[:, ch] for ch in range(dose_raw.shape[1])}
     assert tuple(sorted(norm_ch)) == _ANNOUNCE_CHANNELS, (
         f"announced set {tuple(sorted(norm_ch))} != CHANNEL_TO_FEAT {_ANNOUNCE_CHANNELS}"
     )
@@ -2955,12 +2961,13 @@ def _run_validation(
     for _k, _v in cg_ega.cg_ega_fractions(_night_cgega_counts).items():
         result[f'night_cgega_{_k}'] = _v
 
-    # Counterfactual dose-response probe (diagnostic), over the same validation samples.
-    result.update(_run_counterfactual_probe(
-        model, val_dataset, norm_stats, device,
-        hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
-        samples=val_samples_ordered,
-    ))
+    # Counterfactual probe (diagnostic); its arms add action curves, so curves layout only.
+    if INPUT_LAYOUT == 'curves':
+        result.update(_run_counterfactual_probe(
+            model, val_dataset, norm_stats, device,
+            hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
+            samples=val_samples_ordered,
+        ))
 
     return result
 
@@ -2985,6 +2992,7 @@ def _build_checkpoint(
     ``weighting``), so they serialize separately as ``weighting_state_dict``."""
     ckpt = {
         'arch_version': ARCH_VERSION,
+        'input_layout': INPUT_LAYOUT,
         'loss_schema': LOSS_SCHEMA,
         'step': step,
         'model_state_dict': model.state_dict(),
@@ -3025,6 +3033,9 @@ def _check_resume_architecture(ckpt: dict, path: str) -> None:
     if ckpt.get('arch_version') != ARCH_VERSION:
         sys.exit(f"--checkpoint {path}: arch_version {ckpt.get('arch_version')!r} != "
                  f"config.py {ARCH_VERSION!r}")
+    if ckpt.get('input_layout', 'curves') != INPUT_LAYOUT:
+        sys.exit(f"--checkpoint {path}: trained on {ckpt.get('input_layout', 'curves')!r} "
+                 f"inputs, this run reads {INPUT_LAYOUT!r} (--inputs)")
     policy = checkpoint_masked_channel_policy(ckpt)
     if policy != masked_channel_policy(blind=False):
         sys.exit(f"--checkpoint {path}: masked_channel_policy {policy!r}; train.py trains "
@@ -3292,7 +3303,14 @@ def train(
 
     train_start_time = time.time()
 
-    if os.path.exists(NORM_STATS_FILE):
+    if INPUT_LAYOUT == 'events':
+        # Point doses are fitted by the cache builder; there is no on-the-fly fit for them.
+        if cache_path is None:
+            sys.exit("--inputs events needs --cache-path, built by cache_simulator.py --events")
+        events_stats = os.path.join(cache_path, 'normalization_stats_events.json')
+        norm_stats = load_normalization_stats(events_stats)
+        print(f"Loaded normalization stats from {events_stats}")
+    elif os.path.exists(NORM_STATS_FILE):
         norm_stats = load_normalization_stats()
         print(f"Loaded normalization stats from {NORM_STATS_FILE}")
     else:
@@ -4003,6 +4021,9 @@ if __name__ == '__main__':
                         help='Hours discarded from the start of every simulator run.')
     parser.add_argument('--ema-decay', type=float, default=None,
                         help='Decay factor for the weight-EMA shadow used at validation. 0 disables.')
+    parser.add_argument('--inputs', choices=('curves', 'events'), default=None,
+                        help='Dose inputs: action curves (default), or per-step point doses '
+                             'from a cache built with cache_simulator.py --events.')
     parser.add_argument('--cache-path', type=str, default=None,
                         help='Path to a simulator cache directory produced by T1DMSIM/cache_simulator.py.')
     parser.add_argument('--checkpoint', type=str, default=None,

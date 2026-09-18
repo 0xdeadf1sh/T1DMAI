@@ -97,7 +97,22 @@ forecast *protocol*; it is not a region of a training sample.
 - **Patch = 6 timesteps = 30 min.** Patches are the attention/loss unit; the BG head emits
   `PATCH_SIZE` timesteps per slot.
 - **Combined insulin = basal + bolus.** The simulator provides them separately; always sum.
-- **5 input features — the FROZEN index map.** `[bg_absolute, carb_intake, insulin_combined,
+- **Two input layouts, one per checkpoint.** `--inputs curves|events` on `train.py` and
+  `finetune.py`; `config.INPUT_LAYOUTS` lists each layout's normalized channels and
+  `config.set_input_layout` derives `N_INPUT_FEATURES`, `PATCH_DIM`, `MASKABLE_FEATS` and
+  `CHANNEL_TO_FEAT` from it. The flag travels as the `T1DMAI_INPUT_LAYOUT` env var, which `config`
+  reads at import, so DataLoader workers bind the same layout. The bullets below describe
+  `curves`. `events` is `[bg_absolute, *T1DMSIM.simulator.EVENT_CHANNELS, bg_masked]` — 11
+  features, `PATCH_DIM` 66: each dose at its onset step (`carb_g`, `bolus_u`, `basal_u`,
+  `exercise_min`, log1p + z) with its descriptors (`carb_gi`, `*_peak_min`, `*_dur_h`) as
+  `ln(x / ref)` on a dosed step and 0 elsewhere (`normalization.LOG_RATIO_REFS`, fixed mean 0 /
+  std 1, no inverse — `denormalize` raises). Its statistics are the cache's
+  `normalization_stats_events.json` (`cache_simulator.py --events`, or `finetune_data.py build`,
+  whose cache holds both layouts); there is no on-the-fly fit. A checkpoint is stamped
+  `input_layout`; a mismatch with `--inputs` exits. Under `events` the counterfactual probe is
+  skipped (its arms add curves), the phone pool is refused (it carries curves only), and the
+  exporter refuses the checkpoint.
+- **5 input features — the FROZEN index map (`curves`).** `[bg_absolute, carb_intake, insulin_combined,
   exercise_equiv, bg_masked]`, `N_INPUT_FEATURES = 5`, `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES =
   30`, **step-major**, so a feature's columns are the stride `[:, f::N_INPUT_FEATURES]`. There are no
   temporal sin/cos features and no `TEMPORAL_FEAT_START`.

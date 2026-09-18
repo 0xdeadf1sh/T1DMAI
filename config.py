@@ -1,7 +1,10 @@
 """All tunable constants. CLI flags override these; train.py prints the resolved set."""
 
+import os as _os
+
 # Owned by T1DMSIM (SIMULATOR_WARMUP_HOURS: hours to basal steady state); needs the symlink.
 from T1DMSIM.simulator import (
+    EVENT_CHANNELS as _EVENT_CHANNELS,
     SIMULATOR_WARMUP_HOURS,
     EXERCISE_CARB_EQUIV_PER_MIN as _EX_G_PER_MIN,
     EXERCISE_DURATION_MEAN_MIN as _EX_DUR_MEAN_MIN,
@@ -15,16 +18,32 @@ HEAD_DIM = D_MODEL // N_HEADS
 FFN_DIM = 1 * D_MODEL
 PATCH_SIZE = 6                   # 6 × 5 min = 30 min per patch
 
-# FROZEN order, step-major: 0 bg z(f(bg)) | 1 carb | 2 insulin | 3 exercise g/step | 4 bg_masked.
-N_INPUT_FEATURES = 5
-# feat 4 has no norm stats, must stay in the step-major block; mask is ANNOUNCED, not inferred.
-PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES
+# Normalized channels per layout, FROZEN order, step-major; the bg_masked bit follows the last.
+INPUT_LAYOUTS = {
+    "curves": ("bg_absolute", "carb_intake", "insulin_combined", "exercise_equiv"),
+    "events": ("bg_absolute", *_EVENT_CHANNELS),
+}
+INPUT_LAYOUT_ENV = "T1DMAI_INPUT_LAYOUT"
+NON_MASKABLE_FEATS = (0,)  # bg input slot zeroed at every masked patch
 
-# Output-channel space {0: carb, 1: insulin, 2: exercise}; feat 4 is in neither tuple.
-NON_MASKABLE_FEATS = (0,)        # bg input slot zeroed at every masked patch
-MASKABLE_FEATS = (1, 2, 3)
-# The single output-channel -> input-feat mapping; data.py and inference.py both read it.
-CHANNEL_TO_FEAT = {0: 1, 1: 2, 2: 3}
+
+def set_input_layout(layout: str) -> None:
+    """Switch layout before normalization/data/model import; they bind these at import."""
+    global INPUT_LAYOUT, N_INPUT_FEATURES, PATCH_DIM, MASKABLE_FEATS, CHANNEL_TO_FEAT
+    assert layout in INPUT_LAYOUTS, f"unknown input layout {layout!r}"
+    # "events" = per-slot point doses in place of the action curves; a checkpoint is one layout.
+    INPUT_LAYOUT = layout
+    N_INPUT_FEATURES = len(INPUT_LAYOUTS[layout]) + 1
+    # The bit has no norm stats, must stay in the step-major block; mask is ANNOUNCED, not inferred.
+    PATCH_DIM = PATCH_SIZE * N_INPUT_FEATURES
+    # Every dose feat; bg (feat 0) and the trailing bit are in neither.
+    MASKABLE_FEATS = tuple(range(1, N_INPUT_FEATURES - 1))
+    # Dose channel i -> input feat i + 1; data.py and inference.py both read it.
+    CHANNEL_TO_FEAT = {i: f for i, f in enumerate(MASKABLE_FEATS)}
+
+
+# The env var reaches DataLoader workers, which import this module fresh.
+set_input_layout(_os.environ.get(INPUT_LAYOUT_ENV, "curves"))
 
 # Context 84-168 h; floor is far above the sim's 5.3 h ACF (T1DMSIM/diff/README.md §0.5).
 MAX_CONTEXT_PATCHES = 336        # patches, not hours: hours = / _PATCHES_PER_HOUR

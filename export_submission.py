@@ -179,17 +179,17 @@ class _ExportDataset(torch.utils.data.Dataset):
         bg = _interp_short_gaps(ch["bg"].astype(np.float32), self.max_interp_steps)
         # The zone's own bg is the answer; it must not reach the input by any route.
         bg[n_ctx * ps :] = np.nan
-        carb, ins, ex = ch["carb"], ch["insulin"], ch["exercise"]
         if self.future_doses == DOSES_ZERO:
-            carb, ins, ex = carb.copy(), ins.copy(), ex.copy()
-            for a in (carb, ins, ex):
-                a[n_ctx * ps :] = 0.0
+            ch = {c: v.copy() for c, v in ch.items()}
+            for c, a in ch.items():
+                if c not in ("bg", "is_test"):
+                    a[n_ctx * ps :] = 0.0
 
         visible = np.isfinite(bg).reshape(seq_len, ps).all(axis=1)
         visible[n_ctx:] = False
         gap_patches = np.flatnonzero(~visible[:n_ctx]).astype(np.int64)
         feats = _normalize_features(
-            np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL), carb, ins, ex, self.stats
+            np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL), ch, self.stats
         )
         return _assemble_sample(
             feats,

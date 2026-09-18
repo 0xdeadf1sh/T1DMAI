@@ -3,6 +3,10 @@ torch>=2.4
 numpy>=1.24
 blosc2>=2.7          # simulator cache (T1DMDataset cache path)
 
+# --- MetaboNet cache build and leaderboard export (finetune_data.py, export_submission.py) ---
+pyarrow>=14
+pandas>=2.0
+
 # --- Plotting & report figures ---
 matplotlib>=3.7
 

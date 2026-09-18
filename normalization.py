@@ -11,35 +11,44 @@ import numpy as np
 
 # Pool seed = master_seed + 1_000_000 + i; a training-seed collision is astronomically unlikely.
 from config import (
+    INPUT_LAYOUT, INPUT_LAYOUTS,
     NORM_N_PATIENTS, NORM_STATS_FILE,
     MASTER_SEED,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
 )
 
 # Order pins each channel's index project-wide; reordering invalidates every saved checkpoint.
-CHANNEL_NAMES = [
-    'bg_absolute',         # observed CGM glucose, mg/dL, post-CGM-noise
-    'carb_intake',         # carbohydrate absorption, g/step, post-absorption-noise
-    'insulin_combined',    # basal+bolus insulin action, U/step, post-absorption-noise
-    'exercise_equiv',      # exercise disposal as a carbohydrate EQUIVALENT, g/step
-]
+CHANNEL_NAMES = list(INPUT_LAYOUTS[INPUT_LAYOUT])
 
 N_CHANNELS = len(CHANNEL_NAMES)
 
-# Pinned at 4, not config.N_INPUT_FEATURES=5: feat 4 (bg_masked) is a bit, not normalized here.
-assert N_CHANNELS == 4, (
-    f"CHANNEL_NAMES has {N_CHANNELS} entries; N_CHANNELS is pinned at 4 "
-    "(bg_absolute, carb_intake, insulin_combined, exercise_equiv). Adding or "
-    "removing a normalized signal channel invalidates every saved checkpoint "
-    "and every saved normalization_stats.json, so change this deliberately."
+# Pinned per layout: a changed count invalidates every checkpoint and stats file of that layout.
+assert N_CHANNELS == {'curves': 4, 'events': 10}[INPUT_LAYOUT], (
+    f"layout {INPUT_LAYOUT!r} has {N_CHANNELS} normalized channels; the count is pinned"
 )
 
+# Curves: g/step, U/step, g-equivalent/step. Events: g, U, U, session minutes, at the onset slot.
 SPARSE_LOG1P_CHANNELS: frozenset[str] = frozenset({
     'carb_intake', 'insulin_combined', 'exercise_equiv',
+    'carb_g', 'bolus_u', 'basal_u', 'exercise_min',
 })
 
 # Disjoint from SPARSE_LOG1P_CHANNELS; only a glucose ever belongs here.
 RISK_SPACE_CHANNELS: frozenset[str] = frozenset({'bg_absolute'})
+
+# Dose descriptors: ln(x / ref) on a dosed slot, 0 elsewhere; stats fixed at mean 0, std 1.
+LOG_RATIO_REFS: dict[str, float] = {
+    'carb_gi': 50.0,
+    'bolus_peak_min': 60.0, 'bolus_dur_h': 5.0,
+    'basal_peak_min': 60.0, 'basal_dur_h': 5.0,
+}
+LOG_RATIO_STATS = {'mean': 0.0, 'std': 1.0}
+
+
+def log_ratio(x: np.ndarray, ref: float) -> np.ndarray:
+    """ln(x / ref) where x > 0, else 0."""
+    x = np.asarray(x, dtype=np.float64)
+    return np.where(x > 0.0, np.log(np.maximum(x, 1e-6) / ref), 0.0)
 
 
 def _forward_transform(x: np.ndarray, name: str) -> np.ndarray:
@@ -51,6 +60,8 @@ def _forward_transform(x: np.ndarray, name: str) -> np.ndarray:
     if name in SPARSE_LOG1P_CHANNELS:
         # max(x, 0) absorbs tiny negative float drift.
         return np.log1p(np.maximum(x, 0.0))
+    if name in LOG_RATIO_REFS:
+        return log_ratio(x, LOG_RATIO_REFS[name])
     return x
 
 
@@ -181,7 +192,12 @@ def compute_normalization_stats_from_cache(
     pool_size = int(meta['pool_size'])
     n_timesteps = int(meta['n_timesteps'])
     cache_format = str(meta['cache_format'])
-    if tuple(meta['channels']) != CACHE_CHANNEL_NAMES:
+    if INPUT_LAYOUT != 'curves':
+        raise ValueError(
+            "the events layout takes the cache's own normalization_stats_events.json "
+            "(cache_simulator.py --events); only the curves layout is fit here."
+        )
+    if tuple(meta['channels'])[:len(CACHE_CHANNEL_NAMES)] != CACHE_CHANNEL_NAMES:
         raise ValueError(
             f"Cache channels {tuple(meta['channels'])} disagree with expected "
             f"{CACHE_CHANNEL_NAMES}; rebuild the cache."
@@ -261,6 +277,10 @@ def load_normalization_stats(path: str = NORM_STATS_FILE) -> dict[str, dict[str,
     """
     with open(path, 'r') as f:
         stats = json.load(f)
+    # A dose descriptor has no fitted statistic; a cache's file may leave it out.
+    for name in CHANNEL_NAMES:
+        if name in LOG_RATIO_REFS:
+            stats.setdefault(name, dict(LOG_RATIO_STATS))
 
     missing = [name for name in CHANNEL_NAMES if name not in stats]
     if missing:
@@ -311,6 +331,8 @@ def normalize(
             x = kovatchev_f_np(x)
         elif name in SPARSE_LOG1P_CHANNELS:
             x = np.log1p(np.maximum(x, 0.0))
+        elif name in LOG_RATIO_REFS:
+            x = log_ratio(x, LOG_RATIO_REFS[name])
         # The 1e-8 floor defends against a saved std of zero.
         result[..., c] = (x - mean) / (std + 1e-8)
     return result
@@ -329,6 +351,10 @@ def denormalize(
     import torch
     if channel_names is None:
         channel_names = CHANNEL_NAMES
+    # ln(x / ref) maps an empty slot and a dose at ref both to 0: no inverse exists.
+    lossy = [n for n in channel_names if n in LOG_RATIO_REFS]
+    if lossy:
+        raise ValueError(f"denormalize: no inverse for dose-descriptor channels {lossy}")
 
     if isinstance(data, torch.Tensor):
         # Cloned so the caller's tensor isn't mutated; fp32 regardless of upstream autocast dtype.

@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 from typing import Any
 
 from config import (
-    PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM,
+    PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM, INPUT_LAYOUT, INPUT_LAYOUTS,
     CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, MASKABLE_FEATS,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
     MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
@@ -24,7 +24,8 @@ from config import (
 import utils
 from utils import compute_patient_seed, kovatchev_f_np
 from normalization import (
-    CHANNEL_NAMES, SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS, normalize,
+    CHANNEL_NAMES, SPARSE_LOG1P_CHANNELS, RISK_SPACE_CHANNELS, LOG_RATIO_REFS,
+    log_ratio, normalize,
 )
 
 # [*CHANNEL_NAMES, bg_masked]; the bit is never normalized, so the two counts differ on purpose.
@@ -247,6 +248,13 @@ CACHE_CHANNEL_NAMES = (
     'hour_of_day',
     'day',
 )
+# Normalized channel -> simulator channel; a point-dose channel keeps its name.
+SIM_CHANNEL = {'bg_absolute': 'bg_observed', 'carb_intake': 'total_carb',
+               'insulin_combined': 'total_insulin', 'exercise_equiv': 'total_exercise'}
+SIM_CHANNEL |= {c: c for c in INPUT_LAYOUTS['events'][1:]}
+# What this layout reads from a cache; one built with --events serves both layouts.
+READ_CACHE_CHANNELS = CACHE_CHANNEL_NAMES + tuple(
+    SIM_CHANNEL[n] for n in CHANNEL_NAMES if SIM_CHANNEL[n] not in CACHE_CHANNEL_NAMES)
 
 
 # blosc2: compressed. npy: raw uncompressed memmap. Same meta.json fields and read semantics.
@@ -373,10 +381,13 @@ class T1DMDataset(Dataset):
                     "change the dataset/training config."
                 )
             cache_channels = tuple(meta['channels'])
-            if cache_channels != CACHE_CHANNEL_NAMES:
+            n_base = len(CACHE_CHANNEL_NAMES)
+            absent = [c for c in READ_CACHE_CHANNELS if c not in cache_channels]
+            if cache_channels[:n_base] != CACHE_CHANNEL_NAMES or absent:
                 raise ValueError(
-                    f"Cache channels={cache_channels} disagrees with expected "
-                    f"{CACHE_CHANNEL_NAMES}. Rebuild the cache."
+                    f"Cache channels={cache_channels} must start with "
+                    f"{CACHE_CHANNEL_NAMES}; the {INPUT_LAYOUT!r} layout also needs {absent} "
+                    "(cache_simulator.py --events). Rebuild the cache."
                 )
 
             self._cache_pool_size = int(meta['pool_size'])
@@ -407,7 +418,7 @@ class T1DMDataset(Dataset):
 
             if cache_format == CACHE_FORMAT_NPY:
                 mmaps: dict[str, tuple[Any, int, int]] = {}
-                for name in CACHE_CHANNEL_NAMES:
+                for name in READ_CACHE_CHANNELS:
                     arr = np.load(
                         os.path.join(self.cache_path, f'{name}.npy'),
                         mmap_mode='r',
@@ -435,7 +446,7 @@ class T1DMDataset(Dataset):
                     self._cache_mmaps = mmaps
             else:
                 import blosc2
-                for name in CACHE_CHANNEL_NAMES:
+                for name in READ_CACHE_CHANNELS:
                     # Not mmap_mode='r': blosc2 has no madvise, so mapped pages never drop.
                     arr = blosc2.open(
                         os.path.join(self.cache_path, f'{name}.b2nd'),
@@ -508,14 +519,14 @@ class T1DMDataset(Dataset):
                 # Copies the row out before MADV_DONTNEED, else it aliases the dropped pages.
                 data = {
                     name: np.array(cache_arrays[name][cache_idx:cache_idx + 1])[0]
-                    for name in CACHE_CHANNEL_NAMES
+                    for name in READ_CACHE_CHANNELS
                 }
                 self._madvise_row(cache_idx)
             else:
                 # blosc2 indexing decompresses into a fresh array; no copy or advise needed.
                 data = {
                     name: np.asarray(cache_arrays[name][cache_idx:cache_idx + 1])[0]
-                    for name in CACHE_CHANNEL_NAMES
+                    for name in READ_CACHE_CHANNELS
                 }
             icr = float(cache_icr[cache_idx])
         else:
@@ -704,9 +715,6 @@ def _build_sample(
     # total_exercise is a carb-EQUIVALENT glucose-disposal curve in g/step; never rescaled.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     bg_raw = data['bg_observed'].astype(np.float32)
-    carb_raw = data['total_carb'].astype(np.float32)
-    insulin_raw = data['total_insulin'].astype(np.float32)
-    exercise_raw = data['total_exercise'].astype(np.float32)
     hour_of_day = data['hour_of_day'].astype(np.float32)
     day_index = data['day'].astype(np.int32)
 
@@ -714,15 +722,12 @@ def _build_sample(
 
     # No smoother; clamp only makes bg a legal Kovatchev-f/last_bg argument (edge-read guard).
     bg = np.clip(bg_raw, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
-    carb = np.maximum(carb_raw, 0.0).astype(np.float32)
-    insulin = np.maximum(insulin_raw, 0.0).astype(np.float32)
-    exercise = np.maximum(exercise_raw, 0.0).astype(np.float32)
+    doses = [np.maximum(data[SIM_CHANNEL[name]], 0.0).astype(np.float32)
+             for name in CHANNEL_NAMES[1:]]
 
-    # [bg_absolute, carb, insulin, exercise g/step, bg_masked bit written per window below].
-    features = np.stack([
-        bg, carb, insulin, exercise,
-        np.zeros_like(bg),
-    ], axis=-1)  # (N, N_INPUT_FEATURES)
+    # [bg_absolute, *dose channels of the layout, bg_masked bit written per window below].
+    features = np.stack([bg, *doses, np.zeros_like(bg)], axis=-1)  # (N, N_INPUT_FEATURES)
+    dose_raw = features[:, 1:BG_MASKED_FEAT].copy()
     # Only the LEADING len(CHANNEL_NAMES) columns are normalized; the trailing bg_masked is a bit.
     assert features.shape[-1] == N_INPUT_FEATURES, (
         f"feature stack has {features.shape[-1]} cols, expected "
@@ -744,6 +749,8 @@ def _build_sample(
             col = kovatchev_f_np(col)
         elif name in SPARSE_LOG1P_CHANNELS:
             col = np.log1p(np.maximum(col, 0.0))
+        elif name in LOG_RATIO_REFS:
+            col = log_ratio(col, LOG_RATIO_REFS[name])
         features[:, c] = (col - mean) / (std + 1e-8)
 
     # One random window per sample: n_ctx variable, horizon fixed, patch-aligned start.
@@ -789,15 +796,9 @@ def _build_sample(
     window = features[start_step:end_step]
     bg_window = bg[start_step:end_step]
     # Announced future-input overrides for rolling validation and counterfactual probes.
-    _carb_feat = CHANNEL_TO_FEAT[0]
-    _insulin_feat = CHANNEL_TO_FEAT[1]
-    _exercise_feat = CHANNEL_TO_FEAT[2]
-    carb_norm_window = features[start_step:end_step, _carb_feat]
-    insulin_norm_window = features[start_step:end_step, _insulin_feat]
-    exercise_norm_window = features[start_step:end_step, _exercise_feat]
-    carb_raw_window = carb[start_step:end_step]
-    insulin_raw_window = insulin[start_step:end_step]
-    exercise_raw_window = exercise[start_step:end_step]
+    _dose_feats = [CHANNEL_TO_FEAT[ch] for ch in sorted(CHANNEL_TO_FEAT)]
+    dose_norm_window = features[start_step:end_step][:, _dose_feats]
+    dose_raw_window = dose_raw[start_step:end_step]
 
     # A leading-axis slice of a C-contiguous array stays contiguous, so this reshape is a view.
     patches_3d = window.reshape(total_patches_needed, PATCH_SIZE, N_INPUT_FEATURES)
@@ -857,12 +858,9 @@ def _build_sample(
 
     # Announced future carbs/insulin/exercise for the conditioned rolled-forecast override.
     _lh = slice(pred_start_in_window, pred_start_in_window + n_long_horizon_steps)
-    extended_carb_norm = carb_norm_window[_lh]
-    extended_insulin_norm = insulin_norm_window[_lh]
-    extended_exercise_norm = exercise_norm_window[_lh]
-    extended_carb_raw = carb_raw_window[_lh]
-    extended_insulin_raw = insulin_raw_window[_lh]
-    extended_exercise_raw = exercise_raw_window[_lh]
+    # (steps, dose channels), columns in CHANNEL_TO_FEAT order.
+    extended_dose_norm = dose_norm_window[_lh].copy()
+    extended_dose_raw = dose_raw_window[_lh].copy()
 
     # For nocturnal metric filtering; indexed with the ABSOLUTE step.
     pred_start_hour = float(hour_of_day[pred_start_step])
@@ -878,13 +876,14 @@ def _build_sample(
         'true_bg_trajectory': true_bg_traj.copy(),
         'extended_true_bg_trajectory': extended_true_bg_traj.copy(),
         'pred_start_hour': pred_start_hour,
-        'extended_carb_norm': extended_carb_norm.copy(),
-        'extended_insulin_norm': extended_insulin_norm.copy(),
-        'extended_exercise_norm': extended_exercise_norm.copy(),
-        'extended_carb_raw': extended_carb_raw.copy(),
-        'extended_insulin_raw': extended_insulin_raw.copy(),
-        'extended_exercise_raw': extended_exercise_raw.copy(),
+        'extended_dose_norm': extended_dose_norm,
+        'extended_dose_raw': extended_dose_raw,
     }
+    if INPUT_LAYOUT == 'curves':
+        # Named views of the same columns, for the curve-shaped what-if and probe tooling.
+        for ch, key in enumerate(('carb', 'insulin', 'exercise')):
+            bg_formula_data[f'extended_{key}_norm'] = extended_dose_norm[:, ch].copy()
+            bg_formula_data[f'extended_{key}_raw'] = extended_dose_raw[:, ch].copy()
     if unblinded_dose_rows is not None:
         # Blind-only, un-collated; absent (not None) under announced (tests/test_blind_dataset.py).
         bg_formula_data['unblinded_dose_rows'] = unblinded_dose_rows

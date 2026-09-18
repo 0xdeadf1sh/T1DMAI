@@ -24,23 +24,31 @@ if os.environ.get(_PATCH_ENV):
 from config import (
     PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM, PREDICTION_PATCHES,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, MAX_MASKED_PATCHES,
-    NON_MASKABLE_FEATS,
+    NON_MASKABLE_FEATS, INPUT_LAYOUT, INPUT_LAYOUTS,
 )
-from normalization import CHANNEL_NAMES, RISK_SPACE_CHANNELS, SPARSE_LOG1P_CHANNELS
+from normalization import (
+    CHANNEL_NAMES, RISK_SPACE_CHANNELS, SPARSE_LOG1P_CHANNELS,
+    LOG_RATIO_REFS, LOG_RATIO_STATS, log_ratio,
+)
 from data import sample_mask_spans, _mask_slots, BG_MASKED_FEAT
 import utils
 from utils import kovatchev_f_np
 from T1DMSIM.simulator import (
     DT_MINUTES, BG_CLAMP_MIN, BG_CLAMP_MAX,
     gamma_curve, basal_curve, bolus_pk_for_dose, gi_gamma_params,
+    gamma_peak_min, bateman_peak_min,
     BOLUS_VARIANTS, BASAL_VARIANTS,
     EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, EXERCISE_CARB_EQUIV_PER_MIN,
 )
 
 STEP_S = DT_MINUTES * 60
-CACHE_CHANNELS = ('bg', 'carb', 'insulin', 'exercise', 'is_test')
+# Point doses at their onset slot; a descriptor is the dose-weighted mean of the slot's doses.
+EVENT_CHANNELS = INPUT_LAYOUTS['events'][1:]
+CACHE_CHANNELS = ('bg', 'carb', 'insulin', 'exercise', 'is_test') + EVENT_CHANNELS
 CHANNEL_DTYPES = {c: np.float32 for c in CACHE_CHANNELS} | {'is_test': np.uint8}
-CACHE_VERSION = 'finetune-cache-v3'
+CACHE_VERSION = 'finetune-cache-v4'
+STATS_FILES = {'curves': 'normalization_stats.json',
+               'events': 'normalization_stats_events.json'}
 
 # Carb entry error above this, not a meal (train.parquet max 855 g).
 CARB_EVENT_MAX_G = 300.0
@@ -116,6 +124,26 @@ def _add_curve(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
         dst[start:start + n] += curve[:n]
 
 
+class _SlotDoses:
+    """Dose summed per slot, with the dose-weighted mean of each descriptor."""
+
+    def __init__(self, n: int, *descriptors: str) -> None:
+        self.dose = np.zeros(n, dtype=np.float64)
+        self.weighted = {d: np.zeros(n, dtype=np.float64) for d in descriptors}
+
+    def add(self, slot: np.ndarray | int, dose: np.ndarray | float, **desc: float) -> None:
+        slot = np.atleast_1d(slot)
+        dose = np.atleast_1d(dose).astype(np.float64)
+        ok = slot < len(self.dose)
+        np.add.at(self.dose, slot[ok], dose[ok])
+        for d, v in desc.items():
+            np.add.at(self.weighted[d], slot[ok], dose[ok] * v)
+
+    def mean(self, descriptor: str) -> np.ndarray:
+        return np.divide(self.weighted[descriptor], self.dose,
+                         out=np.zeros_like(self.dose), where=self.dose > 0.0)
+
+
 def _events_to_curves(
     n: int,
     idx: np.ndarray,
@@ -127,20 +155,26 @@ def _events_to_curves(
     is_mdi: np.ndarray,
     bolus_type: str | None,
     basal_type: str | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(carb_curve, insulin_curve, exercise_curve), each (n,) float32 amount/step.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """(carb_curve, insulin_curve, exercise_curve, events), each array (n,) float32.
 
+    Curves are amount/step; ``events`` holds EVENT_CHANNELS, the same doses at their onset slot.
     ``is_mdi`` is PER ROW: ShanghaiT1DM mixes MDI injections with pump slots in one
     record; a 20 U injection through the rapid kernel would peak 10x too high."""
     carb_out = np.zeros(n, dtype=np.float64)
     ins_out = np.zeros(n, dtype=np.float64)
     ex_out = np.zeros(n, dtype=np.float64)
+    carb_pts = _SlotDoses(n, 'gi')
+    bolus_pts = _SlotDoses(n, 'peak_min', 'dur_h')
+    basal_pts = _SlotDoses(n, 'peak_min', 'dur_h')
+    ex_pts = _SlotDoses(n)
 
     ck, ct, cdur = gi_gamma_params(CARB_GI_DEFAULT)
     ev = np.flatnonzero(np.nan_to_num(carbs) > 0.0)
     for j in ev:
         g = min(float(carbs[j]), CARB_EVENT_MAX_G)
         _add_curve(carb_out, gamma_curve(g, ck, ct, cdur), int(idx[j]))
+        carb_pts.add(int(idx[j]), g, gi=CARB_GI_DEFAULT)
 
     bv = bolus_variant(bolus_type)
     ev = np.flatnonzero(np.nan_to_num(bolus) > 0.0)
@@ -148,6 +182,8 @@ def _events_to_curves(
         k, theta, dur = bolus_pk_for_dose(
             float(bolus[j]), bv['gamma_k'], bv['gamma_theta'], bv['dia_base_hours'])
         _add_curve(ins_out, gamma_curve(float(bolus[j]), k, theta, dur), int(idx[j]))
+        bolus_pts.add(int(idx[j]), float(bolus[j]),
+                      peak_min=gamma_peak_min(k, theta), dur_h=dur / 60.0)
 
     b = np.nan_to_num(basal)
     av = basal_variant(basal_type)
@@ -159,6 +195,9 @@ def _events_to_curves(
             basal_curve(float(basal[j]), av['action_hours'] * 60.0, av['ka'], av['ke']),
             int(idx[j]),
         )
+        basal_pts.add(int(idx[j]), float(basal[j]),
+                      peak_min=bateman_peak_min(av['ka'], av['ke']),
+                      dur_h=av['action_hours'])
     basal_slot = np.zeros(n, dtype=np.float64)
     sel = (b > 0.0) & ~inj
     np.add.at(basal_slot, idx[sel], b[sel])
@@ -168,12 +207,19 @@ def _events_to_curves(
         k, theta, dur = bolus_pk_for_dose(
             float(insulin[j]), bv['gamma_k'], bv['gamma_theta'], bv['dia_base_hours'])
         _add_curve(ins_out, gamma_curve(float(insulin[j]), k, theta, dur), int(idx[j]))
+        bolus_pts.add(int(idx[j]), float(insulin[j]),
+                      peak_min=gamma_peak_min(k, theta), dur_h=dur / 60.0)
     small = only_total & (np.nan_to_num(insulin) < MDI_INJECTION_MIN_U)
     np.add.at(basal_slot, idx[small], insulin[small])
     if basal_slot.any():
         kern = gamma_curve(1.0, bv['gamma_k'], bv['gamma_theta'],
                            bv['dia_base_hours'] * 60.0)
         ins_out += np.convolve(basal_slot, kern)[:n]
+        # A pump's basal is its rapid insulin, so it carries the bolus insulin's descriptors.
+        dosed = np.flatnonzero(basal_slot > 0.0)
+        basal_pts.add(dosed, basal_slot[dosed],
+                      peak_min=gamma_peak_min(bv['gamma_k'], bv['gamma_theta']),
+                      dur_h=bv['dia_base_hours'])
 
     # Bouts joined into sessions (idx sorted) before the gamma spread, per SPEC §5.
     sessions: list[list[float]] = []  # [start_slot, duration_min, end_min]
@@ -193,9 +239,20 @@ def _events_to_curves(
             gamma_curve(mag, EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, dur + 90.0),
             int(slot),
         )
+        ex_pts.add(int(slot), dur)
 
+    events = {
+        'carb_g': carb_pts.dose, 'carb_gi': carb_pts.mean('gi'),
+        'bolus_u': bolus_pts.dose, 'bolus_peak_min': bolus_pts.mean('peak_min'),
+        'bolus_dur_h': bolus_pts.mean('dur_h'),
+        'basal_u': basal_pts.dose, 'basal_peak_min': basal_pts.mean('peak_min'),
+        'basal_dur_h': basal_pts.mean('dur_h'),
+        'exercise_min': ex_pts.dose,
+    }
+    assert tuple(events) == EVENT_CHANNELS
     return (carb_out.astype(np.float32), ins_out.astype(np.float32),
-            ex_out.astype(np.float32))
+            ex_out.astype(np.float32),
+            {c: v.astype(np.float32) for c, v in events.items()})
 
 
 class _ChannelAppender:
@@ -209,8 +266,12 @@ class _ChannelAppender:
 
     def append(self, arrays: dict[str, np.ndarray]) -> int:
         n = len(arrays['bg'])
+        absent = [c for c in EVENT_CHANNELS if c not in arrays]
+        # None at all is a dose-free record (DiaData) or the phone pool, which has curves only.
+        assert not absent or len(absent) == len(EVENT_CHANNELS), f'partial events: {absent}'
+        zeros = np.zeros(n, dtype=np.float32)
         for c in CACHE_CHANNELS:
-            a = arrays[c]
+            a = arrays.get(c, zeros)
             assert a.dtype == CHANNEL_DTYPES[c] and len(a) == n
             self.files[c].write(a.tobytes())
         start = self.offset
@@ -255,7 +316,7 @@ def _process_metabonet_subject(
     have = np.isfinite(cgm)
     bg[idx[have]] = cgm[have]
 
-    carb, ins, ex = _events_to_curves(
+    carb, ins, ex, events = _events_to_curves(
         n, idx, cols['carbs'], cols['basal'], cols['bolus'], cols['insulin'],
         cols['workout_duration'], cols['is_mdi'].astype(bool),
         bolus_type, basal_type,
@@ -269,7 +330,7 @@ def _process_metabonet_subject(
     test_start = int(idx[trow].min()) if trow.any() else -1
 
     start = app.append({'bg': bg, 'carb': carb, 'insulin': ins, 'exercise': ex,
-                        'is_test': is_test_grid})
+                        'is_test': is_test_grid, **events})
     index.append({
         'key': f'metabonet:{source}:{sid}', 'pool': 'metabonet', 'source': source,
         'sid': sid, 'start': start, 'n': n, 't0': t0, 'test_start': test_start,
@@ -477,8 +538,13 @@ def finish_cache(app: _ChannelAppender, index: list[dict[str, Any]], out_dir: st
 def fit_cache_stats(cache_dir: str) -> None:
     """Fit and write ``<cache>/normalization_stats.json`` from the built cache."""
     from normalization import save_normalization_stats
-    stats = compute_cache_stats(FinetuneCache(cache_dir))
-    save_normalization_stats(stats, os.path.join(cache_dir, 'normalization_stats.json'))
+    cache = FinetuneCache(cache_dir)
+    has_phone = any(r['pool'] == 'phone' for r in cache.subjects)
+    for layout, name in STATS_FILES.items():
+        if layout == 'events' and has_phone:
+            continue
+        save_normalization_stats(compute_cache_stats(cache, layout),
+                                 os.path.join(cache_dir, name))
 
 
 class FinetuneCache:
@@ -519,15 +585,19 @@ class FinetuneCache:
         return int(rec['n']) if ts < 0 else min(int(rec['n']), ts)
 
 
-_STATS_CHANNEL = dict(zip(CHANNEL_NAMES, ('bg', 'carb', 'insulin', 'exercise')))
+# Normalized channel -> cache channel; an event channel keeps its name.
+_CACHE_CHANNEL = {'bg_absolute': 'bg', 'carb_intake': 'carb', 'insulin_combined': 'insulin',
+                  'exercise_equiv': 'exercise'} | {c: c for c in EVENT_CHANNELS}
+_CARB_CHANNELS = frozenset({'carb_intake', 'carb_g', 'carb_gi'})
 STATS_FIT_WINDOWS = 2000
 STATS_FIT_SEED = 0
 # Std floor: near-zero data else pushes one event past z=+40; caps channel max at this sigma.
 STATS_SPARSE_Z_MAX = 12.0
 
 
-def compute_cache_stats(cache: 'FinetuneCache') -> dict[str, dict[str, float]]:
-    """Per-channel mean/std fit over SAMPLER-DRAWN training windows.
+def compute_cache_stats(cache: 'FinetuneCache',
+                        layout: str = INPUT_LAYOUT) -> dict[str, dict[str, float]]:
+    """Per-channel mean/std of ``layout`` fit over SAMPLER-DRAWN training windows.
 
     Raw-step fit overweighs DiaData (43% of steps vs ~20% sampler draw), so this
     replays the training draw law (STATS_FIT_WINDOWS windows) and pools steps in
@@ -535,11 +605,12 @@ def compute_cache_stats(cache: 'FinetuneCache') -> dict[str, dict[str, float]]:
     ds = FinetuneTrainDataset(cache, stats=None, seed=STATS_FIT_SEED,
                               total_steps=1, batch_size=1)
     rng = np.random.default_rng(STATS_FIT_SEED)
-    acc = {name: [0.0, 0.0, 0] for name in CHANNEL_NAMES}  # sum, sumsq, n
+    fitted = [n for n in INPUT_LAYOUTS[layout] if n not in LOG_RATIO_REFS]
+    acc = {name: [0.0, 0.0, 0] for name in fitted}  # sum, sumsq, n
     for _ in range(STATS_FIT_WINDOWS):
         w = ds._draw_from(rng, raw=True)
-        for name in CHANNEL_NAMES:
-            x = np.asarray(w[_STATS_CHANNEL[name]], dtype=np.float64)
+        for name in fitted:
+            x = np.asarray(w[_CACHE_CHANNEL[name]], dtype=np.float64)
             if name in RISK_SPACE_CHANNELS:
                 x = x[np.isfinite(x)]
                 if not len(x):
@@ -558,12 +629,12 @@ def compute_cache_stats(cache: 'FinetuneCache') -> dict[str, dict[str, float]]:
         var = max(sq / n - mean * mean, 0.0)
         std = float(np.sqrt(var))
         if name in SPARSE_LOG1P_CHANNELS:
-            mm = cache._maps()[_STATS_CHANNEL[name]]
+            mm = cache._maps()[_CACHE_CHANNEL[name]]
             ch_max = float(np.log1p(max(float(mm.max()), 0.0)))
             std = max(std, (ch_max - mean) / STATS_SPARSE_Z_MAX)
         assert std > 0.0, f'zero variance for channel {name}'
         stats[name] = {'mean': float(mean), 'std': std}
-    return stats
+    return {n: stats.get(n, dict(LOG_RATIO_STATS)) for n in INPUT_LAYOUTS[layout]}
 
 
 def _interp_short_gaps(bg: np.ndarray, max_steps: int) -> np.ndarray:
@@ -579,27 +650,33 @@ def _interp_short_gaps(bg: np.ndarray, max_steps: int) -> np.ndarray:
     return out
 
 
-def _normalize_features(bg: np.ndarray, carb: np.ndarray, insulin: np.ndarray,
-                        exercise: np.ndarray,
-                        stats: dict[str, dict[str, float]]) -> np.ndarray:
-    """(N, N_INPUT_FEATURES) z-space feature stack; NaN bg must be pre-filled."""
-    bg_c = np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
-    feats = np.stack([
-        bg_c,
-        np.maximum(carb, 0.0).astype(np.float32),
-        np.maximum(insulin, 0.0).astype(np.float32),
-        np.maximum(exercise, 0.0).astype(np.float32),
-        np.zeros_like(bg_c),
-    ], axis=-1)
+def _normalize_features(bg: np.ndarray, ch: dict[str, np.ndarray],
+                        stats: dict[str, dict[str, float]],
+                        no_carbs: bool = False) -> np.ndarray:
+    """(N, N_INPUT_FEATURES) z-space stack of the bound layout; NaN bg must be pre-filled.
+
+    ``ch`` is a cache slice; its own ``bg`` is ignored in favour of the filled ``bg``."""
+    feats = np.zeros((len(bg), N_INPUT_FEATURES), dtype=np.float32)
     for c, name in enumerate(CHANNEL_NAMES):
         mean, std = stats[name]['mean'], stats[name]['std']
-        col = feats[:, c]
         if name in RISK_SPACE_CHANNELS:
-            col = kovatchev_f_np(col)
-        elif name in SPARSE_LOG1P_CHANNELS:
-            col = np.log1p(np.maximum(col, 0.0))
+            col = kovatchev_f_np(np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32))
+        else:
+            col = np.maximum(ch[_CACHE_CHANNEL[name]], 0.0).astype(np.float32)
+            if no_carbs and name in _CARB_CHANNELS:
+                col = np.zeros_like(col)
+            if name in SPARSE_LOG1P_CHANNELS:
+                col = np.log1p(col)
+            elif name in LOG_RATIO_REFS:
+                col = log_ratio(col, LOG_RATIO_REFS[name])
         feats[:, c] = (col - mean) / (std + 1e-8)
     return feats
+
+
+def _require_events(cache: 'FinetuneCache') -> None:
+    """The phone pool is written with curves only; under the events layout it reads as dose-free."""
+    if INPUT_LAYOUT == 'events' and any(r['pool'] == 'phone' for r in cache.subjects):
+        raise ValueError(f'{cache.cache_dir}: phone-pool subjects carry no point events')
 
 
 _BG_GAP_FILL_MGDL = 120.0  # written only into masked patches, whose bg input is zeroed
@@ -656,6 +733,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
                  source_alpha: float = 0.5, diadata_frac: float = 0.2,
                  gap_budget: float = 0.2, max_interp_steps: int = 1,
                  no_carbs: bool = False) -> None:
+        _require_events(cache)
         self.cache = cache
         self.stats = stats
         self.seed = seed
@@ -750,13 +828,10 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
                 return None
 
         if raw:
-            return {'bg': bg, 'carb': ch['carb'], 'insulin': ch['insulin'],
-                    'exercise': ch['exercise'], 'start': start, 'seq_len': seq_len}
+            return {**ch, 'bg': bg, 'start': start, 'seq_len': seq_len}
         assert self.stats is not None, 'stats=None dataset is for raw draws only'
-        carb = np.zeros_like(ch['carb']) if self.no_carbs else ch['carb']
         feats = _normalize_features(
-            np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
-            carb, ch['insulin'], ch['exercise'], self.stats)
+            np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL), ch, self.stats, self.no_carbs)
         sample = _assemble_sample(feats, bg, spans, gap_patches, seq_len, n_ctx)
         # Time-probe hour/slot: slot j reads patch mask_idx[j], step start+mask_idx[j]*PATCH_SIZE.
         abs_s = int(rec['t0']) + (start + sample['mask_idx'] * PATCH_SIZE) * STEP_S
@@ -900,6 +975,7 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
     def __init__(self, cache: FinetuneCache, stats: dict[str, dict[str, float]],
                  windows: list[tuple[int, int]], max_interp_steps: int = 1,
                  no_carbs: bool = False) -> None:
+        _require_events(cache)
         self.cache = cache
         self.stats = stats
         self.windows = windows
@@ -925,10 +1001,8 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
         gap_patches = np.flatnonzero(~visible[:n_ctx]).astype(np.int64)
         spans = [(n_ctx, PREDICTION_PATCHES)]
 
-        carb = np.zeros_like(ch['carb']) if self.no_carbs else ch['carb']
         feats = _normalize_features(
-            np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
-            carb, ch['insulin'], ch['exercise'], self.stats)
+            np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL), ch, self.stats, self.no_carbs)
         # Zone gaps filled so targets stay finite; context keeps NaNs for honest anchor reads.
         bg_for_sample = bg.copy()
         zone_lo = n_ctx * PATCH_SIZE

@@ -22,6 +22,9 @@ def _apply_checkpoint_dims(ckpt: dict) -> None:
     sd = ckpt.get("model_ema_state_dict") or ckpt["model_state_dict"]
     tc = ckpt.get("training_config", {})
 
+    # An unstamped checkpoint predates the events layout.
+    config.set_input_layout(ckpt.get("input_layout", "curves"))
+    os.environ[config.INPUT_LAYOUT_ENV] = config.INPUT_LAYOUT
     d_model, patch_dim = sd["patch_embed.weight"].shape
     n_layers = len({int(k.split(".")[1]) for k in sd if k.startswith("blocks.")})
     head_dim = sd["blocks.0.attn.q_norm.weight"].shape[0]
@@ -87,7 +90,21 @@ def _apply_checkpoint_dims(ckpt: dict) -> None:
         {k: getattr(config, k) for k in keys}
     )
 
+    _drop_bound_modules()
+
+
+def _apply_input_layout(layout: str) -> None:
+    """Scratch init: ``config.py``'s architecture under ``layout``, replayed in the workers."""
+    import config
+
+    config.set_input_layout(layout)
+    os.environ[config.INPUT_LAYOUT_ENV] = layout
+    _drop_bound_modules()
+
+
+def _drop_bound_modules() -> None:
     for m in (
+        "normalization",
         "model",
         "data",
         "risk_loss",
@@ -190,6 +207,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="blank the carb channel, context and zone, train and eval",
     )
+    p.add_argument(
+        "--inputs",
+        choices=("curves", "events"),
+        default=None,
+        help="dose inputs: action curves, or per-slot point doses; "
+        "omitted = the checkpoint's layout, curves from scratch",
+    )
     p.add_argument("--log-interval", type=int, default=100)
     return p.parse_args()
 
@@ -199,7 +223,17 @@ def main() -> None:
     ckpt = None
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        ckpt_layout = ckpt.get("input_layout", "curves")
+        if args.inputs not in (None, ckpt_layout):
+            sys.exit(
+                f"--checkpoint {args.checkpoint}: trained on {ckpt_layout!r} inputs, "
+                f"--inputs asks for {args.inputs!r}"
+            )
+        args.inputs = ckpt_layout
         _apply_checkpoint_dims(ckpt)
+    else:
+        args.inputs = args.inputs or "curves"
+        _apply_input_layout(args.inputs)
 
     from torch.utils.data import DataLoader
 
@@ -270,7 +304,9 @@ def main() -> None:
                 )
     else:
         # Scratch init has no pretrained z-space to honour, so stats are the cache's own.
-        stats_path = os.path.join(args.cache, "normalization_stats.json")
+        from finetune_data import STATS_FILES
+
+        stats_path = os.path.join(args.cache, STATS_FILES[args.inputs])
         if not os.path.exists(stats_path):
             sys.exit(
                 f"{stats_path} missing — run: python finetune_data.py "
@@ -611,6 +647,7 @@ def main() -> None:
         torch.save(
             {
                 "arch_version": ARCH_VERSION,
+                "input_layout": args.inputs,
                 "loss_schema": LOSS_SCHEMA,
                 "model_state_dict": sd,
                 # The shadow again, under the key train.py's --ema tooling expects.

@@ -48,8 +48,9 @@ def test_channel_names_are_the_four_input_signals():
     # the normalized channels take the LEADING columns, the bit follows them
     assert BG_MASKED_FEAT == len(CHANNEL_NAMES) == 4
     assert SPARSE_LOG1P_CHANNELS == frozenset(
-        {'carb_intake', 'insulin_combined', 'exercise_equiv'}), \
-        f"exercise_equiv must be log1p-encoded like carb, got {SPARSE_LOG1P_CHANNELS}"
+        {'carb_intake', 'insulin_combined', 'exercise_equiv',
+         'carb_g', 'bolus_u', 'basal_u', 'exercise_min'}), \
+        f"every dose amount, curve or point, is log1p-encoded, got {SPARSE_LOG1P_CHANNELS}"
     assert RISK_SPACE_CHANNELS == frozenset({'bg_absolute'}), \
         ("only bg is a glucose — the Kovatchev transform must never reach "
          f"exercise_equiv, got {RISK_SPACE_CHANNELS}")
