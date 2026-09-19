@@ -231,7 +231,8 @@ slice `[:, f::N_INPUT_FEATURES]`. On a **masked** patch:
   carbohydrate-appearance, insulin-action and exercise-disposal curves, per
   5-minute step** — not the moment of eating, not the injection instant, not the
   start of a session, and not a delivery schedule (`SPEC/invariants.md` §5): the
-  true values during training, the caller's announcement at inference.
+  simulator's exported values during training, the caller's announcement at
+  inference.
 
 The masked set is **announced, not inferred**. Masking is not a position rule,
 and `z = 0` in a withheld glucose slot decodes to an ordinary reading rather than

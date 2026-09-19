@@ -99,7 +99,7 @@ Every dimension lives in `config.py`, and `resize_model.py` rewrites it.
 
 A window is a run of patches, each visible or masked. A masked patch withholds
 its glucose and announces that it did, through a bit the model reads; the
-carbohydrate, insulin and exercise channels keep their true or announced values
+carbohydrate, insulin and exercise channels keep their announced values
 there as everywhere else. The head emits a quantile fan for every masked patch,
 and all of them are decoded in one pass.
 
