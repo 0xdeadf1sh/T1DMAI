@@ -120,7 +120,8 @@ def kovatchev_f_inv(r: torch.Tensor) -> torch.Tensor:
     r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     r = torch.nan_to_num(r, nan=r_lo, posinf=r_hi, neginf=r_lo)
     r = r.clamp(r_lo, r_hi)
-    base = r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET  # >= 0 after the input clamp
+    # Floored at 0: at BG_CLAMP_MIN the base IS 0, and float error below it makes pow NaN.
+    base = (r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET).clamp(min=0.0)
     g = torch.exp(base.pow(1.0 / _KOVATCHEV_POWER))
     return g.clamp(BG_CLAMP_MIN, BG_CLAMP_MAX)
 
@@ -146,7 +147,8 @@ def kovatchev_f_inv_np(r: "np.ndarray") -> "np.ndarray":
     r_hi = _KOVATCHEV_SCALE * (math.log(BG_CLAMP_MAX) ** _KOVATCHEV_POWER - _KOVATCHEV_OFFSET)
     r = np.nan_to_num(r, nan=r_lo, posinf=r_hi, neginf=r_lo)
     r = np.clip(r, r_lo, r_hi)
-    base = r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET  # >= 0 after the input clamp
+    # Floored at 0: at BG_CLAMP_MIN the base IS 0, and float error below it makes pow NaN.
+    base = np.maximum(r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET, 0.0)
     g = np.exp(base ** (1.0 / _KOVATCHEV_POWER))
     return np.clip(g, BG_CLAMP_MIN, BG_CLAMP_MAX)
 

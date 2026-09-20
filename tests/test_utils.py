@@ -210,18 +210,20 @@ def test_kovatchev_f_target_clamps_not_tripwire():
 
 def test_f_once_per_target_batch_is_mgdl():
     """A batch BG target is mg/dL, not yet f-transformed: f is applied exactly once at
-    the top of the loss, and a double-f'd target sits near zero and trips this floor."""
+    the top of the loss. At ``BG_CLAMP_MIN = 1`` the floor catches a double-f only below
+    euglycaemia, so the tripwire is asserted where it still bites."""
     bg_min, bg_max = _sim_clamps()
     # stands in for data.py's target, in the mg/dL physical band
     true_bg = torch.tensor([[55.0, 70.0, 120.0, 180.0, 250.0],
                             [40.0, 90.0, 140.0, 200.0, 300.0]])
     assert (true_bg >= bg_min - 1e-3).all(), "target must be mg/dL, not f-transformed"
     assert (true_bg <= bg_max + 1e-3).all()
-    # a doubly-f'd target lands wholly below the mg/dL floor
     from utils import kovatchev_f
     risk = kovatchev_f(true_bg)
-    assert (risk < bg_min).all(), "f-transformed values are NOT in the mg/dL band"
-    print("\n[DUMP] f-once | batch target in mg/dL band; f'd values fail the floor ✓")
+    hypo = kovatchev_f(torch.tensor([40.0, 55.0, 70.0]))
+    assert (hypo < bg_min).all(), "a hypo target double-f'd must fail the floor"
+    print(f"\n[DUMP] f-once | batch target in mg/dL band; f'd hypo values fail the "
+          f"floor, f'd range [{float(risk.min()):.2f}, {float(risk.max()):.2f}] ✓")
 
 
 def test_three_hop_round_trip():
