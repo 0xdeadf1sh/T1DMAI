@@ -22,6 +22,33 @@ def test_normalization_stats():
         assert values['std'] > 0, f"Zero std for {channel}"
 
 
+def test_on_the_fly_knobs_reach_the_row_builder():
+    """``simulator_warmup_hours`` and ``patient_uniform_sample_prob`` change what is fitted.
+
+    Both are printed and stamped into the checkpoint, so an ignored one is a lie on disk.
+    """
+    from normalization import compute_normalization_stats
+
+    base = compute_normalization_stats(master_seed=5, n_patients=2)
+    warm = compute_normalization_stats(master_seed=5, n_patients=2,
+                                       simulator_warmup_hours=96.0)
+    unif = compute_normalization_stats(master_seed=5, n_patients=2,
+                                       patient_uniform_sample_prob=1.0)
+    assert base != warm, "simulator_warmup_hours never reached the row builder"
+    assert base != unif, "patient_uniform_sample_prob never reached the patient draw"
+
+
+def test_uniform_skill_patch_is_restored():
+    """The skill override is scoped to its block: the next row is the ordinary population."""
+    from data import simulate_row
+
+    _a, _i, plain = simulate_row(1000005)
+    _b, _j, forced = simulate_row(1000005, uniform_skills=True)
+    _c, _k, again = simulate_row(1000005)
+    assert not np.array_equal(plain, forced)
+    np.testing.assert_array_equal(plain, again)
+
+
 def _get_stats():
     import os
     from normalization import compute_normalization_stats, load_normalization_stats, NORM_STATS_FILE

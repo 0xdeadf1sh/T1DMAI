@@ -4,6 +4,7 @@ Sample dict contract lives on ``T1DMDataset.__getitem__``; space/objective rules
 are in this repo's CLAUDE.md.
 """
 
+import contextlib
 import json
 import os
 import numpy as np
@@ -142,29 +143,38 @@ class _UniformSkillRngProxy:
         return np.log(skills / (1.0 - skills))
 
 
+@contextlib.contextmanager
+def _uniform_skill_patient(uniform_skills: bool, sim_cls):
+    """``sim_cls`` construction inside this block draws uniform skills.
+
+    The sole skill-override site: ``generate_patient`` is swapped for the block and restored.
+    """
+    if not uniform_skills:
+        yield
+        return
+    # T1DMSIM is importable as two modules, so patch the namespace __init__ itself resolves in.
+    ns = sim_cls.__init__.__globals__
+    original = ns['generate_patient']
+
+    def _patched(rng):
+        proxy: Any = _UniformSkillRngProxy(rng, ns['SKILL_MIN'], ns['SKILL_MAX'])
+        return original(proxy)
+
+    ns['generate_patient'] = _patched
+    try:
+        yield
+    finally:
+        ns['generate_patient'] = original
+
+
 def _make_simulator(patient_seed: int, uniform_skills: bool):
     """A fresh ``T1DMSimulator``, optionally with uniform-skill sampling.
 
     Never cached: stateful, a reused seed's instance is past warmup.
     """
     from T1DMSIM.simulator import T1DMSimulator
-    if not uniform_skills:
+    with _uniform_skill_patient(uniform_skills, T1DMSimulator):
         return T1DMSimulator(seed=patient_seed)
-
-    # Monkey-patches generate_patient for the constructor only; restored in finally below.
-    from T1DMSIM import simulator as _sim_mod
-
-    original = _sim_mod.generate_patient
-
-    def _patched(rng):
-        proxy: Any = _UniformSkillRngProxy(rng, _sim_mod.SKILL_MIN, _sim_mod.SKILL_MAX)
-        return original(proxy)
-
-    _sim_mod.generate_patient = _patched
-    try:
-        return T1DMSimulator(seed=patient_seed)
-    finally:
-        _sim_mod.generate_patient = original
 
 
 def simulate_discard_warmup(sim, hours: float, warmup_hours: float = SIMULATOR_WARMUP_HOURS) -> dict:
@@ -257,12 +267,12 @@ TAIL_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 SUPPORTED_CACHE_FORMATS = (CACHE_FORMAT_BLOSC2,)
 
 
-def _row_config():
+def _row_config(warmup_hours: float = SIMULATOR_WARMUP_HOURS):
     """T1DMSIM's ``RowConfig`` for an on-the-fly row, at the geometry this model consumes."""
     from T1DMSIM.cache_simulator import RowConfig, DEFAULT_WARMUP_OFFSET_STEPS
     from T1DMSIM.simulator import DT_MINUTES
     return RowConfig(
-        warmup_steps=int(SIMULATOR_WARMUP_HOURS * 60 / DT_MINUTES),
+        warmup_steps=int(warmup_hours * 60 / DT_MINUTES),
         context_steps=CONTEXT_STEPS,
         max_attempts=1, rail_high=float('inf'), rail_low=float('-inf'),
         hypo_prob=0.0, hypo_min_frac=0.0, hypo_threshold=0.0, seed_salt=0,
@@ -271,13 +281,28 @@ def _row_config():
     )
 
 
-def simulate_row(patient_seed: int) -> tuple[dict[str, np.ndarray], float, np.ndarray]:
+def uniform_skill_draw(patient_seed: int, prob: float) -> bool:
+    """Whether this seed's patient is drawn from the uniform-skill pool.
+
+    One definition for the stat fit and the dataset, so the two pools match at any ``prob``.
+    """
+    if prob <= 0.0:
+        return False
+    return bool(np.random.default_rng(int(patient_seed) ^ 0x5A17_5EEDD).random() < prob)
+
+
+def simulate_row(
+    patient_seed: int,
+    warmup_hours: float = SIMULATOR_WARMUP_HOURS,
+    uniform_skills: bool = False,
+) -> tuple[dict[str, np.ndarray], float, np.ndarray]:
     """One un-cached row through T1DMSIM's own builder: arrays, ICR, skills.
 
     The cache is the same builder run ahead of time, so the two paths cannot drift.
     """
-    from T1DMSIM.cache_simulator import simulate_row as _sim_row
-    arrays, stats = _sim_row(int(patient_seed), _row_config())
+    from T1DMSIM.cache_simulator import simulate_row as _sim_row, T1DMSimulator
+    with _uniform_skill_patient(uniform_skills, T1DMSimulator):
+        arrays, stats = _sim_row(int(patient_seed), _row_config(warmup_hours))
     return arrays, float(stats['icr']), np.asarray(stats['skills'], dtype=np.float32)
 
 
@@ -536,7 +561,12 @@ class T1DMDataset(Dataset):
             icr = float(cache_icr[cache_idx])
             skills = cache_skills[cache_idx]
         else:
-            row, icr, skills = simulate_row(patient_seed)
+            row, icr, skills = simulate_row(
+                patient_seed,
+                warmup_hours=self.simulator_warmup_hours,
+                uniform_skills=uniform_skill_draw(
+                    patient_seed, self.patient_uniform_sample_prob),
+            )
 
         rng = np.random.default_rng(patient_seed ^ 0xDEADBEEF)
         return _build_sample(

@@ -119,7 +119,7 @@ def compute_normalization_stats(
     M2s = np.zeros(N_CHANNELS, dtype=np.float64)
 
     # Lazy: data.py imports this module (circular).
-    from data import simulate_row, SIM_CHANNEL
+    from data import simulate_row, uniform_skill_draw, SIM_CHANNEL
 
     print(f"Computing normalization statistics from {n_patients} rows "
           f"(uniform-skill prob {patient_uniform_sample_prob}, "
@@ -128,7 +128,12 @@ def compute_normalization_stats(
     for i in range(n_patients):
         # mod 2^31-1 keeps the seed inside ``np.random.default_rng``'s legal range.
         seed = (master_seed + 1_000_000 + i) % (2**31 - 1)
-        row, _icr, _skills = simulate_row(seed)
+        # Same draw as data.py's dataset, so the fitted pool matches the trained one.
+        row, _icr, _skills = simulate_row(
+            seed,
+            warmup_hours=simulator_warmup_hours,
+            uniform_skills=uniform_skill_draw(seed, patient_uniform_sample_prob),
+        )
 
         # bg_observed is post-CGM-noise; the pipeline normalizes it, never the clean row['bg'].
         for c, name in enumerate(CHANNEL_NAMES):
