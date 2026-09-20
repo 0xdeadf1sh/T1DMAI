@@ -65,7 +65,7 @@ MASK_MAX_SPANS = 3
 MASK_SPAN_LENGTHS = (1, 2, 3, 4, 5, 6, 7, 8)
 # Sampler cap on sum(L), and M, the head's slot count; surplus slots pad, discard via ``valid``.
 MAX_MASKED_PATCHES = 12
-# Share of windows whose LAST span is pinned flush right; invalidates SAMPLER_REFERENCE if moved.
+# Share of UNPINNED windows ending flush right; invalidates SAMPLER_REFERENCE if moved.
 
 # cov90@30: 0.9149 vs control 0.8805 at step 12000; plateaus at 0.15, no gain past 0.60.
 MASK_RIGHT_EDGE_QUOTA = 0.50

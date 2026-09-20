@@ -141,7 +141,10 @@ draw `n_spans` and the length vector identically, so the span-length histogram i
 quota-independent and only the `d` histogram moves. Under uniform placement alone
 a forecast — the case the model is deployed as — falls out as an accident of
 about 3 % of windows, and the band it emits there loses coverage over training
-while every selection scalar improves. One **mandatory visible separator** sits
+while every selection scalar improves. A simulator-cache sample skips the branch
+draw entirely: its trailing `PREDICTION_PATCHES` are the row's behaviour-off
+counterfactual tail, so they are pinned masked every time and the quota reaches
+only the real-data windows and the scoring protocols. One **mandatory visible separator** sits
 between neighbouring spans,
 so two masked spans never abut; the separator is what makes the anchor, the
 spline's node sequence and the DILATE length bucket well defined per span.

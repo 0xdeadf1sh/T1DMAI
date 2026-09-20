@@ -128,6 +128,11 @@ of windows. The length law is the same in both branches. There is no curriculum
 and no annealing — `data.sample_mask_spans` is the sampler, and `config.py` holds
 its constants.
 
+A sample off the simulator cache does not draw that branch: its trailing
+`PREDICTION_PATCHES` are always masked, because they are the row's behaviour-off
+counterfactual tail. The quota governs the other callers — the real-data windows
+and the scoring protocols.
+
 The contract this implements — the masked set, the attention rule, the anchor,
 the decode — is specified once for the whole suite in
 [T1DMCOMMON/SPEC/inference.md](https://github.com/0xdeadf1sh/T1DMCOMMON/blob/main/SPEC/inference.md);

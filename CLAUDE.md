@@ -55,13 +55,18 @@ forecast *protocol*; it is not a region of a training sample.
   each `L_i ~ U(MASK_SPAN_LENGTHS)` independently; `sum(L) > MAX_MASKED_PATCHES` resamples the
   **whole length vector**, never one element (per-element redrawing yields a different length
   distribution and so a different `d` histogram); placement is stars-and-bars over the `n_spans + 1`
-  gaps, **except** that with probability `MASK_RIGHT_EDGE_QUOTA` (0.35) the LAST span is pinned
+  gaps, **except** that with probability `MASK_RIGHT_EDGE_QUOTA` (0.50) the LAST span is pinned
   flush against patch `T-1` and the rest composed over the prefix, which holds the same slack. That
   is the one departure from uniform placement: `n_spans` and the length law are drawn identically in
   both branches, so only the `d` histogram moves. There is no curriculum, no annealing and no
   rejection on placement. At quota 0 the branch draw is short-circuited, so the rng stream is the
   pre-quota one exactly. `d_balance.d_distribution` enumerates both branches, and
   `metrics/protocols.py`'s `SAMPLER_REFERENCE` is produced from it.
+  - **A boundary sample pins instead of drawing.** `_build_sample(boundary=True)` passes
+    `pin_right=PREDICTION_PATCHES`, so the trailing patches are masked in every simulator
+    sample: that span is the row's behaviour-off tail, the horizon, never model input. The
+    quota governs the unpinned callers only — finetune windows and `metrics/protocols.py`,
+    which is why `SAMPLER_REFERENCE` still describes the windows every `d`-binned figure reads.
 - **Two masked spans never abut.** One mandatory visible separator is charged up front. The
   separator is what makes the anchor, the spline's node sequence and the DILATE length bucket well
   defined per span; two spans with nothing between them are one longer span, and `utils._span_layout`
