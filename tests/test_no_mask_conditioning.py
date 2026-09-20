@@ -105,7 +105,7 @@ def test_masked_patches_withhold_bg_and_announce_the_bit():
         masked[bfd['mask_idx'][bfd['valid']]] = True
         n_masked_seen += int(masked.sum())
 
-        # per-patch bit, step-major: all PATCH_SIZE columns of feat 4
+        # per-patch bit, step-major: all PATCH_SIZE columns of the bg_masked feat
         bit = feat_grid[:, :, BG_MASKED_FEAT]
         assert np.array_equal(bit, np.repeat(masked[:, None], PATCH_SIZE, axis=1)
                               .astype(np.float32)), (

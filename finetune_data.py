@@ -864,7 +864,7 @@ def finetune_collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     assert attn_mask.any(dim=-1).all(), "an all-False attention row NaNs softmax"
     _bit = patches[..., BG_MASKED_FEAT::N_INPUT_FEATURES]
     assert torch.equal(_bit[..., 0], masked.to(_bit.dtype)), (
-        "feat 4 does not reproduce the masked set that built attn_mask")
+        "the bg_masked feat does not reproduce the masked set that built attn_mask")
 
     out = {
         'patches': patches, 'targets': targets, 'attn_mask': attn_mask,

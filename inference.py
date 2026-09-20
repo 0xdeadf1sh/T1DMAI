@@ -108,7 +108,7 @@ def _anchor_cells(
 def _assert_mask_announced(
     patches: torch.Tensor, mask_idx: torch.Tensor, valid: torch.Tensor,
 ) -> None:
-    """Assert feat 4 of ``patches`` reproduces the requested masked set, exactly.
+    """Assert the bg_masked feat of ``patches`` reproduces the requested masked set, exactly.
     Run before EVERY forward: unwritten by MASKABLE_FEATS/NON_MASKABLE_FEATS, so a forgetful
     builder leaves it 0.0 (forecast zone announced as observed). Checks the bit is 0.0/1.0,
     uniform across PATCH_SIZE columns, and matches the requested set (valid slots only)."""
@@ -187,7 +187,7 @@ def _build_patches_tensor(
     # Zeroes bg on masked CONTEXT patches (backcast/infill); the dose feats pass through.
     for feat_idx in NON_MASKABLE_FEATS:
         patches[masked_rows, feat_idx::N_INPUT_FEATURES] = 0.0
-    # feat 4 spans PATCH_SIZE step-major cols; unwritten, masked patches announce as observed.
+    # The bit spans PATCH_SIZE step-major cols; unwritten, a masked patch announces as observed.
     patches[:, BG_MASKED_FEAT::N_INPUT_FEATURES] = 0.0
     patches[masked_rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
 
@@ -240,7 +240,7 @@ def _run_forward(
     mask_idx_t = torch.from_numpy(mask_idx).to(device).unsqueeze(0)  # (1, M) int64
     valid_t = torch.from_numpy(valid).to(device).unsqueeze(0)        # (1, M) bool
 
-    # feat 4 must match the requested masked set — checked here, not trusted from the builder.
+    # The bit must match the requested masked set — checked here, not trusted from the builder.
     _assert_mask_announced(patches, mask_idx_t, valid_t)
 
     if grad:
@@ -547,7 +547,7 @@ def predict_rolling(
 
         # Dose feats default to the zero-RAW baseline, not 0.0 — log1p inverts z=0 to a dose.
 
-        # feat 4 stays 0.0 here; correct, since next roll's builder rewrites it wholesale.
+        # The bit stays 0.0 here; correct, since next roll's builder rewrites it wholesale.
         new_ctx_patches = torch.zeros(PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES)
         for feat_idx, feat_baseline_z in baseline_z.items():
             new_ctx_patches[:, :, feat_idx] = feat_baseline_z

@@ -1389,7 +1389,7 @@ def _reconstruct_context_from_patch(
     Returns (C, PATCH_SIZE, N_INPUT_FEATURES), min_patches <= C <= n_ctx, from one
     UN-COLLATED sample; mask_idx/valid are (M,). A run not a gather: a masked patch's
     z=0 bg decodes to ~142 mg/dL, not a sentinel, so a positional prefix would fabricate
-    context. None below min_patches — caller MUST report the skip; feat 4 is zeroed."""
+    context. None below min_patches — caller MUST report the skip; the bit is zeroed."""
     feat_cols = PATCH_SIZE * N_INPUT_FEATURES
     assert patches.shape[1] == feat_cols, (
         f"patches must be (T, {feat_cols}), got {tuple(patches.shape)}"
@@ -1413,7 +1413,7 @@ def _observed_patches(sample: dict[str, Any], norm_stats: dict) -> torch.Tensor:
     Rolling context is OBSERVED CGM history, not the training mask; a holed context
     measures an undeployed case and drops most samples (526/600 windows, live nano run).
     Not leakage — restored patches precede the forecast origin. Under BLIND, feats 1-3
-    are restored too (unblinded_dose_rows/patches); feat 4 stays, zeroed downstream."""
+    are restored too (unblinded_dose_rows/patches); the bit stays, zeroed downstream."""
     bf = sample['bg_formula_data']
     patches = sample['patches']
     if not torch.is_tensor(patches):
@@ -1692,7 +1692,7 @@ def _infill_protocol(
     rows = torch.tensor(keep, device=device, dtype=torch.long)
     n = len(keep)
 
-    # Every patch starts VISIBLE with true bg restored; feat 4 is rewritten wholesale here.
+    # Every patch starts VISIBLE with true bg restored; the bit is rewritten wholesale here.
     inf_patches = patches[rows].clone()
     inf_patches[:, :, _BG_FEAT::N_INPUT_FEATURES] = bg_z[rows]
     inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] = 0.0
@@ -1718,10 +1718,10 @@ def _infill_protocol(
     announce = inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES]
     inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] = announce.masked_fill(
         withheld, 1.0)
-    # Masking isn't inferable from position, z=0 decodes plausibly, so feat 4 IS the announcement.
+    # Masking isn't inferable from position, z=0 decodes plausibly, so the bit IS the announcement.
     assert bool(((inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] > 0.5)
                  == withheld).all()), (
-        "feat 4 does not reproduce the infill protocol's masked set")
+        "the bg_masked feat does not reproduce the infill protocol's masked set")
     # Doses go with bg against THIS protocol's masked set, not the sample's original one.
     blind_masked_doses(inf_patches, inf_masked, blind_fill)
 

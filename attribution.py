@@ -18,7 +18,7 @@ from model import T1DMAI
 from normalization import CHANNEL_NAMES
 from utils import kovatchev_f
 
-# inference's chokepoint announces feat 4 and crosses the denormalize bridge; reuse, don't rebuild.
+# inference's chokepoint announces the bit and crosses the denormalize bridge; reuse, don't rebuild.
 from inference import _resolve_mask_spans, _run_forward
 
 
@@ -88,7 +88,7 @@ def channel_saliency(
     """Fold a ``(T, PATCH_DIM)`` gradient back onto the channel axis, sign intact.
 
     ``grad`` is ∂target/∂patches at ``patches``, step-major so feat ``f`` owns stride
-    ``[:, f::N_INPUT_FEATURES]``. Returns ``(T, len(CHANNEL_NAMES))`` signed; feat 4 has no column.
+    ``[:, f::N_INPUT_FEATURES]``. Returns ``(T, len(CHANNEL_NAMES))`` signed; the bit has no column.
     """
     assert grad.shape == patches.shape, (
         f"grad {tuple(grad.shape)} and patches {tuple(patches.shape)} must match"

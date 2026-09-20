@@ -173,7 +173,7 @@ assert tuple(NON_MASKABLE_FEATS) == (_BG_FEAT,), (
 
 def _assert_mask_is_this_window(patches: torch.Tensor, attn_mask: torch.Tensor,
                                 where: str) -> None:
-    """The mask a forward runs under must be the one THAT input's feat 4 announces.
+    """The mask a forward runs under must be the one THAT input's bg_masked feat announces.
 
     attn_mask (B,T,T) bool blocks a masked column from every visible row. Paired windows
     share n_ctx and mask SHAPE, so a swapped mask raises nothing, only reads withheld evidence.
@@ -2138,10 +2138,10 @@ def _infill_protocol(
         withheld, 1.0)
     # Masking isn't inferable from position; z=0 in a withheld slot decodes to an ordinary
 
-    # reading, so feat 4 IS the announcement: check it before the forward, not after.
+    # reading, so the bit IS the announcement: check it before the forward, not after.
     assert bool(((inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] > 0.5)
                  == withheld).all()), (
-        "feat 4 does not reproduce the infill protocol's masked set")
+        "the bg_masked feat does not reproduce the infill protocol's masked set")
 
     lens = n_context_patches.to(device).reshape(-1)[rows] + P
     is_pad = (torch.arange(T, device=device).unsqueeze(0)

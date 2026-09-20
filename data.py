@@ -865,7 +865,7 @@ def _build_sample(
     # Per-slot TRUE hour of day, at the masked patch's own first step (not derived/interpolated).
     slot_hour = hour_of_day[start_step + mask_idx * PATCH_SIZE].astype(np.float32)
 
-    # Announced future carbs/insulin/exercise for the conditioned rolled-forecast override.
+    # Announced future carbs and insulin for the conditioned rolled-forecast override.
     _lh = slice(pred_start_in_window, pred_start_in_window + n_long_horizon_steps)
     # (steps, dose channels), columns in CHANNEL_TO_FEAT order.
     extended_dose_norm = dose_norm_window[_lh].copy()
@@ -1031,7 +1031,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "the bg_masked bit differs across a patch's step-major columns"
     )
     assert torch.equal(_bit[..., 0], masked.to(_bit.dtype)), (
-        "feat 4 does not reproduce the sampled mask that built attn_mask"
+        "the bg_masked feat does not reproduce the sampled mask that built attn_mask"
     )
 
     # Window k+1 shares k's n_ctx/n_pad but not the masked set, so it gets its own attn_mask.
@@ -1064,7 +1064,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "the next_window bg_masked bit differs across a patch's step-major columns"
         )
         assert torch.equal(_nw_bit[..., 0], nw_masked.to(_nw_bit.dtype)), (
-            "next_window feat 4 does not reproduce the mask that built its attn_mask"
+            "the next_window bit does not reproduce the mask that built its attn_mask"
         )
 
         next_window_batched = {

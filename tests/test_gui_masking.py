@@ -334,7 +334,7 @@ def _fake_context(n_ctx: int):
     from config import N_INPUT_FEATURES
     rng = np.random.default_rng(0)
     ctx = rng.normal(0.0, 0.5, (n_ctx, PATCH_SIZE, N_INPUT_FEATURES)).astype(np.float32)
-    ctx[..., -1] = 0.0                       # feat 4 is a bit; predict rewrites it
+    ctx[..., -1] = 0.0                       # the last feat is a bit; predict rewrites it
     return torch.from_numpy(ctx)
 
 

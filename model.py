@@ -214,7 +214,7 @@ class T1DMAI(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        # Masked bg z=0 is a legal reading (~142 mg/dL), not a sentinel; feat 4 announces the mask.
+        # Masked bg z=0 is a legal reading, not a sentinel; the bg_masked feat announces it.
         self.patch_embed = nn.Linear(PATCH_DIM, D_MODEL)
 
         self.blocks = nn.ModuleList([TransformerBlock() for _ in range(N_LAYERS)])

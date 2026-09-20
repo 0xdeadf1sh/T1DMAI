@@ -90,7 +90,7 @@ def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
 
     assert torch.equal(p[~bit_p], b[~bit_b]), (
         "the blind flag changed a VISIBLE patch — it must only reach the "
-        "patches feat 4 announces")
+        "patches the bg_masked feat announces")
 
     for k in sorted(plain['bg_formula_data']):
         a = np.asarray(plain['bg_formula_data'][k])

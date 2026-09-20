@@ -187,7 +187,7 @@ def test_dataset_shapes():
                         MAX_MASKED_PATCHES)
 
     assert PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES, \
-        "PATCH_DIM must be PATCH_SIZE*N_INPUT_FEATURES (the bit is feat 4, inside it)"
+        "PATCH_DIM must be PATCH_SIZE*N_INPUT_FEATURES (the bit is the last feat, inside it)"
 
     stats = _get_stats()
     dataset = T1DMDataset(master_seed=42, total_steps=10, batch_size=2, normalization_stats=stats)
