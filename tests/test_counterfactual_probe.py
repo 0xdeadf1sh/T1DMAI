@@ -14,7 +14,7 @@ def _get_stats():
                                load_normalization_stats, NORM_STATS_FILE)
     if os.path.exists(NORM_STATS_FILE):
         return load_normalization_stats()
-    return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
+    return compute_normalization_stats(master_seed=42, n_patients=10)
 
 
 def test_counterfactual_probe_smoke():
