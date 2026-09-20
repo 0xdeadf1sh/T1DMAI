@@ -18,18 +18,17 @@ def _get_stats():
                                load_normalization_stats, NORM_STATS_FILE)
     if os.path.exists(NORM_STATS_FILE):
         return load_normalization_stats()
-    return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
+    return compute_normalization_stats(master_seed=42, n_patients=4)
 
 
 def _build(blind: bool, stats, seed: int = BLIND_SEED) -> dict:
     """One sample at a fixed seed; same patient and same rng, so only ``blind`` differs."""
-    from data import (_build_sample, _make_simulator, simulate_discard_warmup,
-                      ON_THE_FLY_SIM_HOURS)
-    sim = _make_simulator(seed, uniform_skills=False)
-    data = simulate_discard_warmup(sim, ON_THE_FLY_SIM_HOURS)
+    from data import _build_sample, row_trajectory, simulate_row
+    row, icr, skills = simulate_row(seed)
     return _build_sample(
-        data=data, icr=float(sim.patient.icr), stats=stats,
+        data=row_trajectory(row, 0), icr=icr, stats=stats,
         rng=np.random.default_rng(seed ^ 0xDEADBEEF), blind=blind,
+        boundary=True, skills=skills,
     )
 
 

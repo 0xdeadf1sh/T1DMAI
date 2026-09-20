@@ -1,8 +1,7 @@
 """normalization.py and data.py — shapes, normalization, collation.
-Five input features ``[bg, carb, insulin, exercise, bg_masked]`` over FOUR normalized
-channels: ``bg_absolute`` in Kovatchev risk space, other three log1p; feat 4 is a
-per-patch bit, no statistics. ``exercise_equiv`` is g/step carb-EQUIVALENT glucose
-disposal, carb's encoding, never Kovatchev; targets raw mg/dL BG of ``MAX_MASKED_PATCHES`` slots."""
+Four input features ``[bg, carb, insulin, bg_masked]`` over THREE normalized channels:
+``bg_absolute`` in Kovatchev risk space, the other two log1p; feat 3 is a per-patch bit,
+no statistics. Targets are raw mg/dL BG of ``MAX_MASKED_PATCHES`` slots."""
 
 import math
 import numpy as np
@@ -13,7 +12,7 @@ import pytest
 def test_normalization_stats():
     from normalization import compute_normalization_stats
 
-    stats = compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
+    stats = compute_normalization_stats(master_seed=42, n_patients=4)
 
     print("\n[DUMP] normalization | statistics:")
     for channel, values in stats.items():
@@ -28,32 +27,27 @@ def _get_stats():
     from normalization import compute_normalization_stats, load_normalization_stats, NORM_STATS_FILE
     if os.path.exists(NORM_STATS_FILE):
         return load_normalization_stats()
-    return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
+    return compute_normalization_stats(master_seed=42, n_patients=4)
 
 
-def test_channel_names_are_the_four_input_signals():
+def test_channel_names_are_the_three_input_signals():
     """The order pins every channel index in the project, so this is a literal pin,
-    not a count — and the two counts, 4 channels against 5 features, pin separately.
-    ``exercise_equiv`` is a log1p channel like carb, never a risk-space one: it is
-    carbohydrate-equivalent glucose disposal in g/step, not a glucose."""
+    not a count — and the two counts, 3 channels against 4 features, pin separately."""
     from config import N_INPUT_FEATURES
     from data import BG_MASKED_FEAT
     from normalization import (CHANNEL_NAMES, N_CHANNELS, SPARSE_LOG1P_CHANNELS,
                                RISK_SPACE_CHANNELS)
-    assert CHANNEL_NAMES == ['bg_absolute', 'carb_intake', 'insulin_combined',
-                             'exercise_equiv'], \
-        f"CHANNEL_NAMES must be the 4-channel input list, got {CHANNEL_NAMES}"
-    assert len(CHANNEL_NAMES) == N_CHANNELS == 4
-    assert N_INPUT_FEATURES == 5
+    assert CHANNEL_NAMES == ['bg_absolute', 'carb_intake', 'insulin_combined'], \
+        f"CHANNEL_NAMES must be the 3-channel input list, got {CHANNEL_NAMES}"
+    assert len(CHANNEL_NAMES) == N_CHANNELS == 3
+    assert N_INPUT_FEATURES == 4
     # the normalized channels take the LEADING columns, the bit follows them
-    assert BG_MASKED_FEAT == len(CHANNEL_NAMES) == 4
+    assert BG_MASKED_FEAT == len(CHANNEL_NAMES) == 3
     assert SPARSE_LOG1P_CHANNELS == frozenset(
-        {'carb_intake', 'insulin_combined', 'exercise_equiv',
-         'carb_g', 'bolus_u', 'basal_u', 'exercise_min'}), \
+        {'carb_intake', 'insulin_combined', 'carb_g', 'bolus_u', 'basal_u'}), \
         f"every dose amount, curve or point, is log1p-encoded, got {SPARSE_LOG1P_CHANNELS}"
     assert RISK_SPACE_CHANNELS == frozenset({'bg_absolute'}), \
-        ("only bg is a glucose — the Kovatchev transform must never reach "
-         f"exercise_equiv, got {RISK_SPACE_CHANNELS}")
+        f"only bg is a glucose — the Kovatchev transform reaches nothing else, got {RISK_SPACE_CHANNELS}"
 
 
 def _cwd_stats_or_skip() -> dict:
@@ -67,9 +61,9 @@ def _cwd_stats_or_skip() -> dict:
 
 def test_normalization_stats_at_load_are_complete_and_nondegenerate():
     """One entry per input channel, each with a strictly positive std.
-    A three-key file raises ``KeyError`` in ``data.py``, loud. A four-key file with
-    ``std: 0.0`` does not: the pipeline divides by ``0 + 1e-8``, scaling feat 3 by
-    ~1e8, and trains to completion behind a plausible validation table."""
+    A short file raises ``KeyError`` in ``data.py``, loud. A full file with ``std: 0.0``
+    does not: the pipeline divides by ``0 + 1e-8``, scaling that feat by ~1e8, and trains
+    to completion behind a plausible validation table."""
     import json
     from normalization import (CHANNEL_NAMES, load_normalization_stats,
                                NORM_STATS_FILE)
@@ -88,7 +82,7 @@ def test_normalization_stats_at_load_are_complete_and_nondegenerate():
     with open(NORM_STATS_FILE) as f:
         good = json.load(f)
     with tempfile.TemporaryDirectory() as tmp:
-        short = {k: v for k, v in good.items() if k != 'exercise_equiv'}
+        short = {k: v for k, v in good.items() if k != 'insulin_combined'}
         short_path = f"{tmp}/short.json"
         with open(short_path, 'w') as f:
             json.dump(short, f)
@@ -96,7 +90,7 @@ def test_normalization_stats_at_load_are_complete_and_nondegenerate():
             load_normalization_stats(short_path)
 
         degenerate = {k: dict(v) for k, v in good.items()}
-        degenerate['exercise_equiv']['std'] = 0.0
+        degenerate['insulin_combined']['std'] = 0.0
         degen_path = f"{tmp}/degenerate.json"
         with open(degen_path, 'w') as f:
             json.dump(degenerate, f)
@@ -104,7 +98,7 @@ def test_normalization_stats_at_load_are_complete_and_nondegenerate():
             load_normalization_stats(degen_path)
 
     print(f"\n[DUMP] stats_at_load | {len(stats)} keys == CHANNEL_NAMES, all std > 0; "
-          f"three-key and std=0 files both rejected at load ✓")
+          f"short and std=0 files both rejected at load ✓")
 
 
 def test_normalize_denormalize_roundtrip():
@@ -228,25 +222,20 @@ def test_dataset_shapes():
 
 
 def test_masked_set_always_conditioned():
-    """On a masked patch bg is zeroed while carb, insulin and exercise keep their true
-    or announced values, at every position, masked or visible. The masked set comes
-    from ``bg_formula_data``, never position. Exercise sessions are rarer than meals, so
-    feat 3 is guarded on never being the literal-0.0 fill, not on being non-zero somewhere."""
-    from data import (_build_sample, _make_simulator, simulate_discard_warmup,
-                      ON_THE_FLY_SIM_HOURS)
+    """On a masked patch bg is zeroed while carb and insulin keep their true or announced
+    values, at every position, masked or visible. The masked set comes from
+    ``bg_formula_data``, never position."""
+    from data import _build_sample, row_trajectory, simulate_row
     from config import (PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM, CHANNEL_TO_FEAT)
     from normalization import CHANNEL_NAMES, normalize
 
-    assert CHANNEL_TO_FEAT == {0: 1, 1: 2, 2: 3}, \
-        "carb -> feat1, insulin -> feat2, exercise -> feat3"
+    assert CHANNEL_TO_FEAT == {0: 1, 1: 2}, "carb -> feat1, insulin -> feat2"
 
     stats = _get_stats()
-    sim = _make_simulator(patient_seed=321, uniform_skills=False)
-    data = simulate_discard_warmup(sim, ON_THE_FLY_SIM_HOURS)
-    icr = float(sim.patient.icr)
+    row, icr, skills = simulate_row(321)
 
-    s = _build_sample(data=data, icr=icr, stats=stats,
-                      rng=np.random.default_rng(7))
+    s = _build_sample(data=row_trajectory(row, 0), icr=icr, stats=stats,
+                      rng=np.random.default_rng(7), boundary=True, skills=skills)
     assert 'reveal_mask' not in s, "a built sample must carry no reveal_mask"
     patches = s['patches'].numpy()
     assert patches.shape[1] == PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES, \
@@ -260,7 +249,6 @@ def test_masked_set_always_conditioned():
 
     carb_feat = CHANNEL_TO_FEAT[0]
     insulin_feat = CHANNEL_TO_FEAT[1]
-    exercise_feat = CHANNEL_TO_FEAT[2]
     # bg is the predicted target, always zeroed on a masked patch
     assert (feat_grid[masked, :, 0] == 0.0).all(), \
         "bg feat 0 must be zeroed on every masked patch"
@@ -269,21 +257,19 @@ def test_masked_set_always_conditioned():
         "carb feat 1 must carry true doses on the masked patches"
     assert np.any(feat_grid[masked, :, insulin_feat] != 0.0), \
         "insulin feat 2 must carry true doses on the masked patches"
-    # no-session exercise cell is normalize(0), NOT 0.0; all-zero column means gather dropped it.
-    exercise_baseline = float(normalize(
-        np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats)[0, exercise_feat])
-    ex_col = feat_grid[:, :, exercise_feat]
-    assert not np.all(ex_col == 0.0), (
-        f"exercise feat {exercise_feat} is the literal-0.0 fill — an unannounced "
-        f"cell must carry the zero-RAW baseline {exercise_baseline:.6f}")
-    assert (ex_col >= exercise_baseline - 1e-4).all(), (
-        f"exercise feat {exercise_feat} below the zero-RAW baseline "
-        f"{exercise_baseline:.6f} (min {float(ex_col.min()):.6f})")
+    # a no-dose cell is normalize(0), NOT 0.0; an all-zero column means gather dropped it.
+    carb_baseline = float(normalize(
+        np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats)[0, carb_feat])
+    carb_col = feat_grid[:, :, carb_feat]
+    assert not np.all(carb_col == 0.0), (
+        f"carb feat {carb_feat} is the literal-0.0 fill — an unannounced "
+        f"cell must carry the zero-RAW baseline {carb_baseline:.6f}")
+    assert (carb_col >= carb_baseline - 1e-4).all(), (
+        f"carb feat {carb_feat} below the zero-RAW baseline "
+        f"{carb_baseline:.6f} (min {float(carb_col.min()):.6f})")
     print(f"\n[DUMP] masked_set | PATCH_DIM={PATCH_DIM}; masked patches "
           f"{sorted(np.flatnonzero(masked).tolist())} of {T}; bg feat0 zeroed there, "
-          f"carb feat{carb_feat}/insulin feat{insulin_feat}/exercise "
-          f"feat{exercise_feat} conditioned (exercise min "
-          f"{float(ex_col.min()):.6f} vs baseline {exercise_baseline:.6f}) ✓")
+          f"carb feat{carb_feat}/insulin feat{insulin_feat} conditioned ✓")
 
 
 def test_pick_pred_start_step_uniform():
@@ -401,7 +387,7 @@ def test_next_window_batch_shape_and_space():
            (nw['anchor_bg'] <= sim.BG_CLAMP_MAX + 1e-3).all(), \
         "every next_window anchor, padded slots included, must be physical mg/dL"
 
-    # NIGHT_LONG_HORIZON_HOURS (8h) leaves room for one 2h shift, so every next window is in range.
+    # A boundary row shifts the pair back one horizon, which the context always has room for.
     assert bool(nw['valid'].all()), \
         f"all next windows should be valid at default config, got {nw['valid'].tolist()}"
 

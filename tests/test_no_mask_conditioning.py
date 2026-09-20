@@ -13,11 +13,11 @@ def _get_stats():
                                load_normalization_stats, NORM_STATS_FILE)
     if os.path.exists(NORM_STATS_FILE):
         return load_normalization_stats()
-    return compute_normalization_stats(master_seed=42, n_patients=10, n_hours=72)
+    return compute_normalization_stats(master_seed=42, n_patients=4)
 
 
 def test_patch_dim_and_feat_map():
-    """feat 4 is in NEITHER feat list: written from the masked set, not announced."""
+    """bg_masked is in NEITHER feat list: written from the masked set, not announced."""
     import config
     from config import PATCH_DIM, PATCH_SIZE, N_INPUT_FEATURES
     from data import BG_MASKED_FEAT
@@ -25,7 +25,7 @@ def test_patch_dim_and_feat_map():
     assert PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES, (
         f"PATCH_DIM {PATCH_DIM} != PATCH_SIZE*N_INPUT_FEATURES "
         f"{PATCH_SIZE * N_INPUT_FEATURES}")
-    assert PATCH_DIM == 30, f"expected PATCH_DIM 30 at the active config, got {PATCH_DIM}"
+    assert PATCH_DIM == 24, f"expected PATCH_DIM 24 at the active config, got {PATCH_DIM}"
     assert not hasattr(config, 'N_MASK_BITS'), \
         "config.N_MASK_BITS must be deleted — the trailing mask-bit tier is gone"
     for gone in ('BLOCK_MASK_PROB', 'CARB_NOISE_AUG_ENABLED', 'CARB_NOISE_AUG_SIGMA'):
@@ -33,16 +33,15 @@ def test_patch_dim_and_feat_map():
     assert hasattr(config, 'CHANNEL_TO_FEAT'), "config.CHANNEL_TO_FEAT must exist"
     assert not hasattr(config, 'CHANNEL_TO_FEAT_BIT'), \
         "config.CHANNEL_TO_FEAT_BIT renamed to CHANNEL_TO_FEAT"
-    assert config.CHANNEL_TO_FEAT == {0: 1, 1: 2, 2: 3}, \
-        ("CHANNEL_TO_FEAT must map carb->feat1, insulin->feat2, exercise->feat3, "
-         f"got {config.CHANNEL_TO_FEAT}")
+    assert config.CHANNEL_TO_FEAT == {0: 1, 1: 2}, \
+        f"CHANNEL_TO_FEAT must map carb->feat1, insulin->feat2, got {config.CHANNEL_TO_FEAT}"
     assert config.NON_MASKABLE_FEATS == (0,), \
         f"NON_MASKABLE_FEATS must be (0,), got {config.NON_MASKABLE_FEATS}"
-    assert config.MASKABLE_FEATS == (1, 2, 3), \
-        f"MASKABLE_FEATS must be (1, 2, 3), got {config.MASKABLE_FEATS}"
+    assert config.MASKABLE_FEATS == (1, 2), \
+        f"MASKABLE_FEATS must be (1, 2), got {config.MASKABLE_FEATS}"
     assert tuple(config.CHANNEL_TO_FEAT.values()) == config.MASKABLE_FEATS, \
         "CHANNEL_TO_FEAT's image must be exactly MASKABLE_FEATS"
-    assert BG_MASKED_FEAT == 4, f"bg_masked must be feat 4, got {BG_MASKED_FEAT}"
+    assert BG_MASKED_FEAT == 3, f"bg_masked must be feat 3, got {BG_MASKED_FEAT}"
     assert BG_MASKED_FEAT not in config.MASKABLE_FEATS, \
         "bg_masked must not be announceable — it is derived from the masked set"
     assert BG_MASKED_FEAT not in config.NON_MASKABLE_FEATS, \
@@ -53,28 +52,25 @@ def test_patch_dim_and_feat_map():
 
 
 def test_build_sample_no_reveal_mask_and_patch_width():
-    from data import (_build_sample, _make_simulator, simulate_discard_warmup,
-                      ON_THE_FLY_SIM_HOURS)
+    from data import _build_sample, row_trajectory, simulate_row
     from config import PATCH_DIM, PATCH_SIZE, N_INPUT_FEATURES
 
     stats = _get_stats()
-    sim = _make_simulator(patient_seed=321, uniform_skills=False)
-    data = simulate_discard_warmup(sim, ON_THE_FLY_SIM_HOURS)
-    icr = float(sim.patient.icr)
+    row, icr, skills = simulate_row(321)
 
-    s = _build_sample(data=data, icr=icr, stats=stats,
-                      rng=np.random.default_rng(7))
+    s = _build_sample(data=row_trajectory(row, 0), icr=icr, stats=stats,
+                      rng=np.random.default_rng(7), boundary=True, skills=skills)
 
     assert 'reveal_mask' not in s, "a built sample must not carry reveal_mask"
     assert 'loss_mask' not in s, "a built sample must not carry loss_mask"
     last_dim = int(s['patches'].shape[-1])
-    assert last_dim == PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES == 30, (
-        f"patch last-dim {last_dim} != PATCH_DIM {PATCH_DIM} (30)")
+    assert last_dim == PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES == 24, (
+        f"patch last-dim {last_dim} != PATCH_DIM {PATCH_DIM} (24)")
     print(f"\n[DUMP] build_sample | keys={sorted(s.keys())}; patch last-dim={last_dim} ✓")
 
 
 def test_masked_patches_withhold_bg_and_announce_the_bit():
-    """The trap: no announce loop writes feat 4, so left at its 0.0 init it announces
+    """The trap: no announce loop writes the bit, so left at its 0.0 init it announces
     a withheld patch as OBSERVED, at the right shapes and with a legal-looking z in
     the bg slot. Assert it REPRODUCES the mask, not that it is somewhere non-zero."""
     from data import T1DMDataset, BG_MASKED_FEAT
@@ -87,16 +83,15 @@ def test_masked_patches_withhold_bg_and_announce_the_bit():
 
     carb_feat = CHANNEL_TO_FEAT[0]
     insulin_feat = CHANNEL_TO_FEAT[1]
-    exercise_feat = CHANNEL_TO_FEAT[2]
-    assert (carb_feat, insulin_feat, exercise_feat) == (1, 2, 3)
+    assert (carb_feat, insulin_feat) == (1, 2)
 
-    # exercise zero-RAW baseline = log1p(0) z-scored, NOT 0; a no-session cell carries this value.
+    # zero-RAW baseline = log1p(0) z-scored, NOT 0; a no-dose cell carries this value.
     zero_raw_z = normalize(
         np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), stats)[0]
-    exercise_baseline = float(zero_raw_z[exercise_feat])
+    carb_baseline = float(zero_raw_z[carb_feat])
 
     saw_carb = saw_insulin = False
-    exercise_min = np.inf
+    carb_min = np.inf
     n_masked_seen = 0
     for idx in range(8):
         s = dataset[idx]
@@ -124,16 +119,16 @@ def test_masked_patches_withhold_bg_and_announce_the_bit():
         assert not (feat_grid[~masked, :, 0] == 0.0).all(), \
             f"bg feat 0 zeroed on a VISIBLE patch (sample {idx})"
 
-        ex_col = feat_grid[:, :, exercise_feat]
-        assert not np.all(ex_col == 0.0), (
-            f"exercise feat {exercise_feat} is the literal-0.0 fill (sample "
-            f"{idx}) — the announced column was dropped; a no-session cell must "
-            f"carry {exercise_baseline:.6f}")
-        assert (ex_col >= exercise_baseline - 1e-4).all(), (
-            f"exercise feat {exercise_feat} fell below the zero-RAW baseline "
-            f"{exercise_baseline:.6f} (sample {idx}, min {float(ex_col.min()):.6f}) "
+        carb_col = feat_grid[:, :, carb_feat]
+        assert not np.all(carb_col == 0.0), (
+            f"carb feat {carb_feat} is the literal-0.0 fill (sample "
+            f"{idx}) — the announced column was dropped; a no-dose cell must "
+            f"carry {carb_baseline:.6f}")
+        assert (carb_col >= carb_baseline - 1e-4).all(), (
+            f"carb feat {carb_feat} fell below the zero-RAW baseline "
+            f"{carb_baseline:.6f} (sample {idx}, min {float(carb_col.min()):.6f}) "
             "— raw floor or log1p encoding missing")
-        exercise_min = min(exercise_min, float(ex_col.min()))
+        carb_min = min(carb_min, float(carb_col.min()))
         if np.any(feat_grid[:, :, carb_feat] != 0.0):
             saw_carb = True
         if np.any(feat_grid[:, :, insulin_feat] != 0.0):
@@ -142,9 +137,9 @@ def test_masked_patches_withhold_bg_and_announce_the_bit():
     assert saw_carb, "carb feat 1 must carry true future doses (always conditioned)"
     assert saw_insulin, "insulin feat 2 must carry true future doses (always conditioned)"
     print(f"\n[DUMP] announcement | {n_masked_seen} masked patches over 8 samples; "
-          f"feat 4 reproduces the mask; bg feat0 withheld there; carb feat{carb_feat} "
-          f"& insulin feat{insulin_feat} conditioned; exercise feat{exercise_feat} "
-          f"min={exercise_min:.6f} >= baseline {exercise_baseline:.6f} ✓")
+          f"the bit reproduces the mask; bg feat0 withheld there; carb feat{carb_feat} "
+          f"min={carb_min:.6f} >= baseline {carb_baseline:.6f}; "
+          f"insulin feat{insulin_feat} conditioned ✓")
 
 
 def test_collate_no_reveal_mask():
@@ -160,7 +155,7 @@ def test_collate_no_reveal_mask():
 
     assert 'reveal_mask' not in batch, "batch must not carry reveal_mask"
     assert 'loss_mask' not in batch, "batch must not carry loss_mask"
-    assert int(batch['patches'].shape[-1]) == PATCH_DIM == 30, \
+    assert int(batch['patches'].shape[-1]) == PATCH_DIM == 24, \
         f"batch patch last-dim {batch['patches'].shape[-1]} != PATCH_DIM {PATCH_DIM}"
 
     bit = batch['patches'][..., BG_MASKED_FEAT::N_INPUT_FEATURES]   # (B, max_T, S)

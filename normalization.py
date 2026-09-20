@@ -23,14 +23,14 @@ CHANNEL_NAMES = list(INPUT_LAYOUTS[INPUT_LAYOUT])
 N_CHANNELS = len(CHANNEL_NAMES)
 
 # Pinned per layout: a changed count invalidates every checkpoint and stats file of that layout.
-assert N_CHANNELS == {'curves': 4, 'events': 10}[INPUT_LAYOUT], (
+assert N_CHANNELS == {'curves': 3, 'events': 9}[INPUT_LAYOUT], (
     f"layout {INPUT_LAYOUT!r} has {N_CHANNELS} normalized channels; the count is pinned"
 )
 
-# Curves: g/step, U/step, g-equivalent/step. Events: g, U, U, session minutes, at the onset slot.
+# Curves: g/step, U/step. Events: g, U, U at the onset slot.
 SPARSE_LOG1P_CHANNELS: frozenset[str] = frozenset({
-    'carb_intake', 'insulin_combined', 'exercise_equiv',
-    'carb_g', 'bolus_u', 'basal_u', 'exercise_min',
+    'carb_intake', 'insulin_combined',
+    'carb_g', 'bolus_u', 'basal_u',
 })
 
 # Disjoint from SPARSE_LOG1P_CHANNELS; only a glucose ever belongs here.
@@ -105,61 +105,39 @@ def _finalize_welford_stats(
 def compute_normalization_stats(
     master_seed: int = MASTER_SEED,
     n_patients: int = NORM_N_PATIENTS,
-    n_hours: float | None = None,
     patient_uniform_sample_prob: float = PATIENT_UNIFORM_SAMPLE_PROB,
     simulator_warmup_hours: float = SIMULATOR_WARMUP_HOURS,
 ) -> dict[str, dict[str, float]]:
     """
-    Per-channel ``{name: {mean, std}}`` from ``n_patients`` independent simulations.
+    Per-channel ``{name: {mean, std}}`` from ``n_patients`` rows off T1DMSIM's row builder.
 
-    Matches training's generative process (skill mix, warmup, sim hours); stats fit the input.
+    Fitted over each row's context and all four tails, the span a sample draws from.
     """
     # float64: sums tens of millions of values; float32 accumulates visible rounding error here.
     counts = np.zeros(N_CHANNELS, dtype=np.float64)
     means = np.zeros(N_CHANNELS, dtype=np.float64)
     M2s = np.zeros(N_CHANNELS, dtype=np.float64)
 
-    # Lazy: data.py imports this module (circular); reuses its _make_simulator/ON_THE_FLY_SIM_HOURS.
-    from data import simulate_discard_warmup, _make_simulator, ON_THE_FLY_SIM_HOURS
-    if n_hours is None:
-        n_hours = ON_THE_FLY_SIM_HOURS
+    # Lazy: data.py imports this module (circular).
+    from data import simulate_row, SIM_CHANNEL
 
-    print(f"Computing normalization statistics from {n_patients} patients × "
-          f"{n_hours}h (uniform-skill prob {patient_uniform_sample_prob}, "
+    print(f"Computing normalization statistics from {n_patients} rows "
+          f"(uniform-skill prob {patient_uniform_sample_prob}, "
           f"warmup {simulator_warmup_hours}h)...")
 
     for i in range(n_patients):
         # mod 2^31-1 keeps the seed inside ``np.random.default_rng``'s legal range.
         seed = (master_seed + 1_000_000 + i) % (2**31 - 1)
-        # Same XOR constant as data.py; skill mix matches at patient_uniform_sample_prob.
-        use_uniform = bool(
-            np.random.default_rng(seed ^ 0x5A17_5EEDD).random() < patient_uniform_sample_prob
-        )
-        sim = _make_simulator(seed, uniform_skills=use_uniform)
-        # Drops the artificial cold-start window (no IOB, fresh basal).
-        data = simulate_discard_warmup(sim, n_hours, warmup_hours=simulator_warmup_hours)
+        row, _icr, _skills = simulate_row(seed)
 
-        # bg_observed is post-CGM-noise; the pipeline normalizes it, never the clean data['bg'].
-        bg = data['bg_observed'].astype(np.float64)
-        carb = data['total_carb'].astype(np.float64)
-        insulin = data['total_insulin'].astype(np.float64)
-        exercise = data['total_exercise'].astype(np.float64)
-
-        # Order MUST match CHANNEL_NAMES; a short list silently zip-truncates a channel to std=0.0.
-        raw_channels = [bg, carb, insulin, exercise]
-        assert len(raw_channels) == len(CHANNEL_NAMES), (
-            f"{len(raw_channels)} raw channels against {len(CHANNEL_NAMES)} "
-            "CHANNEL_NAMES; every named channel needs its own array."
-        )
-
-        # Transformed before Welford, on raw post-noise channels; stats live in the model's space.
-        channels = [
-            _forward_transform(arr, name)
-            for arr, name in zip(raw_channels, CHANNEL_NAMES)
-        ]
-
-        for c, vals in enumerate(channels):
-            _welford_batch_update(counts, means, M2s, c, vals)
+        # bg_observed is post-CGM-noise; the pipeline normalizes it, never the clean row['bg'].
+        for c, name in enumerate(CHANNEL_NAMES):
+            src = SIM_CHANNEL[name]
+            vals = np.concatenate(
+                [np.asarray(row[src]).ravel(),
+                 np.asarray(row[f'tail_{src}']).ravel()]).astype(np.float64)
+            # Transformed before Welford, on raw post-noise values; stats live in model space.
+            _welford_batch_update(counts, means, M2s, c, _forward_transform(vals, name))
 
         if (i + 1) % 100 == 0:
             print(f"  Processed {i + 1}/{n_patients} patients")
@@ -179,7 +157,7 @@ def compute_normalization_stats_from_cache(
     """
     import os
     # Lazy: dodges the data ↔ normalization circular import.
-    from data import CACHE_CHANNEL_NAMES, CACHE_FORMAT_NPY, CACHE_FORMAT_BLOSC2
+    from data import CACHE_CHANNEL_NAMES, CACHE_FORMAT_BLOSC2, SIM_CHANNEL
 
     meta_path = os.path.join(cache_path, 'meta.json')
     if not os.path.exists(meta_path):
@@ -202,25 +180,20 @@ def compute_normalization_stats_from_cache(
             f"Cache channels {tuple(meta['channels'])} disagree with expected "
             f"{CACHE_CHANNEL_NAMES}; rebuild the cache."
         )
-    # Temporal, IS and HGO channels are not normalized; the loop follows CHANNEL_NAMES order.
-    needed = ('bg_observed', 'total_carb', 'total_insulin', 'total_exercise')
-
-    arrays: dict[str, Any] = {}
-    if cache_format == CACHE_FORMAT_NPY:
-        for name in needed:
-            arrays[name] = np.load(
-                os.path.join(cache_path, f'{name}.npy'), mmap_mode='r')
-    elif cache_format == CACHE_FORMAT_BLOSC2:
-        import blosc2
-        for name in needed:
-            # Not mmap: a mapped .b2nd never releases touched chunks, and this reads the whole pool.
-            arrays[name] = blosc2.open(
-                os.path.join(cache_path, f'{name}.b2nd'), mode='r')
-    else:
+    if cache_format != CACHE_FORMAT_BLOSC2:
         raise ValueError(
             f"Unsupported cache_format {cache_format!r} (expected "
-            f"{CACHE_FORMAT_NPY!r} or {CACHE_FORMAT_BLOSC2!r})."
+            f"{CACHE_FORMAT_BLOSC2!r})."
         )
+    # Temporal, IS and HGO channels are not normalized; the loop follows CHANNEL_NAMES order.
+    needed = [SIM_CHANNEL[name] for name in CHANNEL_NAMES]
+
+    import blosc2
+    arrays: dict[str, Any] = {}
+    for name in needed + [f'tail_{n}' for n in needed]:
+        # Not mmap: a mapped .b2nd never releases touched chunks, and this reads the whole pool.
+        arrays[name] = blosc2.open(
+            os.path.join(cache_path, f'{name}.b2nd'), mode='r')
 
     n_rows = pool_size if sample_rows is None else min(int(sample_rows), pool_size)
 
@@ -238,20 +211,15 @@ def compute_normalization_stats_from_cache(
 
     for start in range(0, n_rows, batch_rows):
         stop = min(start + batch_rows, n_rows)
-        bg = np.asarray(arrays['bg_observed'][start:stop], dtype=np.float64)  # (B, T)
-        carb = np.asarray(arrays['total_carb'][start:stop], dtype=np.float64)
-        insulin = np.asarray(arrays['total_insulin'][start:stop], dtype=np.float64)
-        exercise = np.asarray(arrays['total_exercise'][start:stop], dtype=np.float64)
-
-        # Order MUST match CHANNEL_NAMES; a short list silently zip-truncates a channel to std=0.0.
-        raw_channels = [bg, carb, insulin, exercise]
-        assert len(raw_channels) == len(CHANNEL_NAMES), (
-            f"{len(raw_channels)} raw channels against {len(CHANNEL_NAMES)} "
-            "CHANNEL_NAMES; every named channel needs its own array."
-        )
-        for c, (arr, name) in enumerate(zip(raw_channels, CHANNEL_NAMES)):
-            # Each (B, T) block transformed with no smoothing, matching data._build_sample's space.
-            _welford_batch_update(counts, means, M2s, c, _forward_transform(arr, name))
+        # Context and all four tails, the span a sample draws from.
+        for c, name in enumerate(CHANNEL_NAMES):
+            src = needed[c]
+            block = np.concatenate([
+                np.asarray(arrays[src][start:stop], dtype=np.float64).ravel(),
+                np.asarray(arrays[f'tail_{src}'][start:stop], dtype=np.float64).ravel(),
+            ])
+            # Transformed with no smoothing, matching data._build_sample's space.
+            _welford_batch_update(counts, means, M2s, c, _forward_transform(block, name))
 
         if start == 0 or stop % (batch_rows * 25) < batch_rows or stop == n_rows:
             print(f"  Processed {stop:,}/{n_rows:,} rows", flush=True)

@@ -265,8 +265,8 @@ def test_train_inference_anchor_identical():
     import os
     import numpy as np
     from utils import last_bg_mgdl_from_context
-    from data import (_anchor_step_for_span, _build_sample, _make_simulator,
-                      simulate_discard_warmup)
+    from data import (_anchor_step_for_span, _build_sample, row_trajectory,
+                      simulate_row)
     from config import PATCH_SIZE, N_INPUT_FEATURES, PREDICTION_PATCHES
     from normalization import load_normalization_stats, NORM_STATS_FILE
 
@@ -274,18 +274,15 @@ def test_train_inference_anchor_identical():
         pytest.skip("normalization_stats.json required")
     stats = load_normalization_stats()
 
-    # never a literal: this follows MAX_CONTEXT_PATCHES, or a widened window raises here
-    from data import ON_THE_FLY_SIM_HOURS
-
-    sim = _make_simulator(patient_seed=4242, uniform_skills=False)
-    data = simulate_discard_warmup(sim, ON_THE_FLY_SIM_HOURS)
-    icr = float(sim.patient.icr)
+    row, icr, skills = simulate_row(4242)
+    data = row_trajectory(row, 0)
 
     n_slots = n_right_edge = 0
     # the parity must hold for every drawn n_ctx and every masked set in it
     for seed in range(16):
         sample = _build_sample(data=data, icr=icr, stats=stats,
-                               rng=np.random.default_rng(seed))
+                               rng=np.random.default_rng(seed),
+                               boundary=True, skills=skills)
         n_ctx = int(sample['n_context_patches'])
         bf = sample['bg_formula_data']
         mask_idx, valid = bf['mask_idx'], bf['valid']

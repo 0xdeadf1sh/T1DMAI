@@ -5,7 +5,6 @@ are in this repo's CLAUDE.md.
 """
 
 import json
-import mmap
 import os
 import numpy as np
 import torch
@@ -17,8 +16,8 @@ from config import (
     CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, MASKABLE_FEATS,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
     MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
-    PATIENT_UNIFORM_SAMPLE_PROB,
-    SIMULATOR_WARMUP_HOURS, NIGHT_LONG_HORIZON_PATCHES, CACHE_MADVISE_DONTNEED,
+    PATIENT_UNIFORM_SAMPLE_PROB, N_SKILLS, SKILL_NAMES,
+    SIMULATOR_WARMUP_HOURS, NIGHT_LONG_HORIZON_PATCHES,
     TIME_PROBE_ENABLED, TIME_PROBE_CROSS_WINDOW_WEIGHT,
 )
 import utils
@@ -88,9 +87,6 @@ def blind_masked_doses(
     for feat_idx, z in fill.items():
         block = patches[..., feat_idx::N_INPUT_FEATURES]
         patches[..., feat_idx::N_INPUT_FEATURES] = block.masked_fill(withheld, z)
-
-# N≡90 mod 288 for exact hour-of-day coverage to a 336-patch context; must match cache_simulator.py.
-ON_THE_FLY_SIM_HOURS: float = 199.5
 
 # Clear of training hashed seeds and normalization's +1_000_000 band; backs split-conformal only.
 CALIBRATION_SEED_OFFSET: int = 2_000_000
@@ -238,29 +234,60 @@ def _pick_pred_start_step_at_hour(
     return int(cands[int(np.argmin(circ))])
 
 
-CACHE_CHANNEL_NAMES = (
-    'bg_observed',
-    'total_carb',
-    'total_insulin',
-    'insulin_resistance',
-    'hgo',
-    'total_exercise',
-    'hour_of_day',
-    'day',
+# Owned by T1DMSIM: the cache's own channel lists, arm order, format string and skills file.
+from T1DMSIM.cache_simulator import (  # noqa: E402
+    CACHE_FORMAT_VERSION as CACHE_FORMAT_BLOSC2,
+    CHANNEL_NAMES as CACHE_CHANNEL_NAMES,
+    N_TAIL_ARMS, SKILLS_FILE, TAIL_ARMS,
 )
+
 # Normalized channel -> simulator channel; a point-dose channel keeps its name.
 SIM_CHANNEL = {'bg_absolute': 'bg_observed', 'carb_intake': 'total_carb',
-               'insulin_combined': 'total_insulin', 'exercise_equiv': 'total_exercise'}
+               'insulin_combined': 'total_insulin'}
 SIM_CHANNEL |= {c: c for c in INPUT_LAYOUTS['events'][1:]}
 # What this layout reads from a cache; one built with --events serves both layouts.
 READ_CACHE_CHANNELS = CACHE_CHANNEL_NAMES + tuple(
     SIM_CHANNEL[n] for n in CHANNEL_NAMES if SIM_CHANNEL[n] not in CACHE_CHANNEL_NAMES)
+# Per-step tail channels a sample needs: the input channels plus the clock the slots read.
+READ_TAIL_CHANNELS = tuple(SIM_CHANNEL[n] for n in CHANNEL_NAMES) + ('hour_of_day', 'day')
+
+# The tails end the row, so a sample's context is the last n_ctx patches before the boundary.
+CONTEXT_STEPS = MAX_CONTEXT_PATCHES * PATCH_SIZE
+TAIL_STEPS = PREDICTION_PATCHES * PATCH_SIZE
+SUPPORTED_CACHE_FORMATS = (CACHE_FORMAT_BLOSC2,)
 
 
-# blosc2: compressed. npy: raw uncompressed memmap. Same meta.json fields and read semantics.
-CACHE_FORMAT_BLOSC2 = 'blosc2-ndarray-v1'
-CACHE_FORMAT_NPY = 'npy-memmap-v1'
-SUPPORTED_CACHE_FORMATS = (CACHE_FORMAT_BLOSC2, CACHE_FORMAT_NPY)
+def _row_config():
+    """T1DMSIM's ``RowConfig`` for an on-the-fly row, at the geometry this model consumes."""
+    from T1DMSIM.cache_simulator import RowConfig, DEFAULT_WARMUP_OFFSET_STEPS
+    from T1DMSIM.simulator import DT_MINUTES
+    return RowConfig(
+        warmup_steps=int(SIMULATOR_WARMUP_HOURS * 60 / DT_MINUTES),
+        context_steps=CONTEXT_STEPS,
+        max_attempts=1, rail_high=float('inf'), rail_low=float('-inf'),
+        hypo_prob=0.0, hypo_min_frac=0.0, hypo_threshold=0.0, seed_salt=0,
+        event_refractory_steps=1, events=INPUT_LAYOUT == 'events',
+        tail_steps=TAIL_STEPS, warmup_offset_steps=DEFAULT_WARMUP_OFFSET_STEPS,
+    )
+
+
+def simulate_row(patient_seed: int) -> tuple[dict[str, np.ndarray], float, np.ndarray]:
+    """One un-cached row through T1DMSIM's own builder: arrays, ICR, skills.
+
+    The cache is the same builder run ahead of time, so the two paths cannot drift.
+    """
+    from T1DMSIM.cache_simulator import simulate_row as _sim_row
+    arrays, stats = _sim_row(int(patient_seed), _row_config())
+    return arrays, float(stats['icr']), np.asarray(stats['skills'], dtype=np.float32)
+
+
+def row_trajectory(row: dict[str, Any], arm: int) -> dict[str, np.ndarray]:
+    """Context plus one arm's tail per channel, so the boundary is the trajectory's end."""
+    return {
+        name: np.concatenate(
+            [np.asarray(row[name]), np.asarray(row[f'tail_{name}'][arm])])
+        for name in READ_TAIL_CHANNELS
+    }
 
 
 class T1DMDataset(Dataset):
@@ -305,14 +332,10 @@ class T1DMDataset(Dataset):
         # Lazy: populated on first access, so no open cache handle is pickled across the fork.
         self._cache_arrays: dict[str, Any] | None = None
         self._cache_icr: np.ndarray | None = None
+        self._cache_skills: np.ndarray | None = None
         self._cache_pool_size: int | None = None
         self._cache_n_timesteps: int | None = None
         self._cache_meta: dict[str, Any] | None = None
-        # name -> (mmap, data_offset_bytes, row_bytes); None under blosc2 or w/o MADV_DONTNEED.
-        self._cache_mmaps: dict[str, tuple[Any, int, int]] | None = None
-        self._madv_dontneed: int | None = (
-            getattr(mmap, 'MADV_DONTNEED', None) if CACHE_MADVISE_DONTNEED else None
-        )
 
         if cache_path is not None:
             from T1DMSIM.simulator import DT_MINUTES as _DT_MINUTES
@@ -330,6 +353,7 @@ class T1DMDataset(Dataset):
                 'pool_size', 'n_timesteps', 'sim_hours',
                 'simulator_warmup_hours', 'patient_uniform_sample_prob',
                 'dt_minutes', 'channels', 'cache_format',
+                'context_steps', 'tail_steps', 'tail_arms', 'tail_channels',
             )
             missing = [k for k in required_keys if k not in meta]
             if missing:
@@ -358,12 +382,35 @@ class T1DMDataset(Dataset):
                     "Rebuild the cache with the matching warmup or change the "
                     "dataset/training config."
                 )
-            cache_sim_hours = float(meta['sim_hours'])
-            if abs(cache_sim_hours - float(ON_THE_FLY_SIM_HOURS)) > 1e-6:
+            # The geometry is read off the cache, never off a simulated-hours scalar held here.
+            context_steps = int(meta['context_steps'])
+            if (context_steps != int(meta['n_timesteps'])
+                    or context_steps % PATCH_SIZE
+                    or context_steps < MIN_CONTEXT_PATCHES * PATCH_SIZE):
                 raise ValueError(
-                    f"Cache sim_hours={cache_sim_hours} disagrees with "
-                    f"ON_THE_FLY_SIM_HOURS={ON_THE_FLY_SIM_HOURS}. "
-                    "Rebuild the cache or change ON_THE_FLY_SIM_HOURS in data.py."
+                    f"Cache context_steps={context_steps} must equal n_timesteps="
+                    f"{meta['n_timesteps']}, be a multiple of PATCH_SIZE={PATCH_SIZE} "
+                    f"and hold at least MIN_CONTEXT_PATCHES={MIN_CONTEXT_PATCHES} "
+                    "patches. Rebuild the cache."
+                )
+            if int(meta['tail_steps']) != TAIL_STEPS:
+                raise ValueError(
+                    f"Cache tail_steps={meta['tail_steps']} disagrees with "
+                    f"PREDICTION_PATCHES*PATCH_SIZE={TAIL_STEPS}; the horizon is the "
+                    "tail. Rebuild the cache with --tail-steps to match."
+                )
+            if tuple(meta['tail_arms']) != TAIL_ARMS:
+                raise ValueError(
+                    f"Cache tail_arms={tuple(meta['tail_arms'])} disagrees with "
+                    f"{TAIL_ARMS}; the index is the arm's identity. Rebuild the cache."
+                )
+            tail_absent = [c for c in READ_TAIL_CHANNELS
+                           if c not in tuple(meta['tail_channels'])]
+            if tail_absent:
+                raise ValueError(
+                    f"Cache tail_channels lack {tail_absent}, which the "
+                    f"{INPUT_LAYOUT!r} layout reads at the horizon "
+                    "(cache_simulator.py --events). Rebuild the cache."
                 )
             cache_dt = float(meta['dt_minutes'])
             if abs(cache_dt - float(_DT_MINUTES)) > 1e-6:
@@ -402,99 +449,57 @@ class T1DMDataset(Dataset):
     def __len__(self) -> int:
         return self.total_steps * self.batch_size
 
-    def _load_cache(self) -> tuple[dict[str, Any], np.ndarray]:
+    def _load_cache(self) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
         """Open the cache arrays on first use in this process.
 
-        Per-channel array dict plus the per-patient ICR array. Only the npy format is mapped.
+        Per-channel array dict — context plus ``tail_`` arms — with the ICR and skill tables.
         """
         if self._cache_arrays is None:
             assert self.cache_path is not None
             assert self._cache_pool_size is not None
             assert self._cache_n_timesteps is not None
             assert self._cache_meta is not None
-            expected_shape = (self._cache_pool_size, self._cache_n_timesteps)
-            cache_format = str(self._cache_meta['cache_format'])
+            pool = self._cache_pool_size
+            import blosc2
             arrays: dict[str, Any] = {}
-
-            if cache_format == CACHE_FORMAT_NPY:
-                mmaps: dict[str, tuple[Any, int, int]] = {}
-                for name in READ_CACHE_CHANNELS:
-                    arr = np.load(
-                        os.path.join(self.cache_path, f'{name}.npy'),
-                        mmap_mode='r',
+            wanted = [(n, (pool, self._cache_n_timesteps)) for n in READ_CACHE_CHANNELS]
+            wanted += [(f'tail_{n}', (pool, N_TAIL_ARMS, TAIL_STEPS))
+                       for n in READ_TAIL_CHANNELS]
+            for name, expected_shape in wanted:
+                # Not mmap_mode='r': blosc2 has no madvise, so mapped pages never drop.
+                arr = blosc2.open(
+                    os.path.join(self.cache_path, f'{name}.b2nd'), mode='r')
+                if not isinstance(arr, blosc2.NDArray):
+                    raise ValueError(
+                        f"Cache channel {name!r} is not a blosc2 NDArray "
+                        f"(got {type(arr).__name__}). The cache directory "
+                        "is corrupt or built by a different tool — rebuild it."
                     )
-                    if tuple(arr.shape) != expected_shape:
-                        raise ValueError(
-                            f"Cache channel {name!r} has shape {tuple(arr.shape)}, "
-                            f"expected {expected_shape} from meta.json. The cache "
-                            "directory is corrupt or partially-written — rebuild it."
-                        )
-                    arrays[name] = arr
-                    # Suppresses 128 KB readahead; access is 100% random, so it buys nothing.
-                    _madv_random = getattr(mmap, 'MADV_RANDOM', None)
-                    if _madv_random is not None:
-                        try:
-                            arr._mmap.madvise(_madv_random)
-                        except (OSError, ValueError, AttributeError):
-                            pass
-                    # Per-row byte geometry, for __getitem__'s MADV_DONTNEED.
-                    mmaps[name] = (
-                        arr._mmap, int(arr.offset),
-                        int(arr.shape[1] * arr.dtype.itemsize),
+                if tuple(arr.shape) != expected_shape:
+                    raise ValueError(
+                        f"Cache channel {name!r} has shape {tuple(arr.shape)}, "
+                        f"expected {expected_shape} from meta.json. The cache "
+                        "directory is corrupt or partially-written — rebuild it."
                     )
-                if self._madv_dontneed is not None:
-                    self._cache_mmaps = mmaps
-            else:
-                import blosc2
-                for name in READ_CACHE_CHANNELS:
-                    # Not mmap_mode='r': blosc2 has no madvise, so mapped pages never drop.
-                    arr = blosc2.open(
-                        os.path.join(self.cache_path, f'{name}.b2nd'),
-                        mode='r',
-                    )
-                    if not isinstance(arr, blosc2.NDArray):
-                        raise ValueError(
-                            f"Cache channel {name!r} is not a blosc2 NDArray "
-                            f"(got {type(arr).__name__}). The cache directory "
-                            "is corrupt or built by a different tool — rebuild it."
-                        )
-                    if tuple(arr.shape) != expected_shape:
-                        raise ValueError(
-                            f"Cache channel {name!r} has shape {tuple(arr.shape)}, "
-                            f"expected {expected_shape} from meta.json. The cache "
-                            "directory is corrupt or partially-written — rebuild it."
-                        )
-                    arrays[name] = arr
+                arrays[name] = arr
             self._cache_arrays = arrays
             icr = np.load(os.path.join(self.cache_path, 'icr.npy'))
-            if icr.shape != (self._cache_pool_size,):
+            if icr.shape != (pool,):
                 raise ValueError(
                     f"Cache icr.npy has shape {icr.shape}, expected "
-                    f"({self._cache_pool_size},). Rebuild the cache."
+                    f"({pool},). Rebuild the cache."
                 )
             self._cache_icr = icr
+            skills = np.load(os.path.join(self.cache_path, SKILLS_FILE))
+            if skills.shape != (pool, N_SKILLS):
+                raise ValueError(
+                    f"Cache {SKILLS_FILE} has shape {skills.shape}, expected "
+                    f"({pool}, {N_SKILLS}) for {list(SKILL_NAMES)}. Rebuild the cache."
+                )
+            self._cache_skills = skills.astype(np.float32)
         assert self._cache_arrays is not None and self._cache_icr is not None
-        return self._cache_arrays, self._cache_icr
-
-    def _madvise_row(self, cache_idx: int) -> None:
-        """Reclaim the page-cache pages just read for row ``cache_idx``.
-
-        Best-effort: a no-op under blosc2 (never mapped) or without ``MADV_DONTNEED``.
-        """
-        mmaps = self._cache_mmaps
-        advice = self._madv_dontneed
-        if mmaps is None or advice is None:
-            return
-        page = mmap.PAGESIZE
-        for mm, data_offset, row_bytes in mmaps.values():
-            start = data_offset + cache_idx * row_bytes
-            aligned = start - (start % page)
-            length = (start + row_bytes) - aligned
-            length += (-length) % page  # whole pages
-            try:
-                mm.madvise(advice, aligned, length)
-            except (OSError, ValueError, AttributeError):
-                pass
+        assert self._cache_skills is not None
+        return self._cache_arrays, self._cache_icr, self._cache_skills
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """One training sample for ``idx`` in ``[0, total_steps * batch_size)``.
@@ -508,50 +513,41 @@ class T1DMDataset(Dataset):
             self.master_seed + self.seed_offset, step, position,
         )
 
+        # Separate substream, so the arm draw cannot influence window selection.
+        arm = int(np.random.default_rng(patient_seed ^ 0xA12_0F5E1).integers(N_TAIL_ARMS))
+
         if self.cache_path is not None:
-            cache_arrays, cache_icr = self._load_cache()
+            cache_arrays, cache_icr, cache_skills = self._load_cache()
             assert self._cache_pool_size is not None
             assert self._cache_slab is not None
             # DISJOINT band: a held-out (val/cal) seed can only resolve to a reserved tail row.
             slab_start, slab_size = self._cache_slab
             cache_idx = slab_start + int(patient_seed % slab_size)
-            if self._cache_mmaps is not None:
-                # Copies the row out before MADV_DONTNEED, else it aliases the dropped pages.
-                data = {
-                    name: np.array(cache_arrays[name][cache_idx:cache_idx + 1])[0]
-                    for name in READ_CACHE_CHANNELS
-                }
-                self._madvise_row(cache_idx)
-            else:
-                # blosc2 indexing decompresses into a fresh array; no copy or advise needed.
-                data = {
-                    name: np.asarray(cache_arrays[name][cache_idx:cache_idx + 1])[0]
-                    for name in READ_CACHE_CHANNELS
-                }
+            # blosc2 indexing decompresses into a fresh array; no copy or advise needed.
+            row = {
+                name: np.asarray(cache_arrays[name][cache_idx:cache_idx + 1])[0]
+                for name in READ_CACHE_CHANNELS
+            }
+            row |= {
+                f'tail_{name}': np.asarray(
+                    cache_arrays[f'tail_{name}'][cache_idx:cache_idx + 1])[0]
+                for name in READ_TAIL_CHANNELS
+            }
             icr = float(cache_icr[cache_idx])
+            skills = cache_skills[cache_idx]
         else:
-            # Keyed off patient_seed so the same idx always resolves the same way.
-            if self.patient_uniform_sample_prob > 0.0:
-                mode_rng = np.random.default_rng(patient_seed ^ 0x5A17_5EEDD)
-                use_uniform = bool(mode_rng.random() < self.patient_uniform_sample_prob)
-            else:
-                use_uniform = False
+            row, icr, skills = simulate_row(patient_seed)
 
-            sim = _make_simulator(patient_seed, uniform_skills=use_uniform)
-            data = simulate_discard_warmup(
-                sim, ON_THE_FLY_SIM_HOURS, warmup_hours=self.simulator_warmup_hours
-            )
-            icr = float(sim.patient.icr)
-
-        # Separate substream, so the mode rng above cannot influence window selection.
         rng = np.random.default_rng(patient_seed ^ 0xDEADBEEF)
         return _build_sample(
-            data=data,
+            data=row_trajectory(row, arm),
             icr=icr,
             stats=self.stats,
             rng=rng,
             force_pred_start_hour=self.force_pred_start_hour,
             blind=self.blind,
+            boundary=True,
+            skills=skills,
         )
 
 
@@ -706,17 +702,17 @@ def _build_sample(
     rng: np.random.Generator,
     force_pred_start_hour: float | None = None,
     blind: bool = False,
+    boundary: bool = False,
+    skills: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """One training sample from a raw simulator output dict.
 
-    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``, ``icr``
-    (g/U, the patient's, read only by the counterfactual probe). Raw post-noise, no smoothing.
+    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``, ``icr``,
+    ``skills``. ``boundary`` pins the horizon to the trajectory's last PREDICTION_PATCHES.
     """
-    # total_exercise is a carb-EQUIVALENT glucose-disposal curve in g/step; never rescaled.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     bg_raw = data['bg_observed'].astype(np.float32)
     hour_of_day = data['hour_of_day'].astype(np.float32)
-    day_index = data['day'].astype(np.int32)
 
     N = len(bg_raw)
 
@@ -739,7 +735,7 @@ def _build_sample(
         f"{len(CHANNEL_NAMES)}, N_INPUT_FEATURES={N_INPUT_FEATURES}"
     )
 
-    # Exercise is a carb-equivalent disposal rate, not a glucose: log1p branch, never risk.
+    # A dose channel is a rate or a point dose, not a glucose: log1p branch, never risk.
     for c, name in enumerate(CHANNEL_NAMES):
         mean = stats[name]['mean']
         std = stats[name]['std']
@@ -753,42 +749,55 @@ def _build_sample(
             col = log_ratio(col, LOG_RATIO_REFS[name])
         features[:, c] = (col - mean) / (std + 1e-8)
 
-    # One random window per sample: n_ctx variable, horizon fixed, patch-aligned start.
-    n_ctx = int(rng.integers(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1))
-    long_horizon_patches = max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
-    total_patches_needed = n_ctx + long_horizon_patches
-    total_steps_needed = total_patches_needed * PATCH_SIZE
-
-    # Multiple of PATCH_SIZE for a clean reshape; too short for drawn n_ctx falls back to minimum.
-    N_trimmed = (N // PATCH_SIZE) * PATCH_SIZE
-    if N_trimmed < total_steps_needed:
-        n_ctx = MIN_CONTEXT_PATCHES
-        total_patches_needed = n_ctx + long_horizon_patches
-        total_steps_needed = total_patches_needed * PATCH_SIZE
-
     n_pred_steps = PREDICTION_PATCHES * PATCH_SIZE
-    n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
-    # The room requirement is the long horizon, so the trailing GT slice fits.
-    if force_pred_start_hour is not None:
-        # Falls back to a uniform-random origin when no candidate near the target hour fits.
-        pred_start_step = _pick_pred_start_step_at_hour(
-            hour_of_day[:N_trimmed], n_ctx, n_long_horizon_steps,
-            float(force_pred_start_hour), rng,
-        )
-        if pred_start_step is None:
+    # Multiple of PATCH_SIZE for a clean reshape.
+    N_trimmed = (N // PATCH_SIZE) * PATCH_SIZE
+
+    if boundary:
+        # The tails end the row, so the horizon is fixed and the context is what precedes it.
+        long_horizon_patches = PREDICTION_PATCHES
+        pred_start_step = N_trimmed - n_pred_steps
+        ctx_avail = pred_start_step // PATCH_SIZE
+        if ctx_avail < MIN_CONTEXT_PATCHES:
+            raise RuntimeError(
+                f"boundary row holds {ctx_avail} context patches, below "
+                f"MIN_CONTEXT_PATCHES={MIN_CONTEXT_PATCHES}"
+            )
+        n_ctx = int(rng.integers(
+            MIN_CONTEXT_PATCHES, min(MAX_CONTEXT_PATCHES, ctx_avail) + 1))
+    else:
+        # One random window per sample: n_ctx variable, horizon fixed, patch-aligned start.
+        n_ctx = int(rng.integers(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1))
+        long_horizon_patches = max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
+        # Too short for the drawn n_ctx falls back to the minimum.
+        if N_trimmed < (n_ctx + long_horizon_patches) * PATCH_SIZE:
+            n_ctx = MIN_CONTEXT_PATCHES
+        n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
+        # The room requirement is the long horizon, so the trailing GT slice fits.
+        if force_pred_start_hour is not None:
+            # Falls back to a uniform-random origin when no candidate near the target fits.
+            pred_start_step = _pick_pred_start_step_at_hour(
+                hour_of_day[:N_trimmed], n_ctx, n_long_horizon_steps,
+                float(force_pred_start_hour), rng,
+            )
+            if pred_start_step is None:
+                pred_start_step = _pick_pred_start_step(
+                    N_trimmed, n_ctx, n_long_horizon_steps, rng,
+                )
+        else:
             pred_start_step = _pick_pred_start_step(
                 N_trimmed, n_ctx, n_long_horizon_steps, rng,
             )
-    else:
-        pred_start_step = _pick_pred_start_step(
-            N_trimmed, n_ctx, n_long_horizon_steps, rng,
-        )
-    if pred_start_step is None:
-        # Raising skips the sample; DataLoader retries the next index.
-        raise RuntimeError(
-            f"No prediction window found; trajectory length {N_trimmed}, "
-            f"n_ctx={n_ctx}, n_pred={n_pred_steps}"
-        )
+        if pred_start_step is None:
+            # Raising skips the sample; DataLoader retries the next index.
+            raise RuntimeError(
+                f"No prediction window found; trajectory length {N_trimmed}, "
+                f"n_ctx={n_ctx}, n_pred={n_pred_steps}"
+            )
+
+    total_patches_needed = n_ctx + long_horizon_patches
+    total_steps_needed = total_patches_needed * PATCH_SIZE
+    n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
     start_step = pred_start_step - n_ctx * PATCH_SIZE
     end_step = start_step + total_steps_needed
 
@@ -881,7 +890,7 @@ def _build_sample(
     }
     if INPUT_LAYOUT == 'curves':
         # Named views of the same columns, for the curve-shaped what-if and probe tooling.
-        for ch, key in enumerate(('carb', 'insulin', 'exercise')):
+        for ch, key in enumerate(('carb', 'insulin')):
             bg_formula_data[f'extended_{key}_norm'] = extended_dose_norm[:, ch].copy()
             bg_formula_data[f'extended_{key}_raw'] = extended_dose_raw[:, ch].copy()
     if unblinded_dose_rows is not None:
@@ -895,22 +904,26 @@ def _build_sample(
         'n_context_patches': n_ctx,
         'bg_formula_data': bg_formula_data,
         'icr': float(icr),
+        'skills': None if skills is None else np.asarray(skills, dtype=np.float32),
     }
 
-    # Cross-window time-of-day probe: window k+1, teacher-forced, one right-edge span; diagnostic.
+    # Cross-window time-of-day probe: the paired window, teacher-forced, one right-edge span.
     if TIME_PROBE_ENABLED and TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0:
-        next_end_patch = n_ctx + 2 * PREDICTION_PATCHES
-        next_valid = next_end_patch <= total_patches_needed   # in-range on patches_3d
+        # A boundary row has nothing past its horizon, so the pair shifts back into the context.
+        next_offset = PREDICTION_PATCHES * PATCH_SIZE
+        if n_ctx + 2 * PREDICTION_PATCHES > total_patches_needed:
+            next_offset = -next_offset
+        next_start = start_step + next_offset
+        next_valid = next_start >= 0 and next_start + seq_len * PATCH_SIZE <= N_trimmed
         next_spans = [(n_ctx, PREDICTION_PATCHES)]
         next_mask_idx, next_slot_valid, next_d, next_anchor_step = _mask_slots(
             next_spans, seq_len
         )
         next_masked_rows = torch.arange(n_ctx, n_ctx + PREDICTION_PATCHES)
-        # Window k+1's own step 0 is at PREDICTION_PATCHES*PATCH_SIZE in bg_window.
-        next_offset = PREDICTION_PATCHES * PATCH_SIZE
         if next_valid:
+            next_bg_window = bg[next_start:next_start + seq_len * PATCH_SIZE]
             next_patches_t = torch.from_numpy(
-                patches_3d[PREDICTION_PATCHES:next_end_patch]
+                features[next_start:next_start + seq_len * PATCH_SIZE]
                 .reshape(seq_len, PATCH_SIZE * N_INPUT_FEATURES).copy()
             )
             for feat_idx in NON_MASKABLE_FEATS:
@@ -918,15 +931,15 @@ def _build_sample(
             next_patches_t[next_masked_rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
             next_pred_start_step = pred_start_step + next_offset
             next_last_bg = float(
-                bg_window[next_offset + _anchor_step_for_span(n_ctx, PREDICTION_PATCHES)]
+                next_bg_window[_anchor_step_for_span(n_ctx, PREDICTION_PATCHES)]
             )                                                # raw mg/dL (clamped, physical)
             next_anchor_bg = np.full(MAX_MASKED_PATCHES, next_last_bg, dtype=np.float32)
-            next_anchor_bg[next_slot_valid] = bg_window[
-                next_offset + next_anchor_step[next_slot_valid]
+            next_anchor_bg[next_slot_valid] = next_bg_window[
+                next_anchor_step[next_slot_valid]
             ]
             next_pred_start_hour = float(hour_of_day[next_pred_start_step])
             next_slot_hour = hour_of_day[
-                start_step + next_offset + next_mask_idx * PATCH_SIZE
+                next_start + next_mask_idx * PATCH_SIZE
             ].astype(np.float32)
         else:
             # Finite placeholder, masked out downstream; reuses window k's legal last_bg.
@@ -997,6 +1010,16 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     # Diagonal is forced True at EVERY position (padding included) so no row is all-False.
     attn_masks = utils.create_attention_mask_from_visible(~masked, is_pad)
     assert attn_masks.any(dim=-1).all(), "an all-False attention row NaNs softmax"
+
+    # The skill head pools these patches alone: real readings the model was allowed to see.
+    pool_mask = (~masked) & (~is_pad)
+    skills_valid = torch.tensor(
+        [s.get('skills') is not None for s in samples], dtype=torch.bool)
+    skills_batch = torch.zeros(B, N_SKILLS, dtype=torch.float32)
+    for i, s in enumerate(samples):
+        if skills_valid[i]:
+            skills_batch[i] = torch.from_numpy(
+                np.asarray(s['skills'], dtype=np.float32))
 
     # Feat 4 must agree with the masked set that built attn_mask; nothing else catches drift.
     _bit = patches_batch[..., BG_MASKED_FEAT::N_INPUT_FEATURES]   # (B, max_T, PATCH_SIZE)
@@ -1092,6 +1115,9 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         'patches': patches_batch,
         'targets': targets_batch,
         'attn_mask': attn_masks,
+        'pool_mask': pool_mask,
+        'skills': skills_batch,
+        'skills_valid': skills_valid,
         'bg_formula_data': bg_formula_batched,
         'n_context_patches': n_ctx_tensor,
         **({'next_window': next_window_batched} if next_window_batched is not None else {}),

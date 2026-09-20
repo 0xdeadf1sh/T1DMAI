@@ -1,8 +1,7 @@
 """The blosc2-backed simulator cache (T1DMSIM/cache_simulator.py + data.py). Builder lives in the
 EXTERNAL T1DMSIM repo (``T1DMSIM.cache_simulator``), reached via the T1DMAI/T1DMSIM symlink; no
-causal smoothing, stats fit on RAW transformed channels. FOUR normalized channels; input stack is
-five wide, feat 4 = ``bg_masked`` bit, no statistics. ``pool_size=4``, ``n_jobs=1``, real
-``ON_THE_FLY_SIM_HOURS``/``SIMULATOR_WARMUP_HOURS`` so ``T1DMDataset`` needs no monkey-patch."""
+causal smoothing, stats fit on RAW transformed channels over context AND tails. ``pool_size=4``,
+``n_jobs=1``, the contract geometry so ``T1DMDataset`` needs no monkey-patch."""
 
 from __future__ import annotations
 
@@ -16,11 +15,11 @@ import pytest
 import torch
 
 import config as _cfg
-import data as _data
 from config import (
     MAX_CONTEXT_PATCHES,
     MAX_MASKED_PATCHES,
     MIN_CONTEXT_PATCHES,
+    N_SKILLS,
     PATCH_DIM,
     PATCH_SIZE,
     PREDICTION_PATCHES,
@@ -29,27 +28,31 @@ from T1DMSIM.cache_simulator import (
     CACHE_FORMAT_VERSION,
     CHANNEL_NAMES,
     DEFAULT_ROWS_PER_CHUNK,
+    N_TAIL_ARMS,
+    SKILLS_FILE,
+    TAIL_ARMS,
     _BLOSC2_MAX_CHUNK_BYTES,
     _resolve_rows_per_chunk,
     build_cache,
+    tail_channel_names,
 )
 from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
 
-
-# Matches what T1DMDataset checks against config; one patient ~90 ms, pool_size=4 stays under 1s.
-_TINY_SIM_HOURS = _data.ON_THE_FLY_SIM_HOURS
 _TINY_WARMUP_HOURS = _cfg.SIMULATOR_WARMUP_HOURS
 _TINY_POOL = 4
 _TINY_UNIFORM_PROB = 0.0
+_CONTEXT_STEPS = MAX_CONTEXT_PATCHES * PATCH_SIZE
+_TAIL_STEPS = PREDICTION_PATCHES * PATCH_SIZE
 
-# the eight top-level meta.json keys the T1DMDataset loader hard-checks
+# the top-level meta.json keys the T1DMDataset loader hard-checks
 _REQUIRED_META_KEYS = (
     'pool_size', 'n_timesteps', 'sim_hours', 'simulator_warmup_hours',
     'patient_uniform_sample_prob', 'dt_minutes', 'channels', 'cache_format',
+    'context_steps', 'tail_steps', 'tail_arms', 'tail_channels',
 )
-# {mean, std} keys the builder emits: all four of ``normalization.CHANNEL_NAMES``, pinned here.
+# {mean, std} keys the builder emits for the curves layout, pinned here.
 _BUILDER_NORM_STATS_KEYS = frozenset({
-    'bg_absolute', 'carb_intake', 'insulin_combined', 'exercise_equiv',
+    'bg_absolute', 'carb_intake', 'insulin_combined',
 })
 
 
@@ -59,7 +62,6 @@ def _build_tiny_cache(out_dir: str, rows_per_chunk: int = DEFAULT_ROWS_PER_CHUNK
     build_cache(
         out_dir=out_dir,
         pool_size=_TINY_POOL,
-        sim_hours=_TINY_SIM_HOURS,
         warmup_hours=_TINY_WARMUP_HOURS,
         n_jobs=1,
         rows_per_chunk=rows_per_chunk,
@@ -90,38 +92,14 @@ def _model_stats(cache_dir: str) -> dict:
     return compute_normalization_stats_from_cache(cache_dir)
 
 
-def _transcode_to_npy_memmap(blosc2_dir: str, npy_dir: str) -> None:
-    """Rewrite a built blosc2 cache as an ``npy-memmap-v1`` cache, same data.
-
-    The external builder only emits blosc2, so the reader's npy path is exercised
-    through this synthesis.
-    """
-    import blosc2
-
-    os.makedirs(npy_dir, exist_ok=True)
-    for name in CHANNEL_NAMES:
-        arr = blosc2.open(os.path.join(blosc2_dir, f'{name}.b2nd'), mode='r')
-        assert isinstance(arr, blosc2.NDArray)
-        np.save(os.path.join(npy_dir, f'{name}.npy'), np.asarray(arr[:]))
-    shutil.copy(
-        os.path.join(blosc2_dir, 'icr.npy'), os.path.join(npy_dir, 'icr.npy')
-    )
-    with open(os.path.join(blosc2_dir, 'meta.json')) as f:
-        meta = json.load(f)
-    meta['cache_format'] = 'npy-memmap-v1'
-    meta.pop('rows_per_chunk', None)
-    meta.pop('zstd_clevel', None)
-    with open(os.path.join(npy_dir, 'meta.json'), 'w') as f:
-        json.dump(meta, f)
-
-
 def test_cache_layout(blosc2_cache: str) -> None:
     out_dir = blosc2_cache
 
     files = set(os.listdir(out_dir))
     expected = (
         {f'{name}.b2nd' for name in CHANNEL_NAMES}
-        | {'icr.npy', 'meta.json', 'normalization_stats.json'}
+        | {f'tail_{name}.b2nd' for name in tail_channel_names(False)}
+        | {'icr.npy', SKILLS_FILE, 'meta.json', 'normalization_stats.json'}
     )
     assert files == expected, f"Cache directory mismatch: {files} != {expected}"
 
@@ -134,11 +112,16 @@ def test_cache_layout(blosc2_cache: str) -> None:
     assert not missing, f"meta.json missing required keys: {missing}"
     assert meta['cache_format'] == CACHE_FORMAT_VERSION
     assert meta['pool_size'] == _TINY_POOL
-    assert meta['n_timesteps'] > 0
-    assert abs(meta['sim_hours'] - _TINY_SIM_HOURS) < 1e-6
+    assert meta['n_timesteps'] == _CONTEXT_STEPS == meta['context_steps']
+    assert meta['tail_steps'] == _TAIL_STEPS
+    assert tuple(meta['tail_arms']) == TAIL_ARMS
     assert abs(meta['simulator_warmup_hours'] - _TINY_WARMUP_HOURS) < 1e-6
     assert meta['patient_uniform_sample_prob'] == _TINY_UNIFORM_PROB
     assert tuple(meta['channels']) == CHANNEL_NAMES
+
+    skills = np.load(os.path.join(out_dir, SKILLS_FILE))
+    assert skills.shape == (_TINY_POOL, N_SKILLS) and skills.dtype == np.float32
+    assert ((skills >= 0.0) & (skills <= 1.0)).all()
 
     # the builder's emitted {mean, std} must COVER the model's input stack, nothing left over
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
@@ -153,8 +136,26 @@ def test_cache_layout(blosc2_cache: str) -> None:
         f"builder-emitted stats {sorted(stats)} vs model channels "
         f"{sorted(NORM_CHANNEL_NAMES)}: the builder must fit every channel and "
         f"only those")
-    print(f"[DUMP] cache_layout | norm stats = {stats} (builder: 3 keys; model "
-          f"needs {len(NORM_CHANNEL_NAMES)}, exercise_equiv hand-merged)")
+    print(f"[DUMP] cache_layout | norm stats = {stats}")
+
+
+def test_tail_arrays_have_the_contract_shape(blosc2_cache: str) -> None:
+    """One (pool, 4, tail_steps) array per tail channel; arm 0 is the no-dose continuation."""
+    import blosc2
+
+    for name in tail_channel_names(False):
+        arr = blosc2.open(os.path.join(blosc2_cache, f'tail_{name}.b2nd'), mode='r')
+        assert isinstance(arr, blosc2.NDArray)
+        assert tuple(arr.shape) == (_TINY_POOL, N_TAIL_ARMS, _TAIL_STEPS), name
+
+    carb = np.asarray(blosc2.open(
+        os.path.join(blosc2_cache, 'tail_total_carb.b2nd'), mode='r')[:])
+    bolus = np.asarray(blosc2.open(
+        os.path.join(blosc2_cache, 'tail_bolus_insulin.b2nd'), mode='r')[:])
+    # arms 2/3 carry the boundary carbohydrate, arms 1/3 the boundary bolus
+    assert (carb[:, 2, 0] > carb[:, 0, 0]).all()
+    assert (bolus[:, 1, 0] > bolus[:, 0, 0]).all()
+    print(f"\n[DUMP] tails | arms={TAIL_ARMS} steps={_TAIL_STEPS}")
 
 
 def test_cache_compression_shrinks_disk(blosc2_cache: str) -> None:
@@ -200,7 +201,8 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
 
     for i in range(len(dataset)):
         sample = dataset[i]
-        assert set(sample) >= {'patches', 'targets', 'n_context_patches', 'bg_formula_data'}
+        assert set(sample) >= {'patches', 'targets', 'n_context_patches',
+                               'bg_formula_data', 'skills'}
         patches = sample['patches']
         targets = sample['targets']
         n_ctx = sample['n_context_patches']
@@ -212,6 +214,7 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
         assert patches.dtype == torch.float32 and targets.dtype == torch.float32
         assert torch.isfinite(patches).all(), f"non-finite patches at {i}"
         assert torch.isfinite(targets).all(), f"non-finite targets at {i}"
+        assert sample['skills'].shape == (N_SKILLS,)
 
         # the target is the true BG label, in physical mg/dL
         tnp = targets.numpy()
@@ -228,17 +231,35 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
           f"n_ctx={s0['n_context_patches']} last_bg={s0['bg_formula_data']['last_bg']:.1f}")
 
 
+def test_horizon_bg_is_the_sampled_arms_tail(blosc2_cache: str) -> None:
+    """The forecast target is the chosen arm's tail BG, read straight off the cache."""
+    import blosc2
+    from data import T1DMDataset
+
+    stats = _model_stats(blosc2_cache)
+    ds = T1DMDataset(master_seed=0, total_steps=4, batch_size=1,
+                     normalization_stats=stats, cache_path=blosc2_cache)
+    tail_bg = np.asarray(blosc2.open(
+        os.path.join(blosc2_cache, 'tail_bg_observed.b2nd'), mode='r')[:])
+    for i in range(4):
+        s = ds[i]
+        true_bg = np.asarray(s['bg_formula_data']['true_bg_trajectory'])
+        # one of the four arms, clamped to the physical range by _build_sample
+        arms = np.clip(tail_bg[:, :, :], BG_CLAMP_MIN, BG_CLAMP_MAX)
+        assert any(np.allclose(true_bg, arms[r, a], atol=1e-4)
+                   for r in range(_TINY_POOL) for a in range(N_TAIL_ARMS)), i
+
+
 def test_stats_missing_a_channel_are_refused_by_the_loader(blosc2_cache: str) -> None:
     """A missing channel must FAIL rather than leave that channel untrained.
     Input gather walks ``CHANNEL_NAMES`` and indexes ``stats[name]``, so a
     ``.get(name, {'mean': 0, 'std': 1})`` fallback anywhere turns a missing fit into an
-    untrained channel that trains to completion. Short file CONSTRUCTED here, so a builder
-    that stops emitting one cannot retire this path."""
+    untrained channel that trains to completion."""
     from data import T1DMDataset
 
     stats = {k: v for k, v in _cache_stats(blosc2_cache).items()
-             if k != 'exercise_equiv'}
-    assert 'exercise_equiv' not in stats
+             if k != 'insulin_combined'}
+    assert 'insulin_combined' not in stats
     dataset = T1DMDataset(
         master_seed=0,
         total_steps=1,
@@ -248,10 +269,9 @@ def test_stats_missing_a_channel_are_refused_by_the_loader(blosc2_cache: str) ->
         simulator_warmup_hours=_TINY_WARMUP_HOURS,
         cache_path=blosc2_cache,
     )
-    with pytest.raises(KeyError, match='exercise_equiv'):
+    with pytest.raises(KeyError, match='insulin_combined'):
         dataset[0]
-    print("\n[DUMP] three_key_stats | builder file raises KeyError('exercise_equiv') "
-          "at the input gather — no silent-default fallback ✓")
+    print("\n[DUMP] short_stats | raises KeyError at the input gather ✓")
 
 
 def test_rows_per_chunk_does_not_perturb_values(tmp_path: pathlib.Path) -> None:
@@ -292,7 +312,7 @@ def test_missing_required_meta_key_is_rejected(
     shutil.copytree(blosc2_cache, bad_dir)
     with open(os.path.join(bad_dir, 'meta.json')) as f:
         meta = json.load(f)
-    meta.pop('pool_size', None)
+    meta.pop('tail_arms', None)
     with open(os.path.join(bad_dir, 'meta.json'), 'w') as f:
         json.dump(meta, f)
 
@@ -332,48 +352,27 @@ def test_unsupported_cache_format_is_rejected(
         )
 
 
-def test_npy_memmap_cache_reads_back_identically(
+def test_wrong_tail_geometry_is_rejected(
     blosc2_cache: str, tmp_path: pathlib.Path
 ) -> None:
-    """The uncompressed layout is a read convenience for pools shaped elsewhere, so it
-    must decode to exactly the same per-channel data as the compressed one."""
-    from data import CACHE_CHANNEL_NAMES, CACHE_FORMAT_NPY, T1DMDataset
+    """The horizon IS the tail: a tail of another length cannot be consumed."""
+    from data import T1DMDataset
 
-    blosc2_dir = blosc2_cache
-    npy_dir = str(tmp_path / 'cache_npy')
-    _transcode_to_npy_memmap(blosc2_dir, npy_dir)
+    bad_dir = str(tmp_path / 'cache_bad_tail')
+    shutil.copytree(blosc2_cache, bad_dir)
+    with open(os.path.join(bad_dir, 'meta.json')) as f:
+        meta = json.load(f)
+    meta['tail_steps'] = _TAIL_STEPS + 6
+    with open(os.path.join(bad_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f)
 
-    files = set(os.listdir(npy_dir))
-    expected = {f'{name}.npy' for name in CHANNEL_NAMES} | {'icr.npy', 'meta.json'}
-    assert files == expected, f"npy cache dir mismatch: {files} != {expected}"
-    with open(os.path.join(npy_dir, 'meta.json')) as f:
-        assert json.load(f)['cache_format'] == CACHE_FORMAT_NPY
-
-    stats = _model_stats(blosc2_dir)
-    kwargs = dict(
-        master_seed=0,
-        total_steps=2,
-        batch_size=4,
-        normalization_stats=stats,
-        patient_uniform_sample_prob=_TINY_UNIFORM_PROB,
-        simulator_warmup_hours=_TINY_WARMUP_HOURS,
-    )
-    ds_b2 = T1DMDataset(cache_path=blosc2_dir, **kwargs)
-    ds_npy = T1DMDataset(cache_path=npy_dir, **kwargs)
-
-    # raw cache rows must be byte-identical across the two on-disk formats
-    arrays_b2, icr_b2 = ds_b2._load_cache()
-    arrays_npy, icr_npy = ds_npy._load_cache()
-    assert np.array_equal(icr_b2, icr_npy), "icr differs between formats"
-    for name in CACHE_CHANNEL_NAMES:
-        a = np.asarray(arrays_b2[name][:])
-        b = np.asarray(arrays_npy[name][:])
-        print(f"\n[DUMP] npy_parity | {name:<20} equal={np.array_equal(a, b)}")
-        assert np.array_equal(a, b), f"channel {name!r} differs between formats"
-
-    sample = ds_npy[0]
-    assert torch.isfinite(sample['patches']).all()
-    assert torch.isfinite(sample['targets']).all()
+    stats = _model_stats(blosc2_cache)
+    with pytest.raises(ValueError, match='tail_steps'):
+        T1DMDataset(
+            master_seed=0, total_steps=1, batch_size=1,
+            normalization_stats=stats,
+            cache_path=bad_dir,
+        )
 
 
 def test_resolve_rows_per_chunk_clamps() -> None:
@@ -408,11 +407,11 @@ def test_no_partial_dir_left_after_success(blosc2_cache: str) -> None:
 
 def _oracle_cache_stats(cache_dir: str, n_rows: int | None = None) -> dict:
     """A naive oracle for the streaming Welford in ``compute_normalization_stats_from_cache``.
-    Reads all four signals in full, applies the fit's own forward transform —
-    ``kovatchev_f_np`` on bg, ``log1p(max(x, 0))`` on the sparse three — to RAW post-noise
-    values, then plain ``np.mean``/``np.std(ddof=1)``. ``total_exercise`` reads at its
-    cached g/step scale: not a glucose, so log1p, never the risk transform."""
+    Reads each signal's context AND tails in full, applies the fit's own forward transform —
+    ``kovatchev_f_np`` on bg, ``log1p(max(x, 0))`` on the sparse pair — to RAW post-noise
+    values, then plain ``np.mean``/``np.std(ddof=1)``."""
     import blosc2
+    from data import SIM_CHANNEL
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
     from utils import kovatchev_f_np
 
@@ -421,20 +420,10 @@ def _oracle_cache_stats(cache_dir: str, n_rows: int | None = None) -> dict:
         full = np.asarray(arr[:], dtype=np.float64)
         return full if n_rows is None else full[:n_rows]
 
-    # model channel -> the cached channel it is fit from
-    _SOURCE_CHANNEL = {
-        'bg_absolute': 'bg_observed',
-        'carb_intake': 'total_carb',
-        'insulin_combined': 'total_insulin',
-        'exercise_equiv': 'total_exercise',
-    }
-    assert set(_SOURCE_CHANNEL) == set(NORM_CHANNEL_NAMES), (
-        f"oracle covers {sorted(_SOURCE_CHANNEL)} but the model fits "
-        f"{sorted(NORM_CHANNEL_NAMES)} — an uncovered channel silently drops out")
-
     out = {}
     for name in NORM_CHANNEL_NAMES:
-        raw = _read(_SOURCE_CHANNEL[name])
+        src = SIM_CHANNEL[name]
+        raw = np.concatenate([_read(src).ravel(), _read(f'tail_{src}').ravel()])
         if name == 'bg_absolute':
             vals = kovatchev_f_np(raw).ravel()
         else:
@@ -443,11 +432,9 @@ def _oracle_cache_stats(cache_dir: str, n_rows: int | None = None) -> dict:
     return out
 
 
-def test_normalization_stats_from_cache(
-    blosc2_cache: str, tmp_path: pathlib.Path
-) -> None:
-    """Matches the oracle, is format-agnostic, honours ``sample_rows``, and reproduces
-    the builder's own emitted ``normalization_stats.json``."""
+def test_normalization_stats_from_cache(blosc2_cache: str) -> None:
+    """Matches the oracle, honours ``sample_rows``, and reproduces the builder's own
+    emitted ``normalization_stats.json``."""
     from normalization import (
         CHANNEL_NAMES as NORM_CHANNEL_NAMES,
         compute_normalization_stats_from_cache,
@@ -462,14 +449,6 @@ def test_normalization_stats_from_cache(
         assert got[name]['mean'] == pytest.approx(oracle[name]['mean'], rel=1e-6, abs=1e-6), name
         assert got[name]['std'] == pytest.approx(oracle[name]['std'], rel=1e-6, abs=1e-6), name
 
-    # the same data as npy-memmap-v1 must fit identical stats
-    npy_dir = str(tmp_path / 'cache_np')
-    _transcode_to_npy_memmap(blosc2_dir, npy_dir)
-    got_npy = compute_normalization_stats_from_cache(npy_dir, batch_rows=3)
-    for name in NORM_CHANNEL_NAMES:
-        assert got_npy[name]['mean'] == pytest.approx(got[name]['mean'], rel=1e-6, abs=1e-6), name
-        assert got_npy[name]['std'] == pytest.approx(got[name]['std'], rel=1e-6, abs=1e-6), name
-
     # sample_rows reads only the leading rows
     got_2 = compute_normalization_stats_from_cache(blosc2_dir, sample_rows=2, batch_rows=2)
     oracle_2 = _oracle_cache_stats(blosc2_dir, n_rows=2)
@@ -482,11 +461,6 @@ def test_normalization_stats_from_cache(
     for name in sorted(_BUILDER_NORM_STATS_KEYS):
         assert emitted[name]['mean'] == pytest.approx(got[name]['mean'], rel=1e-6, abs=1e-6), name
         assert emitted[name]['std'] == pytest.approx(got[name]['std'], rel=1e-6, abs=1e-6), name
-    assert 'exercise_equiv' in got and got['exercise_equiv']['std'] > 0, (
-        "the cache fitter must produce exercise_equiv even though the builder "
-        "does not emit it")
 
-    print(f"\n[DUMP] norm_from_cache | oracle match + npy==blosc2 + sample_rows "
-          f"honored across {len(NORM_CHANNEL_NAMES)} channels; "
-          f"emitted==recomputed over the builder's {len(_BUILDER_NORM_STATS_KEYS)} "
-          f"(exercise_equiv fit but not emitted)")
+    print(f"\n[DUMP] norm_from_cache | oracle match + sample_rows honored across "
+          f"{len(NORM_CHANNEL_NAMES)} channels; emitted==recomputed")
