@@ -259,7 +259,7 @@ SIM_CHANNEL |= {c: c for c in INPUT_LAYOUTS['events'][1:]}
 READ_CACHE_CHANNELS = CACHE_CHANNEL_NAMES + tuple(
     SIM_CHANNEL[n] for n in CHANNEL_NAMES if SIM_CHANNEL[n] not in CACHE_CHANNEL_NAMES)
 # Per-step tail channels a sample needs: the input channels plus the clock the slots read.
-READ_TAIL_CHANNELS = tuple(SIM_CHANNEL[n] for n in CHANNEL_NAMES) + ('hour_of_day', 'day')
+READ_TAIL_CHANNELS = tuple(SIM_CHANNEL[n] for n in CHANNEL_NAMES) + ('hour_of_day',)
 
 # The tails end the row, so a sample's context is the last n_ctx patches before the boundary.
 CONTEXT_STEPS = MAX_CONTEXT_PATCHES * PATCH_SIZE
