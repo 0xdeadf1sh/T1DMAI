@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from config import PATCH_SIZE, PREDICTION_PATCHES, QUANTILE_LEVELS
+import data as data_mod
 from data import T1DMDataset
 from model import T1DMAI
 from normalization import load_normalization_stats
@@ -382,7 +383,20 @@ def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
     kw = dict(master_seed=20_000_017, total_steps=N_VAL, batch_size=1,
               normalization_stats=stats, patient_uniform_sample_prob=0.0)
 
-    ds = T1DMDataset(**kw)
+    class _OneSlotRow(T1DMDataset):
+        """Row 0 masks one patch, the 0/0 jump case the pinned boundary tail cannot produce."""
+
+        def __getitem__(self, idx):
+            if idx != 0:
+                return super().__getitem__(idx)
+            original = data_mod.sample_mask_spans
+            data_mod.sample_mask_spans = lambda n, rng, pin_right=None: [(n - 1, 1)]
+            try:
+                return super().__getitem__(idx)
+            finally:
+                data_mod.sample_mask_spans = original
+
+    ds = _OneSlotRow(**kw)
     no_pair = sum(
         1 for i in range(N_VAL)
         if not bool((lambda v: v[1:] & v[:-1])(
@@ -391,7 +405,7 @@ def test_the_jump_row_a_real_validation_reports_is_the_filtered_mean():
         'no window in this fixture lacks a slot pair, so the filtered and '
         'unfiltered means are equal and this test has no subject')
 
-    metrics = train._run_validation(model, T1DMDataset(**kw), stats, device, weighting)
+    metrics = train._run_validation(model, _OneSlotRow(**kw), stats, device, weighting)
     reported = metrics['tod_jump_h']
 
     # same forward, same batching: the candidates differ only in which rows they average

@@ -44,26 +44,31 @@ def _dose_cells(patches: torch.Tensor, rows, cols) -> dict[int, torch.Tensor]:
 
 
 def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
-    """``_forecast_protocol`` masks ``[T-PREDICTION_PATCHES, T)``; the sampler usually
-    masked elsewhere, so those patches carry true doses. Withhold only bg and the whole
-    clinical suite measures a conditioned forecast this model never trains on.
+    """``_forecast_protocol`` masks ``[T-PREDICTION_PATCHES, T)`` and must fill its doses.
+
+    The zone is announced here, as a batch off any other sampler carries it. Withhold only
+    bg and the clinical suite measures a conditioned forecast this model never trains on.
     """
     fill = zero_dose_fill(stats)
+    T = blind_batch['patches'].shape[1]
+    zone = list(range(T - PREDICTION_PATCHES, T))
+    # The boundary tail is masked at the dataset, so blind already filled it; announce a dose.
+    patches = blind_batch['patches'].clone()
+    for feat in MASKABLE_FEATS:
+        patches[:, zone, feat::N_INPUT_FEATURES] = float(fill[feat]) + 1.0
     fc = train_blind._forecast_protocol(
-        blind_batch['patches'], blind_batch['bg_formula_data']['mask_idx'].long(),
+        patches, blind_batch['bg_formula_data']['mask_idx'].long(),
         blind_batch['bg_formula_data']['valid'], blind_batch['n_context_patches'],
         fill)
     assert fc is not None, "no row survived the forecast protocol's anchor filter"
 
-    T = blind_batch['patches'].shape[1]
-    zone = list(range(T - PREDICTION_PATCHES, T))
     rows = torch.arange(fc['patches'].shape[0])
     print(f"\n[DUMP] forecast protocol: {len(rows)}/{N_SAMPLES} rows kept, "
           f"T={T}, zone={zone[0]}..{zone[-1]}")
 
     # The conditioned protocol on the SAME batch: the input the blind model must NOT validate on.
     fc_announced = train._forecast_protocol(
-        blind_batch['patches'], blind_batch['bg_formula_data']['mask_idx'].long(),
+        patches, blind_batch['bg_formula_data']['mask_idx'].long(),
         blind_batch['bg_formula_data']['valid'], blind_batch['n_context_patches'])
     assert fc_announced is not None
 
