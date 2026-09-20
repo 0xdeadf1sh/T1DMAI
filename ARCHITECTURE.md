@@ -176,7 +176,7 @@ weights trained under any of them.
 
 ## Inputs
 
-Five features per 5-minute step: four signal channels and one bit. There are no
+Four features per 5-minute step: three signal channels and one bit. There are no
 time-of-day features — day and night are inferred from the trajectory alone.
 
 | Feature | Units | Transform before the model |
@@ -231,7 +231,7 @@ slice `[:, f::N_INPUT_FEATURES]`. On a **masked** patch:
 
 The masked set is **announced, not inferred**. Masking is not a position rule,
 and `z = 0` in a withheld glucose slot decodes to an ordinary reading rather than
-a sentinel, so feat 4 is the only thing that tells the model which patches it
+a sentinel, so feat 3 is the only thing that tells the model which patches it
 must predict. `data.collate_fn` and `inference._assert_mask_announced` each assert
 that the bit reproduces the masked set — the one the attention mask was built from
 on the training path, the one the head gathers by `mask_idx` on the inference path

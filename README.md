@@ -160,7 +160,7 @@ one space. Only the reporting layer converts back to mg/dL.
 
 ## Inputs and outputs
 
-Five features per 5-minute step:
+Four features per 5-minute step:
 
 | Feature | Units | Transform |
 | --- | --- | --- |
@@ -334,11 +334,11 @@ at each seam.
 ## Capacity
 
 Capacity is set by `D_MODEL`, `N_LAYERS` and `N_HEADS` alone: `FFN_DIM`,
-`BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are multiples of `D_MODEL` and follow
-it.
+`BG_HEAD_HIDDEN`, `TIME_PROBE_HIDDEN` and `SKILL_HEAD_HIDDEN` are multiples of
+`D_MODEL` and follow it.
 
 `resize_model.py` instantiates a capacity and prints its exact trainable
-parameter count at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 30`, computed
+parameter count at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 24`, computed
 from the architecture rather than targeted; the model carries no buffers.
 
 Accuracy, wall-clock and peak-memory figures are not listed: none has been
@@ -486,8 +486,8 @@ both accepted.
 ## Real-world data: MetaboNet
 
 `finetune_data.py` merges MetaboNet's `train.parquet` and `test.parquet` (and,
-unless skipped, the DiaData archive) into one flat cache. Logged meals, doses and
-workouts become the suite's curves and, beside them, point events; the cache holds
+unless skipped, the DiaData archive) into one flat cache. Logged meals and doses
+become the suite's curves and, beside them, point events; the cache holds
 both layouts and both statistics files. It needs `pyarrow` and `pandas`.
 
 ```bash
@@ -666,10 +666,10 @@ layers, which carry no such term, and back to the composed one. `,` and `.` step
 forecast records one per roll, and only roll 0 reads a context that is entirely
 observed — every later roll attends to one partly built from the model's own
 output. Attention
-runs over patches alone — the patch embedding mixes the five features into one
+runs over patches alone — the patch embedding mixes the four features into one
 token before the first block — so the rows below it are gradient rather than
 attention: the signed `grad ⊙ input` per channel, red where an input raises the
-span's forecast and blue where it lowers it, on one scale across the four
+span's forecast and blue where it lowers it, on one scale across the three
 channels with each channel's share of the total at the right. A masked span's
 median is its anchor plus a delta, so the BG row carries the anchor's own term
 at the one context cell it was read from. Over a masked patch that row is marked

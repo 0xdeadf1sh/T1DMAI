@@ -31,18 +31,18 @@ evaluation and `compare.py` respectively.
 
 | Size | Architecture | Parameters |
 | --- | --- | ---: |
-| nano | D=32, 2L, 2H, FFN=128 | 37,779 |
-| small | D=64, 4L, 4H, FFN=256 | 278,547 |
-| medium | D=128, 8L, 8H, FFN=512 | 2,155,539 |
+| nano | D=32, 2L, 2H, FFN=128 | 38,775 |
+| small | D=64, 4L, 4H, FFN=256 | 282,583 |
+| medium | D=128, 8L, 8H, FFN=512 | 2,171,799 |
 
 The column is trainable parameters, measured at `PATCH_DIM = PATCH_SIZE ×
-N_INPUT_FEATURES = 30` by instantiating each capacity. The model carries no buffers:
+N_INPUT_FEATURES = 24` by instantiating each capacity. The model carries no buffers:
 the head's step-state weights are a fixed matrix rebuilt per span shape, not a stored
 tensor, and the head's final `Linear` emits `1 + 2·N_SPREADS` values for one 5-minute
 step, so its width does not scale with `PATCH_SIZE`. Each capacity is set by `D_MODEL`,
-`N_LAYERS` and `N_HEADS` alone — `FFN_DIM`, `BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are
-multiples of `D_MODEL` and follow it — and `resize_model.py` prints the count for any of
-them. Wall-clock and peak-memory figures are not listed because none has been measured
+`N_LAYERS` and `N_HEADS` alone — `FFN_DIM`, `BG_HEAD_HIDDEN`, `TIME_PROBE_HIDDEN` and
+`SKILL_HEAD_HIDDEN` are multiples of `D_MODEL` and follow it — and `resize_model.py`
+prints the count for any of them. Wall-clock and peak-memory figures are not listed because none has been measured
 against this architecture: position is RoPE alone, the attention mask reaches SDPA as a
 bool rather than as a per-layer additive float, and the BG head gathers
 `MAX_MASKED_PATCHES` slots by index.
