@@ -150,9 +150,8 @@ def draw_architecture(t: Theme, path: Path) -> None:
             fontsize=8.0, color=t.muted, style="italic")
     _down(ax, t, 0.5, 0.922, 0.882)
 
-    _box(ax, t, L, 0.828, W, 0.052, "Four input channels, one 5-minute grid",
-         "CGM  mg/dL · carbohydrate  g / step · insulin  U / step"
-         " · exercise  g / step (carbohydrate-equivalent)",
+    _box(ax, t, L, 0.828, W, 0.052, "Three input channels, one 5-minute grid",
+         "CGM  mg/dL · carbohydrate  g / step · insulin  U / step",
          accent=t.NAVY)
     ax.text(0.5, 0.820, "insulin sensitivity and hepatic output are simulator latents — deliberately not inputs",
             ha="center", va="top", fontsize=8.0, color=t.muted, style="italic")
@@ -162,7 +161,7 @@ def draw_architecture(t: Theme, path: Path) -> None:
     _box(ax, t, L, 0.736, tw, 0.052, "CGM → Kovatchev f → z-score",
          "the model reads and writes glucose in risk space", accent=t.CLAY,
          mono_sub=False, title_size=10.2)
-    _box(ax, t, R - tw, 0.736, tw, 0.052, "carb, insulin, exercise → log1p → z-score",
+    _box(ax, t, R - tw, 0.736, tw, 0.052, "carb, insulin → log1p → z-score",
          "keeps rare event spikes off the scale", accent=t.CLAY,
          mono_sub=False, title_size=10.2)
     _arrow(ax, t, (L + tw / 2, 0.732), (0.5, 0.712))
@@ -395,11 +394,7 @@ def _load_model(checkpoint: str, device):
 
 
 def _sim_window(seed: int, stats, hours: float):
-    """One simulator patient: normalized features and the raw channels behind them.
-
-    ``exercise`` is T1DMSIM's carbohydrate-equivalent glucose-disposal curve in
-    g/step, on the same scale as ``carb`` — never an intensity.
-    """
+    """One simulator patient: normalized features and the raw channels behind them."""
     import numpy as np
     from T1DMSIM.simulator import T1DMSimulator, BG_CLAMP_MIN, BG_CLAMP_MAX
     from data import simulate_discard_warmup
@@ -409,17 +404,16 @@ def _sim_window(seed: int, stats, hours: float):
     bg = np.clip(raw["bg_observed"], BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.maximum(raw["total_carb"], 0.0).astype(np.float32)
     ins = np.maximum(raw["total_insulin"], 0.0).astype(np.float32)
-    exr = np.maximum(raw["total_exercise"], 0.0).astype(np.float32)
     from data import BG_MASKED_FEAT
 
-    # Four normalized signal columns; bg_masked above them is a bit, never through normalize.
-    cols = [bg, carb, ins, exr]
+    # Normalized signal columns; bg_masked above them is a bit, never through normalize.
+    cols = [bg, carb, ins]
     assert len(cols) == BG_MASKED_FEAT < config.N_INPUT_FEATURES, (
         f"{len(cols)} raw signal columns against BG_MASKED_FEAT={BG_MASKED_FEAT}, "
         f"N_INPUT_FEATURES={config.N_INPUT_FEATURES}")
     feats = np.zeros((len(bg), config.N_INPUT_FEATURES), dtype=np.float32)
     feats[:, :BG_MASKED_FEAT] = normalize(np.stack(cols, axis=-1), stats)
-    return feats, bg, carb, ins, exr, raw["hour_of_day"].astype(np.float32)
+    return feats, bg, carb, ins, raw["hour_of_day"].astype(np.float32)
 
 
 CROP_HOURS = 24.0          # the slice each panel shows out of the whole window
@@ -456,7 +450,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     span_len = cfg.MAX_MASKED_PATCHES - P
 
     # 10 h of slack, so the patch-aligned start below never runs off a short trajectory
-    feats, bg, carb, ins, exr, _hour = _sim_window(
+    feats, bg, carb, ins, _hour = _sim_window(
         seed, stats, hours=(ctx_steps + pred_steps) * 5.0 / 60.0 + 10.0)
     start = ((len(bg) - ctx_steps - pred_steps) // S) * S
     ctx_np = feats[start:start + ctx_steps].reshape(n_ctx, S, cfg.N_INPUT_FEATURES)
@@ -598,8 +592,6 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
                          color=t.SAGE, alpha=0.55, lw=0, zorder=2)
     plan_ax.plot(td, ins[sl] / max(float(ins[sl].max()), 1e-6),
                  color=t.PLUM, lw=1.3, zorder=3)
-    plan_ax.plot(td, exr[sl] / max(float(exr[sl].max()), 1e-6),
-                 color=t.GOLD, lw=1.3, ls=(0, (3, 2)), zorder=3)
     plan_ax.axvspan(hours(s0 * S), hours((s0 + length) * S - 1),
                     color=t.CLAY, alpha=0.07, lw=0, zorder=1)
     plan_ax.set_xlim(crop_axes[-1].get_xlim())
@@ -625,8 +617,8 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
              "One objective, three placements of the masked span. Each panel is a "
              f"separate forward pass over the same {n_ctx}-patch window above,\n"
              f"cropped to the {CROP_HOURS:.0f} h around its span. The plan strip carries "
-             "carbohydrate appearance (filled), insulin action (solid)\n"
-             "and exercise disposal (dashed), each normalised to its own peak; the model "
+             "carbohydrate appearance (filled) and insulin action (solid),\n"
+             "each normalised to its own peak; the model "
              f"reads them at masked patches too.  ·  T1DMSIM patient, seed {seed}.",
              ha="center", va="top", fontsize=9.0, color=t.slate, linespacing=1.7)
 

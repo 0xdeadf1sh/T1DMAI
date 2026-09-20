@@ -89,7 +89,7 @@ def _slice(seg: Segment, a: int, b: int) -> Segment:
     return replace(
         seg, t0=seg.t0 + timedelta(minutes=GRID_MIN * a),
         cgm=seg.cgm[a:b], carb_grams=seg.carb_grams[a:b], bolus_units=seg.bolus_units[a:b],
-        basal_rate=seg.basal_rate[a:b], exercise=seg.exercise[a:b],
+        basal_rate=seg.basal_rate[a:b],
         carb_curve=(None if seg.carb_curve is None else seg.carb_curve[a:b]),
         insulin_curve=(None if seg.insulin_curve is None else seg.insulin_curve[a:b]))
 
@@ -234,7 +234,7 @@ def _denorm_channel(col_norm: np.ndarray, name: str, stats: dict) -> np.ndarray:
 
 def _make_night_overrides_fn(feats: np.ndarray, pred_start: int,
                              announce: tuple[int, ...], stats: dict):
-    """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for predict_rolling, one night.
+    """Per-roll announced carb(0)/insulin(1) overrides for predict_rolling, one night.
 
     Roll r masks the same right-edge span advanced by one horizon, returned both normalized and
     raw as {ch: (PREDICTION_PATCHES, PATCH_SIZE)}. None past the segment end (BG-autoregressive)."""
@@ -310,7 +310,7 @@ def _finalize_night_side(tr: int, pr: int, tp: int) -> dict:
 
 
 def night_onset_from_records(model, stats, records, device,
-                             announce: tuple[int, ...] = (0, 1, 2),
+                             announce: tuple[int, ...] = (0, 1),
                              max_nights: int | None = None) -> dict:
     """Per-night nocturnal-excursion scorer over records -> {'hypo':.., 'hyper':.., 'n_nights'}.
 
@@ -355,7 +355,7 @@ def night_onset_from_records(model, stats, records, device,
 
 
 def evaluate_night_onset(model, stats, test_segs: list[Segment], device,
-                         announce: tuple[int, ...] = (0, 1, 2),
+                         announce: tuple[int, ...] = (0, 1),
                          max_nights: int | None = None) -> dict:
     """Per-night nocturnal excursion prediction on a dataset's test segments.
 
@@ -371,7 +371,7 @@ def evaluate_night_onset(model, stats, test_segs: list[Segment], device,
 def rmse_by_horizon_from_records(model, stats, records, device,
                                  horizons_min: tuple[int, ...] = FIGURE_HORIZONS,
                                  conditional: bool = True,
-                                 announce: tuple[int, ...] = (0, 1, 2),
+                                 announce: tuple[int, ...] = (0, 1),
                                  stride_patches: int = 8,
                                  max_windows: int = 200) -> dict:
     """Per-horizon point and window-mean RMSE, model and persistence, off a forecast ROLLED to hmax.
@@ -455,7 +455,7 @@ def rmse_by_horizon_from_records(model, stats, records, device,
 def rmse_by_horizon_rolling(model, stats, test_segs: list[Segment], device,
                             horizons_min: tuple[int, ...] = FIGURE_HORIZONS,
                             conditional: bool = True,
-                            announce: tuple[int, ...] = (0, 1, 2),
+                            announce: tuple[int, ...] = (0, 1),
                             stride_patches: int = 8,
                             max_windows: int = 200) -> dict:
     """Hour-by-hour RMSE-vs-horizon over test segments; see rmse_by_horizon_from_records."""

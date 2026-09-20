@@ -106,16 +106,11 @@ def build_representative_input(
     insulin = np.full(n_steps, 0.02, dtype=np.float64)          # basal action
     insulin[int(0.30 * n_steps):int(0.30 * n_steps) + 10] += 0.25
     insulin[int(0.68 * n_steps):int(0.68 * n_steps) + 10] += 0.20
-    # carbohydrate-EQUIVALENT disposal in g/step, not an intensity: one bout, the meals' scale
-    exercise = np.zeros(n_steps, dtype=np.float64)
-    exercise[int(0.55 * n_steps):int(0.55 * n_steps) + 12] = 1.5
-
     # no smoothing: bg clamped to physical range, rest floored at 0, as data._build_sample does
     signals = {
         'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX),
         'carb_intake': np.maximum(carb, 0.0),
         'insulin_combined': np.maximum(insulin, 0.0),
-        'exercise_equiv': np.maximum(exercise, 0.0),
     }
     # CHANNEL_NAMES order comes from normalization; a channel added there raises here, not misplaced
     raw = np.stack([signals[name] for name in CHANNEL_NAMES], axis=-1).astype(np.float32)

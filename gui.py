@@ -95,7 +95,6 @@ HYPER_THRESHOLD_MGDL = BG_HYPER_THRESHOLD
 COLOR_BG_CURVE = (70, 180, 70)
 COLOR_CARBS = (230, 160, 50)
 COLOR_INSULIN = (80, 140, 240)
-COLOR_EXERCISE = (190, 125, 235)
 
 PREDICTION_LINE_ALPHA = 200
 OVERRIDE_LINE_COLOR = (255, 80, 80)
@@ -125,7 +124,6 @@ ATTN_CHANNEL_ABBREV = {
     'bg_absolute': 'BG',
     'carb_intake': 'carb',
     'insulin_combined': 'ins',
-    'exercise_equiv': 'exer',
 }
 ATTN_ROW_LABELS = ['attn'] + [
     ATTN_CHANNEL_ABBREV[name] for name in _CHANNEL_NAMES
@@ -148,44 +146,41 @@ _DOSE_PAINTING_BUTTONS = frozenset({
 CONFIDENCE_BAND_SMOOTH_STEPS = 25
 MU_SMOOTH_STEPS = 13
 
-# the three announceable channels, in output-channel order
-OUTPUT_CHANNEL_ORDER = ['carb_intake', 'insulin_combined', 'exercise_equiv']
+# the announceable channels, in output-channel order
+OUTPUT_CHANNEL_ORDER = ['carb_intake', 'insulin_combined']
 
-N_DISPLAY_CHANNELS = 4
+N_DISPLAY_CHANNELS = 3
 
-# y-axis span per channel, own raw unit; exercise shares carb's range (carb-equivalent, g/step).
+# y-axis span per channel, own raw unit.
 DISPLAY_CHANNEL_RAW_RANGES: list[tuple[float, float]] = [
     (0.0,     400.0),
     (0.0,     10.0),
     (0.0,     1.0),
-    (0.0,     10.0),
 ]
 
 DISPLAY_TO_STATS_NAME: list[str] = [
-    'bg_absolute', 'carb_intake', 'insulin_combined', 'exercise_equiv',
+    'bg_absolute', 'carb_intake', 'insulin_combined',
 ]
 
-# display channel → input feat; BG/carb/insulin/exercise at 0/1/2/3, all but BG announceable
-DISPLAY_TO_FEATURE_IDX: list[int] = [0, 1, 2, 3]
+# display channel → input feat; BG/carb/insulin at 0/1/2, all but BG announceable
+DISPLAY_TO_FEATURE_IDX: list[int] = [0, 1, 2]
 
 # display channel → announced output channel; BG (display 0) is a forecast, never an input
-DISPLAY_TO_OUTPUT_CH: dict[int, int] = {1: 0, 2: 1, 3: 2}
+DISPLAY_TO_OUTPUT_CH: dict[int, int] = {1: 0, 2: 1}
 
 # inverse of DISPLAY_TO_OUTPUT_CH, routing a pencil stroke back through the override compiler
 OUTPUT_TO_DISPLAY_CH: dict[int, int] = {v: k for k, v in DISPLAY_TO_OUTPUT_CH.items()}
 
-DISPLAY_CHANNEL_CLEAR_DEFAULTS: list[float] = [100.0, 0.0, 0.0, 0.0]
+DISPLAY_CHANNEL_CLEAR_DEFAULTS: list[float] = [100.0, 0.0, 0.0]
 
-OUTPUT_CHANNEL_SHORT_NAMES: list[str] = ['carbs', 'insulin', 'exercise']
+OUTPUT_CHANNEL_SHORT_NAMES: list[str] = ['carbs', 'insulin']
 
 INSULIN_OUTPUT_CH: int = OUTPUT_CHANNEL_ORDER.index('insulin_combined')
 
-# Exercise stays at the trained g/step carb-equivalent scale, never a 0-1 intensity.
 DISPLAY_CHANNEL_UNITS: list[str] = [
     'mg/dL',
     'g/5min',
     'U/5min',
-    'g/step',
 ]
 
 SCROLL_SPEED = 48
@@ -199,7 +194,7 @@ HOVER_TOOLTIP_DELAY_MS = 200
 
 # indexed by ``disp_ch`` on every draw path, so it stays as long as the tables above
 CHANNEL_COLORS = [
-    COLOR_BG_CURVE, COLOR_CARBS, COLOR_INSULIN, COLOR_EXERCISE,
+    COLOR_BG_CURVE, COLOR_CARBS, COLOR_INSULIN,
 ]
 assert len(CHANNEL_COLORS) == N_DISPLAY_CHANNELS
 
@@ -227,25 +222,21 @@ def _features_from_raw(
     from normalization import CHANNEL_NAMES, normalize
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
-    # bg_observed post-CGM-noise, clamped; sparse three floored at 0 (mirrors _build_sample).
+    # bg_observed post-CGM-noise, clamped; the sparse pair floored at 0 (mirrors _build_sample).
     bg_obs_raw = raw['bg_observed'].astype(np.float32)
     carb_raw = raw['total_carb'].astype(np.float32)
     insulin_raw = raw['total_insulin'].astype(np.float32)
-    exercise_raw = raw['total_exercise'].astype(np.float32)
     bg_obs = np.clip(bg_obs_raw, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.clip(carb_raw, 0.0, None).astype(np.float32)
     insulin = np.clip(insulin_raw, 0.0, None).astype(np.float32)
-    exercise = np.clip(exercise_raw, 0.0, None).astype(np.float32)
     N = (len(bg_obs) // PATCH_SIZE) * PATCH_SIZE
     bg_obs = bg_obs[:N]; carb = carb[:N]; insulin = insulin[:N]
-    exercise = exercise[:N]
     bg_obs_raw = bg_obs_raw[:N]; carb_raw = carb_raw[:N]; insulin_raw = insulin_raw[:N]
-    exercise_raw = exercise_raw[:N]
 
     # the plotted channels stay RAW; only ``features`` carries the clamp and normalization
     bg_raw = bg_obs_raw.copy()
     context_raw = np.stack(
-        [bg_obs_raw, carb_raw, insulin_raw, exercise_raw], axis=-1,
+        [bg_obs_raw, carb_raw, insulin_raw], axis=-1,
     ).astype(np.float32)
 
     # bg_masked bit carries no statistics, so the stack is one column wider than CHANNEL_NAMES.
@@ -254,7 +245,7 @@ def _features_from_raw(
         f"BG_MASKED_FEAT={BG_MASKED_FEAT}, N_INPUT_FEATURES={N_INPUT_FEATURES}: "
         f"{list(CHANNEL_NAMES)}"
     )
-    signal = np.stack([bg_obs, carb, insulin, exercise], axis=-1).astype(np.float32)
+    signal = np.stack([bg_obs, carb, insulin], axis=-1).astype(np.float32)
     features = np.zeros((len(bg_obs), N_INPUT_FEATURES), dtype=np.float32)
     features[:, :BG_MASKED_FEAT] = normalize(signal, norm_stats)
 
@@ -590,7 +581,7 @@ def _compile_overrides_from_edits(
     """The painted curve / pencil / basal edits as announced dose overrides for the pred zone.
 
     Built from a ZERO baseline plus what the user painted; bells and pencil strokes SUM.
-    Returns ``(overrides_norm, overrides_raw)`` over {0: carb, 1: insulin, 2: exercise}.
+    Returns ``(overrides_norm, overrides_raw)`` over {0: carb, 1: insulin}.
     """
     from config import PATCH_SIZE, CHANNEL_TO_FEAT
 
@@ -646,7 +637,7 @@ def _compile_overrides_from_edits(
 
         modified_raw = np.maximum(modified_raw, 0.0)
 
-        # overrides_raw keeps the RAW announced value at its trained scale: exercise g/step.
+        # overrides_raw keeps the RAW announced value at its trained scale.
         norm_vals = _normalize_channel_array(
             modified_raw.flatten(), ch_name, norm_stats
         ).reshape(n_pred, PATCH_SIZE)
@@ -1397,7 +1388,7 @@ class T1DMAIGui:
         if dose_painting_enabled(self.state.masked_channel_policy):
             return ''
         return ("Dose painting is off: this checkpoint was trained blind, with "
-                "masked-patch carb / insulin / exercise pinned at the no-dose "
+                "masked-patch carb / insulin pinned at the no-dose "
                 "fill — a painted override is invisible to it.")
 
     def _do_mask_tool(self) -> None:
@@ -1495,7 +1486,7 @@ class T1DMAIGui:
             ch_name = self.state.channel_names[self.state.selected_edit_channel]
             self.state.status_message = (
                 f"Pencil ON — drag to draw {ch_name} "
-                "(Tab = carb/insulin/exercise, L = long predict)"
+                "(Tab = carb/insulin, L = long predict)"
             )
         self._needs_redraw = True
 
@@ -3330,7 +3321,7 @@ class T1DMAIGui:
         elif tool == TOOL_PENCIL:
             ch_name = self.state.channel_names[self.state.selected_edit_channel]
             lines = [
-                f"Pencil — channel: {ch_name}  (Tab to cycle carb/insulin/exercise)",
+                f"Pencil — channel: {ch_name}  (Tab to cycle carb/insulin)",
                 "Drag in the PRED zone to draw a dose curve (smoothed). Draw past 2 h to plan ahead.",
                 "L / Shift+Space = long predict (covers your drawing). Ctrl+Z = undo. P = exit tool",
             ]
@@ -3342,7 +3333,7 @@ class T1DMAIGui:
             lines = [
                 "SPC=Predict 2h  L/Shift+SPC=Long Predict  W=What-If  P=Pencil  M=Mask  F=Roll  G=Sim Fwd  V=Eval  R=Reset",
                 "E=Curve Editor  Tab=Cycle edit channel  C=Clear All curves  N=New Patient  S=Screenshot",
-                "1-4=Toggle channels (BG/Carbs/Insulin/Exercise)  A=Toggle all  "
+                "1-3=Toggle channels (BG/Carbs/Insulin)  A=Toggle all  "
                 "T=Attention strips  [ / ]=Attention layer  , / .=Attention roll  Q=Quit",
                 "Left/Right=Pan (Shift=a full screen)  Scroll=Zoom at cursor  "
                 "+/-=Zoom  Middle/Right-drag=Pan",
@@ -3799,7 +3790,7 @@ class T1DMAIGui:
         elif key == pygame.K_s:
             self._do_screenshot()
 
-        elif key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
+        elif key in (pygame.K_1, pygame.K_2, pygame.K_3):
             from gui_state import (
                 MASK_PRESET_BEGIN_FILL, MASK_PRESET_FORECAST, MASK_PRESET_INFILL,
                 TOOL_MASK,

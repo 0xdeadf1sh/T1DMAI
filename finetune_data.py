@@ -1,6 +1,6 @@
 """MetaboNet + DiaData merge into a finetuning cache; gap-aware datasets over it.
 
-``python finetune_data.py build`` writes bg/carb/insulin/exercise channels via the
+``python finetune_data.py build`` writes bg/carb/insulin channels via the
 event-to-curve rules of ``T1DMCOMMON/SPEC/invariants.md`` §5; a gap masks the head
 slot, never the loss. ``_normalize_features`` mirrors ``data._build_sample``'s transform."""
 
@@ -38,24 +38,19 @@ from T1DMSIM.simulator import (
     gamma_curve, basal_curve, bolus_pk_for_dose, gi_gamma_params,
     gamma_peak_min, bateman_peak_min,
     BOLUS_VARIANTS, BASAL_VARIANTS,
-    EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, EXERCISE_CARB_EQUIV_PER_MIN,
 )
 
 STEP_S = DT_MINUTES * 60
 # Point doses at their onset slot; a descriptor is the dose-weighted mean of the slot's doses.
 EVENT_CHANNELS = INPUT_LAYOUTS['events'][1:]
-CACHE_CHANNELS = ('bg', 'carb', 'insulin', 'exercise', 'is_test') + EVENT_CHANNELS
+CACHE_CHANNELS = ('bg', 'carb', 'insulin', 'is_test') + EVENT_CHANNELS
 CHANNEL_DTYPES = {c: np.float32 for c in CACHE_CHANNELS} | {'is_test': np.uint8}
-CACHE_VERSION = 'finetune-cache-v4'
+CACHE_VERSION = 'finetune-cache-v5'
 STATS_FILES = {'curves': 'normalization_stats.json',
                'events': 'normalization_stats_events.json'}
 
 # Carb entry error above this, not a meal (train.parquet max 855 g).
 CARB_EVENT_MAX_G = 300.0
-# Workout row above this isn't a session (max 8218 min; unbounded peaks at 367 g/step, z=+32).
-EXERCISE_SESSION_MAX_MIN = 240.0
-# Bouts within this of the prior bout's end join one session, else disposal runs 40x too high.
-EXERCISE_SESSION_JOIN_MIN = 30.0
 # Below this, an MDI-labeled row is a per-slot pump rate; at/above, a long-acting injection.
 MDI_INJECTION_MIN_U = 1.5
 
@@ -77,7 +72,7 @@ DIADATA_CSV = 'DiaData_V3.0/5_min_sampling/raw/raw/MDB_5min_sampling_raw/MDB_5mi
 
 METABONET_COLUMNS = [
     'id', 'source_file', 'date', 'CGM', 'basal', 'bolus', 'insulin', 'carbs',
-    'workout_duration', 'insulin_delivery_modality',
+    'insulin_delivery_modality',
     'insulin_type_basal', 'insulin_type_bolus',
 ]
 
@@ -151,23 +146,20 @@ def _events_to_curves(
     basal: np.ndarray,
     bolus: np.ndarray,
     insulin: np.ndarray,
-    workout: np.ndarray,
     is_mdi: np.ndarray,
     bolus_type: str | None,
     basal_type: str | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """(carb_curve, insulin_curve, exercise_curve, events), each array (n,) float32.
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """(carb_curve, insulin_curve, events), each array (n,) float32.
 
     Curves are amount/step; ``events`` holds EVENT_CHANNELS, the same doses at their onset slot.
     ``is_mdi`` is PER ROW: ShanghaiT1DM mixes MDI injections with pump slots in one
     record; a 20 U injection through the rapid kernel would peak 10x too high."""
     carb_out = np.zeros(n, dtype=np.float64)
     ins_out = np.zeros(n, dtype=np.float64)
-    ex_out = np.zeros(n, dtype=np.float64)
     carb_pts = _SlotDoses(n, 'gi')
     bolus_pts = _SlotDoses(n, 'peak_min', 'dur_h')
     basal_pts = _SlotDoses(n, 'peak_min', 'dur_h')
-    ex_pts = _SlotDoses(n)
 
     ck, ct, cdur = gi_gamma_params(CARB_GI_DEFAULT)
     ev = np.flatnonzero(np.nan_to_num(carbs) > 0.0)
@@ -221,37 +213,15 @@ def _events_to_curves(
                       peak_min=gamma_peak_min(bv['gamma_k'], bv['gamma_theta']),
                       dur_h=bv['dia_base_hours'])
 
-    # Bouts joined into sessions (idx sorted) before the gamma spread, per SPEC §5.
-    sessions: list[list[float]] = []  # [start_slot, duration_min, end_min]
-    for j in np.flatnonzero(np.nan_to_num(workout) > 0.0):
-        t_min = float(idx[j]) * DT_MINUTES
-        dur = float(workout[j])
-        if sessions and t_min - sessions[-1][2] < EXERCISE_SESSION_JOIN_MIN:
-            sessions[-1][1] += dur
-            sessions[-1][2] = max(sessions[-1][2], t_min + dur)
-        else:
-            sessions.append([float(idx[j]), dur, t_min + dur])
-    for slot, dur, _end in sessions:
-        dur = min(dur, EXERCISE_SESSION_MAX_MIN)
-        mag = dur * EXERCISE_CARB_EQUIV_PER_MIN
-        _add_curve(
-            ex_out,
-            gamma_curve(mag, EXERCISE_GAMMA_K, EXERCISE_GAMMA_THETA, dur + 90.0),
-            int(slot),
-        )
-        ex_pts.add(int(slot), dur)
-
     events = {
         'carb_g': carb_pts.dose, 'carb_gi': carb_pts.mean('gi'),
         'bolus_u': bolus_pts.dose, 'bolus_peak_min': bolus_pts.mean('peak_min'),
         'bolus_dur_h': bolus_pts.mean('dur_h'),
         'basal_u': basal_pts.dose, 'basal_peak_min': basal_pts.mean('peak_min'),
         'basal_dur_h': basal_pts.mean('dur_h'),
-        'exercise_min': ex_pts.dose,
     }
     assert tuple(events) == EVENT_CHANNELS
     return (carb_out.astype(np.float32), ins_out.astype(np.float32),
-            ex_out.astype(np.float32),
             {c: v.astype(np.float32) for c, v in events.items()})
 
 
@@ -295,7 +265,7 @@ def _process_metabonet_subject(
     ts = np.concatenate([np.concatenate(p['ts']) for p in parts])
     cols = {c: np.concatenate([np.concatenate(p[c]) for p in parts])
             for c in ('CGM', 'basal', 'bolus', 'insulin', 'carbs',
-                      'workout_duration', 'is_mdi', 'is_test')}
+                      'is_mdi', 'is_test')}
     order = np.argsort(ts, kind='stable')
     ts = ts[order]
     cols = {c: v[order] for c, v in cols.items()}
@@ -316,10 +286,9 @@ def _process_metabonet_subject(
     have = np.isfinite(cgm)
     bg[idx[have]] = cgm[have]
 
-    carb, ins, ex, events = _events_to_curves(
+    carb, ins, events = _events_to_curves(
         n, idx, cols['carbs'], cols['basal'], cols['bolus'], cols['insulin'],
-        cols['workout_duration'], cols['is_mdi'].astype(bool),
-        bolus_type, basal_type,
+        cols['is_mdi'].astype(bool), bolus_type, basal_type,
     )
 
     # Per-step test flag: CTR3 rows interleave train/test; one boundary index can't say which.
@@ -329,7 +298,7 @@ def _process_metabonet_subject(
     # Off the sorted grid: parquet chunk order isn't preserved; ShanghaiT1DM blocks violate it.
     test_start = int(idx[trow].min()) if trow.any() else -1
 
-    start = app.append({'bg': bg, 'carb': carb, 'insulin': ins, 'exercise': ex,
+    start = app.append({'bg': bg, 'carb': carb, 'insulin': ins,
                         'is_test': is_test_grid, **events})
     index.append({
         'key': f'metabonet:{source}:{sid}', 'pool': 'metabonet', 'source': source,
@@ -340,7 +309,7 @@ def _process_metabonet_subject(
 def _new_acc() -> dict:
     return {
         'ts': [], 'CGM': [], 'basal': [], 'bolus': [], 'insulin': [],
-        'carbs': [], 'workout_duration': [], 'is_mdi': [], 'is_test': [],
+        'carbs': [], 'is_mdi': [], 'is_test': [],
         'bolus_type': None, 'basal_type': None,
     }
 
@@ -367,7 +336,7 @@ def _collect_parquet(path: str, keep: dict[tuple[str, str], dict] | None,
         df = batch.to_pandas()
         ts = df['date'].to_numpy().astype('datetime64[s]').astype(np.int64)
         num = {c: df[c].to_numpy(dtype=np.float32, na_value=np.nan)
-               for c in ('CGM', 'basal', 'bolus', 'insulin', 'carbs', 'workout_duration')}
+               for c in ('CGM', 'basal', 'bolus', 'insulin', 'carbs')}
         mdi = df['insulin_delivery_modality'].eq('MDI').to_numpy(
             dtype=bool, na_value=False).astype(np.uint8)
         srcs = df['source_file'].to_numpy(dtype=object)
@@ -466,7 +435,7 @@ def _build_diadata(app: _ChannelAppender, index: list[dict[str, Any]],
         have = np.isfinite(cgm)
         bg[idx[have]] = cgm[have]
         z = np.zeros(n, dtype=np.float32)
-        start = app.append({'bg': bg, 'carb': z, 'insulin': z, 'exercise': z,
+        start = app.append({'bg': bg, 'carb': z, 'insulin': z,
                             'is_test': np.zeros(n, dtype=np.uint8)})
         index.append({
             'key': f'diadata:{source}:{pid}', 'pool': 'diadata', 'source': source,
@@ -586,8 +555,8 @@ class FinetuneCache:
 
 
 # Normalized channel -> cache channel; an event channel keeps its name.
-_CACHE_CHANNEL = {'bg_absolute': 'bg', 'carb_intake': 'carb', 'insulin_combined': 'insulin',
-                  'exercise_equiv': 'exercise'} | {c: c for c in EVENT_CHANNELS}
+_CACHE_CHANNEL = {'bg_absolute': 'bg', 'carb_intake': 'carb',
+                  'insulin_combined': 'insulin'} | {c: c for c in EVENT_CHANNELS}
 _CARB_CHANNELS = frozenset({'carb_intake', 'carb_g', 'carb_gi'})
 STATS_FIT_WINDOWS = 2000
 STATS_FIT_SEED = 0

@@ -889,7 +889,7 @@ def build_verdicts(
     bit_rel = float(np.linalg.norm(pe[:, mask_bit_cols].sum(axis=1)) / (np.median(feat_cols) + 1e-12))
     ev = [f'{arch.patch_size} steps/patch ({arch.patch_size * STEP_MINUTES} min); '
           f'{dead_feat}/{feat_cols.size} signal feature-columns dead',
-          'mean embed column norm per feature [bg, carb, insulin, exercise]: '
+          'mean embed column norm per signal feature, in CHANNEL_NAMES order: '
           + ', '.join(f'{x:.3f}' for x in per_feat)
           + f'; bg_masked bit {bit_rel:.2f}× the median signal column',
           'per-step column norm (step 0..S-1), bg feature: '

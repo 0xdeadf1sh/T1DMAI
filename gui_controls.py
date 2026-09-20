@@ -397,11 +397,10 @@ HELP_SECTIONS: list[tuple[str, list[str]]] = [
     ]),
     ("Editing inputs", [
         "E — toggle the Curve Editor (raised-cosine bells, draggable points).",
-        "P — toggle the Pencil: drag in the prediction zone to draw a carb,",
-        "    insulin or exercise curve freehand; the stroke is smoothed.",
+        "P — toggle the Pencil: drag in the prediction zone to draw a carb",
+        "    or insulin curve freehand; the stroke is smoothed.",
         "    Draw past the 2 h mark to plan doses far ahead, then press L.",
-        "Tab / Shift+Tab — cycle the channel being edited (carbs / insulin /",
-        "                  exercise, the last in g/step carb-equivalent).",
+        "Tab / Shift+Tab — cycle the channel being edited (carbs / insulin).",
         "C — clear all manual curves and pencil strokes.",
         "Del — remove the selected curve point.",
         "Ctrl+Z — undo the last curve / pencil edit.",
@@ -426,7 +425,7 @@ HELP_SECTIONS: list[tuple[str, list[str]]] = [
         "re-aims them. A new masked set, dose or context needs a new prediction.",
     ]),
     ("Channels", [
-        "1–4     — toggle channel visibility (BG/Carbs/Insulin/Exercise).",
+        "1–3     — toggle channel visibility (BG/Carbs/Insulin).",
         "A       — toggle all channels at once.",
     ]),
     ("View", [

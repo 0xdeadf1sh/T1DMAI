@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--future-doses",
         choices=(DOSES_ANNOUNCED, DOSES_ZERO),
         default=DOSES_ANNOUNCED,
-        help="carb/insulin/exercise over the forecast zone; 'zero' is strictly "
+        help="carb and insulin over the forecast zone; 'zero' is strictly "
         "causal but out of distribution for a model trained on announced doses",
     )
     p.add_argument(

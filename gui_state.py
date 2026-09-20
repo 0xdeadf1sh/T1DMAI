@@ -51,7 +51,7 @@ class CurveEvent:
     Positions are ABSOLUTE patch units from the start of the context window, so they stay put
     when a roll extends the prediction zone.
     """
-    channel: int       # display channel (1=carbs, 2=insulin, 3=exercise)
+    channel: int       # display channel (1=carbs, 2=insulin)
     left_patch: float   # absolute patch position of left tail
     peak_patch: float   # absolute patch position of peak
     right_patch: float  # absolute patch position of right tail
@@ -69,11 +69,11 @@ class PencilStroke:
     """One freehand announced-dose stroke, as parallel ``xs`` / ``ys`` samples.
 
     ``xs``: ABSOLUTE patch positions, like ``CurveEvent``. ``ys``: raw doses (g/5min carbs,
-    U/5min insulin, g/step exercise), resampled/smoothed at compile time; 0 outside ``xs``.
+    U/5min insulin), resampled/smoothed at compile time; 0 outside ``xs``.
     """
-    channel: int             # display channel (1=carbs, 2=insulin, 3=exercise)
+    channel: int             # display channel (1=carbs, 2=insulin)
     xs: list[float] = field(default_factory=list)   # absolute patch positions
-    ys: list[float] = field(default_factory=list)   # raw values (g/5min, U/5min or g/step)
+    ys: list[float] = field(default_factory=list)   # raw values (g/5min or U/5min)
 
 
 # Trailing span (n_ctx, n_pred) is mandatory: inference._resolve_mask_spans requires it masked.
@@ -320,15 +320,15 @@ class PredictionResult:
 class GUIState:
     def __init__(self) -> None:
         # Per-channel, zipped with gui.CHANNEL_COLORS for sidebar toggles; short list drops toggles
-        self.channel_visible: list[bool] = [True, True, True, True]
+        self.channel_visible: list[bool] = [True, True, True]
         self.channel_names: list[str] = [
-            'Blood Glucose', 'Carbs', 'Insulin', 'Exercise',
+            'Blood Glucose', 'Carbs', 'Insulin',
         ]
 
         self.active_tool: str = TOOL_NONE
         self.selected_channel: int = -1       # which channel is selected for editing
 
-        # {0=carbs,1=insulin,2=exercise: (P,S) NORMALIZED}; predict_what_if input, BG excluded
+        # {0=carbs,1=insulin: (P,S) NORMALIZED}; predict_what_if input, BG excluded
         self.overrides: dict[int, np.ndarray] = {}
 
         self.prediction: PredictionResult = PredictionResult()
@@ -346,7 +346,7 @@ class GUIState:
         # Live simulator: "Sim Fwd" advances truth in place, appends patches; None until loaded
         self.sim: Any = None
 
-        # display channel being edited: 1=Carbs, 2=Insulin, 3=Exercise (BG is not editable)
+        # display channel being edited: 1=Carbs, 2=Insulin (BG is not editable)
         self.selected_edit_channel: int = 1
 
         self.view_start_patch: float = 0.0    # leftmost visible patch index
@@ -403,7 +403,7 @@ class GUIState:
         self.mask_drag_end: int = -1           # last patch of the in-flight drag
 
     def set_override(self, channel: int, values: np.ndarray) -> None:
-        """``channel`` 0=carbs, 1=insulin, 2=exercise; ``values`` ``(P, PATCH_SIZE)`` normalized."""
+        """``channel`` 0=carbs, 1=insulin; ``values`` ``(P, PATCH_SIZE)`` normalized."""
         assert values.ndim == 2, f"Override must be 2D (patches, timesteps), got {values.shape}"
         self.overrides[channel] = values.copy()
 

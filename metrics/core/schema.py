@@ -1,7 +1,7 @@
 """Canonical record every evaluation source parses into.
 
 A Segment is a contiguous, gap-free, 5-min-grid stretch of RAW events (see field comments
-for units). exercise is g/step already; convert other sources before this field.
+for units).
 """
 from __future__ import annotations
 
@@ -31,14 +31,13 @@ class Segment:
     carb_grams: np.ndarray     # (N,) grams ingested in this step
     bolus_units: np.ndarray    # (N,) bolus IU delivered in this step
     basal_rate: np.ndarray     # (N,) basal IU/hour, piecewise-constant
-    exercise: np.ndarray       # (N,) g/step carb-equivalent disposal (0 if unavailable)
     split: str = ''            # 'training' | 'testing' | '' — canonical-protocol origin
     carb_curve: np.ndarray | None = None      # (N,) g/step appearance, pre-resolved
     insulin_curve: np.ndarray | None = None   # (N,) IU/step action, pre-resolved (basal+bolus)
 
     def __post_init__(self) -> None:
         n = len(self.cgm)
-        for name in ('carb_grams', 'bolus_units', 'basal_rate', 'exercise'):
+        for name in ('carb_grams', 'bolus_units', 'basal_rate'):
             arr = getattr(self, name)
             assert arr.shape == (n,), f"{name} length {arr.shape} != cgm length {n}"
         assert (self.carb_curve is None) == (self.insulin_curve is None), (
@@ -72,7 +71,6 @@ def segment_grid(
     carb_grams: np.ndarray,
     bolus_units: np.ndarray,
     basal_rate: np.ndarray,
-    exercise: np.ndarray,
     carb_curve: np.ndarray | None = None,
     insulin_curve: np.ndarray | None = None,
 ) -> list[Segment]:
@@ -82,7 +80,7 @@ def segment_grid(
     ones break the record. ``grid_t0`` is grid index 0's time; event channels are already gridded.
     """
     m = len(cgm)
-    assert all(len(a) == m for a in (carb_grams, bolus_units, basal_rate, exercise))
+    assert all(len(a) == m for a in (carb_grams, bolus_units, basal_rate))
     assert (carb_curve is None) == (insulin_curve is None), (
         "carb_curve and insulin_curve must be supplied together or both left None"
     )
@@ -100,7 +98,7 @@ def segment_grid(
     first, last = int(np.argmax(finite)), m - int(np.argmax(finite[::-1]))
     cgm = cgm[first:last].copy()
     named = [('carb_grams', carb_grams), ('bolus_units', bolus_units),
-             ('basal_rate', basal_rate), ('exercise', exercise)]
+             ('basal_rate', basal_rate)]
     if carb_curve is not None:
         named += [('carb_curve', carb_curve), ('insulin_curve', insulin_curve)]
     chans = {k: v[first:last].copy() for k, v in named}
@@ -146,7 +144,6 @@ def segment_grid(
             carb_grams=chans['carb_grams'][lo:hi],
             bolus_units=chans['bolus_units'][lo:hi],
             basal_rate=chans['basal_rate'][lo:hi],
-            exercise=chans['exercise'][lo:hi],
             carb_curve=(None if carb_curve is None else chans['carb_curve'][lo:hi]),
             insulin_curve=(None if carb_curve is None else chans['insulin_curve'][lo:hi]),
         ))

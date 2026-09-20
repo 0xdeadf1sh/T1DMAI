@@ -35,18 +35,14 @@ def raw_history(n_steps: int) -> dict[str, np.ndarray]:
         bg += amp * np.exp(-0.5 * ((t - center * n_steps) / width) ** 2)
     carb = np.zeros(n_steps)
     insulin = np.full(n_steps, 0.021)
-    exercise = np.zeros(n_steps)
     for frac, g, u in ((0.20, 6.5, 0.26), (0.53, 5.5, 0.22), (0.79, 4.0, 0.18)):
         i = int(frac * n_steps)
         carb[i:i + 8] = g
         insulin[i:i + 10] += u
-    e = int(0.66 * n_steps)
-    exercise[e:e + 14] = 1.4
     return {
         'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX),
         'carb_intake': np.maximum(carb, 0.0),
         'insulin_combined': np.maximum(insulin, 0.0),
-        'exercise_equiv': np.maximum(exercise, 0.0),
     }
 
 
@@ -182,7 +178,6 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
         "raw_bg": raw['bg_absolute'].tolist(),
         "raw_carb": raw['carb_intake'].tolist(),
         "raw_insulin": raw['insulin_combined'].tolist(),
-        "raw_exercise": raw['exercise_equiv'].tolist(),
         "t": T,
         "pad0": int(pad0),
         "n_masked": int(n_masked),

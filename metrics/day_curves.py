@@ -50,13 +50,13 @@ PRED = PR.SPAN_STEPS                              # steps in one masked forecast
 DAY_PATCHES = 48 * _PATCHES_PER_HOUR              # 48 h day window (fixed figure span)
 H8_PATCHES = NIGHT_LONG_HORIZON_PATCHES           # NIGHT_LONG_HORIZON_HOURS long-horizon window
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
-ANNOUNCE = (0, 1, 2)                              # carb, insulin, exercise
+ANNOUNCE = (0, 1)                                 # carb, insulin
 
-# A short set leaves the slot at normalize(0) — exercise_equiv's −0.139 z, an untrained regime.
+# A short set leaves the slot at normalize(0), a phantom dose rather than an absence.
 assert ANNOUNCE == tuple(CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(CHANNEL_TO_FEAT)}")
 
-# output channel → input feature: carb 0→1, insulin 1→2, exercise 2→3, off ``CHANNEL_TO_FEAT``
+# output channel → input feature: carb 0→1, insulin 1→2, off ``CHANNEL_TO_FEAT``
 _ANNOUNCE_FEAT_IDX = {ch: CHANNEL_TO_FEAT[ch] for ch in ANNOUNCE}
 
 CKPT = os.path.join(ROOT, 'checkpoints', 't1dmai_best.pt')
@@ -82,7 +82,7 @@ def _slice_seg(seg, a: int, b: int):
     return replace(
         seg, t0=seg.t0 + timedelta(minutes=GRID_MIN * a),
         cgm=seg.cgm[a:b], carb_grams=seg.carb_grams[a:b], bolus_units=seg.bolus_units[a:b],
-        basal_rate=seg.basal_rate[a:b], exercise=seg.exercise[a:b],
+        basal_rate=seg.basal_rate[a:b],
         carb_curve=(None if seg.carb_curve is None else seg.carb_curve[a:b]),
         insulin_curve=(None if seg.insulin_curve is None else seg.insulin_curve[a:b]))
 
@@ -106,7 +106,7 @@ def _pick_day_start(seg) -> int | None:
 
 def _make_night_overrides_fn(feats: np.ndarray, pred_start: int,
                              announce: tuple[int, ...], stats: dict):
-    """Per-roll announced carb(0)/insulin(1)/exercise(2) overrides for ``predict_rolling``.
+    """Per-roll announced carb(0)/insulin(1) overrides for ``predict_rolling``.
 
     Roll r masks the right-edge span advanced by one horizon, sliced normalized from ``feats``. Raw
     half unused, returned zeroed; None once a roll runs past segment. Past roll 0, left neighbour
@@ -412,7 +412,7 @@ def plot_day(spec, pretty, path):
     if bt is None:                                        # simulator: combined insulin only
         dose = f"48 h totals: {spec['carb_total']:.0f} g carb · {spec['bolus_total']:.1f} U insulin"
     ctx_h = MAX_CONTEXT_PATCHES * PATCH_SIZE * GRID_MIN / 60.0
-    caption = ("Headline median_bg forecast (future carbs/insulin/exercise announced); each origin fed "
+    caption = ("Headline median_bg forecast (future carbs/insulin announced); each origin fed "
                f"{ctx_h:g} h context; BG band = empirical per-horizon error envelope  ·  {dose}")
     fig.tight_layout(rect=[0, 0, 1, 0.955])
     fig.text(0.5, 0.992, f"{pretty} · {spec['patient']} · 48 h", ha='center', va='top',

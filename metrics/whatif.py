@@ -1,7 +1,7 @@
 """What-if effectiveness: does an announced dose move the forecast the way physiology requires?
 
 Every number is a response against the model's own baseline, not a ground truth -- a
-physiologic characterization. Five blocks: carb/insulin/exercise ladders, empty_future, null_rail.
+physiologic characterization. Four blocks: carb and insulin ladders, empty_future, null_rail.
 """
 from __future__ import annotations
 import argparse, os, sys, json
@@ -18,10 +18,10 @@ torch.set_num_threads(8)
 
 from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
                     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, CHANNEL_TO_FEAT,
-                    CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U, CF_EXERCISE_G)
+                    CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U)
 from T1DMSIM.simulator import gamma_curve
 from metrics.core.features import (build_feature_stack, context_window, segment_to_channels,
-                               CARB_KERNEL, BOLUS_KERNEL, EXERCISE_KERNEL, _convolve)
+                               CARB_KERNEL, BOLUS_KERNEL, _convolve)
 from metrics.core.calibrate import _future_overrides
 from metrics.core.horizons import HORIZONS, HORIZON_IDX, GRID_MIN
 from metrics.core import run_eval
@@ -42,16 +42,14 @@ SIM_DATASET = 'sim'                        # fresh T1DMSIM patients: the source
 DATASETS = (SIM_DATASET,)
 STRIDE = 8 * PATCH_SIZE
 CAP = 40                                   # windows/segment
-ANNOUNCE = (0, 1, 2)                       # carb, insulin, exercise
-# A set short of CHANNEL_TO_FEAT hits normalize(0): a legal "no session", an unseen regime.
+ANNOUNCE = (0, 1)                          # carb, insulin
+# A set short of CHANNEL_TO_FEAT hits normalize(0): a phantom dose, an unseen regime.
 assert ANNOUNCE == tuple(CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(CHANNEL_TO_FEAT)}")
 # Anchored on the training probe's dose scale; the 1.0x rung IS the CF_* dose.
 LADDER = (0.0, 0.25, 0.5, 1.0, 2.0)
 CARB_DOSES = tuple(f * CF_CARB_BOLUS_G for f in LADDER)
 INSULIN_DOSES = tuple(f * CF_INSULIN_BOLUS_U for f in LADDER)
-# Grams carb-EQUIVALENT disposal per session, never minutes; 1x rung is one population-mean session.
-EXERCISE_DOSES = tuple(f * CF_EXERCISE_G for f in LADDER)
 REF_IDX = LADDER.index(1.0)
 QUIET_CTX_MIN = 180                        # trailing context with no events, for a 'quiet' window
 QUIET_STEPS = QUIET_CTX_MIN // GRID_MIN
@@ -62,15 +60,9 @@ RESCUE_LAG_MIN = 30                        # a dose cannot act before this; resc
 RESCUE_LAG = RESCUE_LAG_MIN // GRID_MIN
 TERM = HORIZON_IDX[HORIZONS[-1]]           # terminal forecast step (120 min at default geometry)
 KERNEL_MASS = {'carb': float(CARB_KERNEL[:PRED].sum()),
-               'insulin': float(BOLUS_KERNEL[:PRED].sum()),
-               'exercise': float(EXERCISE_KERNEL[:PRED].sum())}
+               'insulin': float(BOLUS_KERNEL[:PRED].sum())}
 
 # Why an arm didn't run, carried in JSON so a zero never reads as a measurement; from segments.
-EX_NOT_ANNOUNCED = (
-    "exercise column is identically zero across these segments, so there is no "
-    "session to perturb and the baseline is uniformly 'no session' — every real "
-    "adapter writes zeros, and the ladder is meaningless until one does not"
-)
 NO_EVENTS_TO_STRIP = (
     "no segment carries raw carb/bolus events — this source supplies pre-resolved "
     "channels only, so an emptied future would be the null arm relabelled"
@@ -138,14 +130,6 @@ def _frac(hits: int, n: int) -> float | None:
     return round(hits / n, 3) if n else None
 
 
-def exercise_is_announced(segs: list) -> bool:
-    """True if a segment carries a non-zero exercise column: the exercise ladder's admission test.
-
-    Read from the data, not the source name, so filling the column needs no edit here.
-    """
-    return any(bool(np.any(np.asarray(s.exercise, dtype=np.float64) > 0.0)) for s in segs)
-
-
 def events_are_recorded(segs: list) -> bool:
     """True if any segment carries raw carb/bolus events — the empty-future arm's admission test.
 
@@ -162,18 +146,16 @@ def run(model, stats: dict, device, segs: list,
     """Probe every strided window of segs -> the source's summary dict.
 
     Every figure is a FRACTION over windows -- a sign rate off nine windows moves in steps of
-    0.11. Exercise and empty-future arms are admitted or refused from the segments themselves.
+    0.11. The empty-future arm is admitted or refused from the segments themselves.
     """
     # Supplied kernel replaces the default for DOSE arms; empty-future deconvolves with it too.
     ck = CARB_KERNEL if carb_kernel is None else carb_kernel
     bk = BOLUS_KERNEL if bolus_kernel is None else bolus_kernel
 
-    ex_ok = exercise_is_announced(segs)
     ev_ok = events_are_recorded(segs)
 
     carb_d: list[np.ndarray] = []           # per window: (L, PRED) ΔBG vs the null arm
     ins_d: list[np.ndarray] = []
-    ex_d: list[np.ndarray] = []
     nulls: list[np.ndarray] = []            # per window: (PRED,) null-arm forecast
     empties: list[np.ndarray] = []
     quiet: list[bool] = []
@@ -187,7 +169,6 @@ def run(model, stats: dict, device, segs: list,
         ch = segment_to_channels(seg)
         carb_raw = np.clip(ch['carb'], 0.0, None)
         ins_raw = np.clip(ch['insulin'], 0.0, None)
-        ex_raw = np.clip(ch['exercise'], 0.0, None)
         cnt = 0
         for ps in range(CTX, n - PRED + 1, stride):
             if cnt >= cap:
@@ -196,72 +177,57 @@ def run(model, stats: dict, device, segs: list,
             ctx = context_window(feats, ps, MAX_CONTEXT_PATCHES)
             ov = _future_overrides(feats, ps, ANNOUNCE)
 
-            def _fc(carb_t: torch.Tensor, ins_t: torch.Tensor,
-                    ex_t: torch.Tensor, ov=ov) -> np.ndarray:
-                """Forecast with all three dosed channels replaced.
+            def _fc(carb_t: torch.Tensor, ins_t: torch.Tensor, ov=ov) -> np.ndarray:
+                """Forecast with both dosed channels replaced.
 
                 Dict passed whole, then overwritten key by key: only writing perturbed channels
                 would SILENTLY drop other announcements (unannounced slots take normalize(0)).
                 """
                 out = predict(model, ctx, normalization_stats=stats, device=device,
-                              overrides={**ov, 0: carb_t, 1: ins_t, 2: ex_t})
+                              overrides={**ov, 0: carb_t, 1: ins_t})
                 return out['median_bg'].detach().cpu().numpy().astype(np.float64)
 
-            base = _fc(ov[0], ov[1], ov[2])
+            base = _fc(ov[0], ov[1])
 
             c_fut = carb_raw[ps:ps + PRED]
             i_fut = ins_raw[ps:ps + PRED]
-            e_fut = ex_raw[ps:ps + PRED]
             c_null_t = _renorm(c_fut, stats, 'carb_intake')
             i_null_t = _renorm(i_fut, stats, 'insulin_combined')
-            e_null_t = _renorm(e_fut, stats, 'exercise_equiv')
-            null = _fc(c_null_t, i_null_t, e_null_t)
+            null = _fc(c_null_t, i_null_t)
             rail.append(float(np.max(np.abs(base - null))))
 
             cd = np.zeros((len(CARB_DOSES), PRED))
             for j, g in enumerate(CARB_DOSES):
                 if j != 0:
                     cd[j] = _fc(_renorm(c_fut + _dose_curve(g, ck), stats, 'carb_intake'),
-                                i_null_t, e_null_t) - null
+                                i_null_t) - null
             idl = np.zeros((len(INSULIN_DOSES), PRED))
             for j, u in enumerate(INSULIN_DOSES):
                 if j != 0:
                     idl[j] = _fc(c_null_t,
                                  _renorm(i_fut + _dose_curve(u, bk), stats,
-                                         'insulin_combined'), e_null_t) - null
-            # A COUNTERFACTUAL session on what the window already announces, never scaled to g/step.
-            if ex_ok:
-                ed = np.zeros((len(EXERCISE_DOSES), PRED))
-                for j, g in enumerate(EXERCISE_DOSES):
-                    if j != 0:
-                        ed[j] = _fc(c_null_t, i_null_t,
-                                    _renorm(e_fut + _dose_curve(g, EXERCISE_KERNEL),
-                                            stats, 'exercise_equiv')) - null
-                ex_d.append(ed)
+                                         'insulin_combined')) - null
 
             if ev_ok:
                 # Only events with ONSET in the prediction zone; a session under way can't retract.
                 c_empty = np.clip(c_fut - _convolve(seg.carb_grams[ps:ps + PRED], ck), 0.0, None)
                 i_empty = np.clip(i_fut - _convolve(seg.bolus_units[ps:ps + PRED], bk), 0.0, None)
                 empties.append(_fc(_renorm(c_empty, stats, 'carb_intake'),
-                                   _renorm(i_empty, stats, 'insulin_combined'),
-                                   e_null_t))
+                                   _renorm(i_empty, stats, 'insulin_combined')))
                 lo = max(0, ps - QUIET_STEPS)
                 quiet.append(bool(np.all(seg.carb_grams[lo:ps + PRED] <= 0)
-                                  and np.all(seg.bolus_units[lo:ps + PRED] <= 0)
-                                  and np.all(ex_raw[lo:ps + PRED] <= 0)))
+                                  and np.all(seg.bolus_units[lo:ps + PRED] <= 0)))
 
             carb_d.append(cd); ins_d.append(idl); nulls.append(null)
 
-    return _summarize(carb_d, ins_d, ex_d, nulls, empties, quiet, rail,
-                      ex_ok=ex_ok, ev_ok=ev_ok)
+    return _summarize(carb_d, ins_d, nulls, empties, quiet, rail, ev_ok=ev_ok)
 
 
 def _side(deltas: list[np.ndarray], doses: tuple[float, ...], nulls: list[np.ndarray],
           sign: int, thr: float, unit: str, rule: str) -> dict:
     """Summarize one dose ladder.
 
-    ``sign`` is the direction the announcement must move the forecast: +1 carb, -1 insulin/exercise.
+    ``sign`` is the direction the announcement must move the forecast: +1 carb, -1 insulin.
     It is the whole of the sign gate; ``sign_gate`` records the rule beside the numbers.
     """
     n = len(deltas)
@@ -354,9 +320,9 @@ def _empty_block(empties: list[np.ndarray]) -> dict:
     }
 
 
-def _summarize(carb_d: list[np.ndarray], ins_d: list[np.ndarray], ex_d: list[np.ndarray],
+def _summarize(carb_d: list[np.ndarray], ins_d: list[np.ndarray],
                nulls: list[np.ndarray], empties: list[np.ndarray], quiet: list[bool],
-               rail: list[float], ex_ok: bool, ev_ok: bool) -> dict:
+               rail: list[float], ev_ok: bool) -> dict:
     q = np.asarray(quiet, dtype=bool)
     empty = ({'all': _empty_block(empties),
               'quiet': _empty_block([e for e, k in zip(empties, quiet) if k])}
@@ -371,9 +337,6 @@ def _summarize(carb_d: list[np.ndarray], ins_d: list[np.ndarray], ex_d: list[np.
                       'announced carbohydrate must raise the forecast'),
         'insulin': _side(ins_d, INSULIN_DOSES, nulls, -1, BG_HYPER_THRESHOLD, 'U',
                          'announced insulin must lower the forecast'),
-        'exercise': (_side(ex_d, EXERCISE_DOSES, nulls, -1, BG_HYPER_THRESHOLD, 'g',
-                           'announced exercise must lower the forecast')
-                     if ex_ok else {'n': 0, 'not_probed': EX_NOT_ANNOUNCED}),
         'empty_future': empty,
         'null_rail': {'max_abs_dbg': round(float(np.max(rail)), 4) if rail else None,
                       'mean_abs_dbg': round(float(np.mean(rail)), 4) if rail else None},
@@ -383,7 +346,7 @@ def _summarize(carb_d: list[np.ndarray], ins_d: list[np.ndarray], ex_d: list[np.
 def _report(ds: str, r: dict) -> None:
     print(f"\n== {ds} ==  windows={r['n_windows']}  quiet={r['n_quiet']}  "
           f"null-rail max|Δ|={r['null_rail']['max_abs_dbg']} mg/dL")
-    for side in ('carb', 'insulin', 'exercise'):
+    for side in ('carb', 'insulin'):
         b = r[side]
         if not b['n']:
             # a refused arm says so, here as in the JSON
@@ -440,9 +403,8 @@ def _panel_curves(ax, block: dict, ramp: tuple[str, ...], unit: str, title: str,
 
 # One identity per arm across panels, fixed slots; ARM_RESCUE: carb clears hypo, others hyper.
 ARMS = (('carb', F.SERIES[0], 'carbohydrate'),
-        ('insulin', F.SERIES[1], 'insulin'),
-        ('exercise', F.SERIES[2], 'exercise'))
-ARM_RESCUE = {'carb': 'hypo', 'insulin': 'hyper', 'exercise': 'hyper'}
+        ('insulin', F.SERIES[1], 'insulin'))
+ARM_RESCUE = {'carb': 'hypo', 'insulin': 'hyper'}
 
 
 def _drawable(r: dict):
@@ -623,12 +585,9 @@ def main() -> None:
                           else load_model(device))
     model = model.to(device); model.eval()
     print(f"[whatif] model step={step} device={device}  kernel mass in horizon: "
-          f"carb {KERNEL_MASS['carb']:.2f} insulin {KERNEL_MASS['insulin']:.2f} "
-          f"exercise {KERNEL_MASS['exercise']:.2f}")
+          f"carb {KERNEL_MASS['carb']:.2f} insulin {KERNEL_MASS['insulin']:.2f}")
     res = {'_meta': {'step': step, 'carb_doses_g': list(CARB_DOSES),
                      'insulin_doses_u': list(INSULIN_DOSES),
-                     # grams of carbohydrate-EQUIVALENT disposal per session, the trained unit
-                     'exercise_doses_g_equiv': list(EXERCISE_DOSES),
                      'kernel_mass_in_horizon': KERNEL_MASS,
                      'horizon_min': list(HORIZONS), 'quiet_context_min': QUIET_CTX_MIN,
                      'checkpoint': args.checkpoint, 'datasets': list(datasets),
@@ -658,8 +617,6 @@ def main() -> None:
     res['_meta']['kernel_mass_in_horizon'] = {
         'carb': float((CARB_KERNEL if carb_kernel is None else carb_kernel)[:PRED].sum()),
         'insulin': float((BOLUS_KERNEL if bolus_kernel is None else bolus_kernel)[:PRED].sum()),
-        # No CLI replaces the exercise kernel: the simulator's session shape is the trained one.
-        'exercise': KERNEL_MASS['exercise'],
     }
     if SIM_DATASET in datasets:
         res['_meta']['sim_seeds'] = list(sim_data.TEST_SEEDS[:max(1, int(args.sim_seeds))])

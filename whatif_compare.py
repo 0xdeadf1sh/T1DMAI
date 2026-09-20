@@ -25,7 +25,7 @@ from metrics.core.horizons import HORIZONS
 from metrics.core.schema import segment_grid
 from t1dmdroid_converter import custom_curve, live_events, read_archive, record_channels
 
-SIDES = (('carb', 'hypo'), ('insulin', 'hyper'), ('exercise', 'hyper'))
+SIDES = (('carb', 'hypo'), ('insulin', 'hyper'))
 
 
 def phone_bolus_kernel(kinds: dict) -> tuple[np.ndarray, int]:
@@ -48,7 +48,7 @@ def record_segments(kinds: dict) -> list:
           + timedelta(minutes=r['tz_min']))
     z = np.zeros(len(r['bg']))
     return segment_grid('phone', 'record', t0, r['bg'].astype(np.float64), z, z, z,
-                        r['exercise'], carb_curve=r['carb'], insulin_curve=r['insulin'])
+                        carb_curve=r['carb'], insulin_curve=r['insulin'])
 
 
 def rows(r: dict, sides: tuple[str, ...]) -> list[tuple[str, float | None]]:
@@ -132,8 +132,8 @@ def main() -> None:
         n = res['gamma'][0]['n_windows']
         rail = ' / '.join(f'{r["null_rail"]["max_abs_dbg"]}' for r in res['gamma'])
         print(f'\n#### {cohort}: {n} windows, null-rail max |Δ| {rail} mg/dL')
-        print_table(f'{cohort} — carb and exercise', names,
-                    *[rows(r, ('carb', 'exercise')) for r in res['gamma']])
+        print_table(f'{cohort} — carb', names,
+                    *[rows(r, ('carb',)) for r in res['gamma']])
         print_table(f'{cohort} — insulin, simulator gamma bolus', names,
                     *[rows(r, ('insulin',)) for r in res['gamma']])
         print_table(f'{cohort} — insulin, phone bolus (mean of {n_bolus} logged curves)', names,

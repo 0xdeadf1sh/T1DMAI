@@ -184,7 +184,7 @@ def _build_patches_tensor(
     # Withhold bg then announce it; slot expansion via data._mask_slots, shared with training.
     mask_idx, valid, _d, _anchor_step = _mask_slots(spans, seq_len)
     masked_rows = torch.from_numpy(mask_idx[valid])
-    # Zeroes bg on masked CONTEXT patches (backcast/infill); carb/insulin/exercise pass through.
+    # Zeroes bg on masked CONTEXT patches (backcast/infill); the dose feats pass through.
     for feat_idx in NON_MASKABLE_FEATS:
         patches[masked_rows, feat_idx::N_INPUT_FEATURES] = 0.0
     # feat 4 spans PATCH_SIZE step-major cols; unwritten, masked patches announce as observed.
@@ -401,8 +401,8 @@ def predict_what_if(
     device: torch.device | None = None,
     return_time: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """What-if prediction: announce carb / insulin / exercise in the prediction zone.
-    overrides must already be NORMALIZED (normalization.normalize), routed to feat 1/2/3 via
+    """What-if prediction: announce the dose channels in the prediction zone.
+    overrides must already be NORMALIZED (normalization.normalize), routed to the dose feats via
     CHANNEL_TO_FEAT; BG is never overrideable. normalization_stats is REQUIRED for the
     mg/dL last_bg anchor and median_bg/bands. Returns the same as predict, reflecting the
     conditioned channels."""
@@ -432,7 +432,7 @@ def predict_rolling(
     """Autoregressive rolling prediction, extending the horizon beyond one window.
 
     Re-feed is BG-AUTOREGRESSIVE ONLY: f_inv(median) mg/dL -> normalize -> bg_absolute slot 0;
-    carb/insulin/exercise from overrides_fn or ZERO-RAW baseline (normalize(0), NOT torch.zeros).
+    dose feats from overrides_fn or ZERO-RAW baseline (normalize(0), NOT torch.zeros).
     carry_spread accumulates PER LEVEL in QUADRATURE, never additive/shared; median untouched."""
     if normalization_stats is None:
         raise ValueError(
@@ -545,7 +545,7 @@ def predict_rolling(
         all_bands.append(bands)
         all_pred_bgs.append(pred_bg_roll)
 
-        # Dose feats default to the zero-RAW baseline, not 0.0 — exercise baseline is z=-0.1387.
+        # Dose feats default to the zero-RAW baseline, not 0.0 — log1p inverts z=0 to a dose.
 
         # feat 4 stays 0.0 here; correct, since next roll's builder rewrites it wholesale.
         new_ctx_patches = torch.zeros(PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES)
@@ -636,15 +636,12 @@ if __name__ == '__main__':
     raw = simulate_discard_warmup(sim, 24)
 
     # bg_observed (post-CGM-noise), raw and unsmoothed, mirroring data._build_sample.
-
-    # total_exercise is the simulator's carb-equivalent g/step curve, never rescaled.
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     bg_obs = np.clip(raw['bg_observed'], BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
     carb = np.maximum(raw['total_carb'], 0.0).astype(np.float32)
     insulin = np.maximum(raw['total_insulin'], 0.0).astype(np.float32)
-    exercise = np.maximum(raw['total_exercise'], 0.0).astype(np.float32)
 
-    # Stack order: [bg_absolute, carb_intake, insulin_combined, exercise_equiv].
+    # Stack order: [bg_absolute, carb_intake, insulin_combined].
 
     # Count is len(CHANNEL_NAMES), not N_INPUT_FEATURES — bg_masked is a bit, appended below.
     assert len(CHANNEL_NAMES) == BG_MASKED_FEAT, (
@@ -652,7 +649,7 @@ if __name__ == '__main__':
         f"feat {BG_MASKED_FEAT}: {list(CHANNEL_NAMES)}"
     )
     raw_features = np.stack(
-        [bg_obs, carb, insulin, exercise], axis=-1
+        [bg_obs, carb, insulin], axis=-1
     )                                             # (N, len(CHANNEL_NAMES))
     assert raw_features.shape[-1] == len(CHANNEL_NAMES), (
         f"raw signal stack has {raw_features.shape[-1]} columns but "

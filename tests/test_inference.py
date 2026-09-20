@@ -165,17 +165,14 @@ def test_rolling_prediction():
         f"re-fed carb baseline must decode to ~0 g, got {float(decoded[1]):.4f}")
     assert abs(float(decoded[2])) < 1e-3, (
         f"re-fed insulin baseline must decode to ~0 U, got {float(decoded[2]):.4f}")
-    exercise_feat = CHANNEL_TO_FEAT[2]
-    assert abs(float(decoded[exercise_feat])) < 1e-3, (
-        f"re-fed exercise baseline must decode to ~0 g/step, got "
-        f"{float(decoded[exercise_feat]):.4f}")
+    insulin_feat = CHANNEL_TO_FEAT[1]
     # z=0 decodes to a nonzero phantom dose
     phantom = denormalize(
         np.zeros((1, N_INPUT_FEATURES), dtype=np.float32), stats)[0]
     assert float(phantom[1]) > 1e-3 or float(phantom[2]) > 1e-3, (
         "z=0 should decode to a phantom dose — the baseline fix is meaningful")
-    assert float(phantom[exercise_feat]) > 1e-3, (
-        "z=0 in the exercise slot should decode to a phantom session — feat 3 "
+    assert float(phantom[insulin_feat]) > 1e-3, (
+        "z=0 in the insulin slot should decode to a phantom dose — a dose feat "
         "left at literal 0.0 on an unconditioned roll is the trap this pins")
 
     print(f"\n[DUMP] rolling | {n_rolls} rolls, pred_bg range "
@@ -183,10 +180,8 @@ def test_rolling_prediction():
     print(f"[DUMP] rolling | roll-end band half-widths (risk-fan carry): "
           f"{[round(h, 3) for h in roll_end_halfwidth]}")
     print(f"[DUMP] rolling | zero-RAW baseline decodes carb={float(decoded[1]):.4f}g "
-          f"insulin={float(decoded[2]):.4f}U exercise="
-          f"{float(decoded[exercise_feat]):.4f}g/step vs z=0 phantom "
-          f"carb={float(phantom[1]):.4f}g insulin={float(phantom[2]):.4f}U "
-          f"exercise={float(phantom[exercise_feat]):.4f}g/step ✓")
+          f"insulin={float(decoded[2]):.4f}U vs z=0 phantom "
+          f"carb={float(phantom[1]):.4f}g insulin={float(phantom[2]):.4f}U ✓")
 
 
 def test_bands_bracket_median():

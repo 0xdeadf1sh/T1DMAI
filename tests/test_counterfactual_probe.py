@@ -38,7 +38,7 @@ def test_counterfactual_probe_smoke():
         hypo_threshold=BG_HYPO_THRESHOLD, hyper_threshold=BG_HYPER_THRESHOLD,
     )
 
-    fractions = ('cf_carb_sign', 'cf_insulin_sign', 'cf_exercise_sign',
+    fractions = ('cf_carb_sign', 'cf_insulin_sign',
                  'cf_carb_monotonic', 'cf_insulin_monotonic',
                  'cf_carb_onset_frac', 'cf_insulin_onset_frac')
     # Conditional on a response, a baseline excursion or an ICR existing: None is a legal reading.
@@ -47,7 +47,7 @@ def test_counterfactual_probe_smoke():
                    'cf_insulin_gain', 'cf_meal_coverage', 'cf_meal_coverage_ref',
                    'cf_hypo_rescue', 'cf_hyper_rescue')
     expected_keys = set(fractions) | set(conditional) | {
-        'cf_carb_gain', 'cf_exercise_gain',
+        'cf_carb_gain',
         'cf_insulin_linearity_ref', 'cf_insulin_preaction_dbg',
         'cf_n', 'cf_hypo_n', 'cf_hyper_n',
     }
@@ -55,7 +55,7 @@ def test_counterfactual_probe_smoke():
     assert result['cf_insulin_gain'] is not None
     assert set(result.keys()) == expected_keys, (
         f"cf_* key set mismatch: got {sorted(result.keys())}")
-    assert len(expected_keys) == 23
+    assert len(expected_keys) == 21
 
     assert isinstance(result['cf_n'], int) and result['cf_n'] >= 1, (
         f"cf_n must be a positive probe count, got {result['cf_n']!r}")
@@ -79,7 +79,6 @@ def test_counterfactual_probe_smoke():
           f"hypo_n={result['cf_hypo_n']} hyper_n={result['cf_hyper_n']}")
     print(f"[DUMP] cf_probe | carb_gain={result['cf_carb_gain']:.3f} "
           f"insulin_gain={result['cf_insulin_gain']:.3f} "
-          f"exercise_gain={result['cf_exercise_gain']:.3f} "
           f"carb_sign={result['cf_carb_sign']:.2f} insulin_sign={result['cf_insulin_sign']:.2f} "
           f"carb_mono={result['cf_carb_monotonic']:.2f} "
           f"insulin_mono={result['cf_insulin_monotonic']:.2f} "
@@ -90,8 +89,8 @@ def test_counterfactual_probe_smoke():
 def test_cf_reference_response_is_the_sim_open_loop():
     """A rung's reference is BG_SCALE_FACTOR × the curve's mass inside the horizon."""
     from train import _cf_bolus_curve, _CF_LADDER
-    from config import CF_INSULIN_BOLUS_U, CF_EXERCISE_G, PREDICTION_PATCHES, PATCH_SIZE
-    from T1DMSIM.simulator import BG_SCALE_FACTOR, bolus_pk_for_dose
+    from config import CF_INSULIN_BOLUS_U, PREDICTION_PATCHES, PATCH_SIZE
+    from T1DMSIM.simulator import bolus_pk_for_dose
 
     ps = PREDICTION_PATCHES * PATCH_SIZE
     assert _CF_LADDER == (0.5, 1.0, 2.0)
@@ -103,13 +102,7 @@ def test_cf_reference_response_is_the_sim_open_loop():
     assert not np.allclose(half, 0.5 * full)
     assert float(half.sum()) / (0.5 * CF_INSULIN_BOLUS_U) > float(full.sum()) / CF_INSULIN_BOLUS_U
 
-    ex = _cf_bolus_curve('exercise', CF_EXERCISE_G, ps)
-    assert ex.shape == (ps,) and (ex >= 0.0).all()
-    assert 0.0 < float(ex.sum()) < CF_EXERCISE_G, float(ex.sum())
-    ref_terminal = BG_SCALE_FACTOR * float(ex.sum())
-    assert ref_terminal > 0.0
-    print(f"\n[DUMP] cf_ref | insulin DIA min by rung={durations} "
-          f"exercise mass in horizon={float(ex.sum()) / CF_EXERCISE_G:.3f}")
+    print(f"\n[DUMP] cf_ref | insulin DIA min by rung={durations}")
 
 
 def test_cf_bolus_curve_is_the_spec_curve_not_a_rectangle():
@@ -125,14 +118,17 @@ def test_cf_bolus_curve_is_the_spec_curve_not_a_rectangle():
     assert abs(float(carb.sum()) - CF_CARB_BOLUS_G) < 1e-3, float(carb.sum())
     # GI 100 peaks at (k-1)*theta = 15 min, the fourth 5-min step
     assert int(carb.argmax()) == 3, f"carb peak at step {int(carb.argmax())}"
-    assert abs(float(carb[0]) - 1.7907) < 1e-3, float(carb[0])
+    assert abs(float(carb[0]) - 1.7953) < 1e-3, float(carb[0])
     # the rectangle this replaced was flat across the first PATCH_SIZE steps
     assert float(carb[0]) < 0.5 * float(carb[3]), (float(carb[0]), float(carb[3]))
 
     ins = _cf_bolus_curve('insulin', CF_INSULIN_BOLUS_U, ps)
     assert ins.shape == (ps,)
     assert (ins >= 0.0).all()
-    assert abs(float(ins.sum()) - CF_INSULIN_BOLUS_U) < 1e-3, float(ins.sum())
+    # the DIA of a 2 U bolus runs past the 2 h horizon, so only its head lands inside ps
+    assert 0.0 < float(ins.sum()) < CF_INSULIN_BOLUS_U, float(ins.sum())
+    assert abs(float(_cf_bolus_curve('insulin', CF_INSULIN_BOLUS_U, 4 * ps).sum())
+               - CF_INSULIN_BOLUS_U) < 1e-3
     assert int(ins.argmax()) > int(carb.argmax()), (
         f"insulin peaks at step {int(ins.argmax())}, carbs at {int(carb.argmax())}")
 
@@ -143,7 +139,7 @@ def test_cf_bolus_curve_is_the_spec_curve_not_a_rectangle():
     assert float(short.sum()) < CF_CARB_BOLUS_G
 
     with pytest.raises(ValueError):
-        _cf_bolus_curve('exercise', 1.0, ps)
+        _cf_bolus_curve('basal', 1.0, ps)
 
     print(f"\n[DUMP] cf_curve | carb sum={carb.sum():.3f} peak_step={int(carb.argmax())} "
           f"step0={carb[0]:.4f} | insulin sum={ins.sum():.3f} "

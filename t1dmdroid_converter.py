@@ -1,12 +1,8 @@
-"""Convert a T1DMDROID ``.t1dmbak`` backup into a finetune cache, its last N days held out as test.
+"""Convert a T1DMDROID ``.t1dmbak`` backup into a finetune cache, last N days held out as test.
 
 Pool ``phone`` in ``finetune_data``'s format. BG: measured, NORMAL-flagged grid samples. Carb and
-insulin: rebuilt from logged events per ``SPEC/invariants.md`` §5, custom curves verbatim. Exercise:
-the grams the phone laid into each bucket.
-
-The grid carries only the sensor that was authoritative at the time. Every sensor's own NORMAL
-readings form one more subject each, over that sensor's span cut at the held-out boundary, so the
-grid alone is scored; overlapping sensors are separate subjects, never merged."""
+insulin: rebuilt from logged events per ``SPEC/invariants.md`` §5; the phone's ``exg`` grams are
+read past. Each sensor's own NORMAL readings form one more subject, cut at the held-out boundary."""
 
 import argparse
 import base64
@@ -103,7 +99,7 @@ def _lay(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
 
 
 def record_channels(kinds: dict[str, list[dict]]) -> dict:
-    """Per 5-min step: bg mg/dL (NaN unmeasured), carb g, insulin U, exercise g."""
+    """Per 5-min step: bg mg/dL (NaN unmeasured), carb g, insulin U."""
     samples = kinds.get('sample', [])
     if not samples:
         raise SystemExit('the backup has no samples')
@@ -112,12 +108,10 @@ def record_channels(kinds: dict[str, list[dict]]) -> dict:
     t0_ms = first['ts']
     n = (max(s['ts'] for s in samples) - t0_ms) // STEP_MS + 1
     bg = np.full(n, np.nan, dtype=np.float32)
-    exercise = np.zeros(n, dtype=np.float64)
     for s in samples:
         i = (s['ts'] - t0_ms) // STEP_MS
         if 'bg' in s and s.get('pv') == 'MEASURED' and s.get('fl') == 'NORMAL':
             bg[i] = s['bg']
-        exercise[i] = float(s.get('exg', 0.0))
 
     carb, insulin = np.zeros(n), np.zeros(n)
     at = lambda ts: int(round((ts - t0_ms) / STEP_MS))  # noqa: E731 — bucketize's rounding
@@ -126,7 +120,7 @@ def record_channels(kinds: dict[str, list[dict]]) -> dict:
     for o in events['dose']:
         _lay(insulin, dose_curve(o), at(o['ts']))
     return {'t0_ms': t0_ms, 'tz_min': int(first['tz']), 'bg': bg, 'carb': carb,
-            'insulin': insulin, 'exercise': np.nan_to_num(exercise),
+            'insulin': insulin,
             'n_meals': len(events['meal']), 'n_doses': len(events['dose']), 'n_deleted': n_deleted}
 
 
@@ -150,11 +144,10 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str,
     # Local wall-clock seconds: the time probe reads the hour straight off t0.
     t0 = r['t0_ms'] // 1000 + r['tz_min'] * 60
     carb, insulin = r['carb'].astype(np.float32), r['insulin'].astype(np.float32)
-    exercise = r['exercise'].astype(np.float32)
 
     def add(src: str, subject: str, bg: np.ndarray, lo: int, hi: int) -> None:
         start = app.append({'bg': bg[lo:hi], 'carb': carb[lo:hi], 'insulin': insulin[lo:hi],
-                            'exercise': exercise[lo:hi], 'is_test': is_test[lo:hi]})
+                            'is_test': is_test[lo:hi]})
         ts = test_start - lo
         index.append({
             'key': f'phone:{src}:{subject}', 'pool': 'phone', 'source': src, 'sid': subject,

@@ -1163,7 +1163,7 @@ def _render_validation_table(
     title_top = f"┌─{'─' * inner_w}─┐"
     title_lines = [
         f"Validation @ step {step} — {PREDICTION_HORIZON_HOURS}h window",
-        "BLIND (masked patches withhold carbs+insulin+exercise too)",
+        "BLIND (masked patches withhold carbs+insulin too)",
     ]
     title_inner = [
         f"│ {_ANSI_BOLD}{_ANSI_CYAN}{_pad(t, inner_w, 'c')}{_ANSI_RESET} │"
@@ -3359,7 +3359,7 @@ class HelpfulParser(argparse.ArgumentParser):
 
 if __name__ == '__main__':
     parser = HelpfulParser(
-        description='Train T1DMAI with NO conditioning — a masked patch withholds its carbs, insulin and exercise as well as its bg. Writes to checkpoints_blind/ and logs_blind/. Parameters are resolved in this order: '
+        description='Train T1DMAI with NO conditioning — a masked patch withholds its carbs and insulin as well as its bg. Writes to checkpoints_blind/ and logs_blind/. Parameters are resolved in this order: '
                     'CLI args > config.py.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

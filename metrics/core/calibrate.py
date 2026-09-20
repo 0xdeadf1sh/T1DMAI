@@ -119,7 +119,7 @@ def _future_overrides(feats: np.ndarray, pred_start: int,
     """Announced-channel prediction future -> {ch: (PREDICTION_PATCHES, PATCH_SIZE)}, normalized.
 
     ``feats`` is the normalized (N, F) stack; ch sits at CHANNEL_TO_FEAT[ch]
-    (carb 0→feat 1, insulin 1→feat 2, exercise 2→feat 3)."""
+    (carb 0→feat 1, insulin 1→feat 2)."""
     fut = feats[pred_start:pred_start + PRED_STEPS]      # (PRED_STEPS, F), normalized
     ov: dict[int, torch.Tensor] = {}
     for ch in announce:
@@ -132,12 +132,12 @@ def _future_overrides(feats: np.ndarray, pred_start: int,
 def collect_windows(model, stats, segments: list[Segment], device,
                     stride_patches: int = 8, max_per_patient: int | None = None,
                     seed: int = 0, conditional: bool = True,
-                    announce: tuple[int, ...] = (0, 1, 2)) -> list[Window]:
+                    announce: tuple[int, ...] = (0, 1)) -> list[Window]:
     """Slide prediction windows across each segment and capture the BG forecast.
 
     ALWAYS conditioned: each window's true future ``announce`` channels reach the model, the
     deployment regime. ``stride_patches`` in patches between starts; ``max_per_patient`` subsamples
-    at random. ``announce``: carb 0, insulin 1, exercise 2 — BG is never conditionable."""
+    at random. ``announce``: carb 0, insulin 1 — BG is never conditionable."""
     by_patient: dict[str, list[Window]] = {}
     for seg in segments:
         n = (len(seg) // PATCH_SIZE) * PATCH_SIZE

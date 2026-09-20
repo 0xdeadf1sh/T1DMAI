@@ -7,14 +7,14 @@ NAN = np.nan
 
 def _rows(**cols):
     n = len(cols['idx'])
-    base = {c: np.full(n, NAN) for c in ('carbs', 'basal', 'bolus', 'insulin', 'workout')}
+    base = {c: np.full(n, NAN) for c in ('carbs', 'basal', 'bolus', 'insulin')}
     base['is_mdi'] = np.zeros(n, dtype=bool)
     return base | {k: np.asarray(v) for k, v in cols.items()}
 
 
 def _events(n, r, bolus_type=None, basal_type=None):
     return fd._events_to_curves(
-        n, r['idx'], r['carbs'], r['basal'], r['bolus'], r['insulin'], r['workout'],
+        n, r['idx'], r['carbs'], r['basal'], r['bolus'], r['insulin'],
         r['is_mdi'], bolus_type, basal_type)
 
 
@@ -27,7 +27,7 @@ def test_event_channels_match_the_layout():
 
 def test_doses_land_on_their_slot_and_conserve_the_curve_total():
     r = _rows(idx=[10, 10, 50], carbs=[40.0, NAN, NAN], bolus=[NAN, 4.0, 2.0])
-    carb, ins, _, ev = _events(400, r)
+    carb, ins, ev = _events(400, r)
     assert ev['carb_g'][10] == 40.0 and ev['carb_g'].sum() == 40.0
     assert ev['carb_gi'][10] == fd.CARB_GI_DEFAULT
     assert ev['bolus_u'][10] == 4.0 and ev['bolus_u'][50] == 2.0
@@ -63,9 +63,3 @@ def test_mdi_injection_carries_the_long_acting_descriptors():
     np.testing.assert_allclose(ev['basal_dur_h'][5], av['action_hours'], rtol=1e-6)
     np.testing.assert_allclose(
         ev['basal_peak_min'][5], fd.bateman_peak_min(av['ka'], av['ke']), rtol=1e-5)
-
-
-def test_joined_bouts_are_one_session_event():
-    r = _rows(idx=[10, 16], workout=[30.0, 30.0])
-    *_, ev = _events(400, r)
-    assert ev['exercise_min'][10] == 60.0 and np.count_nonzero(ev['exercise_min']) == 1

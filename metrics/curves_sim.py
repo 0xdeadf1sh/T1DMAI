@@ -31,7 +31,7 @@ SEEDS = list(SD.TEST_SEEDS)[:14]          # held-out sim test patients (≥N_DAY
 
 def sim_bg_sigma(model, stats, runs, horizon_patches,
                  stride_steps=8 * CV.PATCH_SIZE, max_windows=200, report=None):
-    """Per-horizon ±1σ envelope, mg/dL; each window announces its future carb/insulin/exercise."""
+    """Per-horizon ±1σ envelope, mg/dL; each window announces its future carb and insulin."""
     H = horizon_patches * CV.PATCH_SIZE
     acc = {'se': np.zeros(H), 'n': np.zeros(H), 'count': 0}
     for pid, d in runs:

@@ -64,7 +64,6 @@ def backup_stretches(path: str, test_days: int) -> list[dict[str, np.ndarray]]:
         'bg_observed': r['bg'][a:b],
         'total_carb': r['carb'][a:b],
         'total_insulin': r['insulin'][a:b],
-        'total_exercise': r['exercise'][a:b],
         'hour_of_day': (local_s[a:b] % 86400) / 3600.0,
         'day': local_s[a:b] // 86400,
     } for a, b in zip(edges[::2], edges[1::2])]

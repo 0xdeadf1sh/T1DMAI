@@ -569,9 +569,9 @@ def _policy_wording(cfg: dict) -> dict[str, str]:
             "row": "blind",
             "footer": ("masked-patch carbs/insulin are withheld at the no-dose fill "
                        "(blind regime)"),
-            "caveat": ("Masked patches carry no dose information: carb, insulin and\n"
-                       "exercise are withheld with BG at the no-dose fill. The model\n"
-                       "cannot respond to an announced dose, so what-if response is\n"
+            "caveat": ("Masked patches carry no dose information: carb and insulin\n"
+                       "are withheld with BG at the no-dose fill. The model cannot\n"
+                       "respond to an announced dose, so what-if response is\n"
                        "not available."),
         }
     return {
@@ -611,8 +611,6 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
         ("BG absolute",           "mg/dL",     "always · 0 where masked"),
         ("Carbs",                 "g / 5 min", wording["dose_note"]),
         ("Insulin",               "U / 5 min", wording["dose_note"]),
-        # exercise is a carb-equivalent glucose-disposal curve on the carb scale, not an intensity
-        ("Exercise (carb-equiv)", "g / 5 min", wording["dose_note"]),
         # bit/patch, not normalized; z=0 in a masked BG slot is a legal reading, not a sentinel
         ("BG masked",             "bit/patch", "1 where BG is withheld"),
     ]
@@ -690,7 +688,7 @@ def card_io_schema(cfg: dict, arch: dict) -> None:
             transform=ax.transAxes)
     ax.text(n_x + 0.015, n_y + n_h - 0.060,
             "The BG head emits an ascending fan of risk-space quantiles;\n"
-            "there are no dynamics outputs. Carbs / insulin / exercise are inputs only;\n"
+            "there are no dynamics outputs. Carbs / insulin are inputs only;\n"
             "IS / HGO are simulator latents — dropped, neither in nor out.\n"
             f"{_forecast_line}",
             fontsize=9, color=SLATE, va="top", family=FONT_BODY,
@@ -1056,7 +1054,7 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
     y = _header(ax, "Validation metrics",
                 "Headline results",
                 "Best-over-run (with the step where it was achieved) and mean over the "
-                "last 10 validation rows. Masked-patch carb/insulin/exercise are "
+                "last 10 validation rows. Masked-patch carb/insulin are "
                 f"{_policy_wording(cfg)['regime']}.")
 
     def _tight_section(yy: float, lab: str, color=NAVY) -> float:

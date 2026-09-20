@@ -42,7 +42,7 @@ INFILL_D_PER_STEP = np.repeat(
     np.array([min(j + 1, INFILL_SPAN_LEN - j) for j in range(INFILL_SPAN_LEN)]),
     config.PATCH_SIZE)
 
-ANNOUNCE = (0, 1, 2)                       # carb, insulin, exercise
+ANNOUNCE = (0, 1)                          # carb, insulin
 # Checked: an announced set short of CHANNEL_TO_FEAT leaves that slot at normalize(0).
 assert ANNOUNCE == tuple(config.CHANNEL_TO_FEAT), (
     f"announced set {ANNOUNCE} != announceable set {tuple(config.CHANNEL_TO_FEAT)}")

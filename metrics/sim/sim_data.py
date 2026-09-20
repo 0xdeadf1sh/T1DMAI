@@ -29,8 +29,7 @@ from metrics.core.run_eval import _make_night_overrides_fn
 def _assert_announces_all(announce: tuple[int, ...]) -> None:
     """Every announceable channel must be announced, on every evaluation path.
 
-    A dropped slot sits at ``normalize(0)`` — for exercise_equiv a legal "no session" (-0.139 z on
-    the balanced pool) — so the window scores as if nothing happened and the table looks right.
+    A dropped slot sits at ``normalize(0)``, so the window scores as if nothing happened.
     """
     assert tuple(announce) == tuple(CHANNEL_TO_FEAT), (
         f"announced set {tuple(announce)} != announceable set {tuple(CHANNEL_TO_FEAT)}")
@@ -77,7 +76,7 @@ TEST_SEEDS = tuple(range(8000, 8030))    # 30 test patients
 def make_sim_runs(seeds, hours: float) -> list[tuple[str, dict]]:
     """One fresh simulator patient per seed -> ``[(patient_id, data_dict)]``, ``hours`` each.
 
-    ``data_dict`` keys: bg_observed/total_carb/total_insulin/total_exercise/hour_of_day/day, plus
+    ``data_dict`` keys: bg_observed/total_carb/total_insulin/hour_of_day/day, plus
     insulin_resistance/hgo (neither input nor output).
     """
     runs = []
@@ -95,8 +94,8 @@ SIM_EPOCH = datetime(2024, 1, 1, 0, 0, 0)
 def run_to_segment(pid: str, d: dict) -> Segment:
     """One simulator run as a ``Segment``, for the consumers that take Segments.
 
-    carb_curve/insulin_curve carry total_carb/total_insulin verbatim (already curves); exercise is
-    UNRESCALED total_exercise. EVENT CHANNELS ARE EMPTY: convolved into the curves, unrecoverable.
+    carb_curve/insulin_curve carry total_carb/total_insulin verbatim (already curves).
+    EVENT CHANNELS ARE EMPTY: convolved into the curves, unrecoverable.
     """
     bg = np.clip(np.asarray(d['bg_observed'], dtype=np.float64),
                  BG_CLAMP_MIN, BG_CLAMP_MAX)
@@ -108,7 +107,6 @@ def run_to_segment(pid: str, d: dict) -> Segment:
         t0=SIM_EPOCH + timedelta(hours=float(d['hour_of_day'][0])),
         cgm=bg,
         carb_grams=zeros(), bolus_units=zeros(), basal_rate=zeros(),
-        exercise=np.clip(np.asarray(d['total_exercise'], dtype=np.float64), 0.0, None),
         carb_curve=np.clip(np.asarray(d['total_carb'], dtype=np.float64), 0.0, None),
         insulin_curve=np.clip(np.asarray(d['total_insulin'], dtype=np.float64), 0.0, None),
     )
@@ -137,7 +135,6 @@ def build_sim_feature_stack(d: dict, stats: dict) -> np.ndarray:
     raw[:, 0] = np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float64)
     raw[:, 1] = np.clip(d['total_carb'].astype(np.float64), 0.0, None).astype(np.float64)
     raw[:, 2] = np.clip(d['total_insulin'].astype(np.float64), 0.0, None).astype(np.float64)
-    raw[:, 3] = np.clip(d['total_exercise'].astype(np.float64), 0.0, None).astype(np.float64)
     # normalize() owns the per-channel transform and z-score: single source of truth for the input.
     feats = np.zeros((n, N_INPUT_FEATURES), dtype=np.float32)
     feats[:, :BG_MASKED_FEAT] = normalize(raw, stats)
@@ -146,7 +143,7 @@ def build_sim_feature_stack(d: dict, stats: dict) -> np.ndarray:
 
 def collect_sim_windows(model, stats, runs, device, stride_patches: int = 8,
                         max_per_patient: int | None = None,
-                        announce: tuple[int, ...] = (0, 1, 2), seed: int = 0,
+                        announce: tuple[int, ...] = (0, 1), seed: int = 0,
                         conformal_delta=None) -> list[Window]:
     """Slide windows per simulated patient, capturing median BG and RAW mg/dL fan per Window.
 
@@ -185,7 +182,7 @@ def collect_sim_windows(model, stats, runs, device, stride_patches: int = 8,
 
 
 def collect_sim_rows(model, stats, runs, device,
-                     announce: tuple[int, ...] = (0, 1, 2), cap: int = 24,
+                     announce: tuple[int, ...] = (0, 1), cap: int = 24,
                      conformal_delta=None) -> list[dict]:
     """Per-window conditional BG forecasts for the trajectory/parity/clarke figures.
 

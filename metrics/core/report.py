@@ -446,10 +446,9 @@ quality.{step_line}
   distinct random patient — {meta.get('hours', '?')} h per patient after a
   {meta.get('warmup', '?')} h warmup discard. Calibration and test patients are disjoint
   seed pools.
-- **Inputs.** The announced-event (what-if) regime: each window's future carbohydrate,
-  insulin and exercise over the forecast horizon are given to the model. The model
-  consumes only CGM, carbohydrate, insulin and the
-  carbohydrate-equivalent exercise channel (time-of-day is inferred, not an input).
+- **Inputs.** The announced-event (what-if) regime: each window's future carbohydrate
+  and insulin over the forecast horizon are given to the model. The model consumes only
+  CGM, carbohydrate and insulin (time-of-day is inferred, not an input).
 - **Forecast.** The model emits a risk-space quantile fan, inverted to mg/dL; the headline
   level metrics score the truth against the τ={METRIC_BAND_TAU_LO:.2f}–τ={METRIC_BAND_TAU_HI:.2f}
   band (definition below), with the same metrics on the quantile median kept alongside in
@@ -496,7 +495,7 @@ band-scored and the median-line series.
 
 - In-domain: the model was trained on this simulator, so these numbers are an upper
   reference and say nothing about generalisation beyond it.
-- The prediction-horizon carbohydrate, insulin and exercise are announced to the model.
+- The prediction-horizon carbohydrate and insulin are announced to the model.
 - Per-window counts are capped (test windows shown above).
 - Hypo/hyper recall and precision rest on the event counts noted under the suite table.
 
