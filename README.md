@@ -1,8 +1,8 @@
 # T1DMAI
 
 An encoder-only transformer that forecasts blood glucose for Type 1 Diabetes.
-It reads the four signals a phone can actually observe — CGM, logged
-carbohydrate, logged insulin, logged exercise — and returns a fan of seven
+It reads the three signals a phone can actually observe — CGM, the carbohydrate
+the patient guessed, the insulin they think they took — and returns a fan of seven
 quantiles over any withheld stretch of glucose, so every prediction carries its
 own uncertainty. The trailing case is the next two hours.
 
@@ -89,6 +89,11 @@ from the trajectory alone. It never touches the forecast, but its gradient does
 reach the shared trunk, which pushes the same representations the glucose head
 reads to encode circadian phase.
 
+A third head reads four patient skills — dietary discipline, attentiveness,
+dosing competence, lifestyle consistency — off the pooled visible context, as
+four numbers in `[0, 1]`. It is trained only where the simulator supplies the
+answers, it never touches the forecast, and it is not exported.
+
 The model is patient-agnostic. There is no learned per-patient vector; identity
 is whatever the 84–168 hour context window implies.
 
@@ -99,7 +104,7 @@ Every dimension lives in `config.py`, and `resize_model.py` rewrites it.
 
 A window is a run of patches, each visible or masked. A masked patch withholds
 its glucose and announces that it did, through a bit the model reads; the
-carbohydrate, insulin and exercise channels keep their announced values
+carbohydrate and insulin channels keep their announced values
 there as everywhere else. The head emits a quantile fan for every masked patch,
 and all of them are decoded in one pass.
 
@@ -162,18 +167,17 @@ Five features per 5-minute step:
 | CGM glucose | mg/dL | Kovatchev `f`, then z-score |
 | carbohydrate | g / step | `log1p`, then z-score |
 | insulin (basal + bolus) | U / step | `log1p`, then z-score |
-| exercise | g / step | `log1p`, then z-score |
 | glucose withheld | bit | none |
 
-Exercise is glucose disposal expressed as a carbohydrate equivalent, so it takes
-carbohydrate's scale and encoding exactly — never minutes, never an intensity.
+The carbohydrate is the patient's guessed grams at their guessed glycaemic index,
+and the insulin is the dose they injected — not what the site delivered.
 
 `log1p` is near-linear near zero, so the dense basal baseline survives while
 rare meal and bolus spikes are compressed into the bulk of the distribution.
 
-The fifth feature is a bit rather than a signal: it is written into every step
+The fourth feature is a bit rather than a signal: it is written into every step
 column of a masked patch to say that the glucose slot there is blank. It carries
-no normalization statistics, so there are four normalized channels behind five
+no normalization statistics, so there are three normalized channels behind four
 input features. A patch is `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES` values,
 laid out step-major.
 
@@ -182,21 +186,21 @@ cannot supply them, so they are deliberately withheld: the model only ever sees
 what deployment will give it. There are no time-of-day features either.
 
 At a masked patch the glucose slot is blanked — it is what the model predicts —
-while the carbohydrate, insulin and exercise slots carry the meals, doses and
-sessions as their absorption, action and disposal curves, per step, in the units
+while the carbohydrate and insulin slots carry the meals and doses as their
+absorption and action curves, per step, in the units
 above. The model is therefore *always* conditioned on a declared plan, which is
 what makes the what-if mode a property of the forward pass rather than a separate
 mode.
 
 ### Point-event layout
 
-`--inputs events` on `train.py` and `finetune.py` replaces the three curves with
-each dose at the step it was taken, eleven features per step:
+`--inputs events` on `train.py` and `finetune.py` replaces the two curves with
+each dose at the step it was taken, ten features per step:
 
 | Feature | Units | Transform |
 | --- | --- | --- |
 | CGM glucose | mg/dL | Kovatchev `f`, then z-score |
-| `carb_g`, `bolus_u`, `basal_u`, `exercise_min` | g, U, U, session minutes | `log1p`, then z-score |
+| `carb_g`, `bolus_u`, `basal_u` | g, U, U | `log1p`, then z-score |
 | `carb_gi` | glycaemic index | `ln(x / 50)` on a dosed step, 0 elsewhere |
 | `bolus_peak_min`, `basal_peak_min` | minutes to peak action | `ln(x / 60)` on a dosed step, 0 elsewhere |
 | `bolus_dur_h`, `basal_dur_h` | hours of action | `ln(x / 5)` on a dosed step, 0 elsewhere |
@@ -311,7 +315,7 @@ suite-wide specification in
 non-PyTorch runtime implements against.
 
 **Single pass.** Given 84–168 hours of context, forecast the next two hours as
-seven quantiles per 5-minute step. Upcoming carbohydrate, insulin and exercise
+seven quantiles per 5-minute step. Upcoming carbohydrate and insulin
 can be announced to condition the forecast. `mask_spans` moves the masked
 patches elsewhere — a backcast or an infill — through the same call; the future
 patches stay masked whatever else is, since no glucose was ever observed there.
@@ -432,11 +436,11 @@ locally by `T1DMSIM/cache_simulator.py`. The pools T1DMSIM publishes are earlier
 geometries, which `data.py` rejects at load against the accepted one.
 
 ```bash
-python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000 --sim-hours 199.5
+python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000
 python train.py --cache-path simulator_cache --total-steps 100000
 
 # curves plus point events in one pool; either layout trains from it
-python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000 --sim-hours 199.5 --events
+python T1DMSIM/cache_simulator.py --out-dir simulator_cache --pool-size 1000000 --events
 python train.py --inputs events --cache-path simulator_cache --total-steps 100000
 ```
 
@@ -444,33 +448,35 @@ python train.py --inputs events --cache-path simulator_cache --total-steps 10000
 `normalization_stats_events.json` beside `normalization_stats.json`. The event
 layout reads its statistics from the pool, so it requires `--cache-path`.
 
-The geometry the dataset accepts is 2394 steps, 199.5 h at 5-minute resolution
-after a 48 h warmup; a pool at any other geometry is rejected at load. The
-`--sim-hours` flag above is required until `cache_simulator.py`'s own default
-moves to match — its built-in default still builds the retired 1242-step pool.
+A row is 2016 steps of context — 7 days at 5-minute resolution, after a 48 h
+warm-up and a random extra offset that lands its boundary on a uniform hour — then
+four paired 24-step continuations with the patient's behaviour switched off: one
+with nothing at the boundary, one with a bolus, one with carbohydrate, one with
+both. A sample takes one arm, so its horizon's announced doses and its ground
+truth are the same counterfactual. `cache_simulator.py`'s defaults are that
+geometry, and a pool built to any other is rejected at load.
 
-`--hypo-oversample` weights the pool toward hypoglycemia. Pool size scales with
-the row length: at a million trajectories the retired 1242-step balanced pool
-occupied 16.80 GB and its hypo-weighted twin 16.91 GB, so the 2394-step geometry
-runs about 32 GB. Each pool directory carries a `DATASET.md` describing what is
-in it and the `normalization_stats.json` fitted on that pool.
+`--hypo-oversample` weights the pool toward hypoglycemia; it reads the context
+alone, and a tail is never rejected. Each pool directory carries a `DATASET.md`
+describing what is in it and the `normalization_stats.json` fitted on that pool,
+over the context and all four tails.
 
 Each channel is a chunked blosc2 array with byte-shuffle and zstd. Byte-shuffle
 groups the high-entropy mantissa bytes of each float apart from the low-entropy
 exponent bytes, which gives zstd a far more compressible stream than raw IEEE-754
 layout. On a million-row balanced pool that is about 1.3–1.7× on the dense
 physiologic channels and 27–539× on the near-constant ones — hour-of-day 309×,
-day index 539× — for roughly 2.4× over the pool as a whole. An uncompressed
-`.npy` memmap layout is also accepted.
+day index 539× — for roughly 2.4× over the pool as a whole.
 
-Pool reuse is benign, because every draw takes a fresh random window from its
-row: over a 168–336-patch context a 2394-step trajectory admits 22,308 distinct
-patch-aligned windows, so a 1–3 M-row pool is ample for a 100,000-step run at
+Pool reuse is benign, because every draw takes a fresh arm and a fresh context
+crop from its row: 4 arms × 169 context widths is 676 distinct windows per row,
+so a 1–3 M-row pool is ample for a 100,000-step run at
 batch 512. Each row is drawn about 64 times at
 10⁶ rows, but the expected number of repeated (row, window) pairs across a whole
 run is under a fifth of a percent of draws — and each of those still draws its
 own mask. The dataset checks
-the cache's `meta.json` — format, channel list, warmup and sim hours, `dt`, the
+the cache's `meta.json` — format, channel list, tail geometry and arm order,
+warmup, `dt`, the
 uniform-sample probability — and each channel's shape against the runtime config,
 and refuses to train on divergent data. The generation parameters under `params`
 are not checked, so two pools built with different hypoglycemia oversampling are
@@ -679,7 +685,7 @@ the whole window and do not move with the view.
 
 The GUI reads the checkpoint's `masked_channel_policy` and shows it. Under the
 blind policy the masked spans carry the no-dose fill rather than the recorded
-carb / insulin / exercise, matching how that checkpoint was trained, and the
+carb / insulin, matching how that checkpoint was trained, and the
 dose-painting controls are disabled.
 
 

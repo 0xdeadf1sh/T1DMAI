@@ -44,9 +44,9 @@ not.
 ## Overview
 
 An encoder-only transformer over patches of CGM glucose, carbohydrate
-appearance, insulin action and exercise disposal. Every patch of a window is
+appearance and insulin action. Every patch of a window is
 either **visible** — its glucose observed — or **masked**, its glucose withheld
-while the other three channels keep their true or announced values. The model
+while the other two channels keep their true or announced values. The model
 emits a fan of `N_QUANTILES` blood-glucose quantiles per 5-minute step of every
 masked patch.
 
@@ -103,7 +103,7 @@ Derived, not settable:
 
 | Constant | Definition |
 | --- | --- |
-| `N_INPUT_FEATURES` | 5 — `[bg_absolute, carb_intake, insulin_combined, exercise_equiv, bg_masked]`, of which the leading four are normalized signal channels |
+| `N_INPUT_FEATURES` | 4 — `[bg_absolute, carb_intake, insulin_combined, bg_masked]`, of which the leading three are normalized signal channels |
 | `PATCH_DIM` | `PATCH_SIZE × N_INPUT_FEATURES` |
 | `PREDICTION_PATCHES` | `PREDICTION_HORIZON_HOURS × 60 / (PATCH_SIZE × 5)` |
 | `MAX_SEQ_LEN` | `MAX_CONTEXT_PATCHES + PREDICTION_PATCHES` |
@@ -184,24 +184,22 @@ time-of-day features — day and night are inferred from the trajectory alone.
 | `bg_absolute` | mg/dL | Clamp to `[BG_CLAMP_MIN, BG_CLAMP_MAX]`, Kovatchev `f`, z-score |
 | `carb_intake` | g / step | Floor at 0, `log1p`, z-score |
 | `insulin_combined` | U / step | Floor at 0, `log1p`, z-score |
-| `exercise_equiv` | g / step, carbohydrate-equivalent | Floor at 0, `log1p`, z-score |
 | `bg_masked` | bit, one value per patch | None — it is never normalized |
 
 `log1p` is near-linear near zero, so the dense basal baseline passes through
-almost unchanged while rare meal, bolus and exercise spikes are compressed out of
+almost unchanged while rare meal and bolus spikes are compressed out of
 the channel's standard deviation. `normalization.py` holds the membership sets —
-`RISK_SPACE_CHANNELS` for glucose, `SPARSE_LOG1P_CHANNELS` for the other three —
+`RISK_SPACE_CHANNELS` for glucose, `SPARSE_LOG1P_CHANNELS` for the other two —
 and every forward and inverse transform consults them, so the pipeline stays
 invertible. `bg_masked` is in neither set: it carries no mean, no std and no
-`log1p`, which is why `CHANNEL_NAMES` has four entries where
-`N_INPUT_FEATURES` is five.
+`log1p`, which is why `CHANNEL_NAMES` has three entries where
+`N_INPUT_FEATURES` is four.
 
-`exercise_equiv` is carbohydrate-equivalent glucose disposal in g/step — the
-quantity the simulator subtracts from the appearance term — so it takes carb's
-encoding exactly, never the Kovatchev transform and never a rescaling to an
-intensity.
+The carbohydrate is the patient's guessed grams at their guessed glycaemic index,
+and the insulin is the dose they injected, before the site-quality factor. What
+drives the simulated glucose is held back (`SPEC/cache.md` §4).
 
-All four signal channels are the **raw post-noise** simulator signals. There is
+All three signal channels are the **raw post-noise** simulator signals. There is
 no smoother anywhere, on the inputs or the target. The same raw glucose is the
 model input, the forecast target and the anchor, so there is no input/target
 asymmetry, and a live CGM stream needs no on-device filter to reproduce.
@@ -210,27 +208,24 @@ Insulin sensitivity and hepatic glucose output stay in the cache but never reach
 the model. They are internal states a real CGM cannot observe, so withholding
 them forces the model to forecast from signals deployment can supply.
 
-`carb_intake`, `insulin_combined` and `exercise_equiv` are **rates**, not
-ingestion, injection and session instants: grams entering the blood, units acting,
-and grams of carbohydrate-equivalent disposal in each 5-minute step. Pretraining
-takes them from the simulator directly. A record that logs bare amounts instead is
-converted by `metrics/core/features.py`, which convolves them with population-mean
-kernels. A record whose events already carry their resolved series supplies them on
-`Segment.carb_curve` / `Segment.insulin_curve`, which bypass the kernels; the
-transforms in the table above are unchanged either way. `Segment.exercise` is
-already a resolved g/step curve, so nothing on the input path convolves it.
+`carb_intake` and `insulin_combined` are **rates**, not ingestion and injection
+instants: grams entering the blood and units acting in each 5-minute step.
+Pretraining takes them from the simulator directly. A record that logs bare amounts
+instead is converted by `metrics/core/features.py`, which convolves them with
+population-mean kernels. A record whose events already carry their resolved series
+supplies them on `Segment.carb_curve` / `Segment.insulin_curve`, which bypass the
+kernels; the transforms in the table above are unchanged either way.
 
 ### The index map
 
-Every patch carries all five features, step-major, so feature `f` is the stride
+Every patch carries all four features, step-major, so feature `f` is the stride
 slice `[:, f::N_INPUT_FEATURES]`. On a **masked** patch:
 
 - `bg_absolute` is **zeroed** — it is what the model predicts;
-- `bg_masked` is 1.0 in all `PATCH_SIZE` step-major columns of feat 4;
-- `carb_intake`, `insulin_combined` and `exercise_equiv` **still carry the
-  carbohydrate-appearance, insulin-action and exercise-disposal curves, per
-  5-minute step** — not the moment of eating, not the injection instant, not the
-  start of a session, and not a delivery schedule (`SPEC/invariants.md` §5): the
+- `bg_masked` is 1.0 in all `PATCH_SIZE` step-major columns of feat 3;
+- `carb_intake` and `insulin_combined` **still carry the carbohydrate-appearance
+  and insulin-action curves, per 5-minute step** — not the moment of eating, not
+  the injection instant, and not a delivery schedule (`SPEC/invariants.md` §5): the
   simulator's exported values during training, the caller's announcement at
   inference.
 
@@ -354,10 +349,12 @@ graph see nothing of it.
 
 ## Heads
 
-Both heads read the final-normed hidden states by `mask_idx`, never as a trailing
-slice: the masked set may sit anywhere in the sequence. The time probe takes the
-`M` slot states as they are, one `D_MODEL` vector per slot; the glucose head takes
-a per-step state interpolated from them and their span's visible neighbours.
+The glucose head and the time probe read the final-normed hidden states by
+`mask_idx`, never as a trailing slice: the masked set may sit anywhere in the
+sequence. The time probe takes the `M` slot states as they are, one `D_MODEL`
+vector per slot; the glucose head takes a per-step state interpolated from them
+and their span's visible neighbours. The skill probe reads neither, pooling the
+visible patches instead.
 
 ### Blood-glucose quantile head
 
@@ -441,9 +438,11 @@ rather than a fixed offset from the context edge. A second term couples
 consecutive windows: `data.py` ships window `k + 1` — the same trajectory shifted
 forward one horizon, teacher-forced, at the same context length — and a penalty
 ties the two origin-phase estimates to exactly one horizon apart, measured in the
-`(cos, sin)` plane so the gradient is stable across the midnight wrap. Within a
-single window the slots share one forward pass and are already consistent, so no
-within-window term is needed.
+`(cos, sin)` plane so the gradient is stable across the midnight wrap. On a cache
+row nothing exists past the tail, so the pair shifts one horizon BACKWARD instead;
+the advance is signed, and the coupling is the same. Within a single window the
+slots share one forward pass and are already consistent, so no within-window term
+is needed.
 
 With `TIME_PROBE_DETACH = False`, the released setting, the probe's gradient
 reaches the shared trunk. That is the point of it: the per-slot representations
@@ -460,6 +459,25 @@ pygame and matplotlib renderers share one implementation.
 
 `TIME_PROBE_ENABLED = False` leaves the head unbuilt and the forward
 bit-identical to a model without it.
+
+### Patient-skill probe
+
+A 2-layer SiLU MLP over the mean-pooled final-normed trunk state, emitting
+`N_SKILLS` sigmoids in the cache's frozen `skills.npy` column order —
+dietary discipline, attentiveness, dosing competence, lifestyle consistency. The
+pool covers the VISIBLE, non-pad patches only: a masked patch's glucose was
+withheld and a pad patch is zeros, so pooling either would drag every prediction
+toward 0.5.
+
+The loss is MSE against the row's own skills, scaled by
+`SKILL_HEAD_LOSS_WEIGHT` and added to the backward loss beside the time probe's
+cross-entropy — outside `risk_total_loss`, outside checkpoint selection. A sample
+that carries no skills, which is every row of a real finetune pool, weighs zero.
+
+`forward` emits the skills only under `return_skills=True`; with the flag unset
+the 2-tuple is bit-identical to a model built without the head, because the head
+is constructed and initialised under a saved and restored RNG state, last. It
+reaches neither the descriptor nor the exported graph.
 
 
 ## Loss
@@ -897,9 +915,9 @@ block per horizon: realized coverage of the band, and its mean width in mg/dL.
 
 ## Normalization statistics
 
-Four channels, one file — `normalization_stats.json`, a `{mean, std}` pair each
-for `bg_absolute`, `carb_intake`, `insulin_combined` and `exercise_equiv`.
-Glucose statistics live in **risk space** and the other three in **log1p space**,
+Three channels, one file — `normalization_stats.json`, a `{mean, std}` pair each
+for `bg_absolute`, `carb_intake` and `insulin_combined`.
+Glucose statistics live in **risk space** and the other two in **log1p space**,
 so a consumer must apply the same forward transform before normalizing and the
 same inverse after denormalizing. `bg_masked` has no entry, being a bit rather
 than a signal.
@@ -929,15 +947,22 @@ GPU it starves the device. `T1DMSIM/cache_simulator.py` pre-generates a pool of
 post-warmup trajectories once; `T1DMDataset(cache_path=...)` then reads rows
 instead of simulating. No pool ships with this repository; each is built locally,
 and the build writes a `DATASET.md` into the pool directory recording that pool's
-geometry, glycemic mix and per-channel storage. The two pools T1DMSIM publishes
-are the earlier 666-step geometry, which the loader rejects.
+geometry, glycemic mix and per-channel storage. The pools T1DMSIM published
+before the counterfactual tails are rejected by the loader.
 
-**Layout.** One file per channel under `<out_dir>/`, plus a small raw `icr.npy`,
-a `normalization_stats.json`, and a `meta.json` written last as the completion
-sentinel. `meta.json` names the `cache_format`, which selects the reader:
-`'blosc2-ndarray-v1'` for the compressed `.b2nd` layout, `'npy-memmap-v1'` for one
-uncompressed `.npy` memmap per channel. Both carry the same fields and the same
-per-row semantics. A cache with no `cache_format` key is rejected.
+**Row geometry (`SPEC/cache.md`).** A row is `context_steps` of behaviour-on
+context ending at a boundary, then four behaviour-off continuations of
+`tail_steps` — the arms `none`, `bolus`, `carbs`, `bolus_carbs`, in that frozen
+order. A sample draws one arm, appends its tail to the context, and crops its
+context from the right end, so the horizon's announced doses and its ground-truth
+glucose always come from the same arm. The same row builder serves the on-the-fly
+path through `data.simulate_row`, so the two cannot drift.
+
+**Layout.** One file per context channel under `<out_dir>/`, one
+`tail_<channel>.b2nd` of shape `(pool_size, 4, tail_steps)` beside it, the raw
+`icr.npy` and `skills.npy`, a `normalization_stats.json` fitted over context and
+tails alike, and a `meta.json` written last as the completion sentinel.
+`meta.json` names the `cache_format`; only `'blosc2-ndarray-v3'` is read.
 
 **Build.** Workers stage rows into per-channel `.npy` memmaps inside
 `<out_dir>.partial/`, keeping parent RAM near zero; a single-threaded pass then
@@ -948,9 +973,10 @@ directory is renamed into place only after every channel has flushed, so a
 crashed build is never loadable.
 
 **Validation on load.** `T1DMDataset.__init__` checks the cache format, the
-channel list, the warmup hours, the simulated hours, `dt_minutes` and the
-uniform-sample probability against the runtime config, and raises rather than
-train on divergent data. The per-channel shape check against
+channel list, the tail geometry and its arm order, the warmup hours, `dt_minutes`
+and the uniform-sample probability against the runtime config, and raises rather
+than train on divergent data. The geometry is read off the cache's own keys, never
+compared against a simulated-hours scalar the reader holds. The per-channel shape check against
 `pool_size × n_timesteps` happens later, in `_load_cache`, on the first row read
 inside a DataLoader worker — the open is deliberately lazy so open cache handles
 are not pickled across the fork. The generation parameters under
@@ -960,32 +986,21 @@ checked at all, so two pools with different glycemic mixes are both accepted.
 **Compression.** Each `.b2nd` is chunked `(rows_per_chunk, T)` with byte-shuffle
 and zstd. Byte-shuffle groups each float's high-entropy mantissa bytes apart from
 its low-entropy exponent bytes, which compresses far better than raw IEEE-754
-layout. On a million-row pool at the 1242-step geometry this runs about 1.3–1.7×
+layout. On a million-row pool this runs about 1.3–1.7×
 on the dense physiologic channels and 27–539× on the near-constant ones, for
 roughly 2.4× over the pool as a whole; each pool's `DATASET.md` carries its own
 measured per-channel ratios. Smaller chunks waste fewer decompressed bytes per
 single-row read but give zstd a smaller window; at the default 32 rows per chunk a
-chunk is `32 × n_timesteps × 4 B`, about 159 KB per channel at 1242 steps.
+chunk is `32 × n_timesteps × 4 B`, about 258 KB per channel at 2016 steps.
 
-**Resident memory.** The two layouts are read differently, and only one of them is
-mapped. Under blosc2 each channel is opened for ordinary file I/O and a read
-decompresses one chunk per channel into a fresh array, so nothing accumulates in
-the process; the compressed bytes stay in kernel page cache, shared between
-DataLoader workers and reclaimed under pressure. Mapping a `.b2nd` instead makes
-each touched chunk's compressed pages resident in every worker that read it, with
-no way to release them — blosc2 exposes no mapping to `madvise` — so random access
-over a large pool drives the resident set toward the pool's whole compressed
-footprint.
-
-Under `npy-memmap` the channel is mapped and a read faults *uncompressed* pages of
-the touched row. Random access over a large pool touches ever-new rows, so the
-resident set climbs toward the full on-disk footprint — on a unified-memory device
-that presents as rising GPU memory and can starve the allocator.
-`CACHE_MADVISE_DONTNEED` bounds it: each read copies its row out and issues
-`madvise(MADV_DONTNEED)` on the pages it faulted. The reader also issues
-`madvise(MADV_RANDOM)` at open, without which the kernel's 128 KB readahead pulls
-far more than the row needs and leaves the remainder resident. The flag is a no-op
-under blosc2 and on the fly.
+**Resident memory.** Nothing is mapped. Each channel is opened for ordinary file
+I/O and a read decompresses one chunk per channel into a fresh array, so nothing
+accumulates in the process; the compressed bytes stay in kernel page cache, shared
+between DataLoader workers and reclaimed under pressure. Mapping a `.b2nd` instead
+would make each touched chunk's compressed pages resident in every worker that
+read it, with no way to release them — blosc2 exposes no mapping to `madvise` — so
+random access over a large pool would drive the resident set toward the pool's
+whole compressed footprint.
 
 **Reuse is benign.** The index maps to a row by `patient_seed % slab_size` within
 the partition's disjoint slab, and each draw takes a fresh random window from
@@ -1004,16 +1019,16 @@ specifies the recipes they implement.
 the trailing `PREDICTION_PATCHES` patches — a forecast — and `mask_spans` names
 any other: a span at patch 0 is a backcast, one between visible patches an
 infill. The masked patches carry a zeroed glucose slot, an announced `bg_masked`
-bit, and either the announced plan or the zero-dose baseline in the three plan
+bit, and either the announced plan or the zero-dose baseline in the two plan
 slots; the anchors and their patch indices are built by the same
 `data._mask_slots` the training path uses. `predict` accepts an optional
 conformal correction, applied to the bands with the median untouched.
 
 The zero-dose baseline is `normalize(0)` per channel, **not** a literal `z = 0`.
-A literal zero decodes through the sparse log1p inverse to a phantom dose or a
-phantom exercise session, which would corrupt a no-dose forecast.
+A literal zero decodes through the sparse log1p inverse to a phantom dose, which
+would corrupt a no-dose forecast.
 
-**What-if.** The same forward pass with different values in the three plan slots.
+**What-if.** The same forward pass with different values in the two plan slots.
 A baseline is simply another call.
 
 **Rolling.** Re-feed is glucose-only: the median goes through the inverse

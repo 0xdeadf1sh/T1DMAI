@@ -103,8 +103,9 @@ both keeps the two together.
 **48, 96 and 144 are the arithmetically clean widths.** Hour-of-day coverage is
 exactly uniform when `n_candidates % 48 == 0`, where
 `n_candidates = N/PATCH_SIZE − max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES) − n_ctx + 1`.
-At the accepted 2394 steps, `n_candidates = 384 − n_ctx`, so it holds at every
-multiple of 48 up to the 336-patch ceiling — 48, 96, 144, 192, 240, 288 and 336.
+That arithmetic applies to a trajectory a window is cropped from anywhere. A
+cache row's boundary is fixed and its warm-up offset is drawn uniformly over the
+day instead, so hour-of-day coverage comes from the pool, not from the width.
 
 **Evaluation sets shrink with the window.** `metrics/core/calibrate.py` drops any
 segment shorter than the context plus the horizon, and segments are cut at every
@@ -118,10 +119,10 @@ memory of 52, and 148 about 8.1×.
 
 ## 3. Pool and statistics
 
-Two pools, both at 10⁶ rows. Both were built at the retired 1242-step geometry
-and no longer load: `data.py` accepts 2394 steps (see `ON_THE_FLY_SIM_HOURS`) and
-rejects any other length at first row read. Rebuild with
-`--sim-hours 199.5` before use.
+Two pools, both at 10⁶ rows. Neither loads: they predate the counterfactual tails,
+and `data.py` refuses a cache whose `cache_format` is not `blosc2-ndarray-v3`, or
+whose `tail_steps` is not the forecast horizon. Rebuild them with the current
+`T1DMSIM/cache_simulator.py`, whose defaults are the contract geometry.
 
 | pool | `hypo_oversample` | steps below 70 mg/dL |
 | --- | ---: | ---: |
@@ -150,7 +151,7 @@ are wrong:
 | check | what is otherwise silent |
 | --- | --- |
 | statistics match this pool | no code path opens `<cache>/normalization_stats.json`; the CWD file wins |
-| pool identity | `data.py` compares `sim_hours`, warmup, `dt_minutes`, channels and format — not `hypo_oversample` or `hypo_min_frac`, the only fields that distinguish the two pools |
+| pool identity | `data.py` compares the geometry keys, warmup, `dt_minutes`, channels and format — not `hypo_oversample` or `hypo_min_frac`, the only fields that distinguish the two pools |
 | pool is complete | the `.partial` staging files are full-size from the first byte, so a half-built cache looks finished by size alone |
 | statistics well-formed | one entry per channel, each `std > 0`; a zero std divides by `0 + 1e-8` and scales that channel by about 1e8 |
 
