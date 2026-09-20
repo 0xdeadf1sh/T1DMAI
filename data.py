@@ -579,18 +579,23 @@ def make_calibration_dataset(
 def sample_mask_spans(
     seq_len: int,
     rng: np.random.Generator,
+    pin_right: int | None = None,
 ) -> list[tuple[int, int]]:
     """The masked spans of one sample over a ``seq_len``-patch window, left to right.
 
-    ``(start_patch, length)`` pairs; sampler semantics per this repo's CLAUDE.md
-    (masked-BG objective section). Mirror a placement change in ``d_balance.d_distribution``.
+    ``(start_patch, length)`` pairs; semantics in this repo's CLAUDE.md, mirrored in
+    ``d_balance``. ``pin_right`` fixes the last span flush right at that length.
     """
+    assert pin_right is None or 0 < pin_right <= MAX_MASKED_PATCHES, (
+        f"pin_right={pin_right} must fit MAX_MASKED_PATCHES={MAX_MASKED_PATCHES}")
     lengths_pool = np.asarray(MASK_SPAN_LENGTHS, dtype=np.int64)
     n_spans = int(rng.integers(1, MASK_MAX_SPANS + 1))
 
     # Rejection is on the LENGTH VECTOR as a whole.
     while True:
         span_lengths = rng.choice(lengths_pool, size=n_spans, replace=True)
+        if pin_right is not None:
+            span_lengths[-1] = pin_right
         if int(span_lengths.sum()) <= MAX_MASKED_PATCHES:
             break
 
@@ -622,7 +627,8 @@ def sample_mask_spans(
     spans: list[tuple[int, int]] = []
     # Pins the LAST span at the final patch; rest compose over the prefix, trailing gap fixed at 0.
     last = int(span_lengths[-1])
-    right_edge = MASK_RIGHT_EDGE_QUOTA > 0.0 and rng.random() < MASK_RIGHT_EDGE_QUOTA
+    right_edge = pin_right is not None or (
+        MASK_RIGHT_EDGE_QUOTA > 0.0 and rng.random() < MASK_RIGHT_EDGE_QUOTA)
 
     if right_edge and n_spans == 1:
         spans.append((seq_len - last, last))
@@ -814,7 +820,9 @@ def _build_sample(
 
     # Only the first PREDICTION_PATCHES past context are exposed; the rest is GT-only.
     seq_len = n_ctx + PREDICTION_PATCHES
-    spans = sample_mask_spans(seq_len, rng)
+    # The tail is a behaviour-off counterfactual, so it is the horizon and never model input.
+    spans = sample_mask_spans(
+        seq_len, rng, pin_right=PREDICTION_PATCHES if boundary else None)
     masked_patches = np.concatenate(
         [np.arange(s, s + L, dtype=np.int64) for s, L in spans]
     )

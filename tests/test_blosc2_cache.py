@@ -250,6 +250,31 @@ def test_horizon_bg_is_the_sampled_arms_tail(blosc2_cache: str) -> None:
                    for r in range(_TINY_POOL) for a in range(N_TAIL_ARMS)), i
 
 
+def test_tail_is_never_visible_model_input(blosc2_cache: str) -> None:
+    """Every cached sample masks all PREDICTION_PATCHES tail patches and zeroes their bg.
+
+    The tail is behaviour-off: visible, the model reads a counterfactual as observed
+    history and gets the forecast handed to it.
+    """
+    from config import N_INPUT_FEATURES, PREDICTION_PATCHES
+    from data import T1DMDataset, BG_MASKED_FEAT
+
+    stats = _model_stats(blosc2_cache)
+    ds = T1DMDataset(master_seed=3, total_steps=12, batch_size=2,
+                     normalization_stats=stats, cache_path=blosc2_cache)
+    for i in range(24):
+        s = ds[i]
+        n_ctx = int(s['n_context_patches'])
+        tail = slice(n_ctx, n_ctx + PREDICTION_PATCHES)
+        bit = s['patches'][tail, BG_MASKED_FEAT::N_INPUT_FEATURES]
+        bg = s['patches'][tail, 0::N_INPUT_FEATURES]
+        assert bool((bit == 1.0).all()), f"sample {i} leaves a tail patch announced-visible"
+        assert bool((bg == 0.0).all()), f"sample {i} feeds tail bg to the model"
+        fd = s['bg_formula_data']
+        scored = set(np.asarray(fd['mask_idx'])[np.asarray(fd['valid'])].tolist())
+        assert set(range(n_ctx, n_ctx + PREDICTION_PATCHES)) <= scored
+
+
 def test_stats_missing_a_channel_are_refused_by_the_loader(blosc2_cache: str) -> None:
     """A missing channel must FAIL rather than leave that channel untrained.
     Input gather walks ``CHANNEL_NAMES`` and indexes ``stats[name]``, so a

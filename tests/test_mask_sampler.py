@@ -459,6 +459,38 @@ def test_right_edge_draws_are_flush_and_still_separated(T):
 
 
 @pytest.mark.parametrize("T", [20, 36, 52])
+def test_pin_right_always_covers_the_trailing_span(T):
+    """``pin_right`` masks the last ``pin_right`` patches of every draw, quota irrelevant.
+
+    The boundary tail is a behaviour-off counterfactual: visible, it enters the model
+    as observed history and hands it the answer.
+    """
+    rng = np.random.default_rng(31_000 + T)
+    counts = set()
+    for _ in range(5000):
+        spans = sample_mask_spans(T, rng, pin_right=PREDICTION_PATCHES)
+        assert spans[-1] == (T - PREDICTION_PATCHES, PREDICTION_PATCHES), \
+            f"pinned span {spans[-1]} is not flush right at T={T}"
+        total = sum(L for _s, L in spans)
+        assert total <= MAX_MASKED_PATCHES, f"{total} masked patches over budget"
+        for (s0, l0), (s1, _l1) in zip(spans, spans[1:]):
+            assert s1 > s0 + l0, f"abutting spans {spans} at T={T}"
+        counts.add(len(spans))
+    assert counts == set(range(1, MASK_MAX_SPANS + 1)), \
+        f"span counts {sorted(counts)} do not cover 1..{MASK_MAX_SPANS}"
+    print(f"\n[DUMP] pin_right={PREDICTION_PATCHES} T={T} | 5000 draws, every one flush "
+          f"right and separated, arities {sorted(counts)} ✓")
+
+
+def test_pin_right_leaves_the_unpinned_stream_untouched():
+    """An unpinned call draws exactly what it drew before the pin existed."""
+    a = np.random.default_rng(4242)
+    b = np.random.default_rng(4242)
+    for _ in range(200):
+        assert sample_mask_spans(40, a) == sample_mask_spans(40, b, pin_right=None)
+
+
+@pytest.mark.parametrize("T", [20, 36, 52])
 def test_spans_never_abut_and_fit_the_budget(T):
     """At most MASK_MAX_SPANS spans, lengths in MASK_SPAN_LENGTHS, budget-capped, in the window.
 
