@@ -7,13 +7,12 @@ from T1DMSIM.simulator import (
     EVENT_CHANNELS as _EVENT_CHANNELS,
 )
 from T1DMSIM.simulator import (
-    EXERCISE_CARB_EQUIV_PER_MIN as _EX_G_PER_MIN,
-)
-from T1DMSIM.simulator import (
-    EXERCISE_DURATION_MEAN_MIN as _EX_DUR_MEAN_MIN,
-)
-from T1DMSIM.simulator import (
     SIMULATOR_WARMUP_HOURS,
+)
+
+# Owned by T1DMSIM (SPEC/cache.md §6): the skill columns of the cache's skills.npy, in order.
+from T1DMSIM.cache_simulator import (
+    SKILL_NAMES,
 )
 
 # resize_model.py rewrites these; don't bake values elsewhere. PATCH_SIZE must divide 12.
@@ -26,7 +25,7 @@ PATCH_SIZE = 6  # 6 × 5 min = 30 min per patch
 
 # Normalized channels per layout, FROZEN order, step-major; the bg_masked bit follows the last.
 INPUT_LAYOUTS = {
-    "curves": ("bg_absolute", "carb_intake", "insulin_combined", "exercise_equiv"),
+    "curves": ("bg_absolute", "carb_intake", "insulin_combined"),
     "events": ("bg_absolute", *_EVENT_CHANNELS),
 }
 INPUT_LAYOUT_ENV = "T1DMAI_INPUT_LAYOUT"
@@ -103,6 +102,13 @@ TIME_PROBE_CROSS_WINDOW_FRACTION = (
     1.0  # 2nd forward on first ceil(frac*B) rows; val uses all
 )
 
+# Patient-skill probe over the mean-pooled visible context; its loss never enters selection.
+SKILL_HEAD_ENABLED = True  # False ⇒ head not built
+SKILL_HEAD_HIDDEN = 1 * D_MODEL  # 2-layer SiLU probe MLP, then N_SKILLS sigmoids
+N_SKILLS = len(SKILL_NAMES)
+SKILL_HEAD_LOSS_WEIGHT = 0.1  # scales the skill MSE, backward only
+SKILL_HEAD_INIT_SCALE = 1e-2  # probe final-layer weight init std
+
 ROPE_BASE = 1000
 
 MASTER_SEED = 42
@@ -113,10 +119,6 @@ TOTAL_STEPS = 10000
 BATCH_SIZE = 64
 NUM_WORKERS = 4
 
-# npy-memmap cache: random reads fault pages that never repeat, growing page cache/VRAM.
-
-# MADV_DONTNEED + MADV_RANDOM together cut growth ~160x; blosc2 has no mapping to madvise.
-CACHE_MADVISE_DONTNEED = True
 WARMUP_STEPS = 2000  # steps of linear LR warmup
 LR_MIN_RATIO = 0.01  # cosine decay floor as a fraction of peak LR
 
@@ -185,8 +187,6 @@ EXCURSION_PRECISION_TOLERANCE_MGDL = 10.0
 # Counterfactual probe magnitudes, RAW units, injected at the first masked patch.
 CF_CARB_BOLUS_G = 40.0
 CF_INSULIN_BOLUS_U = 2.0
-# Grams carb-EQUIVALENT disposal per session, never minutes; derived from T1DMSIM, not restated.
-CF_EXERCISE_G = _EX_DUR_MEAN_MIN * _EX_G_PER_MIN
 
 # Hours counted as night; wraps across midnight when END < START (22-06 = 22:00 to 06:00).
 NOCTURNAL_START_HOUR = 22.0

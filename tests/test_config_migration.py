@@ -1,7 +1,7 @@
 def test_active_config_migrated_values():
     """NUM_WORKERS not pinned: host property, not recipe. Range-checked below."""
     import config
-    assert config.BATCH_SIZE == 512
+    assert config.BATCH_SIZE == 64
     assert config.PATIENT_UNIFORM_SAMPLE_PROB == 0.0
     assert config.PREDICTION_HORIZON_HOURS == 2
     assert config.NIGHT_LONG_HORIZON_HOURS == 8
@@ -32,8 +32,7 @@ def test_redesign_provenance_and_knobs_migrated():
         assert not hasattr(config, gone), \
             f"{gone} must be retired (the static combine is replaced by Kendall-Gal)"
     assert not hasattr(config, 'TILDEQ_ALPHA'), "TILDEQ_ALPHA must be retired"
-    assert config.N_INPUT_FEATURES == 5, \
-        ("temporal inputs removed, exercise_equiv at feat 3, bg_masked at feat 4 "
-         "-> 5 features")
+    assert config.N_INPUT_FEATURES == 4, \
+        "bg, carb and insulin, then bg_masked at feat 3 -> 4 features"
     print(f"[DUMP] redesign provenance | ARCH={config.ARCH_VERSION} "
           f"LOSS={config.LOSS_SCHEMA} ROPE_BASE={config.ROPE_BASE}")

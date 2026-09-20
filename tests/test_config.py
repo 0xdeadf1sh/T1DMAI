@@ -10,7 +10,7 @@ def test_config_imports():
     assert FFN_DIM >= D_MODEL
     # the invariant is whole patches tiling an hour, not any one PATCH_SIZE
     assert 60 % (PATCH_SIZE * 5) == 0
-    assert N_INPUT_FEATURES == 5
+    assert N_INPUT_FEATURES == 4
     assert N_QUANTILES == 7
     assert MAX_SEQ_LEN == MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
     assert PREDICTION_PATCHES == PREDICTION_HORIZON_HOURS * (60 // (PATCH_SIZE * 5))
@@ -34,13 +34,13 @@ def test_head_dim_consistency():
 
 
 def test_patch_dim_consistency():
-    """``bg_masked`` is feat 4 inside the step-major block, not a trailing tier —
+    """``bg_masked`` is the last feat inside the step-major block, not a trailing tier —
     the ``[:, f::N_INPUT_FEATURES]`` stride idiom depends on it."""
     import config
     from config import PATCH_DIM, PATCH_SIZE, N_INPUT_FEATURES
     expected = PATCH_SIZE * N_INPUT_FEATURES
     assert PATCH_DIM == expected, f"PATCH_DIM {PATCH_DIM} != {expected}"
-    assert PATCH_DIM == 30, f"expected PATCH_DIM 30 at the active config, got {PATCH_DIM}"
+    assert PATCH_DIM == 24, f"expected PATCH_DIM 24 at the active config, got {PATCH_DIM}"
     assert not hasattr(config, 'N_MASK_BITS'), \
         "config.N_MASK_BITS must be deleted (the trailing mask-bit tier is gone)"
 
@@ -78,12 +78,12 @@ def test_mask_sampler_constants():
 
 def test_channel_count_is_not_the_feature_count():
     """``bg_masked`` is a bit — no mean, no std, no log1p — so it gets no
-    CHANNEL_NAMES entry: 4 channels, 5 features."""
+    CHANNEL_NAMES entry: 3 channels, 4 features."""
     from config import N_INPUT_FEATURES
     from normalization import CHANNEL_NAMES, N_CHANNELS
 
-    assert N_CHANNELS == len(CHANNEL_NAMES) == 4, \
-        f"CHANNEL_NAMES must stay at 4 signal channels, got {CHANNEL_NAMES}"
+    assert N_CHANNELS == len(CHANNEL_NAMES) == 3, \
+        f"CHANNEL_NAMES must stay at 3 signal channels, got {CHANNEL_NAMES}"
     assert N_INPUT_FEATURES == N_CHANNELS + 1, \
         "N_INPUT_FEATURES is the signal channels plus the bg_masked bit"
 

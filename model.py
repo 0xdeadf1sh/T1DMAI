@@ -1,7 +1,7 @@
 """T1DMAI — encoder-only transformer for risk-space BG forecasting.
 
-A masked patch withholds feat 0 (CGM in Kovatchev RISK space); feat 4 announces which
-patches are masked. forward returns (q_tau, median) risk space; fp32-native, no bf16 autocast.
+A masked patch withholds feat 0 (CGM in Kovatchev RISK space); the trailing bg_masked feat
+announces it. forward returns (q_tau, median) risk space; fp32-native, no bf16 autocast.
 """
 
 import math
@@ -18,6 +18,7 @@ from config import (
     ROPE_BASE, BG_HEAD_HIDDEN, N_SPREADS, BG_HEAD_INIT_SCALE,
     TIME_PROBE_ENABLED, TIME_PROBE_HIDDEN, TIME_PROBE_DETACH, TIME_PROBE_INIT_SCALE,
     TIME_PROBE_N_BINS,
+    SKILL_HEAD_ENABLED, SKILL_HEAD_HIDDEN, SKILL_HEAD_INIT_SCALE, N_SKILLS,
 )
 from utils import assemble_quantiles, step_states
 
@@ -240,6 +241,17 @@ class T1DMAI(nn.Module):
         else:
             self.time_head = None
 
+        # Same RNG discipline: the forecast weights are drawn as if no probe existed.
+        if SKILL_HEAD_ENABLED:
+            _rng_state = torch.random.get_rng_state()
+            self.skill_head = nn.Sequential(
+                nn.Linear(D_MODEL, SKILL_HEAD_HIDDEN), nn.SiLU(),
+                nn.Linear(SKILL_HEAD_HIDDEN, N_SKILLS),
+            )
+            torch.random.set_rng_state(_rng_state)
+        else:
+            self.skill_head = None
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -250,9 +262,11 @@ class T1DMAI(nn.Module):
         """
         # sqrt(1.0) is exactly 1.0 in IEEE 754: bit-identical to the literal 0.02 at d_model=512.
         base_std = 0.02 * math.sqrt(512.0 / D_MODEL)
-        time_modules = set(self.time_head.modules()) if self.time_head is not None else set()
+        probe_modules = set(self.time_head.modules()) if self.time_head is not None else set()
+        if self.skill_head is not None:
+            probe_modules |= set(self.skill_head.modules())
         for module in self.modules():
-            if module in time_modules:
+            if module in probe_modules:
                 continue
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=base_std)
@@ -280,6 +294,15 @@ class T1DMAI(nn.Module):
             nn.init.normal_(tfinal.weight, mean=0.0, std=TIME_PROBE_INIT_SCALE)
             nn.init.zeros_(tfinal.bias)
 
+        if self.skill_head is not None:
+            for module in self.skill_head.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=base_std)
+                    nn.init.zeros_(module.bias)
+            sfinal = self.skill_head[-1]
+            nn.init.normal_(sfinal.weight, mean=0.0, std=SKILL_HEAD_INIT_SCALE)
+            nn.init.zeros_(sfinal.bias)
+
     def forward(
         self,
         patches: torch.Tensor,
@@ -287,11 +310,13 @@ class T1DMAI(nn.Module):
         anchor_bg: torch.Tensor,
         mask_idx: torch.Tensor,
         return_time: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        return_skills: bool = False,
+        pool_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         """
         anchor_bg: (B, M) mg/dL, detached before f; padded slots need a legal value (units
         tripwire reads all M) and are discarded via valid. mask_idx: padded slots gather patch 0.
-        return_time=False returns the 2-tuple bit-identically.
+        Neither flag set returns the 2-tuple bit-identically; return_skills appends the skills.
         """
         B, T, _ = patches.shape
         assert mask_idx.dim() == 2 and mask_idx.shape[0] == B, (
@@ -339,14 +364,38 @@ class T1DMAI(nn.Module):
         ), f"head_raw shape {tuple(head_raw.shape)} unexpected"
 
         q_tau, median = assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx)
-        if not return_time:
+        if not return_time and not return_skills:
             return q_tau, median
-        time_pred = None
-        if self.time_head is not None:
-            # Every gathered hidden state, no mean-pool, forces it to encode the absolute clock.
+        out: tuple[torch.Tensor, ...] = (q_tau, median)
+        if return_time:
+            time_pred = None
+            if self.time_head is not None:
+                # Every gathered hidden state, no mean-pool, forces it to encode the clock.
 
-            # Slot j is patch mask_idx[:, j]; hour target follows mask_idx, not a fixed offset.
-            pred = x.gather(1, mask_idx.unsqueeze(-1).expand(B, M, D_MODEL))
-            h = pred if not TIME_PROBE_DETACH else pred.detach()  # (B, M, D_MODEL)
-            time_pred = self.time_head(h)                         # (B, M, TIME_PROBE_N_BINS)
-        return q_tau, median, time_pred
+                # Slot j is patch mask_idx[:, j]; hour target follows mask_idx, not an offset.
+                pred = x.gather(1, mask_idx.unsqueeze(-1).expand(B, M, D_MODEL))
+                h = pred if not TIME_PROBE_DETACH else pred.detach()  # (B, M, D_MODEL)
+                time_pred = self.time_head(h)                     # (B, M, TIME_PROBE_N_BINS)
+            out = out + (time_pred,)
+        if return_skills:
+            out = out + (self.pooled_skills(x, pool_mask),)
+        return out
+
+    def pooled_skills(
+        self, x: torch.Tensor, pool_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """``(B, N_SKILLS)`` in [0, 1] from the final-normed states of the pooled patches.
+
+        ``pool_mask`` (B, T) bool selects the visible non-pad patches; None pools them all.
+        """
+        if self.skill_head is None:
+            return None
+        if pool_mask is None:
+            pooled = x.mean(dim=1)
+        else:
+            assert pool_mask.shape == x.shape[:2], (
+                f"pool_mask {tuple(pool_mask.shape)} does not index {tuple(x.shape[:2])}")
+            w = pool_mask.to(x.dtype).unsqueeze(-1)               # (B, T, 1)
+            # An all-pad row cannot occur (collate keeps the horizon), so the floor never binds.
+            pooled = (x * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+        return torch.sigmoid(self.skill_head(pooled))
