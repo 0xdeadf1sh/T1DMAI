@@ -329,7 +329,7 @@ class T1DMAI(nn.Module):
         assert anchor_bg.shape == (B, M), (
             f"anchor_bg must be (B, M)=({B}, {M}), got {tuple(anchor_bg.shape)}"
         )
-        # Units tripwire: legal z < BG_CLAMP_MIN-1e-3; a normalized value here trips loudly, all M.
+        # Physical floor over all M: a z-space or risk-space batch fails it at its minimum.
         assert bool((anchor_bg >= BG_CLAMP_MIN - 1e-3).all()), (
             "anchor_bg below BG_CLAMP_MIN — non-mg/dL value routed into the anchor"
         )

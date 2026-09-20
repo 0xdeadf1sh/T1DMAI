@@ -4,7 +4,7 @@ import pstats
 from data import _make_simulator, simulate_discard_warmup
 
 PATIENT_SEED = 12345
-HOURS = 720.0  # heaviest realistic request; training's ON_THE_FLY_SIM_HOURS (~200h) is ~1/3 of this
+HOURS = 720.0  # heaviest realistic request; a cached row's 168 h context is under a quarter of it
 
 sim = _make_simulator(PATIENT_SEED, uniform_skills=False)
 

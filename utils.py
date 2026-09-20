@@ -71,10 +71,10 @@ def create_attention_mask(n_context: int, n_prediction: int) -> torch.Tensor:
 
 
 def kovatchev_f(g: torch.Tensor) -> torch.Tensor:
-    """Kovatchev risk transform mg/dL (b) → risk (c). The UNITS TRIPWIRE.
+    """Kovatchev risk transform mg/dL (b) → risk (c). The PHYSICAL-FLOOR GUARD.
 
-    Hard-asserts g >= BG_CLAMP_MIN-1e-3 (no z-scored value satisfies this), so a leak
-    trips loudly. Reserved for f(anchor_bg), re-f of an inverted value. Never differentiated.
+    Hard-asserts g >= BG_CLAMP_MIN-1e-3, which a z-space or risk-space batch fails at its
+    minimum. Reserved for f(anchor_bg), re-f of an inverted value. Never differentiated.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     assert (g >= BG_CLAMP_MIN - 1e-3).all(), (

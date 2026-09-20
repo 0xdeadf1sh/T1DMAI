@@ -3495,7 +3495,7 @@ class T1DMAIGui:
         withheld = np.zeros(attrib.channels.shape[0], dtype=bool)
         withheld[attrib.masked_patches] = True
         blind = not dose_painting_enabled(self.state.masked_channel_policy)
-        # ONE scale across all four channels, else a per-row scale flattens their relative import.
+        # ONE scale across every channel, else a per-row scale flattens their relative import.
         scale = self._display_scale(attrib.channels, lo, hi)
         for ch in range(attrib.channels.shape[1]):
             rows.append((

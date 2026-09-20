@@ -1,6 +1,6 @@
 """Read-only attribution for one masked span: attention rollout, and per-channel grad ⊙ input.
 
-Feat 4 (bg_masked) has no channel column. rollout is a heuristic (Abnar & Zuidema 2020), not
+The bg_masked feat has no channel column. rollout is a heuristic (Abnar & Zuidema 2020), not
 causal. model.forward detaches the anchor, so a bare backward gets the BG row's sign wrong.
 """
 

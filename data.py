@@ -77,7 +77,7 @@ def blind_masked_doses(
 ) -> None:
     """Withhold the dose channels of every masked patch, IN PLACE.
 
-    ``patches`` (..., T, PATCH_DIM) step-major, ``masked`` (..., T) bool. Feats 0/4 untouched.
+    ``patches`` (..., T, PATCH_DIM) step-major, ``masked`` (..., T) bool. bg and bit untouched.
     """
     assert patches.shape[-1] == PATCH_DIM, (
         f"patch row width {patches.shape[-1]} != PATCH_DIM {PATCH_DIM}")
@@ -1059,7 +1059,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
             skills_batch[i] = torch.from_numpy(
                 np.asarray(s['skills'], dtype=np.float32))
 
-    # Feat 4 must agree with the masked set that built attn_mask; nothing else catches drift.
+    # The bg_masked feat must agree with the set that built attn_mask; nothing else catches drift.
     _bit = patches_batch[..., BG_MASKED_FEAT::N_INPUT_FEATURES]   # (B, max_T, PATCH_SIZE)
     assert _bit.shape[-1] == PATCH_SIZE, (
         f"feat {BG_MASKED_FEAT} stride slice gave {_bit.shape[-1]} columns, "

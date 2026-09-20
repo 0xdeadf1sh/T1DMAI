@@ -1412,8 +1412,8 @@ def _observed_patches(sample: dict[str, Any], norm_stats: dict) -> torch.Tensor:
     """One un-collated sample's (T, PATCH_DIM) with every withheld BG written back.
     Rolling context is OBSERVED CGM history, not the training mask; a holed context
     measures an undeployed case and drops most samples (526/600 windows, live nano run).
-    Not leakage — restored patches precede the forecast origin. Under BLIND, feats 1-3
-    are restored too (unblinded_dose_rows/patches); the bit stays, zeroed downstream."""
+    Not leakage — restored patches precede the forecast origin. Under BLIND, the dose
+    feats are restored too (unblinded_dose_rows/patches); the bit stays, zeroed downstream."""
     bf = sample['bg_formula_data']
     patches = sample['patches']
     if not torch.is_tensor(patches):

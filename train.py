@@ -1564,7 +1564,7 @@ def _observed_patches(sample: dict[str, Any], norm_stats: dict) -> torch.Tensor:
     """One sample patch rows with every withheld BG written back, (T, PATCH_DIM).
     Rolling context is the OBSERVED CGM history; a holed context drops most of the sample
     (526/600 nano windows, 88%; 171/203 nocturnal). Not leakage: restored patches precede the
-    forecast origin; RMSE unchanged paired (52.66 vs 51.94 at 360min). Feat 4 left as found.
+    forecast origin; RMSE unchanged paired (52.66 vs 51.94 at 360min). The bit left as found.
     """
     bf = sample['bg_formula_data']
     patches = sample['patches']
@@ -2108,7 +2108,7 @@ def _infill_protocol(
 
     # Every patch starts VISIBLE with true bg restored; this protocol's own spans then withhold
 
-    # and announce. Feat 4 is rewritten wholesale: training mask's announcement isn't this one.
+    # and announce. The bit is rewritten wholesale: training mask's announcement isn't this one.
     inf_patches = patches[rows].clone()
     inf_patches[:, :, _BG_FEAT::N_INPUT_FEATURES] = bg_z[rows]
     inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] = 0.0

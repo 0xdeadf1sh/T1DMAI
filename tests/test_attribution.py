@@ -194,7 +194,7 @@ def test_channel_saliency_folds_the_step_major_stride():
             expected[:, feat] += grad[:, col] * patches[:, col]
     torch.testing.assert_close(saliency, expected, rtol=1e-6, atol=1e-6)
 
-    # Feat 4 is an announcement, not a channel; moving it alone must not move any saliency column.
+    # The bit is an announcement, not a channel; moving it alone must not move a saliency column.
     from data import BG_MASKED_FEAT
     bumped = grad.clone()
     bumped[:, BG_MASKED_FEAT::N_INPUT_FEATURES] += 100.0
@@ -290,7 +290,7 @@ def test_bg_saliency_matches_the_true_response_of_the_forecast():
 
 
 def test_every_channel_carries_saliency_on_a_live_context():
-    """No channel is silently dead — the fixture exercises all four."""
+    """No channel is silently dead — the fixture exercises every CHANNEL_NAMES entry."""
     from attribution import explain
     from normalization import CHANNEL_NAMES
 

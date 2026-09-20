@@ -458,7 +458,7 @@ def draw_masked_bg(t: Theme, path: Path, checkpoint: str, seed: int) -> None:
     origin = start + ctx_steps
 
     # The whole announceable set, in all three passes, so the trailing masked zone conditions alike.
-    ANNOUNCE = tuple(cfg.CHANNEL_TO_FEAT)                  # (0, 1, 2)
+    ANNOUNCE = tuple(cfg.CHANNEL_TO_FEAT)                  # the dose channels, (0, 1)
     ov = {ch: torch.from_numpy(
               feats[origin:origin + pred_steps, cfg.CHANNEL_TO_FEAT[ch]]
               .reshape(-1, S).copy())

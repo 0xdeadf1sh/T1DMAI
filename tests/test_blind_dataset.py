@@ -1,6 +1,6 @@
 """The ``blind`` masked-channel policy, at the dataset boundary.
 
-``blind=True`` withholds feats 1-3 on a masked patch too, at ``zero_dose_fill``'s
+``blind=True`` withholds the dose feats on a masked patch too, at ``zero_dose_fill``'s
 ``normalize(0)``. ``train_blind.py`` is the only caller; ``blind=False`` is what ships.
 """
 
@@ -33,7 +33,7 @@ def _build(blind: bool, stats, seed: int = BLIND_SEED) -> dict:
 
 
 def test_blind_withholds_every_dose_cell_of_a_masked_patch_and_nothing_else():
-    """The flag's whole footprint: feats 1-3 of masked patches, every cell, at exactly the fill.
+    """The flag's whole footprint: dose feats of masked patches, every cell, at exactly the fill.
 
     A leak is silent: an announced dose surviving a masked patch still trains and validates,
     under a blind name. The masked SET must match too, or the tables aren't comparable.

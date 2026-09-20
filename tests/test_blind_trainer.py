@@ -162,7 +162,7 @@ def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatc
 
 
 def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
-    """``_observed_patches`` un-blinds feats 1-3, not feat 0 alone.
+    """``_observed_patches`` un-blinds the dose feats, not feat 0 alone.
 
     Stopping at bg leaves an ASSERTION that a seen half-hour carried no carbs or insulin.
     Pinned against the announced sample at the same seed, so equality here is exact.
