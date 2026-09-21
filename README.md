@@ -611,17 +611,19 @@ post-processing. **An artifact and its descriptor are one unit**: a graph served
 against a descriptor from a different architecture decodes risk space with the
 wrong constants, and nothing downstream can detect it.
 
-The exporters need packages beyond `requirements.txt`: `executorch`, pinned to
-the version the consuming runtime bundles (currently 1.3.1, which requires
-`torch>=2.12` and publishes wheels for CPython 3.10–3.13 only), and
-`litert-torch` for the LiteRT path. Those bounds are narrower than the training
-environment's, which `requirements.txt` puts at `torch>=2.4` on Python 3.10 or
-newer.
+There are two environments. `requirements.txt` is the training one — training,
+evaluation, the GUI and the tests — at `torch>=2.4` on Python 3.10 or newer.
+`requirements-export.txt` is `.venv-export`, which `exporters/` and
+`deploy_model.sh` run under: it pins `executorch` to the version the consuming
+runtime bundles (1.3.1, which requires `torch>=2.12` and publishes wheels for
+CPython 3.10–3.13 only) together with `torch`, `torchao`, `numpy` and `blosc2` at
+the versions that resolve against it. Those bounds conflict with the training
+environment's, so neither file lists the other's packages. The LiteRT path adds
+`litert-torch`, which neither file pins.
 
 ```bash
 python3.11 -m venv .venv-export
-.venv-export/bin/pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
-.venv-export/bin/pip install executorch==1.3.1 numpy
+.venv-export/bin/pip install -r requirements-export.txt
 ```
 
 

@@ -1,0 +1,11 @@
+# --- ExecuTorch export only (exporters/); never install these into the training venv ---
+# python3.11 -m venv .venv-export
+# .venv-export/bin/pip install -r requirements-export.txt
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+executorch==1.3.1    # the version T1DMDROID's runtime bundles
+torchao==0.18.0      # executorch's own hard dependency, pinned beside it
+torch==2.12.0        # executorch 1.3.1 needs >=2.12; CPython 3.10-3.13 wheels only
+numpy==2.4.6
+blosc2==4.13.1       # T1DMSIM.cache_simulator, which config.py imports

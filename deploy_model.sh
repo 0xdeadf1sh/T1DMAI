@@ -21,7 +21,9 @@ out=$root/exported/$id
 remote=/sdcard/Android/data/com.t1dm.app/files/models
 
 cd "$root"
-.venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint "$ckpt" --model-id "$id" --out-dir "$out"
+py=$root/.venv-export/bin/python
+[[ -x $py ]] || { echo "no .venv-export: python3.11 -m venv .venv-export && .venv-export/bin/pip install -r requirements-export.txt" >&2; exit 1; }
+"$py" -m exporters.executorch_xnnpack --checkpoint "$ckpt" --model-id "$id" --out-dir "$out"
 
 [[ $(adb get-state 2>/dev/null) == device ]] || { echo "no device; push skipped, export in $out" >&2; exit 1; }
 

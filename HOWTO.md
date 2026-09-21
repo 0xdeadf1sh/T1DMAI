@@ -26,7 +26,8 @@ venv/bin/python train.py --cache-path ~/Desktop/T1DMSIM/cache_balanced_cf
 ```
 
 Always `venv/bin/python`. A bare `python` has no `blosc2` — it dies only once it
-reaches the cache — and runs a different torch than the one the venv pins.
+reaches the cache — and runs a different torch than the one the venv pins. The
+exporters are the one exception: they run under `.venv-export` (§6).
 
 ---
 
@@ -255,10 +256,17 @@ property of those weights on that partition, and applying one to another set of
 weights gives a band that is finite, plausible and wrong. `--no-write` reports the
 fit without touching the checkpoint.
 
-The exporters run under `.venv-export`, not `venv`: they need `executorch` and
-`litert-torch`, which `requirements.txt` does not pin, and `README.md` has the
-venv. `deploy_model.sh` exports and pushes the result to an attached phone. Its
-model id defaults to the capacity directory of a checkpoint under `models/`; a
+The exporters run under `.venv-export`, not `venv`: they need `executorch`, whose
+`torch>=2.12` and CPython 3.10–3.13 bounds conflict with the training
+environment's. `requirements-export.txt` pins it:
+
+```bash
+python3.11 -m venv .venv-export
+.venv-export/bin/pip install -r requirements-export.txt
+```
+
+`deploy_model.sh` exports and pushes the result to an attached phone. Its model
+id defaults to the capacity directory of a checkpoint under `models/`; a
 checkpoint outside that tree names the id explicitly:
 
 ```bash

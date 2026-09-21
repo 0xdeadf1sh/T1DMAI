@@ -9,6 +9,22 @@ python train.py                         # train
 python -m pytest tests/ -v -s           # test (-s required: DUMP lines catch silent numerical bugs)
 ```
 
+**Two environments, and `requirements.txt` must never name an export package.** `venv` is the
+training one — training, inference, evaluation, GUI, tests. `.venv-export` is the export one:
+`executorch==1.3.1` pins `torch>=2.12` and ships wheels for CPython 3.10–3.13 only, which the
+training venv's interpreter and torch do not satisfy. `requirements-export.txt` pins it, restricted
+to what `exporters/executorch_xnnpack.py`'s import closure actually needs (`executorch`, its
+companion `torchao`, `torch`, `numpy`, and `blosc2` for the `T1DMSIM.cache_simulator` import
+`config.py` makes). Nothing under `exporters/` imports `executorch` at module load, so the
+descriptor emitter and `rust_golden.py` import fine under `venv`; only the lowering and the `.pte`
+run need `.venv-export`.
+
+```bash
+python3.11 -m venv .venv-export
+.venv-export/bin/pip install -r requirements-export.txt
+.venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint <ckpt> --out-dir exported
+```
+
 `T1DMSIM` is a symlink to the sibling checkout and `import config` needs it — config reads
 `SIMULATOR_WARMUP_HOURS` and `EVENT_CHANNELS` from `T1DMSIM.simulator`, and `SKILL_NAMES` from
 `T1DMSIM.cache_simulator`, rather than restating them.
