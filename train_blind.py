@@ -1162,7 +1162,9 @@ def _render_validation_table(
             f"│ {_pad(prev, c3)} │"
         )
     lines.append(bot_edge)
-    return '\n'.join(lines)
+    from train import _render_arm_table
+    arm_table = _render_arm_table(val_metrics)
+    return '\n'.join(lines) + ('\n' + arm_table if arm_table else '')
 
 
 def _build_optimizers(
@@ -1822,6 +1824,14 @@ def _run_validation(
     agg: dict[str, float] = {}
     night_agg: dict[str, float] = {}
 
+    # Tail-arm breakdown: running per-window sums per group, at one shared element-count vector.
+    from train import (
+        _arm_window_stats, _finalize_arm_groups, _run_low_rescue_probe, arm_group_masks,
+    )
+    arm_sums: dict[str, np.ndarray] = {}
+    arm_ns: dict[str, float] = {}
+    arm_counts: np.ndarray | None = None
+
     n_val = min(len(val_dataset), VALIDATION_N_PATIENTS)
 
     # Per-window mg/dL fans + truth + anchor, for _conformal_val_probe.
@@ -1981,6 +1991,19 @@ def _run_validation(
             )
             for k, v in learn.items():
                 agg[k] = agg.get(k, 0.0) + v
+
+            # Same windows, same truth, same statistics as above — only the grouping is new.
+            arm_w, arm_counts = _arm_window_stats(
+                median, pred_bg, q_lo, q_hi, true_bg_full.reshape(B_fc, -1))
+            for _gid, _m in arm_group_masks(
+                    bg_formula['tail_arm'].detach().cpu().numpy(),
+                    bg_formula['arm_bolus_u'].detach().cpu().numpy(),
+                    bg_formula['arm_carb_g'].detach().cpu().numpy()).items():
+                if not _m.any():
+                    continue
+                _part = arm_w[_m].sum(axis=0)
+                arm_sums[_gid] = _part if _gid not in arm_sums else arm_sums[_gid] + _part
+                arm_ns[_gid] = arm_ns.get(_gid, 0.0) + float(_m.sum())
 
             # Infill forward: interior, two-sided, vs LINEAR INTERPOLATION; right-edge unscored.
             infill = _infill_protocol(
@@ -2297,6 +2320,16 @@ def _run_validation(
     for _k, _v in cg_ega.cg_ega_fractions(_night_cgega_counts).items():
         result[f'night_cgega_{_k}'] = _v
 
+    # Tail-arm breakdown of the same forecast forward, plus the paired-arm low-rescue reading.
+    result.update(_finalize_arm_groups(arm_sums, arm_ns, arm_counts))
+    result.update(_run_low_rescue_probe(
+        model, val_dataset, device,
+        min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS),
+        threshold=bg_hypo_threshold,
+        # The blind fork's own builder: the forecast zone withholds doses as well as bg.
+        forecast_protocol=lambda p, mi, v, nc: _forecast_protocol(p, mi, v, nc, blind_fill),
+    ))
+
     return result
 
 
@@ -2382,6 +2415,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
     column name come from metrics.protocols (reachable_d, column), never a local range —
     reachable infill is narrower than the span knob suggests (two-sided L caps at d=ceil(L/2))."""
     from metrics.protocols import FORECAST, INFILL, column, reachable_d
+    from train import ARM_GROUP_COLUMNS, arm_group_ids
 
     eh = _excursion_bucket_horizons(PREDICTION_PATCHES)
     at = _alarm_curve_taus()
@@ -2427,6 +2461,11 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('conf_hypo_esc_raw', 4), ('conf_hypo_esc_cal', 4), ('conf_n', 4),
         # Risk-space mean |Δ²median|, pooled and over the last patch; anti-oscillation witness.
         ('median_roughness', 6), ('median_roughness_far', 6),
+        # The same figures by tail arm and boundary-dose size, truth beside model; n per group.
+        *[(f'arm_{g}_{m}', d) for g in arm_group_ids() for m, d in ARM_GROUP_COLUMNS],
+        # Paired none/carbs low rescue: truth and model each carry their own conditioning count.
+        ('arm_rescue_true_share', 4), ('arm_rescue_true_n', 0),
+        ('arm_rescue_model_share', 4), ('arm_rescue_model_n', 0),
         # train.py's cf_* block is absent: a dose perturbation is invisible to a blind model.
         ('tod_mae_h', 4), ('tod_acc_1h', 4), ('tod_acc_2h', 4), ('tod_acc_bin', 4), ('tod_conf', 4),
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),
@@ -2942,6 +2981,10 @@ def train(
             def _r(x: float | None, n: int = 4) -> float | None:
                 return round(x, n) if isinstance(x, (int, float)) else None
 
+            from train import ARM_GROUP_COLUMNS as _ARM_GROUP_COLUMNS
+            from train import ARM_RESCUE_COLUMNS as _ARM_RESCUE_COLUMNS
+            from train import arm_group_ids as _arm_group_ids
+
             # THIRD SURFACE (val_history), not from _val_log_columns(); add CSV metrics here too.
             val_record = {
                 'step': step,
@@ -2995,6 +3038,9 @@ def train(
                 'conf_n': val_metrics.get('conf_n'),
                 'median_roughness': _r(val_metrics.get('median_roughness'), 6),
                 'median_roughness_far': _r(val_metrics.get('median_roughness_far'), 6),
+                **{f'arm_{_g}_{_m}': _r(val_metrics.get(f'arm_{_g}_{_m}'), _d)
+                   for _g in _arm_group_ids() for _m, _d in _ARM_GROUP_COLUMNS},
+                **{_k: _r(val_metrics.get(_k), 4) for _k in _ARM_RESCUE_COLUMNS},
                 'tod_mae_h': _r(val_metrics.get('tod_mae_h')),
                 'tod_acc_1h': _r(val_metrics.get('tod_acc_1h')),
                 'tod_acc_2h': _r(val_metrics.get('tod_acc_2h')),

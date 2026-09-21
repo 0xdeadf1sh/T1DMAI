@@ -42,6 +42,7 @@ from config import (                                           # noqa: E402
     N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, INPUT_LAYOUT,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
+    MAX_BOLUS_ONLY_U,
     EMA_DECAY,
     CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
@@ -58,7 +59,7 @@ from config import (                                           # noqa: E402
 from config import ARCH_VERSION, LOSS_SCHEMA
 
 from utils import (
-    ModelEMA, kovatchev_f_inv, create_attention_mask_from_visible,
+    ModelEMA, kovatchev_f_inv, kovatchev_f_target, create_attention_mask_from_visible,
     time_of_day_bin_ce, time_of_day_decode_bins, time_of_day_resultant,
     circular_hour_error, circular_hour_residual, circular_bias_hours, circular_std_hours,
 )
@@ -133,7 +134,8 @@ from normalization import (
 )
 from data import (
     T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy,
-    checkpoint_masked_channel_policy,
+    checkpoint_masked_channel_policy, NO_TAIL_ARM, TAIL_ARMS,
+    TAIL_ARM_NONE, TAIL_ARM_CARBS,
 )
 from risk_loss import risk_total_loss, KendallGalWeighting
 import cg_ega
@@ -1301,7 +1303,78 @@ def _render_validation_table(
             f"│ {_pad(prev, c3)} │"
         )
     lines.append(bot_edge)
-    return '\n'.join(lines)
+    arm_table = _render_arm_table(val_metrics)
+    return '\n'.join(lines) + ('\n' + arm_table if arm_table else '')
+
+
+# Header per ARM_GROUP_COLUMNS entry, then its format; ``n`` is the group's window count.
+_ARM_TABLE_FORMATS: "tuple[tuple[str, str, float], ...]" = (
+    ('n', '{:.0f}', 1.0),
+    ('rmse30', '{:.1f}', 1.0), ('rmse60', '{:.1f}', 1.0), ('rmse120', '{:.1f}', 1.0),
+    ('rough', '{:.4f}', 1.0), ('rough_far', '{:.4f}', 1.0),
+    ('true', '{:.4f}', 1.0), ('true_far', '{:.4f}', 1.0),
+    ('ma3', '{:.4f}', 1.0), ('ma3_far', '{:.4f}', 1.0),
+    ('cov90', '{:.1f}', 100.0), ('width', '{:.0f}', 1.0),
+    ('<40', '{:.1f}', 100.0), ('bg120', '{:.0f}', 1.0),
+)
+
+
+def _render_arm_table(val_metrics: dict[str, Any]) -> str:
+    """The by-tail-arm breakdown, one row per group, or ``''`` when no group drew a window.
+
+    Model and truth roughness sit side by side because the target is noisy CGM: the
+    model's figure is only readable against the floor its own target carries.
+    """
+    assert len(_ARM_TABLE_FORMATS) == len(ARM_GROUP_COLUMNS), (
+        f"{len(_ARM_TABLE_FORMATS)} table columns against "
+        f"{len(ARM_GROUP_COLUMNS)} declared group columns")
+    gids = [g for g in arm_group_ids()
+            if float(val_metrics.get(f'arm_{g}_n') or 0.0) > 0.0]
+    if not gids:
+        return ''
+
+    header = ['group', *[h for h, _f, _s in _ARM_TABLE_FORMATS]]
+    body: list[list[str]] = []
+    for gid in gids:
+        cells = [gid]
+        for (_name, _dec), (_h, fmt, scale) in zip(ARM_GROUP_COLUMNS, _ARM_TABLE_FORMATS):
+            v = val_metrics.get(f'arm_{gid}_{_name}')
+            cells.append(fmt.format(float(v) * scale) if isinstance(v, (int, float)) else '—')
+        body.append(cells)
+
+    widths = [max(len(header[i]), *(len(r[i]) for r in body)) for i in range(len(header))]
+    aligns = ['l'] + ['r'] * (len(header) - 1)
+
+    def _row(cells: list[str]) -> str:
+        parts = [c.rjust(widths[i]) if aligns[i] == 'r' else c.ljust(widths[i])
+                 for i, c in enumerate(cells)]
+        return '│ ' + ' │ '.join(parts) + ' │'
+
+    def rule(left: str, mid: str, right: str) -> str:
+        return left + mid.join('─' * (w + 2) for w in widths) + right
+
+    inner = sum(w + 3 for w in widths) - 3
+    rescue = _arm_rescue_line(val_metrics)
+    title = f'By tail arm - forecast protocol, {PREDICTION_HORIZON_HOURS}h horizon'
+    out = [rule('┌', '─', '┐'),
+           '│ ' + title.ljust(inner) + ' │',
+           rule('├', '┬', '┤'), _row(header), rule('├', '┼', '┤'),
+           *[_row(r) for r in body], rule('├', '┴', '┤'),
+           '│ ' + rescue.ljust(inner) + ' │',
+           rule('└', '─', '┘')]
+    return '\n'.join(out)
+
+
+def _arm_rescue_line(val_metrics: dict[str, Any]) -> str:
+    """The paired-arm low-rescue reading as one line, each share with its own n."""
+    def _cell(tag: str) -> str:
+        share = val_metrics.get(f'arm_rescue_{tag}_share')
+        n = int(float(val_metrics.get(f'arm_rescue_{tag}_n') or 0.0))
+        v = f'{float(share) * 100.0:.1f}%' if isinstance(share, (int, float)) else '—'
+        return f'{tag} {v} (n={n})'
+    return (f'low rescue by carbs, paired none arm <{BG_HYPO_THRESHOLD:.0f} mg/dL after '
+            f'{ARM_RESCUE_LAG_STEPS * DT_MINUTES:.0f} min: '
+            f'{_cell("true")}, {_cell("model")}')
 
 
 def _build_optimizers(
@@ -2240,6 +2313,237 @@ def _slot_cross_window_loss(
     return (per * vf).sum() / vf.sum().clamp(min=1.0)
 
 
+# Tail-arm breakdown: the four arms, then the dosed arms split by the size of their own dose.
+ARM_BOLUS_U_BINS: "tuple[tuple[float, float], ...]" = (
+    (0.5, 2.0), (2.0, 6.0), (6.0, 12.0), (12.0, 20.0))
+ARM_CARB_G_BINS: "tuple[tuple[float, float], ...]" = (
+    (5.0, 15.0), (15.0, 40.0), (40.0, 120.0))
+ARM_BOLUS_CARRYING: tuple[str, ...] = ('bolus', 'bolus_carbs')
+ARM_CARB_CARRYING: tuple[str, ...] = ('carbs', 'bolus_carbs')
+# Truth is noisy CGM, so its own roughness is the floor; the MA gives a second, smoothed one.
+ARM_TRUE_MA_WINDOW = 3
+# A tail this low has nobody left to rescue it.
+ARM_DEEP_LOW_MGDL = 40.0
+# Rescue is scored only once a carbohydrate dose can act, as the counterfactual probe does.
+ARM_RESCUE_LAG_STEPS = 30 // DT_MINUTES
+
+# Per group, in table and column order; every one but n is a mean over its own element count.
+ARM_GROUP_COLUMNS: "tuple[tuple[str, int], ...]" = (
+    ('n', 0),
+    ('bg_rmse_30', 4), ('bg_rmse_60', 4), ('bg_rmse_120', 4),
+    ('median_roughness', 6), ('median_roughness_far', 6),
+    ('true_roughness', 6), ('true_roughness_far', 6),
+    ('true_roughness_ma3', 6), ('true_roughness_far_ma3', 6),
+    ('coverage90@120', 4), ('width90@120', 4),
+    ('true_min_lt40', 4), ('true_bg_120', 4),
+)
+# Accumulated as a squared error, reported as a root; every other column is a plain mean.
+_ARM_STAT_SQRT = frozenset({'bg_rmse_30', 'bg_rmse_60', 'bg_rmse_120'})
+ARM_RESCUE_COLUMNS: tuple[str, ...] = (
+    'arm_rescue_true_share', 'arm_rescue_true_n',
+    'arm_rescue_model_share', 'arm_rescue_model_n')
+
+
+def _arm_edge_tag(v: float) -> str:
+    """A bin edge as a column-safe tag: ``0.5`` -> ``0p5``, ``12.0`` -> ``12``."""
+    return f'{v:g}'.replace('.', 'p')
+
+
+def arm_group_ids() -> tuple[str, ...]:
+    """Every tail-arm breakdown group, in table and column order."""
+    ids = list(TAIL_ARMS)
+    for name in ARM_BOLUS_CARRYING:
+        ids += [f'{name}_u{_arm_edge_tag(lo)}_{_arm_edge_tag(hi)}'
+                for lo, hi in ARM_BOLUS_U_BINS]
+    for name in ARM_CARB_CARRYING:
+        ids += [f'{name}_g{_arm_edge_tag(lo)}_{_arm_edge_tag(hi)}'
+                for lo, hi in ARM_CARB_G_BINS]
+    return tuple(ids)
+
+
+def _arm_bin_mask(x: np.ndarray, bins: "tuple[tuple[float, float], ...]",
+                  i: int) -> np.ndarray:
+    """Half-open ``[lo, hi)`` membership, closed on the last bin so its top edge is reachable."""
+    lo, hi = bins[i]
+    return (x >= lo) & ((x <= hi) if i == len(bins) - 1 else (x < hi))
+
+
+def arm_group_masks(arm: Any, bolus_u: Any, carb_g: Any) -> "dict[str, np.ndarray]":
+    """Window membership of every breakdown group, ``{group id: (N,) bool}``.
+
+    A window joins its own arm, and the bin its boundary dose falls in; ``NO_TAIL_ARM``
+    joins none, which is what keeps a non-cache sample out of the breakdown.
+    """
+    arm_a = np.asarray(arm).reshape(-1)
+    bolus_a = np.asarray(bolus_u, dtype=np.float64).reshape(-1)
+    carb_a = np.asarray(carb_g, dtype=np.float64).reshape(-1)
+    assert arm_a.shape == bolus_a.shape == carb_a.shape, (
+        f"arm {arm_a.shape}, bolus {bolus_a.shape}, carb {carb_a.shape} must agree")
+    assert bool((arm_a >= NO_TAIL_ARM).all() and (arm_a < len(TAIL_ARMS)).all()), (
+        f"arm index outside [{NO_TAIL_ARM}, {len(TAIL_ARMS)})")
+    is_arm = {name: arm_a == i for i, name in enumerate(TAIL_ARMS)}
+    out: dict[str, np.ndarray] = {name: m.copy() for name, m in is_arm.items()}
+    for name in ARM_BOLUS_CARRYING:
+        for i, (lo, hi) in enumerate(ARM_BOLUS_U_BINS):
+            out[f'{name}_u{_arm_edge_tag(lo)}_{_arm_edge_tag(hi)}'] = (
+                is_arm[name] & _arm_bin_mask(bolus_a, ARM_BOLUS_U_BINS, i))
+    for name in ARM_CARB_CARRYING:
+        for i, (lo, hi) in enumerate(ARM_CARB_G_BINS):
+            out[f'{name}_g{_arm_edge_tag(lo)}_{_arm_edge_tag(hi)}'] = (
+                is_arm[name] & _arm_bin_mask(carb_a, ARM_CARB_G_BINS, i))
+    return out
+
+
+def _arm_window_stats(
+    median: torch.Tensor,
+    pred_bg: torch.Tensor,
+    q_lo: torch.Tensor,
+    q_hi: torch.Tensor,
+    true_bg: torch.Tensor,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Per-window sums for the breakdown, ``(W (B, K), C (K,))`` over ``ARM_GROUP_COLUMNS[1:]``.
+
+    Roughness is the headline statistic — risk-space mean ``|second difference|``, same
+    slicing — run on the model median and on the truth, raw and 3-point-averaged.
+    """
+    B = pred_bg.shape[0]
+    S = PATCH_SIZE
+    n_steps = PREDICTION_PATCHES * S
+    assert pred_bg.shape == (B, n_steps) and true_bg.shape == (B, n_steps), (
+        f"pred {tuple(pred_bg.shape)} / true {tuple(true_bg.shape)} must be (B, {n_steps})")
+    far0 = (PREDICTION_PATCHES - 1) * S - 1
+    dt = int(STEP_MINUTES)
+
+    def _d2(x: torch.Tensor) -> torch.Tensor:
+        return (x[:, 2:] - 2.0 * x[:, 1:-1] + x[:, :-2]).abs()
+
+    def _ma(x: torch.Tensor) -> torch.Tensor:
+        p = torch.cat([x[:, :1], x, x[:, -1:]], dim=1)
+        return (p[:, :-2] + p[:, 1:-1] + p[:, 2:]) / float(ARM_TRUE_MA_WINDOW)
+
+    y_risk = kovatchev_f_target(true_bg)
+    cols: list[torch.Tensor] = []
+    counts: list[float] = []
+    for h_min in BG_HORIZONS_MIN:
+        h_idx = (h_min // dt) - 1
+        assert 0 <= h_idx < n_steps, f"horizon {h_min} min outside the {n_steps}-step tail"
+        cols.append((pred_bg[:, h_idx] - true_bg[:, h_idx]).pow(2))
+        counts.append(1.0)
+    for series in (median.reshape(B, -1), y_risk, _ma(y_risk)):
+        d2 = _d2(series)
+        cols.append(d2.sum(dim=1))
+        counts.append(float(d2.shape[1]))
+        cols.append(d2[:, far0:].sum(dim=1))
+        counts.append(float(d2[:, far0:].shape[1]))
+    c_idx = (max(COVERAGE_HORIZONS_MIN) // dt) - 1
+    assert 0 <= c_idx < n_steps, f"coverage horizon outside the {n_steps}-step tail"
+    cols.append(((true_bg[:, c_idx] >= q_lo[:, c_idx])
+                 & (true_bg[:, c_idx] <= q_hi[:, c_idx])).float())
+    cols.append(q_hi[:, c_idx] - q_lo[:, c_idx])
+    cols.append((true_bg.min(dim=1).values < ARM_DEEP_LOW_MGDL).float())
+    cols.append(true_bg[:, c_idx])
+    counts += [1.0, 1.0, 1.0, 1.0]
+    assert len(cols) == len(ARM_GROUP_COLUMNS) - 1, (
+        f"{len(cols)} per-window columns against {len(ARM_GROUP_COLUMNS) - 1} declared")
+    return (torch.stack(cols, dim=1).double().detach().cpu().numpy(),
+            np.asarray(counts, dtype=np.float64))
+
+
+def _finalize_arm_groups(
+    sums: "dict[str, np.ndarray]",
+    ns: "dict[str, float]",
+    counts: "np.ndarray | None",
+) -> dict[str, Any]:
+    """Every ``arm_*`` column, absent where the group drew no window rather than 0."""
+    out: dict[str, Any] = {}
+    for gid in arm_group_ids():
+        n = float(ns.get(gid, 0.0))
+        out[f'arm_{gid}_n'] = n
+        total = sums.get(gid)
+        for k, (name, _dec) in enumerate(ARM_GROUP_COLUMNS[1:]):
+            value: float | None = None
+            if n > 0.0 and total is not None and counts is not None:
+                value = float(total[k]) / (n * float(counts[k]))
+                if name in _ARM_STAT_SQRT:
+                    value = math.sqrt(max(value, 0.0))
+            out[f'arm_{gid}_{name}'] = _absent_if_nan(value)
+    return out
+
+
+def _run_low_rescue_probe(
+    model: T1DMAI,
+    val_dataset: T1DMDataset,
+    device: torch.device,
+    n_rows: int,
+    threshold: float = BG_HYPO_THRESHOLD,
+    forecast_protocol: Any = None,
+) -> dict[str, Any]:
+    """Paired ``none``/``carbs`` low-rescue reading, probe-independent.
+
+    Of the rows whose ``none`` tail dips under ``threshold`` past the lag, the share whose
+    ``carbs`` tail does not — truth, then model medians; the blind fork passes its own builder.
+    """
+    out: dict[str, Any] = {k: None for k in ARM_RESCUE_COLUMNS}
+    out['arm_rescue_true_n'] = 0.0
+    out['arm_rescue_model_n'] = 0.0
+    builder = getattr(val_dataset, 'sample_for_arm', None)
+    # Cache only: an on-the-fly row would be re-simulated twice per reading, for no new arm.
+    if builder is None or n_rows <= 0 or getattr(val_dataset, 'cache_path', None) is None:
+        return out
+
+    lag = ARM_RESCUE_LAG_STEPS
+    n_steps = PREDICTION_PATCHES * PATCH_SIZE
+    pair_step = max(1, VAL_BATCH_SIZE // 2)
+    true_pairs: list[np.ndarray] = []
+    pred_pairs: list[np.ndarray] = []
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n_rows, pair_step):
+            idxs = list(range(start, min(start + pair_step, n_rows)))
+            k = len(idxs)
+            batch = collate_fn(
+                [builder(i, TAIL_ARM_NONE) for i in idxs]
+                + [builder(i, TAIL_ARM_CARBS) for i in idxs])
+            patches = batch['patches'].to(device, non_blocking=True)
+            bf = batch['bg_formula_data']
+            mask_idx = bf['mask_idx'].long().to(device, non_blocking=True)
+            build = forecast_protocol or _forecast_protocol
+            fc = build(patches, mask_idx, bf['valid'].to(device, non_blocking=True),
+                       batch['n_context_patches'])
+            if fc is None:
+                continue
+            rows_np = fc['rows'].detach().cpu().numpy()
+            _, median = model(
+                fc['patches'], fc['attn_mask'],
+                bf['last_bg'].float().to(device, non_blocking=True)[fc['rows']]
+                .unsqueeze(1).expand(-1, PREDICTION_PATCHES),
+                fc['mask_idx'])
+            pred = _median_to_mgdl(median.float()).detach().cpu().numpy()
+            true = (bf['true_bg_trajectory'][:, :n_steps].float().numpy())[rows_np]
+            pos = {int(r): j for j, r in enumerate(rows_np)}
+            for i in range(k):
+                a, b = pos.get(i), pos.get(i + k)
+                if a is None or b is None:
+                    continue
+                true_pairs.append(np.stack([true[a], true[b]]))
+                pred_pairs.append(np.stack([pred[a], pred[b]]))
+    if was_training:
+        model.train()
+    if not true_pairs:
+        return out
+
+    for tag, stacked in (('true', np.stack(true_pairs)), ('model', np.stack(pred_pairs))):
+        low = stacked[:, :, lag:].min(axis=2)                    # (N, 2) mg/dL
+        cond = low[:, 0] < threshold
+        n_cond = int(cond.sum())
+        out[f'arm_rescue_{tag}_n'] = float(n_cond)
+        out[f'arm_rescue_{tag}_share'] = (
+            float((low[cond, 1] >= threshold).mean()) if n_cond else None)
+    return out
+
+
 def _run_validation(
     model: T1DMAI,
     val_dataset: T1DMDataset,
@@ -2260,6 +2564,11 @@ def _run_validation(
 
     agg: dict[str, float] = {}
     night_agg: dict[str, float] = {}
+
+    # Tail-arm breakdown: running per-window sums per group, at one shared element-count vector.
+    arm_sums: dict[str, np.ndarray] = {}
+    arm_ns: dict[str, float] = {}
+    arm_counts: np.ndarray | None = None
 
     n_val = min(len(val_dataset), VALIDATION_N_PATIENTS)
 
@@ -2432,6 +2741,20 @@ def _run_validation(
             )
             for k, v in learn.items():
                 agg[k] = agg.get(k, 0.0) + v
+
+            # Same windows, same truth, same statistics as above — only the grouping is new.
+            arm_w, arm_counts = _arm_window_stats(
+                median, pred_bg, q_lo, q_hi,
+                true_bg_full.reshape(B_fc, -1))
+            for _gid, _m in arm_group_masks(
+                    bg_formula['tail_arm'].detach().cpu().numpy(),
+                    bg_formula['arm_bolus_u'].detach().cpu().numpy(),
+                    bg_formula['arm_carb_g'].detach().cpu().numpy()).items():
+                if not _m.any():
+                    continue
+                _part = arm_w[_m].sum(axis=0)
+                arm_sums[_gid] = _part if _gid not in arm_sums else arm_sums[_gid] + _part
+                arm_ns[_gid] = arm_ns.get(_gid, 0.0) + float(_m.sum())
 
             # Interior, two-sided spans: scored vs LINEAR INTERPOLATION, not persistence.
 
@@ -2758,6 +3081,14 @@ def _run_validation(
     for _k, _v in cg_ega.cg_ega_fractions(_night_cgega_counts).items():
         result[f'night_cgega_{_k}'] = _v
 
+    # Tail-arm breakdown of the same forecast forward, plus the paired-arm low-rescue reading.
+    result.update(_finalize_arm_groups(arm_sums, arm_ns, arm_counts))
+    result.update(_run_low_rescue_probe(
+        model, val_dataset, device,
+        min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS),
+        threshold=bg_hypo_threshold,
+    ))
+
     # Counterfactual probe (diagnostic); its arms add action curves, so curves layout only.
     if INPUT_LAYOUT == 'curves':
         result.update(_run_counterfactual_probe(
@@ -2964,6 +3295,11 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('conf_hypo_esc_raw', 4), ('conf_hypo_esc_cal', 4), ('conf_n', 4),
         # Median forecast roughness (risk-space mean |delta^2|), pooled over horizon + last patch.
         ('median_roughness', 6), ('median_roughness_far', 6),
+        # The same figures by tail arm and boundary-dose size, truth beside model; n per group.
+        *[(f'arm_{g}_{m}', d) for g in arm_group_ids() for m, d in ARM_GROUP_COLUMNS],
+        # Paired none/carbs low rescue: truth and model each carry their own conditioning count.
+        ('arm_rescue_true_share', 4), ('arm_rescue_true_n', 0),
+        ('arm_rescue_model_share', 4), ('arm_rescue_model_n', 0),
         # Counterfactual dose-response probe (diagnostic).
         ('cf_carb_sign', 4), ('cf_insulin_sign', 4),
         ('cf_carb_monotonic', 4), ('cf_insulin_monotonic', 4),
@@ -3064,11 +3400,14 @@ def train(
     bg_hyper_threshold: float = BG_HYPER_THRESHOLD,
     cache_path: str | None = None,
     checkpoint: str | None = None,
+    max_bolus_only_u: float | None = MAX_BOLUS_ONLY_U,
+    run_dir: str = '.',
 ) -> list[float]:
     """Run the T1DMAI training loop. Returns the per-step total-loss history.
 
     ``checkpoint``: restore that file's model weights, Kendall-Gal log-σ and EMA shadow, then
-    train from step 0 with fresh optimizers, schedule, histories and best_val_loss."""
+    train from step 0 with fresh optimizers, schedule, histories and best_val_loss.
+    ``run_dir`` holds this run's own ``checkpoints/`` and ``logs/``, so two runs stay apart."""
     # Must run before model/optimizer/dataloader construction, so every RNG draw is reproducible.
     if DETERMINISTIC:
         setup_determinism(master_seed)
@@ -3089,8 +3428,10 @@ def train(
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
+    ckpt_dir = os.path.join(run_dir, 'checkpoints')
+    log_dir = os.path.join(run_dir, 'logs')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     train_start_time = time.time()
 
@@ -3163,6 +3504,8 @@ def train(
         patient_uniform_sample_prob=patient_uniform_sample_prob,
         simulator_warmup_hours=simulator_warmup_hours,
         cache_path=cache_path,
+        # TRAINING only: the val and cal slabs stay uncapped, so both runs score one window set.
+        max_bolus_only_u=max_bolus_only_u,
     )
     val_dataset = T1DMDataset(
         master_seed=master_seed + VAL_SEED_OFFSET,
@@ -3222,13 +3565,15 @@ def train(
         'bg_hyper_threshold': bg_hyper_threshold,
         'cache_path': cache_path,
         'resumed_from': checkpoint,
+        'max_bolus_only_u': max_bolus_only_u,
+        'run_dir': run_dir,
     }
-    with open('logs/resolved_config.json', 'w') as f:
+    with open(os.path.join(log_dir, 'resolved_config.json'), 'w') as f:
         json.dump(training_config, f, indent=2)
 
     # Training log CSV — header and row from the one shared column spec.
     _train_columns = _train_log_columns()
-    train_log_path = 'logs/training_log.csv'
+    train_log_path = os.path.join(log_dir, 'training_log.csv')
     # A run always starts fresh, so always write a fresh header.
     train_log_exists = False
     train_log_file = open(train_log_path, 'a' if train_log_exists else 'w', newline='')
@@ -3237,7 +3582,7 @@ def train(
         train_log_writer.writerow([name for name, _ in _train_columns])
 
     # Validation log CSV.
-    val_log_path = 'logs/validation_log.csv'
+    val_log_path = os.path.join(log_dir, 'validation_log.csv')
     _val_columns = _val_log_columns()
     # A run always starts fresh, so always write a fresh header.
     val_log_exists = False
@@ -3608,6 +3953,9 @@ def train(
                 'conf_n': val_metrics.get('conf_n'),
                 'median_roughness': _r(val_metrics.get('median_roughness'), 6),
                 'median_roughness_far': _r(val_metrics.get('median_roughness_far'), 6),
+                **{f'arm_{_g}_{_m}': _r(val_metrics.get(f'arm_{_g}_{_m}'), _d)
+                   for _g in arm_group_ids() for _m, _d in ARM_GROUP_COLUMNS},
+                **{_k: _r(val_metrics.get(_k), 4) for _k in ARM_RESCUE_COLUMNS},
                 **{k: _r(val_metrics.get(k)) for k in (
                     'cf_carb_sign', 'cf_insulin_sign',
                     'cf_carb_monotonic', 'cf_insulin_monotonic',
@@ -3703,13 +4051,13 @@ def train(
                                       loss_history, training_config, norm_stats,
                                       master_seed, val_history, best_val_loss, best_val_step,
                                       loss_ema, ema=ema),
-                    'checkpoints/t1dmai_best.pt'
+                    os.path.join(ckpt_dir, 't1dmai_best.pt')
                 )
                 print(f"  [Checkpoint] saved best model (val_loss={val_total:.4f})")
 
         # ---- Checkpointing ----
         if checkpoint_interval < 999999 and step % checkpoint_interval == 0 and step > 0:
-            path = f'checkpoints/t1dmai_step_{step}.pt'
+            path = os.path.join(ckpt_dir, f't1dmai_step_{step}.pt')
             torch.save(
                 _build_checkpoint(model, weighting, muon_opt, adam_opt, step,
                                   loss_history, training_config, norm_stats,
@@ -3720,7 +4068,7 @@ def train(
             print(f"  [Checkpoint] saved {path}")
 
             _write_training_summary(
-                log_dir='logs', step=step, total_steps=total_steps,
+                log_dir=log_dir, step=step, total_steps=total_steps,
                 loss_history=loss_history, best_val_loss=best_val_loss,
                 best_val_step=best_val_step, training_config=training_config,
                 train_start_time=train_start_time, val_history=val_history, device=device,
@@ -3738,7 +4086,7 @@ def train(
 
     if _interrupted:
         interrupted_step = step - 1
-        path = f'checkpoints/t1dmai_interrupted_step_{interrupted_step}.pt'
+        path = os.path.join(ckpt_dir, f't1dmai_interrupted_step_{interrupted_step}.pt')
         torch.save(
             _build_checkpoint(model, weighting, muon_opt, adam_opt, interrupted_step,
                               loss_history, training_config, norm_stats,
@@ -3753,7 +4101,7 @@ def train(
         if checkpoint_interval < 999999 and final_step > 0:
             already_saved = final_step % checkpoint_interval == 0
             if not already_saved:
-                path = f'checkpoints/t1dmai_step_{final_step}.pt'
+                path = os.path.join(ckpt_dir, f't1dmai_step_{final_step}.pt')
                 torch.save(
                     _build_checkpoint(model, weighting, muon_opt, adam_opt, final_step,
                                       loss_history, training_config, norm_stats,
@@ -3764,7 +4112,7 @@ def train(
                 print(f"  [Checkpoint] saved final model → {path}")
 
     _write_training_summary(
-        log_dir='logs', step=step - 1, total_steps=total_steps,
+        log_dir=log_dir, step=step - 1, total_steps=total_steps,
         loss_history=loss_history, best_val_loss=best_val_loss,
         best_val_step=best_val_step, training_config=training_config,
         train_start_time=train_start_time, val_history=val_history, device=device,
@@ -3832,6 +4180,12 @@ if __name__ == '__main__':
                         help='Checkpoint whose model weights, Kendall-Gal log-σ and EMA shadow '
                              'start this run; optimizers, schedule, histories and best_val_loss '
                              'start fresh. config.py must match its architecture.')
+    parser.add_argument('--max-bolus-only-u', type=float, default=None,
+                        help='Experimental: a TRAINING sample drawing the bolus-only arm from a '
+                             'row whose intended boundary bolus exceeds this redraws its arm '
+                             'uniformly over the other three. Validation is never capped.')
+    parser.add_argument('--run-dir', type=str, default=None,
+                        help="This run's own directory for checkpoints/ and logs/.")
     args = parser.parse_args()
 
     resolved = {
@@ -3858,6 +4212,8 @@ if __name__ == '__main__':
         'bg_hyper_threshold': BG_HYPER_THRESHOLD,
         'cache_path': None,
         'checkpoint': None,
+        'max_bolus_only_u': MAX_BOLUS_ONLY_U,
+        'run_dir': '.',
     }
     sources = {k: 'config.py' for k in resolved}
 
@@ -3884,6 +4240,8 @@ if __name__ == '__main__':
         'bg_hyper_threshold': args.bg_hyper_threshold,
         'cache_path': args.cache_path,
         'checkpoint': args.checkpoint,
+        'max_bolus_only_u': args.max_bolus_only_u,
+        'run_dir': args.run_dir,
     }
     for key, cli_val in cli_map.items():
         if cli_val is not None:
@@ -3937,4 +4295,6 @@ if __name__ == '__main__':
         bg_hyper_threshold=resolved['bg_hyper_threshold'],
         cache_path=resolved['cache_path'],
         checkpoint=resolved['checkpoint'],
+        max_bolus_only_u=resolved['max_bolus_only_u'],
+        run_dir=resolved['run_dir'],
     )
