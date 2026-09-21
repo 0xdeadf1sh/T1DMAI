@@ -155,8 +155,14 @@ def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatc
                      normalization_stats=stats, patient_uniform_sample_prob=0.0,
                      blind=True)
     agg: dict[str, float] = {}
+    samples = [ds[i] for i in range(N_SAMPLES)]
+    # The probe skips a row whose truth stops at the single forward, which every boundary row does.
+    for s in samples:
+        bf = s['bg_formula_data']
+        bf['extended_true_bg_trajectory'] = np.tile(
+            bf['extended_true_bg_trajectory'], 2)
     train_blind._accumulate_long_horizon_bg_metrics(
-        None, [ds[i] for i in range(N_SAMPLES)], stats, torch.device('cpu'),
+        None, samples, stats, torch.device('cpu'),
         n_rolls=2, agg=agg)
 
     assert seen, "no roll ran — the metric this test is about was never reached"

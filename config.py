@@ -200,10 +200,10 @@ VALIDATION_INTERVAL = 1000  # steps
 LOG_INTERVAL = 100  # steps
 # Coverage row 95% CI: 5-11 pts at n=100 (hid a 0.83 band reading 0.905), ~1.9 pts at n=1000.
 
-# Cost is the per-sample rolling long-horizon loop, which runs on every window.
+# Cost is one forward per window plus the probes below.
 VALIDATION_N_PATIENTS = 1000
 
-# Long-horizon roll + counterfactual probe cost ~77% of validation; each figure has its own n.
+# Caps the per-sample counterfactual probe and the rolling one; each figure has its own n.
 VALIDATION_PROBE_N_PATIENTS = 250
 
 # Stats pass mirrors data generation's window (data.py), not a long 720 h run with wider spread.

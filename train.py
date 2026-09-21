@@ -1630,7 +1630,7 @@ def _accumulate_long_horizon_bg_metrics(
     agg: dict[str, float],
     night_agg: dict[str, float] | None = None,
 ) -> None:
-    """Roll each val sample forward for horizons past a single forward pass.
+    """Roll each val sample whose truth outlasts a single forward; the rest are skipped here.
     Accumulates bg_rmse_{h}_*/bg_mae_{h}_*; predict_rolling is BG-autoregressive (pred_bg=
     f_inv(median) carried across rolls), CONDITIONED on announced future insulin and carb
     (_make_long_horizon_overrides_fn), the known-plan nocturnal-hypo regime.
@@ -1646,6 +1646,9 @@ def _accumulate_long_horizon_bg_metrics(
     for sample in samples:
         n_ctx = int(sample['n_context_patches'])
         bf = sample['bg_formula_data']
+        # Every horizon this probe scores sits past the single forward; no truth there, no roll.
+        if len(bf['extended_true_bg_trajectory']) <= single_pass_steps:
+            continue
         # Read before the floor: a dropped night sample still needs its own denominator counted.
         is_night = _is_nocturnal(float(bf.get('pred_start_hour', 0.0)))
 

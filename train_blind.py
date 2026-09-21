@@ -1469,6 +1469,9 @@ def _accumulate_long_horizon_bg_metrics(
     for sample in samples:
         n_ctx = int(sample['n_context_patches'])
         bf = sample['bg_formula_data']
+        # Every horizon this probe scores sits past the single forward; no truth there, no roll.
+        if len(bf['extended_true_bg_trajectory']) <= single_pass_steps:
+            continue
         # Read before the floor, else a dropped nocturnal sample loses the night denominator.
         is_night = _is_nocturnal(float(bf.get('pred_start_hour', 0.0)))
         # The roll re-feeds its own median, so context must be real readings, not a positional cut.

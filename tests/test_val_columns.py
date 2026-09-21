@@ -457,3 +457,25 @@ def test_families_restored_to_the_table_are_rendered_and_still_recorded(val_metr
     assert not overlap, f"a family is claimed both trimmed and restored: {overlap}"
     print(f"[DUMP] restored families | {len(RESTORED_TO_THE_TABLE)} render on the "
           f"page and are still declared columns ✓")
+
+
+def test_a_boundary_row_is_skipped_by_the_roll_rather_than_rolled_and_discarded(val_metrics):
+    """A row ends at its tail, so no horizon past the single forward has truth to score.
+
+    The probe drops such a row before the forwards; the rolled rows stay empty at n = 0
+    and the single-pass ones keep their values.
+    """
+    single_pass_min = PREDICTION_PATCHES * PATCH_SIZE * 5
+    rolled = [h for h in train.BG_HORIZONS_MIN if h > single_pass_min]
+    assert rolled, 'no horizon past the single forward, so this test has no subject'
+    assert val_metrics['roll_n'] == 0.0 and val_metrics['roll_skipped'] == 0.0, (
+        f"the roll ran on {val_metrics['roll_n']} window(s) whose truth stops at "
+        f"{single_pass_min} min — every forward it spends there scores nothing")
+    for h in rolled:
+        assert val_metrics[f'bg_rmse_{h}'] is None, (
+            f"bg_rmse_{h} has a value with no ground truth behind it")
+        assert val_metrics[f'bg_rmse_{h}_n'] == 0.0
+    for h in (m for m in train.BG_HORIZONS_MIN if m <= single_pass_min):
+        assert val_metrics[f'bg_rmse_{h}'] is not None, (
+            f"bg_rmse_{h} is inside the single forward and must still be scored")
+    print(f"[DUMP] rolled horizons | {rolled} empty at n=0, 0 rolls spent ✓")
