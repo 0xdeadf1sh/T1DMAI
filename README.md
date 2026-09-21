@@ -291,13 +291,29 @@ the training objective. The other two are the
 [fixed protocols](#scoring-rules-and-protocols) — the horizon-keyed clinical
 numbers come from the forecast one, the `infill_*` columns from the other.
 
+From a cache, the forecast figures are also broken down by the tail arm each
+window's horizon came from and by the size of that arm's boundary dose, with the
+truth's own roughness printed beside the model's. Beside it sits a paired
+reading: over rows whose `none` arm drops below 70 mg/dL, the share whose `carbs`
+arm does not, once off the truth and once off the model's two median forecasts. A
+window with no cache row behind it carries arm `-1` and joins no group.
+
 ```bash
 # simulate on the fly
 python train.py --master-seed 42 --total-steps 100000 --batch-size 512
 
 # or from a pre-generated pool — see Simulator cache
 python train.py --cache-path simulator_cache --total-steps 100000
+
+# two runs side by side, each with its own checkpoints/ and logs/
+python train.py --cache-path simulator_cache --run-dir runs/baseline
 ```
+
+`--max-bolus-only-u U` is an experimental training-only draw cap, off by default:
+a sample drawing the bolus-only arm from a row whose intended boundary bolus
+exceeds `U` redraws its arm uniformly over the other three. `bolus_carbs` is not
+capped, and the validation and calibration slabs never are, so a capped and an
+uncapped run are scored on the same windows.
 
 ### The mask sampler
 

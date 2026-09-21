@@ -854,6 +854,36 @@ same call, so the two are never compared across runs. The validation sample is
 small, so the figures are directional; the deployable correction is fit after
 training by `calibrate_conformal.py`.
 
+### Tail-arm breakdown
+
+The same forecast forward is also reported by the tail arm each window's horizon
+came from. `data.py` carries the arm index and that arm's two boundary doses —
+intended bolus in U, logged carbohydrate in g, zero where the arm has neither —
+through `_build_sample` and `collate_fn`. A window with no cache row behind it
+carries arm `-1` and joins no group.
+
+Eighteen groups: the four arms, then the two bolus-carrying arms split by
+intended bolus over `0.5–2 / 2–6 / 6–12 / 12–20 U`, then the two carb-carrying
+arms split by logged grams over `5–15 / 15–40 / 40–120 g`. Each group reports its
+window count, RMSE at 30 / 60 / 120 min, `median_roughness` and
+`median_roughness_far` exactly as the headline computes them, the same two
+statistics of the true target trajectory in risk space both raw and under a
+3-point moving average, 90 % coverage and band width at 120 min, the share of
+windows whose true tail drops below 40 mg/dL, and mean true BG at 120 min. The
+truth's own roughness sits beside the model's because the target is noisy CGM:
+its figure is the floor the model's is read against. The columns are
+`arm_<group>_<metric>` in the CSV and in `val_history`, and the table prints one
+row per populated group after the existing sections.
+
+**Low rescue.** Beside the breakdown, a paired reading that no probe dose enters.
+Over up to `VALIDATION_PROBE_N_PATIENTS` validation rows, both the `none` and the
+`carbs` sample of the same row are built — they share context, width and mask, so
+only the boundary carbohydrate differs. Of the rows whose `none` tail drops below
+`BG_HYPO_THRESHOLD` past the 30-minute rescue lag, it reports the share whose
+`carbs` tail does not, once off the truth and once off the model's own two median
+forecasts. Each share carries its own conditioning count, since the two
+conditions select different rows.
+
 
 ## Conformal calibration
 
@@ -1001,6 +1031,15 @@ would make each touched chunk's compressed pages resident in every worker that
 read it, with no way to release them — blosc2 exposes no mapping to `madvise` — so
 random access over a large pool would drive the resident set toward the pool's
 whole compressed footprint.
+
+**Bolus-only cap (experimental, off by default).** `MAX_BOLUS_ONLY_U` /
+`--max-bolus-only-u U`: a training sample drawing the `bolus` arm from a row whose
+intended boundary bolus exceeds `U` redraws its arm uniformly over the other
+three. `bolus_carbs` is not capped. The redraw spends its own RNG substream and is
+entered only when it fires, so an unset cap leaves the draw bit-identical. The
+validation and calibration slabs refuse the setting, so a capped and an uncapped
+run are scored on the same windows. The value is recorded in the checkpoint's
+`training_config` and in `logs/resolved_config.json`.
 
 **What a reuse repeats.** The index maps to a row by `patient_seed % slab_size`
 within the partition's disjoint slab. The window origin is pinned to the row's

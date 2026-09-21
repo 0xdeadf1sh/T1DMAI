@@ -203,23 +203,43 @@ venv/bin/python train.py \
 
 `--batch-size` defaults to 512. On an 8 GB card, start at 128 and work up.
 
-**`logs/` is a single directory with no per-run isolation.** Two concurrent runs
-interleave their CSVs, and the damage looks like a short file rather than an
-error. Run one at a time, and move `logs/` aside between runs worth keeping.
+**`--run-dir` is the per-run isolation.** `checkpoints/` and `logs/` are created
+inside it, so two runs kept apart write nowhere in common. Without it they both
+land in the repository root, interleave their CSVs, and the damage looks like a
+short file rather than an error.
+
+```bash
+venv/bin/python train.py \
+    --cache-path ~/Desktop/T1DMSIM/cache_balanced_cf \
+    --run-dir runs/baseline
+```
+
+`--max-bolus-only-u U` caps the TRAINING draw: a sample drawing the bolus-only
+arm from a row whose intended boundary bolus exceeds `U` redraws its arm
+uniformly over the other three. `bolus_carbs` is untouched, the validation and
+calibration slabs refuse the setting, and the value lands in the checkpoint's
+`training_config` and in `<run-dir>/logs/resolved_config.json`. It needs a cache
+built with `cache_simulator.py --events`, which is where the per-row boundary
+doses live.
 
 ### Output
 
 | path | contents |
 | --- | --- |
-| `checkpoints/t1dmai_best.pt` | lowest `val_loss_total` so far |
-| `checkpoints/t1dmai_step_N.pt` | periodic and final |
-| `logs/training_log.csv` | per-step losses |
-| `logs/validation_log.csv` | one row per validation |
+| `<run-dir>/checkpoints/t1dmai_best.pt` | lowest `val_loss_total` so far |
+| `<run-dir>/checkpoints/t1dmai_step_N.pt` | periodic and final |
+| `<run-dir>/logs/training_log.csv` | per-step losses |
+| `<run-dir>/logs/validation_log.csv` | one row per validation |
 
 The validation table prints every `--validation-interval` steps. `@30/@60/@90/@120`
 minutes are `d = 1/2/3/4` — the distance in patches to the nearest visible
 evidence. A parenthesised count such as `(76st)` is that row's event count; some
 bins are small enough that the count changes how the percentage reads.
+
+A second box follows it from a cache run: the forecast figures by tail arm and by
+boundary-dose size, the truth's own roughness beside the model's, and the paired
+`none`/`carbs` low-rescue line with an n for each share. Its columns are
+`arm_<group>_<metric>` in the CSV.
 
 The table is a reading surface, not the record: `logs/validation_log.csv` carries
 every metric on every row, including the families the table does not print.
