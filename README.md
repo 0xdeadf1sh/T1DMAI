@@ -227,11 +227,12 @@ every consumer indexes the fan positionally. Inference inverts it to mg/dL.
 
 ## Training
 
-Batches are simulated on the fly, or drawn from a pre-generated cache. Each
-sample is a fresh random window: the context length is re-rolled per sample
-between 84 and 168 hours, the window may start at any patch-aligned position in the
-day, so day and night are learned by one model without a band restriction, and
-the masked spans are drawn per sample.
+Batches are simulated on the fly, or drawn from a pre-generated cache. Every
+window ends at its row's boundary, where the counterfactual tail begins; the
+context length is re-rolled per sample between 84 and 168 hours, and the masked
+spans are drawn per sample. Day and night are learned by one model without a
+band restriction, because each row starts at a random hour, so the boundaries
+spread over the clock.
 
 The loss has three terms, all in risk space:
 
@@ -473,13 +474,12 @@ layout. On a million-row balanced pool that is about 1.3–1.7× on the dense
 physiologic channels and 27–539× on the near-constant ones — hour-of-day 309×,
 day index 539× — for roughly 2.4× over the pool as a whole.
 
-Pool reuse is benign, because every draw takes a fresh arm and a fresh context
-crop from its row: 4 arms × 169 context widths is 676 distinct windows per row,
-so a 1–3 M-row pool is ample for a 100,000-step run at
-batch 512. Each row is drawn about 64 times at
-10⁶ rows, but the expected number of repeated (row, window) pairs across a whole
-run is under a fifth of a percent of draws — and each of those still draws its
-own mask. The dataset checks
+A draw varies only the arm and the context width: the window ends at the row's
+boundary, so 4 arms × 169 widths is 676 distinct windows per row, and the target
+is one of that row's four tails. At 10⁶ rows a 100,000-step run at batch 512
+draws each row about 64 times and lands on about 61 of its 676 windows, so
+roughly 4.5% of draws repeat a (row, window) pair, and a repeated pair still
+draws its own mask. The dataset checks
 the cache's `meta.json` — format, channel list, tail geometry and arm order,
 warmup, `dt`, the
 uniform-sample probability — and each channel's shape against the runtime config,

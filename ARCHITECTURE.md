@@ -1007,12 +1007,15 @@ read it, with no way to release them — blosc2 exposes no mapping to `madvise` 
 random access over a large pool would drive the resident set toward the pool's
 whole compressed footprint.
 
-**Reuse is benign.** The index maps to a row by `patient_seed % slab_size` within
-the partition's disjoint slab, and each draw takes a fresh random window from
-that row, so a reused row yields a different training window. Values are stored
-float32, below the simulator's own noise floor. When the pool is smaller than the
-number of samples the run will draw, the dataset prints a one-line reuse factor
-at construction.
+**What a reuse repeats.** The index maps to a row by `patient_seed % slab_size`
+within the partition's disjoint slab. The window origin is pinned to the row's
+boundary, so a reused row varies only in its arm and its context width — 4 × 169
+= 676 windows — and its target BG is one of that row's four tails. The mask is
+redrawn on top of that: `patient_seed` differs between the two draws, so the
+interior spans move even when arm and width repeat. Values are stored float32,
+below the simulator's own noise floor. When the pool is smaller than the number
+of samples the run will draw, the dataset prints a one-line reuse factor at
+construction.
 
 
 ## Inference and export

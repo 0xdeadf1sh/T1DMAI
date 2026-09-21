@@ -469,7 +469,7 @@ class T1DMDataset(Dataset):
             self._cache_slab = _cache_slab_geometry(
                 self._cache_pool_size, self.cache_partition)
 
-            # A smaller-than-batch pool cycles; benign since each reuse draws a fresh random window.
+            # A cycling pool is benign: a reuse redraws the arm and context width, not the origin.
 
     def __len__(self) -> int:
         return self.total_steps * self.batch_size
