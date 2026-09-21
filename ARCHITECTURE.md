@@ -384,6 +384,21 @@ differs. A patch seam is interior to the same spline as the steps around it, so
 the input path carries no jump in value or slope there and the loss needs no seam
 penalty. The head sees no position input.
 
+**The span-edge rule is a flag, and only one value is exportable.**
+`config.SPLINE_EDGE` — `train.py --spline-edge {repeat,extrapolate}`, env
+`T1DMAI_SPLINE_EDGE`, default `repeat` — chooses the virtual node past a *missing*
+neighbour. `repeat` clamps to the edge node, which is `SPEC/inference.md` §8.2 and
+what the phone's head implements; on a straight line in hidden space it decays the
+last patch's step spacing from `1/S` to `0.22/S`. `extrapolate` continues the last
+segment instead — `node(L+1) = 2·node(L) − node(L−1)`, `node(L+2) = 3·node(L) −
+2·node(L−1)`, mirrored on the left, falling back to `repeat` where the span has no
+second node — which carries that line at constant spacing. Interior spans are
+untouched and the two rules are bit-identical there. The value is stamped into the
+checkpoint's `training_config` and `resolved_config.json`; resuming, validating or
+scoring a checkpoint under the other rule exits, and exporting one trained
+`extrapolate` fails in `exporters/modified_forward.load_model`. It is an
+experiment: `ARCH_VERSION`, the descriptor and the goldens are untouched.
+
 The final layer initialises at `std = BG_HEAD_INIT_SCALE`, so at step 0 the head
 output is near zero, the median offset is near zero, and every slot's forecast is
 a flat persistence line at its own anchor.

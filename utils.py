@@ -443,23 +443,36 @@ def circular_std_hours(pred_hour: torch.Tensor, true_hour: torch.Tensor) -> torc
     return torch.sqrt(-2.0 * torch.log(r_bar)) * (24.0 / two_pi) + 0.0
 
 
-_BSPLINE_STEP_WEIGHT_CACHE: "dict[tuple[int, bool, bool], torch.Tensor]" = {}
+def checkpoint_spline_edge(ckpt: "dict | None") -> str:
+    """The ``config.SPLINE_EDGE`` rule a checkpoint trained under.
+
+    Sole reader of the absent-key convention: absent means the default, never "unknown".
+    """
+    from config import SPLINE_EDGE_DEFAULT
+    tc = (ckpt or {}).get('training_config') or {}
+    return str(tc.get('spline_edge', SPLINE_EDGE_DEFAULT))
+
+
+_BSPLINE_STEP_WEIGHT_CACHE: "dict[tuple[int, bool, bool, str], torch.Tensor]" = {}
 
 
 def bspline_step_weights(L: int, has_left: bool, has_right: bool) -> torch.Tensor:
     """(L*PATCH_SIZE, L+has_left+has_right) fp32 step-state weight matrix.
 
     Row (i-1)*S+j is step j of patch i, patch-major; columns are the span's nodes from lo.
-    Uniform cubic B-spline per row, clamped to [lo,hi]; rows sum to 1. Cached per (L,l,r).
-    """
-    from config import PATCH_SIZE
+    A node past a MISSING neighbour repeats the edge, or continues the last segment under
+    SPLINE_EDGE='extrapolate'; rows sum to 1. Cached per (L, l, r, rule)."""
+    from config import PATCH_SIZE, SPLINE_EDGE
     assert L >= 1, f"span length must be >= 1, got {L}"
-    key = (int(L), bool(has_left), bool(has_right))
+    key = (int(L), bool(has_left), bool(has_right), SPLINE_EDGE)
     W = _BSPLINE_STEP_WEIGHT_CACHE.get(key)
     if W is None:
         S = PATCH_SIZE
         lo = 0 if has_left else 1
         hi = L + 1 if has_right else L
+        ext = SPLINE_EDGE != "repeat"
+        # One node inside each edge; it collapses onto the edge for L==1, which IS repeat.
+        hi_in, lo_in = max(hi - 1, lo), min(lo + 1, hi)
         W = torch.zeros(L * S, hi - lo + 1, dtype=torch.float32)
         for i in range(1, L + 1):
             for j in range(S):
@@ -468,7 +481,15 @@ def bspline_step_weights(L: int, has_left: bool, has_right: bool) -> torch.Tenso
                 w = ((1 - u) ** 3 / 6, (3 * u ** 3 - 6 * u ** 2 + 4) / 6,
                      (-3 * u ** 3 + 3 * u ** 2 + 3 * u + 1) / 6, u ** 3 / 6)
                 for w_o, o in zip(w, (-1, 0, 1, 2)):
-                    W[(i - 1) * S + j, min(max(k + o, lo), hi) - lo] += w_o
+                    n, row = k + o, (i - 1) * S + j
+                    if ext and not has_right and n > hi:
+                        W[row, hi - lo] += w_o * (1 + n - hi)
+                        W[row, hi_in - lo] -= w_o * (n - hi)
+                    elif ext and not has_left and n < lo:
+                        W[row, 0] += w_o * (1 + lo - n)
+                        W[row, lo_in - lo] -= w_o * (lo - n)
+                    else:
+                        W[row, min(max(n, lo), hi) - lo] += w_o
         _BSPLINE_STEP_WEIGHT_CACHE[key] = W
     return W.clone()
 
@@ -511,7 +532,7 @@ def step_states(
     A span's nodes are its L patches plus the readable visible patch each side; states are
     the cubic B-spline over them. Padded/invalid slots are singletons, discarded via valid.
     """
-    from config import PATCH_SIZE
+    from config import PATCH_SIZE, SPLINE_EDGE
     assert x.ndim == 3, f"x must be (B, T, D), got {tuple(x.shape)}"
     B, T, D = x.shape
     assert mask_idx.shape[0] == B and mask_idx.ndim == 2, (
@@ -545,12 +566,26 @@ def step_states(
     lo = torch.where(has_l, torch.zeros_like(L), torch.ones_like(L))
     hi = torch.where(has_r, L + 1, L)
 
-    def node(n: torch.Tensor) -> torch.Tensor:
-        n = torch.maximum(torch.minimum(n, hi), lo)      # the end node repeats
+    def real(n: torch.Tensor) -> torch.Tensor:
+        """State of node n, which must already lie in [lo, hi]."""
         st = node_state.gather(
             1, (start + n - 1).clamp(0, M - 1).unsqueeze(-1).expand(B, M, D))
         st = torch.where((n == 0).unsqueeze(-1), xl, st)
         return torch.where((n == L + 1).unsqueeze(-1), xr, st)
+
+    if SPLINE_EDGE == "repeat":
+        def node(n: torch.Tensor) -> torch.Tensor:
+            return real(torch.maximum(torch.minimum(n, hi), lo))   # the end node repeats
+    else:
+        # Inward segment per edge, zero where the neighbour exists or the span is one patch.
+        seg_r = (real(torch.maximum(hi - 1, lo)) - real(hi)) * (~has_r).unsqueeze(-1).to(x.dtype)
+        seg_l = (real(torch.minimum(lo + 1, hi)) - real(lo)) * (~has_l).unsqueeze(-1).to(x.dtype)
+
+        def node(n: torch.Tensor) -> torch.Tensor:
+            over = (n - hi).clamp(min=0).unsqueeze(-1).to(x.dtype)
+            under = (lo - n).clamp(min=0).unsqueeze(-1).to(x.dtype)
+            st = real(torch.maximum(torch.minimum(n, hi), lo))
+            return st - over * seg_r - under * seg_l
 
     out = []
     for j in range(S):

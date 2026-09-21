@@ -19,12 +19,15 @@ from torch.utils.data import DataLoader, Sampler
 
 
 def _layout_from_argv() -> None:
-    """--inputs sets the layout env var before config binds it; workers inherit the env."""
+    """--inputs / --spline-edge set their env var before config binds it; workers inherit it."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--inputs', choices=('curves', 'events'), default=None)
-    layout = pre.parse_known_args()[0].inputs
-    if layout is not None:
-        os.environ['T1DMAI_INPUT_LAYOUT'] = layout
+    pre.add_argument('--spline-edge', default=None)
+    pre_args = pre.parse_known_args()[0]
+    if pre_args.inputs is not None:
+        os.environ['T1DMAI_INPUT_LAYOUT'] = pre_args.inputs
+    if pre_args.spline_edge is not None:
+        os.environ['T1DMAI_SPLINE_EDGE'] = pre_args.spline_edge
 
 
 if __name__ == '__main__':
@@ -56,10 +59,11 @@ from config import (                                           # noqa: E402
     SKILL_HEAD_LOSS_WEIGHT,
 )
 
-from config import ARCH_VERSION, LOSS_SCHEMA
+from config import ARCH_VERSION, LOSS_SCHEMA, SPLINE_EDGE_RULES
 
 from utils import (
-    ModelEMA, kovatchev_f_inv, kovatchev_f_target, create_attention_mask_from_visible,
+    ModelEMA, checkpoint_spline_edge, kovatchev_f_inv, kovatchev_f_target,
+    create_attention_mask_from_visible,
     time_of_day_bin_ce, time_of_day_decode_bins, time_of_day_resultant,
     circular_hour_error, circular_hour_residual, circular_bias_hours, circular_std_hours,
 )
@@ -3168,6 +3172,10 @@ def _check_resume_architecture(ckpt: dict, path: str) -> None:
     if policy != masked_channel_policy(blind=False):
         sys.exit(f"--checkpoint {path}: masked_channel_policy {policy!r}; train.py trains "
                  f"{masked_channel_policy(blind=False)!r} (train_blind.py owns {policy!r})")
+    edge = checkpoint_spline_edge(ckpt)
+    if edge != _cfg.SPLINE_EDGE:
+        sys.exit(f"--checkpoint {path}: trained under --spline-edge {edge}; this run reads "
+                 f"{_cfg.SPLINE_EDGE} (step_states forms a different node set)")
     # The restored log_sigma_D was fitted to the D slot this value defines.
     if tc.get('mse_alpha') is not None and float(tc['mse_alpha']) != float(_cfg.MSE_ALPHA):
         sys.exit(f"--checkpoint {path}: mse_alpha {tc['mse_alpha']} != config.py "
@@ -3537,9 +3545,12 @@ def train(
     from config import (
         D_MODEL as _CFG_D_MODEL, N_LAYERS as _CFG_N_LAYERS,
         N_HEADS as _CFG_N_HEADS, FFN_DIM as _CFG_FFN_DIM,
+        SPLINE_EDGE as _CFG_SPLINE_EDGE,
     )
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
+        # EXPERIMENT: step_states' span-edge node rule; only 'repeat' is exportable.
+        'spline_edge': _CFG_SPLINE_EDGE,
         # The sampler constants the run trained under — the provenance a loader compares against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
@@ -4184,6 +4195,10 @@ if __name__ == '__main__':
                         help='Experimental: a TRAINING sample drawing the bolus-only arm from a '
                              'row whose intended boundary bolus exceeds this redraws its arm '
                              'uniformly over the other three. Validation is never capped.')
+    parser.add_argument('--spline-edge', choices=SPLINE_EDGE_RULES, default=None,
+                        help='Experimental: virtual node where a span has no readable '
+                             'neighbour. repeat (default) clamps to the edge node; extrapolate '
+                             'continues the last segment. Only repeat is exportable.')
     parser.add_argument('--run-dir', type=str, default=None,
                         help="This run's own directory for checkpoints/ and logs/.")
     args = parser.parse_args()
@@ -4257,6 +4272,9 @@ if __name__ == '__main__':
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
     rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))
     rows.append(('mask_right_edge_quota', str(MASK_RIGHT_EDGE_QUOTA), 'config.py'))
+    import config as _cfg_edge
+    rows.append(('spline_edge', str(_cfg_edge.SPLINE_EDGE),
+                 'CLI' if args.spline_edge is not None else 'config.py'))
     key_w = max(len(k) for k, _, _ in rows)
     val_w = max(len(v) for _, v, _ in rows)
     body = [f"  {k:<{key_w}}  {v:<{val_w}}  [{s}]" for k, v, s in rows]

@@ -21,6 +21,19 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
 
+
+def _spline_edge_from_argv() -> None:
+    """--spline-edge sets the env var before config binds it; workers inherit the env."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--spline-edge', default=None)
+    rule = pre.parse_known_args()[0].spline_edge
+    if rule is not None:
+        os.environ['T1DMAI_SPLINE_EDGE'] = rule
+
+
+if __name__ == '__main__':
+    _spline_edge_from_argv()
+
 from config import (                                           # noqa: E402
     MASTER_SEED, DETERMINISTIC, TOTAL_STEPS, BATCH_SIZE, NUM_WORKERS,
     MUON_LR, MUON_MOMENTUM, MUON_NS_ITERATIONS, MUON_WEIGHT_DECAY,
@@ -44,7 +57,7 @@ from config import (                                           # noqa: E402
     TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_CROSS_WINDOW_WEIGHT, TIME_PROBE_CROSS_WINDOW_FRACTION,
 )
 
-from config import ARCH_VERSION, LOSS_SCHEMA
+from config import ARCH_VERSION, LOSS_SCHEMA, SPLINE_EDGE_RULES
 
 from utils import (
     ModelEMA, kovatchev_f_inv, create_attention_mask_from_visible,
@@ -2655,9 +2668,12 @@ def train(
     from config import (
         D_MODEL as _CFG_D_MODEL, N_LAYERS as _CFG_N_LAYERS,
         N_HEADS as _CFG_N_HEADS, FFN_DIM as _CFG_FFN_DIM,
+        SPLINE_EDGE as _CFG_SPLINE_EDGE,
     )
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
+        # EXPERIMENT: step_states' span-edge node rule; only 'repeat' is exportable.
+        'spline_edge': _CFG_SPLINE_EDGE,
         # Sampler constants the run trained under, for a loader to compare its live config against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
@@ -3238,6 +3254,10 @@ if __name__ == '__main__':
                         help='Decay factor for the weight-EMA shadow used at validation. 0 disables.')
     parser.add_argument('--cache-path', type=str, default=None,
                         help='Path to a simulator cache directory produced by T1DMSIM/cache_simulator.py.')
+    parser.add_argument('--spline-edge', choices=SPLINE_EDGE_RULES, default=None,
+                        help='Experimental: virtual node where a span has no readable '
+                             'neighbour. repeat (default) clamps to the edge node; extrapolate '
+                             'continues the last segment. Only repeat is exportable.')
     args = parser.parse_args()
 
     # Layer 1: config.py defaults.
@@ -3307,6 +3327,9 @@ if __name__ == '__main__':
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
     rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))
     rows.append(('mask_right_edge_quota', str(MASK_RIGHT_EDGE_QUOTA), 'config.py'))
+    import config as _cfg_edge
+    rows.append(('spline_edge', str(_cfg_edge.SPLINE_EDGE),
+                 'CLI' if args.spline_edge is not None else 'config.py'))
     # The one thing separating this run from train.py's, read here before launching.
     rows.append(('masked_channel_policy', masked_channel_policy(blind=True), 'train_blind.py'))
     key_w = max(len(k) for k, _, _ in rows)

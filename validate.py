@@ -110,6 +110,11 @@ def main() -> None:
     if ckpt.get('arch_version') != config.ARCH_VERSION:
         sys.exit(f"{a.checkpoint}: arch_version {ckpt.get('arch_version')!r} != "
                  f"config.py {config.ARCH_VERSION!r}")
+    from utils import checkpoint_spline_edge
+    edge = checkpoint_spline_edge(ckpt)
+    if edge != config.SPLINE_EDGE:
+        sys.exit(f"{a.checkpoint}: trained under --spline-edge {edge}, evaluated under "
+                 f"{config.SPLINE_EDGE}; rerun with {config.SPLINE_EDGE_ENV}={edge}")
     stats = ckpt.get('normalization_stats')
     if stats is None:
         sys.exit(f'{a.checkpoint}: no normalization_stats')

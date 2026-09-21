@@ -197,6 +197,18 @@ forecast *protocol*; it is not a region of a training sample.
     visible neighbours, per `../T1DMCOMMON/SPEC/inference.md` §8.2. `utils.bspline_step_weights(L,
     has_left, has_right)` is the cached `(L·S, n_nodes)` matrix: no parameters, nothing in the
     checkpoint, no position input, one code path for forecast, backcast and infill.
+  - **The span-edge rule is a flag, and `repeat` is the only exportable value.**
+    `config.SPLINE_EDGE` (`--spline-edge {repeat,extrapolate}` on `train.py` / `train_blind.py`,
+    env `T1DMAI_SPLINE_EDGE`, default `repeat`) picks the virtual node past a MISSING neighbour.
+    `repeat` clamps to the edge node — `SPEC/inference.md` §8.2, what the phone's head implements
+    — and decays a straight hidden line's last-patch step spacing from `1/S` to `0.22/S`;
+    `extrapolate` continues the last segment (`node(L+1) = 2·n_L − n_{L−1}`, `node(L+2) = 3·n_L −
+    2·n_{L−1}`, mirrored on the left, falling back to `repeat` where there is no second node) and
+    holds that line at `1/S`. Interior spans are bit-identical under both. The value rides in
+    `training_config` and `resolved_config.json`; a mismatch exits on resume, in `validate.py`,
+    `export_submission.py` and `metrics/core/report.py`, and an `extrapolate` checkpoint is
+    refused by `exporters/modified_forward.load_model`. It is an experiment: `ARCH_VERSION`, the
+    exporters' graph, the descriptor and the goldens are untouched.
   - **Assembly.** `head_raw (B, M, S, 1 + 2·N_SPREADS)` goes to
     `utils.assemble_quantiles`, pointwise per (slot, step): col 0 = median
     delta; cols 1..3 = the `τ>.5` spreads (nearest→far .75/.9/.95); cols 4..6 = the `τ<.5` spreads

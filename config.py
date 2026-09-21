@@ -82,6 +82,21 @@ BG_HEAD_INIT_SCALE = (
 )
 BG_QUANTILE_SPREAD_MIN = 1e-3  # additive floor per softplus spread; anti σ-collapse
 
+# EXPERIMENT: step_states' virtual node at a span edge; the phone implements "repeat" only.
+SPLINE_EDGE_DEFAULT = "repeat"
+SPLINE_EDGE_RULES = (SPLINE_EDGE_DEFAULT, "extrapolate")
+SPLINE_EDGE_ENV = "T1DMAI_SPLINE_EDGE"
+
+
+def set_spline_edge(rule: str) -> None:
+    """Switch the edge rule; utils re-reads it per call, so import order does not matter."""
+    global SPLINE_EDGE
+    assert rule in SPLINE_EDGE_RULES, f"unknown spline edge rule {rule!r}"
+    SPLINE_EDGE = rule
+
+
+set_spline_edge(_os.environ.get(SPLINE_EDGE_ENV, SPLINE_EDGE_DEFAULT))
+
 # Per-slot hour-of-day probe (no mean-pool); its loss never enters risk_total_loss or selection.
 TIME_PROBE_ENABLED = True  # False ⇒ head not built
 TIME_PROBE_HIDDEN = 1 * D_MODEL  # 2-layer SiLU probe MLP
