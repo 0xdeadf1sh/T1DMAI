@@ -7,13 +7,13 @@ import math
 import numpy as np
 import torch
 
-from config import MIN_CONTEXT_PATCHES, NIGHT_LONG_HORIZON_PATCHES, PATCH_SIZE, PREDICTION_PATCHES
+from config import MIN_CONTEXT_PATCHES, PATCH_SIZE, PREDICTION_PATCHES
 from normalization import load_normalization_stats
 from t1dmdroid_converter import STEP_MS, STEPS_PER_DAY
 from validate import BackupWindows, backup_stretches
 
 T0_MS = 1_750_032_000_000  # a UTC midnight
-NEED = (MIN_CONTEXT_PATCHES + max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)) * PATCH_SIZE
+NEED = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
 LONG = NEED + 4 * PATCH_SIZE
 SHORT = PATCH_SIZE
 PRE = STEPS_PER_DAY
@@ -68,4 +68,4 @@ def test_windows_drop_short_stretches_and_repeat_per_index(tmp_path):
         a, b = ds[i], ds[i]
         assert torch.equal(a['patches'], b['patches'])
         assert torch.isfinite(a['targets']).all()
-        assert np.isfinite(a['bg_formula_data']['extended_true_bg_trajectory']).all()
+        assert np.isfinite(a['bg_formula_data']['true_bg_trajectory']).all()

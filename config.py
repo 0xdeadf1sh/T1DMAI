@@ -70,10 +70,6 @@ MAX_MASKED_PATCHES = 12
 # cov90@30: 0.9149 vs control 0.8805 at step 12000; plateaus at 0.15, no gain past 0.60.
 MASK_RIGHT_EDGE_QUOTA = 0.50
 
-# Rolls predict_rolling to this on nocturnal samples; == PREDICTION_HORIZON_HOURS skips rolling.
-NIGHT_LONG_HORIZON_HOURS = 8
-NIGHT_LONG_HORIZON_PATCHES = NIGHT_LONG_HORIZON_HOURS * _PATCHES_PER_HOUR
-
 # q_tau[..., i] indexes QUANTILE_LEVELS[i], assembled per slot around f(anchor_bg).
 
 # head raw cols: 0 median delta | 1-3 tau>.5 spreads .75/.9/.95 | 4-6 tau<.5 .25/.1/.05.

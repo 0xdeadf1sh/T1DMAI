@@ -56,7 +56,6 @@ def _apply_checkpoint_dims(ckpt: dict) -> None:
     config._PATCHES_PER_HOUR = pph
     config.PREDICTION_PATCHES = config.PREDICTION_HORIZON_HOURS * pph
     config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
-    config.NIGHT_LONG_HORIZON_PATCHES = config.NIGHT_LONG_HORIZON_HOURS * pph
     # model.py binds these at import; stale, time_head builds at the wrong bin count.
     config.TIME_PROBE_N_BINS = max(1, round(24.0 / config.PREDICTION_HORIZON_HOURS))
     config.TIME_PROBE_BIN_HOURS = 24.0 / config.TIME_PROBE_N_BINS
@@ -82,7 +81,6 @@ def _apply_checkpoint_dims(ckpt: dict) -> None:
         "_PATCHES_PER_HOUR",
         "PREDICTION_PATCHES",
         "MAX_SEQ_LEN",
-        "NIGHT_LONG_HORIZON_PATCHES",
         "TIME_PROBE_N_BINS",
         "TIME_PROBE_BIN_HOURS",
     )

@@ -20,13 +20,14 @@ from .calibrate import (
 )
 from .features import build_feature_stack, context_window, smoothed_cgm
 from .suite import compute_suite, conformal_intervals, band_project
-from .horizons import HORIZONS, HORIZON_IDX as _HORIZON_IDX, FIGURE_HORIZONS
+from .horizons import (HORIZONS, HORIZON_IDX as _HORIZON_IDX, FIGURE_HORIZONS,
+                       FIGURE_HORIZON_HOURS)
 import conformal
 import mondrian
 from config import (
     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
     PATCH_SIZE, PREDICTION_PATCHES, PREDICTION_HORIZON_HOURS,
-    NIGHT_LONG_HORIZON_HOURS, NOCTURNAL_START_HOUR, NOCTURNAL_END_HOUR,
+    NOCTURNAL_START_HOUR, NOCTURNAL_END_HOUR,
     MAX_CONTEXT_PATCHES, CHANNEL_TO_FEAT, QUANTILE_LEVELS, N_QUANTILES,
     HYPO_ALARM_QUANTILE_TAU, HYPER_ALARM_QUANTILE_TAU,
     METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI,
@@ -317,7 +318,7 @@ def night_onset_from_records(model, stats, records, device,
     A record is (feats, cgm, hod): normalized (N, F) stack, raw truth CGM (N,) mg/dL, fractional
     hour-of-day (N,). Recall is the fraction of true-excursion nights flagged, precision the
     fraction of flagged nights with one; doses announced per roll. {} if n_rolls<=1 or no window."""
-    n_rolls = math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
+    n_rolls = math.ceil(FIGURE_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
     if n_rolls <= 1:
         return {}
 

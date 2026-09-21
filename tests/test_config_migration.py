@@ -4,7 +4,6 @@ def test_active_config_migrated_values():
     assert config.BATCH_SIZE == 64
     assert config.PATIENT_UNIFORM_SAMPLE_PROB == 0.0
     assert config.PREDICTION_HORIZON_HOURS == 2
-    assert config.NIGHT_LONG_HORIZON_HOURS == 8
     print(f"[DUMP] active config: B={config.BATCH_SIZE} workers={config.NUM_WORKERS} "
           f"muon={config.MUON_LR} adam={config.ADAM_LR} det={config.DETERMINISTIC}")
 

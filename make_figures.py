@@ -154,8 +154,7 @@ def fig_loss_components(train, outdir: Path) -> None:
 
 def fig_bg_rmse_horizons(val, outdir: Path) -> None:
     horizons = [("30 min", "bg_rmse_30"), ("60 min", "bg_rmse_60"),
-                ("120 min", "bg_rmse_120"), ("180 min", "bg_rmse_180"),
-                ("360 min", "bg_rmse_360"), ("480 min", "bg_rmse_480")]
+                ("120 min", "bg_rmse_120")]
     fig, ax = plt.subplots(figsize=(8.4, 5.0))
     s = val["step"]
     cmap = plt.colormaps["viridis"]
@@ -338,10 +337,10 @@ def fig_summary(train, val, outdir: Path) -> None:
     ax.set_title("Clarke A % @30m"); ax.set_xlabel("step"); ax.set_ylabel("%")
 
     ax = fig.add_subplot(gs[1, 2])
-    for col, c in [("bg_rmse_30", "#1f77b4"), ("bg_rmse_120", "#2ca02c"),
-                   ("bg_rmse_480", "#d62728")]:
+    for col, c in [("bg_rmse_30", "#1f77b4"), ("bg_rmse_60", "#2ca02c"),
+                   ("bg_rmse_120", "#d62728")]:
         ax.plot(s_v, val[col], label=col.replace("bg_rmse_", "")+"m", color=c, linewidth=1.2)
-    ax.set_title("BG RMSE (short/mid/long)"); ax.set_xlabel("step"); ax.set_ylabel("mg/dL")
+    ax.set_title("BG RMSE by horizon"); ax.set_xlabel("step"); ax.set_ylabel("mg/dL")
     ax.legend(loc="upper right", fontsize=8)
 
     ax = fig.add_subplot(gs[2, 0])

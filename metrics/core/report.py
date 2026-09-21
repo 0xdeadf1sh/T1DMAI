@@ -13,7 +13,7 @@ import torch
 
 from config import (
     MAX_CONTEXT_PATCHES, PATCH_SIZE, PREDICTION_PATCHES,
-    PREDICTION_HORIZON_HOURS, NIGHT_LONG_HORIZON_HOURS,
+    PREDICTION_HORIZON_HOURS,
     NOCTURNAL_START_HOUR, NOCTURNAL_END_HOUR,
     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, TIME_PROBE_ENABLED, TIME_PROBE_N_BINS,
     METRIC_BAND_TAU_LO, METRIC_BAND_TAU_HI,
@@ -26,6 +26,7 @@ from utils import time_of_day_decode_bins
 from .run_eval import _make_night_overrides_fn
 from .calibrate import _future_overrides, CTX_STEPS, PRED_STEPS
 from .features import build_feature_stack, context_window, smoothed_cgm
+from .horizons import FIGURE_HORIZON_HOURS
 from .suite import HORIZONS
 
 # Per-horizon excursion display targets (base@30min, slope_per_30min, floor); DISPLAY-ONLY.
@@ -547,8 +548,8 @@ def render_sim_figure(R: dict, path: str):
 
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 PRED = PREDICTION_PATCHES * PATCH_SIZE
-# parity/clarke roll to the night long horizon; a single pass when no rolling is configured.
-FIG_ROLLS = max(1, math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS))
+# parity/clarke roll to the figure span; a single pass when no rolling is configured.
+FIG_ROLLS = max(1, math.ceil(FIGURE_HORIZON_HOURS / PREDICTION_HORIZON_HOURS))
 FIG_STEPS = FIG_ROLLS * PRED                             # rolled forecast length
 CAP = {'sim': 30}                                        # test windows per patient
 

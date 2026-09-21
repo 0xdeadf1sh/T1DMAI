@@ -990,8 +990,7 @@ def build_models(M: dict) -> dict:
             'architecture': {k: cfg.get(k) for k in
                              ('d_model', 'n_layers', 'n_heads', 'ffn_dim', 'patch_size',
                               'max_context_patches', 'min_context_patches',
-                              'prediction_patches', 'prediction_horizon_hours',
-                              'night_long_horizon_hours')},
+                              'prediction_patches', 'prediction_horizon_hours')},
             'optimization': {k: cfg.get(k) for k in
                              ('total_steps', 'batch_size', 'muon_lr', 'muon_momentum',
                               'adam_lr', 'adam_weight_decay', 'warmup_steps', 'lr_min_ratio',

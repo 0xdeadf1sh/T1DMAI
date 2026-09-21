@@ -159,8 +159,7 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
     # Snapshot every config global this helper mutates, so it stays side-effect-free.
     _MUTATED = ('D_MODEL', 'N_HEADS', 'HEAD_DIM', 'FFN_DIM', 'BG_HEAD_HIDDEN',
                 'TIME_PROBE_HIDDEN', 'SKILL_HEAD_HIDDEN', 'N_LAYERS', 'PATCH_SIZE',
-                'PATCH_DIM', '_PATCHES_PER_HOUR', 'PREDICTION_PATCHES', 'MAX_SEQ_LEN',
-                'NIGHT_LONG_HORIZON_PATCHES')
+                'PATCH_DIM', '_PATCHES_PER_HOUR', 'PREDICTION_PATCHES', 'MAX_SEQ_LEN')
     _saved = {k: getattr(config, k) for k in _MUTATED}
     try:
         config.D_MODEL = d_model
@@ -180,7 +179,6 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
             config._PATCHES_PER_HOUR = pph
             config.PREDICTION_PATCHES = config.PREDICTION_HORIZON_HOURS * pph
             config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
-            config.NIGHT_LONG_HORIZON_PATCHES = config.NIGHT_LONG_HORIZON_HOURS * pph
         sys.modules.pop('model', None)
         from model import T1DMAI
         with torch.device('meta'):

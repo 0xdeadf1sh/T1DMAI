@@ -1,7 +1,7 @@
 """``train_blind.py`` is a copy of ``train.py``; nothing keeps it honest by construction.
 
-Pins: both protocol forwards blind after the sample is built; the roll's OBSERVED
-context restores masked doses; no cf_* column survives; writes only to *_blind dirs.
+Pins: both protocol forwards blind after the sample is built; no cf_* column survives;
+writes only to *_blind dirs.
 """
 
 import ast
@@ -132,101 +132,6 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
             f"feat {feat} moved on a patch this protocol REVEALS — the blinding "
             "reached past its own masked set")
     print(f"[DUMP] {int(_revealed.sum())} revealed patches unchanged")
-
-
-def test_the_rolling_validation_announces_nothing(blind_batch, stats, monkeypatch):
-    """``predict_rolling`` is called with no ``overrides_fn``.
-
-    ``train.py`` passes true future doses to tame a zero-basal OOD runaway; here that would
-    answer a question no other row does. Observed at the call, not the source.
-    """
-    import inference
-    seen: list[dict] = []
-
-    def _stub(model, context, **kw):
-        seen.append(kw)
-        n = PREDICTION_PATCHES * PATCH_SIZE
-        return {'pred_bg': torch.full((n,), 120.0),
-                'bands': torch.full((PREDICTION_PATCHES, PATCH_SIZE, 7), 120.0)}
-
-    monkeypatch.setattr(inference, 'predict_rolling', _stub)
-
-    ds = T1DMDataset(master_seed=SEED, total_steps=N_SAMPLES, batch_size=1,
-                     normalization_stats=stats, patient_uniform_sample_prob=0.0,
-                     blind=True)
-    agg: dict[str, float] = {}
-    samples = [ds[i] for i in range(N_SAMPLES)]
-    # The probe skips a row whose truth stops at the single forward, which every boundary row does.
-    for s in samples:
-        bf = s['bg_formula_data']
-        bf['extended_true_bg_trajectory'] = np.tile(
-            bf['extended_true_bg_trajectory'], 2)
-    train_blind._accumulate_long_horizon_bg_metrics(
-        None, samples, stats, torch.device('cpu'),
-        n_rolls=2, agg=agg)
-
-    assert seen, "no roll ran — the metric this test is about was never reached"
-    print(f"\n[DUMP] {len(seen)} rolls, kwargs {sorted(seen[0])}")
-    for kw in seen:
-        assert kw.get('overrides_fn') is None, (
-            f"the blind roll announced a plan: overrides_fn={kw['overrides_fn']!r}")
-
-
-def test_the_roll_s_observed_context_restores_the_doses_the_mask_blinded(stats):
-    """``_observed_patches`` un-blinds the dose feats, not feat 0 alone.
-
-    Stopping at bg leaves an ASSERTION that a seen half-hour carried no carbs or insulin.
-    Pinned against the announced sample at the same seed, so equality here is exact.
-    """
-    kw = dict(master_seed=SEED, total_steps=N_SAMPLES, batch_size=1,
-              normalization_stats=stats, patient_uniform_sample_prob=0.0)
-    blind_ds = T1DMDataset(blind=True, **kw)
-    plain_ds = T1DMDataset(blind=False, **kw)
-    fill = zero_dose_fill(stats)
-
-    checked = 0
-    for i in range(N_SAMPLES):
-        blind_s, plain_s = blind_ds[i], plain_ds[i]
-        rows = blind_s['bg_formula_data'].get('unblinded_dose_rows')
-        assert rows is not None and len(rows) > 0, (
-            'the blind sample carries no un-blinded dose rows, so the restore '
-            'below has nothing to work from')
-        assert 'unblinded_dose_rows' not in plain_s['bg_formula_data'], (
-            'the announced sample grew a blind-only key; the default path is '
-            'digested byte-for-byte by tests/test_blind_dataset.py')
-
-        r = torch.as_tensor(np.asarray(rows)).long()
-        before = torch.as_tensor(np.asarray(blind_s['patches'])).float()
-        after = train_blind._observed_patches(blind_s, stats)
-        truth = torch.as_tensor(np.asarray(plain_s['patches'])).float()
-
-        for feat in MASKABLE_FEATS:
-            cols = slice(feat, None, N_INPUT_FEATURES)
-            cells = before[r][:, cols]
-            assert torch.allclose(cells, torch.full_like(cells, fill[feat])), (
-                f'feat {feat} on a masked patch is not at the blind fill before '
-                f'the restore, so this test is not measuring the restore')
-            assert torch.equal(after[r][:, cols], truth[r][:, cols]), (
-                f'feat {feat} was not restored to what the patient actually did: '
-                f'the roll conditions on a history that denies the dose')
-
-        keep = torch.ones(before.shape[0], dtype=torch.bool)
-        keep[r] = False
-        for feat in MASKABLE_FEATS:
-            cols = slice(feat, None, N_INPUT_FEATURES)
-            assert torch.equal(after[keep][:, cols], before[keep][:, cols]), (
-                f'the restore reached feat {feat} on a VISIBLE patch')
-        checked += 1
-
-    # the announced fork has nothing to undo and must not have grown a restore
-    plain_out = train._observed_patches(plain_s, stats)
-    plain_in = torch.as_tensor(np.asarray(plain_s['patches'])).float()
-    for feat in MASKABLE_FEATS:
-        cols = slice(feat, None, N_INPUT_FEATURES)
-        assert torch.equal(plain_out[:, cols], plain_in[:, cols]), (
-            f'train.py moved feat {feat}; it never blinds one')
-    print(f"\n[DUMP] roll context | {checked} blind samples: masked doses "
-          f"restored exactly, visible cells and the announced fork untouched ✓")
 
 
 def test_no_counterfactual_column_survives(blind_batch):

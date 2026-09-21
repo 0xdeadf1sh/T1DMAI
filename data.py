@@ -18,7 +18,7 @@ from config import (
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
     MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
     PATIENT_UNIFORM_SAMPLE_PROB, N_SKILLS, SKILL_NAMES,
-    SIMULATOR_WARMUP_HOURS, NIGHT_LONG_HORIZON_PATCHES,
+    SIMULATOR_WARMUP_HOURS,
     TIME_PROBE_ENABLED, TIME_PROBE_CROSS_WINDOW_WEIGHT,
 )
 import utils
@@ -194,10 +194,7 @@ def _pick_pred_start_step(
     n_pred_steps: int,
     rng: np.random.Generator,
 ) -> int | None:
-    """A patch-aligned pred-zone start anywhere in the trajectory, or ``None``.
-
-    Callers pass the long-horizon footprint as room, so the ground-truth slice fits.
-    """
+    """A patch-aligned pred-zone start anywhere in the trajectory, or ``None``."""
     n_ctx_steps = n_ctx * PATCH_SIZE
 
     earliest = n_ctx_steps
@@ -212,36 +209,6 @@ def _pick_pred_start_step(
     n_candidates = (last - first) // PATCH_SIZE + 1
 
     return int(first + PATCH_SIZE * int(rng.integers(0, n_candidates)))
-
-
-def _pick_pred_start_step_at_hour(
-    hour_of_day: np.ndarray,
-    n_ctx: int,
-    n_pred_steps: int,
-    target_hour: float,
-    rng: np.random.Generator,
-    tol_hours: float = 0.5,
-) -> int | None:
-    """A patch-aligned start whose hour-of-day is nearest ``target_hour``, circular.
-
-    Used for pinned-hour eval (e.g. bedtime). Random within ``tol_hours``, else nearest.
-    """
-    n_steps = len(hour_of_day)
-    earliest = n_ctx * PATCH_SIZE
-    latest = n_steps - n_pred_steps
-    if latest < earliest:
-        return None
-    first = ((earliest + PATCH_SIZE - 1) // PATCH_SIZE) * PATCH_SIZE
-    last = (latest // PATCH_SIZE) * PATCH_SIZE
-    if first > last:
-        return None
-    cands = np.arange(first, last + 1, PATCH_SIZE)
-    d = np.abs(hour_of_day[cands] - float(target_hour)) % 24.0
-    circ = np.minimum(d, 24.0 - d)
-    near = cands[circ <= tol_hours]
-    if len(near) > 0:
-        return int(near[int(rng.integers(0, len(near)))])
-    return int(cands[int(np.argmin(circ))])
 
 
 # Owned by T1DMSIM: the cache's own channel lists, arm order, format string and skills file.
@@ -331,7 +298,6 @@ class T1DMDataset(Dataset):
         simulator_warmup_hours: float = SIMULATOR_WARMUP_HOURS,
         cache_path: str | None = None,
         seed_offset: int = 0,
-        force_pred_start_hour: float | None = None,
         cache_partition: str = 'train',
         blind: bool = False,
     ) -> None:
@@ -341,7 +307,6 @@ class T1DMDataset(Dataset):
         self.batch_size = batch_size
         self.stats = normalization_stats
         self.seed_offset = seed_offset
-        self.force_pred_start_hour = force_pred_start_hour
         self.patient_uniform_sample_prob = patient_uniform_sample_prob
         self.simulator_warmup_hours = simulator_warmup_hours
         self.cache_path = cache_path
@@ -574,7 +539,6 @@ class T1DMDataset(Dataset):
             icr=icr,
             stats=self.stats,
             rng=rng,
-            force_pred_start_hour=self.force_pred_start_hour,
             blind=self.blind,
             boundary=True,
             skills=skills,
@@ -736,7 +700,6 @@ def _build_sample(
     icr: float,
     stats: dict[str, dict[str, float]],
     rng: np.random.Generator,
-    force_pred_start_hour: float | None = None,
     blind: bool = False,
     boundary: bool = False,
     skills: np.ndarray | None = None,
@@ -791,7 +754,6 @@ def _build_sample(
 
     if boundary:
         # The tails end the row, so the horizon is fixed and the context is what precedes it.
-        long_horizon_patches = PREDICTION_PATCHES
         pred_start_step = N_trimmed - n_pred_steps
         ctx_avail = pred_start_step // PATCH_SIZE
         if ctx_avail < MIN_CONTEXT_PATCHES:
@@ -804,26 +766,12 @@ def _build_sample(
     else:
         # One random window per sample: n_ctx variable, horizon fixed, patch-aligned start.
         n_ctx = int(rng.integers(MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES + 1))
-        long_horizon_patches = max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES)
         # Too short for the drawn n_ctx falls back to the minimum.
-        if N_trimmed < (n_ctx + long_horizon_patches) * PATCH_SIZE:
+        if N_trimmed < (n_ctx + PREDICTION_PATCHES) * PATCH_SIZE:
             n_ctx = MIN_CONTEXT_PATCHES
-        n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
-        # The room requirement is the long horizon, so the trailing GT slice fits.
-        if force_pred_start_hour is not None:
-            # Falls back to a uniform-random origin when no candidate near the target fits.
-            pred_start_step = _pick_pred_start_step_at_hour(
-                hour_of_day[:N_trimmed], n_ctx, n_long_horizon_steps,
-                float(force_pred_start_hour), rng,
-            )
-            if pred_start_step is None:
-                pred_start_step = _pick_pred_start_step(
-                    N_trimmed, n_ctx, n_long_horizon_steps, rng,
-                )
-        else:
-            pred_start_step = _pick_pred_start_step(
-                N_trimmed, n_ctx, n_long_horizon_steps, rng,
-            )
+        pred_start_step = _pick_pred_start_step(
+            N_trimmed, n_ctx, n_pred_steps, rng,
+        )
         if pred_start_step is None:
             # Raising skips the sample; DataLoader retries the next index.
             raise RuntimeError(
@@ -831,16 +779,14 @@ def _build_sample(
                 f"n_ctx={n_ctx}, n_pred={n_pred_steps}"
             )
 
-    total_patches_needed = n_ctx + long_horizon_patches
+    total_patches_needed = n_ctx + PREDICTION_PATCHES
     total_steps_needed = total_patches_needed * PATCH_SIZE
-    n_long_horizon_steps = long_horizon_patches * PATCH_SIZE
     start_step = pred_start_step - n_ctx * PATCH_SIZE
     end_step = start_step + total_steps_needed
 
-    # bg_window covers the long-horizon range; the model consumes only PREDICTION_PATCHES of it.
     window = features[start_step:end_step]
     bg_window = bg[start_step:end_step]
-    # Announced future-input overrides for rolling validation and counterfactual probes.
+    # Announced horizon doses for the counterfactual probe's baseline arm.
     _dose_feats = [CHANNEL_TO_FEAT[ch] for ch in sorted(CHANNEL_TO_FEAT)]
     dose_norm_window = features[start_step:end_step][:, _dose_feats]
     dose_raw_window = dose_raw[start_step:end_step]
@@ -848,8 +794,7 @@ def _build_sample(
     # A leading-axis slice of a C-contiguous array stays contiguous, so this reshape is a view.
     patches_3d = window.reshape(total_patches_needed, PATCH_SIZE, N_INPUT_FEATURES)
 
-    # Only the first PREDICTION_PATCHES past context are exposed; the rest is GT-only.
-    seq_len = n_ctx + PREDICTION_PATCHES
+    seq_len = total_patches_needed
     # The tail is a behaviour-off counterfactual, so it is the horizon and never model input.
     spans = sample_mask_spans(
         seq_len, rng, pin_right=PREDICTION_PATCHES if boundary else None)
@@ -868,14 +813,9 @@ def _build_sample(
         all_patches_t[masked_rows, feat_idx::N_INPUT_FEATURES] = 0.0
     # Under blind, the same patches withhold doses too, at zero-RAW fill rather than z=0.
     blind_fill = zero_dose_fill(stats) if blind else None
-    unblinded_dose_rows = None
-    unblinded_dose_patches = None
     if blind_fill is not None:
         blind_flags = torch.zeros(seq_len, dtype=torch.bool)
         blind_flags[masked_rows] = True
-        # Kept before the fill overwrites it: the long-horizon roll un-blinds bg from history.
-        unblinded_dose_rows = np.asarray(masked_rows, dtype=np.int64).copy()
-        unblinded_dose_patches = all_patches_t[masked_rows].clone()
         blind_masked_doses(all_patches_t, blind_flags, blind_fill)
     # Masking is not inferable from position (z=0 decodes to an ordinary reading), hence the bit.
     all_patches_t[masked_rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
@@ -892,9 +832,6 @@ def _build_sample(
     true_bg_traj = bg_window[
         pred_start_in_window:pred_start_in_window + PREDICTION_PATCHES * PATCH_SIZE
     ]
-    extended_true_bg_traj = bg_window[
-        pred_start_in_window:pred_start_in_window + n_long_horizon_steps
-    ]
     # Padded slots hold last_bg (a LEGAL mg/dL), so the forward's units tripwire never fires.
     last_bg = float(bg_window[_anchor_step_for_span(n_ctx, PREDICTION_PATCHES)])
     anchor_bg = np.full(MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
@@ -903,11 +840,10 @@ def _build_sample(
     # Per-slot TRUE hour of day, at the masked patch's own first step (not derived/interpolated).
     slot_hour = hour_of_day[start_step + mask_idx * PATCH_SIZE].astype(np.float32)
 
-    # Announced future carbs and insulin for the conditioned rolled-forecast override.
-    _lh = slice(pred_start_in_window, pred_start_in_window + n_long_horizon_steps)
-    # (steps, dose channels), columns in CHANNEL_TO_FEAT order.
-    extended_dose_norm = dose_norm_window[_lh].copy()
-    extended_dose_raw = dose_raw_window[_lh].copy()
+    # Announced horizon carbs and insulin, (steps, dose channels) in CHANNEL_TO_FEAT order.
+    _hz = slice(pred_start_in_window, pred_start_in_window + n_pred_steps)
+    horizon_dose_norm = dose_norm_window[_hz]
+    horizon_dose_raw = dose_raw_window[_hz]
 
     # For nocturnal metric filtering; indexed with the ABSOLUTE step.
     pred_start_hour = float(hour_of_day[pred_start_step])
@@ -921,20 +857,13 @@ def _build_sample(
         'slot_hour': slot_hour,        # (M,) float32 true hour of day per slot
         'last_bg': last_bg,
         'true_bg_trajectory': true_bg_traj.copy(),
-        'extended_true_bg_trajectory': extended_true_bg_traj.copy(),
         'pred_start_hour': pred_start_hour,
-        'extended_dose_norm': extended_dose_norm,
-        'extended_dose_raw': extended_dose_raw,
     }
     if INPUT_LAYOUT == 'curves':
-        # Named views of the same columns, for the curve-shaped what-if and probe tooling.
+        # Per-channel views, for the curve-shaped what-if and probe tooling.
         for ch, key in enumerate(('carb', 'insulin')):
-            bg_formula_data[f'extended_{key}_norm'] = extended_dose_norm[:, ch].copy()
-            bg_formula_data[f'extended_{key}_raw'] = extended_dose_raw[:, ch].copy()
-    if unblinded_dose_rows is not None:
-        # Blind-only, un-collated; absent (not None) under announced (tests/test_blind_dataset.py).
-        bg_formula_data['unblinded_dose_rows'] = unblinded_dose_rows
-        bg_formula_data['unblinded_dose_patches'] = unblinded_dose_patches
+            bg_formula_data[f'horizon_{key}_norm'] = horizon_dose_norm[:, ch].copy()
+            bg_formula_data[f'horizon_{key}_raw'] = horizon_dose_raw[:, ch].copy()
 
     sample = {
         'patches': all_patches_t.float(),
@@ -947,11 +876,12 @@ def _build_sample(
 
     # Cross-window time-of-day probe: the paired window, teacher-forced, one right-edge span.
     if TIME_PROBE_ENABLED and TIME_PROBE_CROSS_WINDOW_WEIGHT > 0.0:
-        # A boundary row has nothing past its horizon, so the pair shifts back into the context.
-        next_offset = PREDICTION_PATCHES * PATCH_SIZE
-        if n_ctx + 2 * PREDICTION_PATCHES > total_patches_needed:
-            next_offset = -next_offset
-        next_start = start_step + next_offset
+        # One horizon later where the row reaches; a boundary row does not, so it shifts back.
+        _step = PREDICTION_PATCHES * PATCH_SIZE
+        next_start = start_step + _step
+        if next_start + seq_len * PATCH_SIZE > N_trimmed:
+            next_start = start_step - _step
+        next_offset = next_start - start_step
         next_valid = next_start >= 0 and next_start + seq_len * PATCH_SIZE <= N_trimmed
         next_spans = [(n_ctx, PREDICTION_PATCHES)]
         next_mask_idx, next_slot_valid, next_d, next_anchor_step = _mask_slots(
@@ -1124,7 +1054,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 [s['next_window']['valid'] for s in samples], dtype=torch.bool),  # (B,)
         }
 
-    # extended_* arrays are deliberately NOT stacked: only consumed from UN-COLLATED samples.
+    # horizon_* arrays are deliberately NOT stacked: only consumed from UN-COLLATED samples.
     bg_formula_batched: dict[str, Any] = {
         # The masked set, on the PADDED patch axis. Every one of these is (B, M).
         'mask_idx': mask_idx_batch,
@@ -1139,10 +1069,6 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
             [s['bg_formula_data']['last_bg'] for s in samples], dtype=torch.float32),
         'true_bg_trajectory': torch.tensor(
             np.stack([s['bg_formula_data']['true_bg_trajectory'] for s in samples]),
-            dtype=torch.float32,
-        ),
-        'extended_true_bg_trajectory': torch.tensor(
-            np.stack([s['bg_formula_data']['extended_true_bg_trajectory'] for s in samples]),
             dtype=torch.float32,
         ),
         'pred_start_hour': torch.tensor(

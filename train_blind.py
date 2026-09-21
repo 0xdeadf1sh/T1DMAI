@@ -38,7 +38,7 @@ from config import (                                           # noqa: E402
     HYPO_ALARM_QUANTILE_TAU, HYPER_ALARM_QUANTILE_TAU,
     EXCURSION_PRECISION_TOLERANCE_MGDL,
     NOCTURNAL_START_HOUR, NOCTURNAL_END_HOUR,
-    PREDICTION_HORIZON_HOURS, NIGHT_LONG_HORIZON_HOURS, NIGHT_LONG_HORIZON_PATCHES,
+    PREDICTION_HORIZON_HOURS,
     QUANTILE_LEVELS, N_QUANTILES,
     TIME_PROBE_LOSS_WEIGHT, TIME_PROBE_N_BINS,
     TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_CROSS_WINDOW_WEIGHT, TIME_PROBE_CROSS_WINDOW_FRACTION,
@@ -142,7 +142,7 @@ def _dt_minutes(bg_formula_data: dict[str, Any]) -> float:
 _PATCH_HOURS = PATCH_SIZE * STEP_MINUTES / 60.0
 
 
-BG_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120, 180, 360, 480)
+BG_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120)
 # Un-pooled Clarke-A and MARD, readable against the single-horizon published bars.
 EVALFIX_CLARKE_MARD_HORIZONS_MIN: tuple[int, ...] = (30, 60, 120)
 # Marginal per-(h, τ) coverage of the central 90% band — per step, NOT joint; lines up with d=1..4.
@@ -737,47 +737,14 @@ def _render_validation_table(
     _section('BG Forecast (RMSE / MAE)')
     bg_rmse_sota = {30: 15.0, 60: 25.0, 120: 36.0}
     # MAE targets = 0.8·RMSE (Gaussian E|e|); a reading aid, not published — literature quotes RMSE.
-    night_bg_rmse_sota = {180: 50.0, 360: 62.0, 480: 72.0}
-    for h_min in (30, 60, 120):
+    for h_min in BG_HORIZONS_MIN:
         lower_row(f'bg_rmse @{h_min}m', val_metrics.get(f'bg_rmse_{h_min}'),
                   bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
                   prev_key=f'bg_rmse_{h_min}', show_absent=True)
-    for h_min in (30, 60, 120):
+    for h_min in BG_HORIZONS_MIN:
         lower_row(f'bg_mae  @{h_min}m', val_metrics.get(f'bg_mae_{h_min}'),
                   0.8 * bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL',
                   warn_mult=1.5, prev_key=f'bg_mae_{h_min}', show_absent=True)
-    _blank()
-
-    # Roll context isn't n_ctx (starts at forecast origin); night rows score a nocturnal subset.
-    _roll_ctx = val_metrics.get('roll_ctx_patches')
-    _roll_n = int(val_metrics.get('roll_n', 0) or 0)
-    _roll_skipped = int(val_metrics.get('roll_skipped', 0) or 0)
-    _roll_seen = _roll_n + _roll_skipped
-    _night_roll_n = int(val_metrics.get('night_roll_n', 0) or 0)
-    _night_roll_skipped = int(val_metrics.get('night_roll_skipped', 0) or 0)
-    _night_seen = _night_roll_n + _night_roll_skipped
-    _section('BG Forecast (RMSE) — Night Only @ 180+')
-    for h_min in (180, 360, 480):
-        _n_h = int(val_metrics.get(f'night_bg_rmse_{h_min}_n', 0) or 0)
-        lower_row(f'night_bg_rmse @{h_min}m ({_n_h}n)',
-                  val_metrics.get(f'night_bg_rmse_{h_min}'),
-                  night_bg_rmse_sota[h_min], fmt='{:.1f}', unit=' mg/dL', warn_mult=1.5,
-                  prev_key=f'night_bg_rmse_{h_min}', show_absent=True)
-    if _roll_seen:
-        # show_absent surfaces an all-skipped run as '—'; each denominator rides in the row label.
-        info_row(f'roll context (mean of {_roll_n} rolled)', _roll_ctx,
-                 fmt='{:.1f}', unit=' patches',
-                 target=f'{MIN_CONTEXT_PATCHES}–{MAX_CONTEXT_PATCHES} at full n_ctx',
-                 prev_key='roll_ctx_patches', direction='none', show_absent=True)
-        info_row(f'night roll skipped, short window (of {_night_seen} nocturnal)',
-                 float(_night_roll_skipped),
-                 fmt='{:.0f}', unit=' samples',
-                 target=f'of {_night_seen} nocturnal',
-                 prev_key='night_roll_skipped', direction='lower', show_absent=True)
-        info_row(f'roll skipped, short window (of {_roll_seen} seen)',
-                 val_metrics.get('roll_skipped'),
-                 fmt='{:.0f}', unit=' samples', target=f'of {_roll_seen} seen',
-                 prev_key='roll_skipped', direction='lower', show_absent=True)
     _blank()
 
     # Coverage carries its width (sharp90/sharp50); binned on d, never pooled — @30..120 IS d=1..4.
@@ -1378,151 +1345,11 @@ VAL_BATCH_SIZE = 8
 # No _ANNOUNCE_CHANNELS here: no eval path announces a dose; blind fill IS the un-announced value.
 
 
-def _reconstruct_context_from_patch(
-    patches: torch.Tensor,
-    n_ctx: int,
-    mask_idx: "np.ndarray | torch.Tensor",
-    valid: "np.ndarray | torch.Tensor",
-    min_patches: int = MIN_CONTEXT_PATCHES,
-) -> "torch.Tensor | None":
-    """Longest run of VISIBLE patches ending at the forecast origin n_ctx-1.
-    Returns (C, PATCH_SIZE, N_INPUT_FEATURES), min_patches <= C <= n_ctx, from one
-    UN-COLLATED sample; mask_idx/valid are (M,). A run not a gather: a masked patch's
-    z=0 bg decodes to ~142 mg/dL, not a sentinel, so a positional prefix would fabricate
-    context. None below min_patches — caller MUST report the skip; the bit is zeroed."""
-    feat_cols = PATCH_SIZE * N_INPUT_FEATURES
-    assert patches.shape[1] == feat_cols, (
-        f"patches must be (T, {feat_cols}), got {tuple(patches.shape)}"
-    )
-    masked = np.asarray(mask_idx).reshape(-1)[np.asarray(valid).reshape(-1).astype(bool)]
-    in_context = masked[masked < n_ctx]
-    ctx_start = int(in_context.max()) + 1 if in_context.size else 0
-    if n_ctx - ctx_start < max(min_patches, 1):
-        return None
-    # No masked index may reach the context tensor — all three roll sites pass here.
-    assert not bool(np.isin(np.arange(ctx_start, n_ctx), masked).any()), (
-        f"masked patch inside the reconstructed context [{ctx_start}, {n_ctx})"
-    )
-    context = patches[ctx_start:n_ctx].reshape(-1, PATCH_SIZE, N_INPUT_FEATURES).clone()
-    context[:, :, BG_MASKED_FEAT] = 0.0
-    return context
-
-
-def _observed_patches(sample: dict[str, Any], norm_stats: dict) -> torch.Tensor:
-    """One un-collated sample's (T, PATCH_DIM) with every withheld BG written back.
-    Rolling context is OBSERVED CGM history, not the training mask; a holed context
-    measures an undeployed case and drops most samples (526/600 windows, live nano run).
-    Not leakage — restored patches precede the forecast origin. Under BLIND, the dose
-    feats are restored too (unblinded_dose_rows/patches); the bit stays, zeroed downstream."""
-    bf = sample['bg_formula_data']
-    patches = sample['patches']
-    if not torch.is_tensor(patches):
-        patches = torch.from_numpy(np.asarray(patches)).float()
-    _, bg_z = _window_bg_mgdl(
-        patches.unsqueeze(0),
-        torch.as_tensor(np.asarray(bf['mask_idx'])).long().reshape(1, -1),
-        torch.as_tensor(np.asarray(bf['valid'])).bool().reshape(1, -1),
-        torch.as_tensor(np.asarray(sample['targets'])).float().unsqueeze(0),
-        norm_stats,
-    )
-    out = patches.clone()
-    out[:, _BG_FEAT::N_INPUT_FEATURES] = bg_z[0]
-    rows = bf.get('unblinded_dose_rows')
-    saved = bf.get('unblinded_dose_patches')
-    if rows is not None and saved is not None and len(rows) > 0:
-        rows_t = torch.as_tensor(np.asarray(rows)).long()
-        saved_t = torch.as_tensor(np.asarray(saved)).float()
-        for feat_idx in MASKABLE_FEATS:
-            out[rows_t, feat_idx::N_INPUT_FEATURES] = saved_t[:, feat_idx::N_INPUT_FEATURES]
-    return out
-
-
 def _is_nocturnal(hour: float) -> bool:
     if NOCTURNAL_START_HOUR <= NOCTURNAL_END_HOUR:
         return NOCTURNAL_START_HOUR <= hour < NOCTURNAL_END_HOUR
     else:
         return hour >= NOCTURNAL_START_HOUR or hour < NOCTURNAL_END_HOUR
-
-
-def _accumulate_long_horizon_bg_metrics(
-    model: T1DMAI,
-    samples: list[dict[str, Any]],
-    norm_stats: dict,
-    device: torch.device,
-    n_rolls: int,
-    agg: dict[str, float],
-    night_agg: dict[str, float] | None = None,
-) -> None:
-    """Rolling prediction per sample, accumulating bg_rmse_{h}_* / bg_mae_{h}_* for horizons
-    one forward can't reach. predict_rolling is BG-autoregressive: f_inv(median) carried
-    across rolls. UNCONDITIONED — no overrides_fn, so future doses stay at zero-RAW
-    normalize(0), matching the blind masked-patch baseline. Counters travel with the
-    metrics: roll_ctx_patches/roll_n/roll_skipped, night_roll_cnt/night_roll_skipped."""
-    from inference import predict_rolling
-
-    if n_rolls <= 0:
-        return
-
-    single_pass_steps = PREDICTION_PATCHES * PATCH_SIZE
-    dt = 0
-
-    for sample in samples:
-        n_ctx = int(sample['n_context_patches'])
-        bf = sample['bg_formula_data']
-        # Every horizon this probe scores sits past the single forward; no truth there, no roll.
-        if len(bf['extended_true_bg_trajectory']) <= single_pass_steps:
-            continue
-        # Read before the floor, else a dropped nocturnal sample loses the night denominator.
-        is_night = _is_nocturnal(float(bf.get('pred_start_hour', 0.0)))
-        # The roll re-feeds its own median, so context must be real readings, not a positional cut.
-        context = _reconstruct_context_from_patch(
-            _observed_patches(sample, norm_stats), n_ctx,
-            np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool))
-        if context is None:
-            agg['roll_skipped'] = agg.get('roll_skipped', 0.0) + 1.0
-            if night_agg is not None and is_night:
-                night_agg['night_roll_skipped'] = night_agg.get('night_roll_skipped', 0.0) + 1.0
-            continue
-        agg['roll_ctx_sum'] = agg.get('roll_ctx_sum', 0.0) + float(context.shape[0])
-        agg['roll_ctx_cnt'] = agg.get('roll_ctx_cnt', 0.0) + 1.0
-        if night_agg is not None and is_night:
-            night_agg['night_roll_cnt'] = night_agg.get('night_roll_cnt', 0.0) + 1.0
-        if dt == 0:
-            dt = int(_dt_minutes(bf))
-
-        result = predict_rolling(
-            model, context, patient_seed=None, n_rolls=n_rolls,
-            normalization_stats=norm_stats,
-            device=device,
-        )
-        pred_bg = result['pred_bg'].detach().cpu()
-        true_bg_extended = bf['extended_true_bg_trajectory']
-        if not isinstance(true_bg_extended, torch.Tensor):
-            true_bg_extended = torch.from_numpy(np.asarray(true_bg_extended)).float()
-        else:
-            true_bg_extended = true_bg_extended.float().cpu()
-
-        usable = min(pred_bg.shape[0], true_bg_extended.shape[0])
-        if usable == 0:
-            continue
-        pb = pred_bg[:usable]
-        tb = true_bg_extended[:usable]
-
-        for h_min in BG_HORIZONS_MIN:
-            h_idx = (h_min // dt) - 1
-            if h_idx < single_pass_steps:
-                continue
-            if 0 <= h_idx < usable:
-                diff = float(pb[h_idx]) - float(tb[h_idx])
-                agg[f'bg_rmse_{h_min}_sq_sum'] = agg.get(f'bg_rmse_{h_min}_sq_sum', 0.0) + diff * diff
-                agg[f'bg_rmse_{h_min}_cnt'] = agg.get(f'bg_rmse_{h_min}_cnt', 0.0) + 1.0
-                agg[f'bg_mae_{h_min}_abs_sum'] = agg.get(f'bg_mae_{h_min}_abs_sum', 0.0) + abs(diff)
-                agg[f'bg_mae_{h_min}_cnt'] = agg.get(f'bg_mae_{h_min}_cnt', 0.0) + 1.0
-                if night_agg is not None and is_night:
-                    night_agg[f'night_bg_rmse_{h_min}_sq_sum'] = night_agg.get(f'night_bg_rmse_{h_min}_sq_sum', 0.0) + diff * diff
-                    night_agg[f'night_bg_rmse_{h_min}_cnt'] = night_agg.get(f'night_bg_rmse_{h_min}_cnt', 0.0) + 1.0
-                    night_agg[f'night_bg_mae_{h_min}_abs_sum'] = night_agg.get(f'night_bg_mae_{h_min}_abs_sum', 0.0) + abs(diff)
-                    night_agg[f'night_bg_mae_{h_min}_cnt'] = night_agg.get(f'night_bg_mae_{h_min}_cnt', 0.0) + 1.0
 
 
 _CONF_MEDIAN_IDX = QUANTILE_LEVELS.index(0.5)
@@ -2179,15 +2006,6 @@ def _run_validation(
                     )
                     infill_windows += 1
 
-            # Capped at VALIDATION_PROBE_N_PATIENTS (per-sample cost); a fixed window-index prefix.
-            n_rolls = math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS)
-            probe_end = min(batch_end, VALIDATION_PROBE_N_PATIENTS)
-            if n_rolls > 1 and batch_start < probe_end:
-                _accumulate_long_horizon_bg_metrics(
-                    model, samples[:probe_end - batch_start], norm_stats, device,
-                    n_rolls, agg, night_agg=night_agg,
-                )
-
             # Nocturnal subset of the forecast protocol; no extra forward.
             pred_start_hours = bg_formula.get('pred_start_hour')
             if pred_start_hours is not None:
@@ -2258,13 +2076,6 @@ def _run_validation(
 
     # What each protocol ran on, so a shrinking sample shows in the log, not just the metric.
     result['fc_n'] = agg.get('fc_n', 0.0)
-    _rcc = agg.get('roll_ctx_cnt', 0.0)
-    result['roll_ctx_patches'] = (agg.get('roll_ctx_sum', 0.0) / _rcc) if _rcc > 0 else None
-    result['roll_n'] = _rcc
-    result['roll_skipped'] = agg.get('roll_skipped', 0.0)
-    # Nocturnal-only split; the pair above is NOT the night_bg_rmse_* denominator.
-    result['night_roll_n'] = night_agg.get('night_roll_cnt', 0.0)
-    result['night_roll_skipped'] = night_agg.get('night_roll_skipped', 0.0)
 
     for h_min in BG_HORIZONS_MIN:
         cnt = agg.get(f'bg_rmse_{h_min}_cnt', 0.0)
@@ -2274,7 +2085,7 @@ def _run_validation(
         else:
             result[f'bg_rmse_{h_min}'] = None
             result[f'bg_mae_{h_min}'] = None
-        # Far horizons come off the rolling probe (VALIDATION_PROBE_N_PATIENTS, not _N_PATIENTS).
+        # Denominator travels with the figure; it is the forecast protocol's own window count.
         result[f'bg_rmse_{h_min}_n'] = cnt
 
     _rc = agg.get('median_rough_cnt', 0.0)
@@ -2446,19 +2257,11 @@ def _run_validation(
         return cov_xy / denom if denom > 1e-9 else None
     result['bg_curve_corr'] = _curve_corr('bgcurve')
 
-    # Two families reach this row (rolled and single-pass); _n is the count behind whichever value.
+    # The nocturnal subset of the same single forward; _n is the count behind the value.
     for h_min in BG_HORIZONS_MIN:
-        cnt = night_agg.get(f'night_bg_rmse_{h_min}_cnt', 0.0)
-        if cnt > 0:
-            result[f'night_bg_rmse_{h_min}'] = math.sqrt(
-                night_agg[f'night_bg_rmse_{h_min}_sq_sum'] / cnt)
-        else:
-            cnt = night_agg.get(f'bg_rmse_{h_min}_cnt', 0.0)
-            if cnt > 0:
-                result[f'night_bg_rmse_{h_min}'] = math.sqrt(
-                    night_agg[f'bg_rmse_{h_min}_sq_sum'] / cnt)
-            else:
-                result[f'night_bg_rmse_{h_min}'] = None
+        cnt = night_agg.get(f'bg_rmse_{h_min}_cnt', 0.0)
+        result[f'night_bg_rmse_{h_min}'] = (
+            math.sqrt(night_agg[f'bg_rmse_{h_min}_sq_sum'] / cnt) if cnt > 0 else None)
         result[f'night_bg_rmse_{h_min}_n'] = cnt
 
     for h_min in EVALFIX_CLARKE_MARD_HORIZONS_MIN:
@@ -2574,8 +2377,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
 
 
 def _val_log_columns() -> "list[tuple[str, int]]":
-    """logs_blind/validation_log.csv columns as (name, decimals). Three axes, not interchangeable.
-    BG_HORIZONS_MIN past the 2h zone come off the ROLLING pass; eh is the forecast protocol's
+    """logs_blind/validation_log.csv columns as (name, decimals). eh is the forecast protocol's
     per-patch end-horizon [30,60,90,120], which IS the d axis. Both d axes and every infill
     column name come from metrics.protocols (reachable_d, column), never a local range —
     reachable infill is narrower than the span knob suggests (two-sided L caps at d=ceil(L/2))."""
@@ -2630,9 +2432,8 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),
         ('tod_mae_hiconf', 4),
         ('tod_jump_h', 4), ('tod_xwin_jump_h', 4),
-        # How much of the val set each protocol saw: fc_n, roll_ctx_patches, roll_n/skipped, night.
-        ('fc_n', 4), ('roll_ctx_patches', 3), ('roll_n', 4), ('roll_skipped', 4),
-        ('night_roll_n', 4), ('night_roll_skipped', 4),
+        # How much of the val set the forecast protocol saw.
+        ('fc_n', 4),
         # Strictly-proper per d: crps, winkler90 (width+miss), sharp90/50 (width), joint_cov90.
         *[(f'{fam}@{h}', 4) for fam in FAN_SCORE_FAMILIES for h in eh],
         # Hypo alarm curve swept over τ: det, fa_day, lead_min (median); pooled (zone max), per-d.
@@ -2830,7 +2631,6 @@ def train(
         'ffn_dim': _CFG_FFN_DIM, 'patch_size': PATCH_SIZE, 'max_context_patches': MAX_CONTEXT_PATCHES,
         'min_context_patches': MIN_CONTEXT_PATCHES, 'prediction_patches': PREDICTION_PATCHES,
         'prediction_horizon_hours': PREDICTION_HORIZON_HOURS,
-        'night_long_horizon_hours': NIGHT_LONG_HORIZON_HOURS,
         'muon_lr': muon_lr, 'muon_momentum': muon_momentum, 'adam_lr': adam_lr,
         'adam_weight_decay': adam_weight_decay, 'warmup_steps': warmup_steps,
         'lr_min_ratio': lr_min_ratio,
@@ -3208,11 +3008,6 @@ def train(
                 'tod_jump_h': _r(val_metrics.get('tod_jump_h')),
                 'tod_xwin_jump_h': _r(val_metrics.get('tod_xwin_jump_h')),
                 'fc_n': val_metrics.get('fc_n'),
-                'roll_ctx_patches': _r(val_metrics.get('roll_ctx_patches'), 3),
-                'roll_n': val_metrics.get('roll_n'),
-                'roll_skipped': val_metrics.get('roll_skipped'),
-                'night_roll_n': val_metrics.get('night_roll_n'),
-                'night_roll_skipped': val_metrics.get('night_roll_skipped'),
                 'tbr_err': _r(val_metrics.get('tbr_err')),
                 'tar_err': _r(val_metrics.get('tar_err')),
             }
@@ -3420,7 +3215,6 @@ if __name__ == '__main__':
         'simulator_warmup_hours': SIMULATOR_WARMUP_HOURS,
         'ema_decay': EMA_DECAY,
         'prediction_horizon_hours': PREDICTION_HORIZON_HOURS,
-        'night_long_horizon_hours': NIGHT_LONG_HORIZON_HOURS,
         'bg_hypo_threshold': BG_HYPO_THRESHOLD,
         'bg_hyper_threshold': BG_HYPER_THRESHOLD,
         'cache_path': None,

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from config import (N_INPUT_FEATURES, PATCH_SIZE, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
-                    PREDICTION_HORIZON_HOURS, NIGHT_LONG_HORIZON_HOURS,
+                    PREDICTION_HORIZON_HOURS,
                     N_QUANTILES, TIME_PROBE_N_BINS, CHANNEL_TO_FEAT)
 from data import (_make_simulator, simulate_discard_warmup, _mask_slots,
                   BG_MASKED_FEAT)
@@ -23,6 +23,7 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 from metrics.core.schema import Segment
 from metrics.core.features import context_window
 from metrics.core.calibrate import Window, _future_overrides
+from metrics.core.horizons import FIGURE_HORIZON_HOURS
 from metrics.core.run_eval import _make_night_overrides_fn
 
 
@@ -47,8 +48,8 @@ def _smooth_sim_bg(bg_raw: np.ndarray) -> np.ndarray:
 # Every window runs FORECAST: one PREDICTION_PATCHES span at the right edge, whole context visible.
 CTX_STEPS = MAX_CONTEXT_PATCHES * PATCH_SIZE
 PRED_STEPS = PREDICTION_PATCHES * PATCH_SIZE
-# parity/clarke roll to the night long horizon for hour-by-hour figures; single pass when unset
-FIG_ROLLS = max(1, math.ceil(NIGHT_LONG_HORIZON_HOURS / PREDICTION_HORIZON_HOURS))
+# parity/clarke roll to the figure span for hour-by-hour figures; single pass when unset
+FIG_ROLLS = max(1, math.ceil(FIGURE_HORIZON_HOURS / PREDICTION_HORIZON_HOURS))
 FIG_STEPS = FIG_ROLLS * PRED_STEPS
 
 # Masked set from data._mask_slots; FORECAST_D bins on d, distance to visible evidence.

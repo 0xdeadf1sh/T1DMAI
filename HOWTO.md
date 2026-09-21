@@ -103,7 +103,7 @@ both keeps the two together.
 
 **48, 96 and 144 are the arithmetically clean widths.** Hour-of-day coverage is
 exactly uniform when `n_candidates % 48 == 0`, where
-`n_candidates = N/PATCH_SIZE − max(PREDICTION_PATCHES, NIGHT_LONG_HORIZON_PATCHES) − n_ctx + 1`.
+`n_candidates = N/PATCH_SIZE − PREDICTION_PATCHES − n_ctx + 1`.
 That arithmetic applies to a trajectory a window is cropped from anywhere. A
 cache row's boundary is fixed and its warm-up offset is drawn uniformly over the
 day instead, so hour-of-day coverage comes from the pool, not from the width.

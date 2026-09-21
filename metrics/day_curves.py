@@ -21,12 +21,12 @@ sys.path.insert(0, HERE)                          # protocols
 torch.set_num_threads(8)
 
 from config import (PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES,
-                    NIGHT_LONG_HORIZON_PATCHES, NIGHT_LONG_HORIZON_HOURS,
                     _PATCHES_PER_HOUR, PREDICTION_HORIZON_HOURS,
                     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD, CHANNEL_TO_FEAT,
                     TIME_PROBE_N_BINS)
 from normalization import load_normalization_stats
 from model import T1DMAI
+from metrics.core.horizons import FIGURE_HORIZON_HOURS
 from metrics.core.calibrate import _future_overrides, CTX_STEPS
 from metrics.core.features import build_feature_stack, context_window
 from metrics.core.schema import GRID_MIN, MIN_SEGMENT_STEPS
@@ -48,7 +48,7 @@ def smooth_bg_truth(bg_raw) -> np.ndarray:
 # ``PR.forecast_masked_set(n_ctx)`` names the span, head slots, per-slot d, predict's output rows.
 PRED = PR.SPAN_STEPS                              # steps in one masked forecast span
 DAY_PATCHES = 48 * _PATCHES_PER_HOUR              # 48 h day window (fixed figure span)
-H8_PATCHES = NIGHT_LONG_HORIZON_PATCHES           # NIGHT_LONG_HORIZON_HOURS long-horizon window
+H8_PATCHES = FIGURE_HORIZON_HOURS * _PATCHES_PER_HOUR   # the rolled-figure span, in patches
 CTX = MAX_CONTEXT_PATCHES * PATCH_SIZE
 ANNOUNCE = (0, 1)                                 # carb, insulin
 

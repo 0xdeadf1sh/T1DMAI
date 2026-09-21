@@ -1008,10 +1008,7 @@ def card_metrics_card(cfg: dict, val: dict[str, np.ndarray]) -> None:
         ("Multi-horizon BG RMSE  (mg/dL)", TEAL,
          [("bg_rmse_30",  False, "30 min",  "{:.2f}", "{:.2f}"),
           ("bg_rmse_60",  False, "60 min",  "{:.2f}", "{:.2f}"),
-          ("bg_rmse_120", False, "120 min", "{:.2f}", "{:.2f}"),
-          ("bg_rmse_180", False, "180 min", "{:.2f}", "{:.2f}"),
-          ("bg_rmse_360", False, "360 min", "{:.2f}", "{:.2f}"),
-          ("bg_rmse_480", False, "480 min", "{:.2f}", "{:.2f}")]),
+          ("bg_rmse_120", False, "120 min", "{:.2f}", "{:.2f}")]),
         ("Excursion detection", CLAY,
          [("hypo_recall",     True, f"hypo recall  (BG < {config.BG_HYPO_THRESHOLD:.0f} mg/dL)",   "{:.3f}", "{:.3f}"),
           ("hypo_precision",  True, "hypo precision",                 "{:.3f}", "{:.3f}"),
@@ -1545,10 +1542,7 @@ def card_showcase(cfg: dict, summary: dict,
     chart_ax.set_facecolor(PAPER)
     horizons = [("30 min",  "bg_rmse_30"),
                 ("60 min",  "bg_rmse_60"),
-                ("120 min", "bg_rmse_120"),
-                ("180 min", "bg_rmse_180"),
-                ("360 min", "bg_rmse_360"),
-                ("480 min", "bg_rmse_480")]
+                ("120 min", "bg_rmse_120")]
     labels = [h for h, _ in horizons]
     values = [stat_for(col, False)[0] for _, col in horizons]
     cmap = plt.colormaps["viridis"]
