@@ -218,6 +218,18 @@ from T1DMSIM.cache_simulator import (  # noqa: E402
     N_TAIL_ARMS, SKILLS_FILE, TAIL_ARMS,
 )
 
+# SPEC/cache.md §3: the index IS the arm's identity, so name the four rather than re-deriving.
+TAIL_ARM_NONE, TAIL_ARM_BOLUS, TAIL_ARM_CARBS, TAIL_ARM_BOLUS_CARBS = range(N_TAIL_ARMS)
+# A sample with no cache row behind it: real data, or an on-the-fly simulated row.
+NO_TAIL_ARM: int = -1
+# The arms a capped bolus-only draw redraws over, in ascending order.
+UNCAPPED_TAIL_ARMS: tuple[int, ...] = (
+    TAIL_ARM_NONE, TAIL_ARM_CARBS, TAIL_ARM_BOLUS_CARBS)
+# SPEC/cache.md §6: intended bolus U and logged carb g at the boundary, one value per arm.
+TAIL_DOSE_BOLUS_U = 'bolus_u'
+TAIL_DOSE_CARB_G = 'carb_g'
+TAIL_DOSE_CHANNELS: tuple[str, ...] = (TAIL_DOSE_BOLUS_U, TAIL_DOSE_CARB_G)
+
 # Normalized channel -> simulator channel; a point-dose channel keeps its name.
 SIM_CHANNEL = {'bg_absolute': 'bg_observed', 'carb_intake': 'total_carb',
                'insulin_combined': 'total_insulin'}
@@ -300,6 +312,7 @@ class T1DMDataset(Dataset):
         seed_offset: int = 0,
         cache_partition: str = 'train',
         blind: bool = False,
+        max_bolus_only_u: float | None = None,
     ) -> None:
         self.master_seed = master_seed
         self.blind = blind
@@ -316,6 +329,14 @@ class T1DMDataset(Dataset):
                 f"{CACHE_PARTITIONS}."
             )
         self.cache_partition = cache_partition
+        # Training-only experiment: cap the bolus-only arm, never the val/cal slabs.
+        self.max_bolus_only_u = (
+            None if max_bolus_only_u is None else float(max_bolus_only_u))
+        if self.max_bolus_only_u is not None and cache_partition != 'train':
+            raise ValueError(
+                f"max_bolus_only_u is a training-only cap; cache_partition="
+                f"{cache_partition!r} must be scored on uncapped windows."
+            )
         # (slab_start, slab_size) for this partition; None in on-the-fly mode.
         self._cache_slab: tuple[int, int] | None = None
 
@@ -326,6 +347,13 @@ class T1DMDataset(Dataset):
         self._cache_pool_size: int | None = None
         self._cache_n_timesteps: int | None = None
         self._cache_meta: dict[str, Any] | None = None
+        self._cache_tail_dose: bool = False
+
+        if self.max_bolus_only_u is not None and cache_path is None:
+            raise ValueError(
+                "max_bolus_only_u needs the cache's per-row boundary bolus; an "
+                "on-the-fly run has no tail_dose_ arrays to read it from."
+            )
 
         if cache_path is not None:
             from T1DMSIM.simulator import DT_MINUTES as _DT_MINUTES
@@ -434,6 +462,17 @@ class T1DMDataset(Dataset):
             self._cache_slab = _cache_slab_geometry(
                 self._cache_pool_size, self.cache_partition)
 
+            # Written only under --events; absent leaves every boundary dose 0, not an error.
+            self._cache_tail_dose = all(
+                os.path.exists(os.path.join(cache_path, f'tail_dose_{n}.b2nd'))
+                for n in TAIL_DOSE_CHANNELS)
+            if self.max_bolus_only_u is not None and not self._cache_tail_dose:
+                raise ValueError(
+                    f"Cache {cache_path!r} has no tail_dose_{TAIL_DOSE_BOLUS_U}.b2nd, "
+                    "so the bolus-only cap cannot read a row's intended bolus. "
+                    "Rebuild the cache with cache_simulator.py --events."
+                )
+
             # A cycling pool is benign: a reuse redraws the arm and context width, not the origin.
 
     def __len__(self) -> int:
@@ -455,6 +494,9 @@ class T1DMDataset(Dataset):
             wanted = [(n, (pool, self._cache_n_timesteps)) for n in READ_CACHE_CHANNELS]
             wanted += [(f'tail_{n}', (pool, N_TAIL_ARMS, TAIL_STEPS))
                        for n in READ_TAIL_CHANNELS]
+            if self._cache_tail_dose:
+                wanted += [(f'tail_dose_{n}', (pool, N_TAIL_ARMS))
+                           for n in TAIL_DOSE_CHANNELS]
             for name, expected_shape in wanted:
                 # Not mmap_mode='r': blosc2 has no madvise, so mapped pages never drop.
                 arr = blosc2.open(
@@ -497,6 +539,18 @@ class T1DMDataset(Dataset):
         Keys are ``_build_sample``'s.  The same ``idx`` always resolves to the same
         patient seed, whichever worker handles it.
         """
+        return self._sample(idx)
+
+    def sample_for_arm(self, idx: int, arm: int) -> dict[str, Any]:
+        """``__getitem__(idx)`` on one named tail arm, for paired-arm readings.
+
+        Every other draw is ``idx``'s own, so two arms of a row share context, width and mask.
+        """
+        assert 0 <= arm < N_TAIL_ARMS, f"arm {arm} outside {TAIL_ARMS}"
+        return self._sample(idx, arm_override=int(arm))
+
+    def _sample(self, idx: int, arm_override: int | None = None) -> dict[str, Any]:
+        """``__getitem__``'s body, with the tail arm optionally forced rather than drawn."""
         step = idx // self.batch_size
         position = idx % self.batch_size
         patient_seed = compute_patient_seed(
@@ -505,7 +559,11 @@ class T1DMDataset(Dataset):
 
         # Separate substream, so the arm draw cannot influence window selection.
         arm = int(np.random.default_rng(patient_seed ^ 0xA12_0F5E1).integers(N_TAIL_ARMS))
+        if arm_override is not None:
+            arm = arm_override
 
+        sample_arm = NO_TAIL_ARM
+        doses = (0.0, 0.0)
         if self.cache_path is not None:
             cache_arrays, cache_icr, cache_skills = self._load_cache()
             assert self._cache_pool_size is not None
@@ -513,6 +571,18 @@ class T1DMDataset(Dataset):
             # DISJOINT band: a held-out (val/cal) seed can only resolve to a reserved tail row.
             slab_start, slab_size = self._cache_slab
             cache_idx = slab_start + int(patient_seed % slab_size)
+            row_dose = {
+                n: (np.asarray(cache_arrays[f'tail_dose_{n}'][cache_idx:cache_idx + 1])[0]
+                    if self._cache_tail_dose else np.zeros(N_TAIL_ARMS, dtype=np.float32))
+                for n in TAIL_DOSE_CHANNELS
+            }
+            # Own substream, entered only when the cap fires, so an uncapped run is bit-identical.
+            if (arm_override is None and self.max_bolus_only_u is not None
+                    and arm == TAIL_ARM_BOLUS
+                    and float(row_dose[TAIL_DOSE_BOLUS_U][TAIL_ARM_BOLUS])
+                    > self.max_bolus_only_u):
+                redraw = np.random.default_rng(patient_seed ^ 0xB015_CA9)
+                arm = UNCAPPED_TAIL_ARMS[int(redraw.integers(len(UNCAPPED_TAIL_ARMS)))]
             # blosc2 indexing decompresses into a fresh array; no copy or advise needed.
             row = {
                 name: np.asarray(cache_arrays[name][cache_idx:cache_idx + 1])[0]
@@ -525,6 +595,9 @@ class T1DMDataset(Dataset):
             }
             icr = float(cache_icr[cache_idx])
             skills = cache_skills[cache_idx]
+            sample_arm = arm
+            doses = (float(row_dose[TAIL_DOSE_BOLUS_U][arm]),
+                     float(row_dose[TAIL_DOSE_CARB_G][arm]))
         else:
             row, icr, skills = simulate_row(
                 patient_seed,
@@ -542,6 +615,9 @@ class T1DMDataset(Dataset):
             blind=self.blind,
             boundary=True,
             skills=skills,
+            arm=sample_arm,
+            arm_bolus_u=doses[0],
+            arm_carb_g=doses[1],
         )
 
 
@@ -703,6 +779,9 @@ def _build_sample(
     blind: bool = False,
     boundary: bool = False,
     skills: np.ndarray | None = None,
+    arm: int = NO_TAIL_ARM,
+    arm_bolus_u: float = 0.0,
+    arm_carb_g: float = 0.0,
 ) -> dict[str, Any]:
     """One training sample from a raw simulator output dict.
 
@@ -858,6 +937,10 @@ def _build_sample(
         'last_bg': last_bg,
         'true_bg_trajectory': true_bg_traj.copy(),
         'pred_start_hour': pred_start_hour,
+        # SPEC/cache.md §3-4: the tail arm this horizon came from, with its boundary doses.
+        'tail_arm': int(arm),
+        'arm_bolus_u': float(arm_bolus_u),
+        'arm_carb_g': float(arm_carb_g),
     }
     if INPUT_LAYOUT == 'curves':
         # Per-channel views, for the curve-shaped what-if and probe tooling.
@@ -1073,6 +1156,16 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         'pred_start_hour': torch.tensor(
             [s['bg_formula_data']['pred_start_hour'] for s in samples], dtype=torch.float32),
+        # NO_TAIL_ARM where the sample has no cache row, which is what excludes it downstream.
+        'tail_arm': torch.tensor(
+            [s['bg_formula_data'].get('tail_arm', NO_TAIL_ARM) for s in samples],
+            dtype=torch.long),
+        'arm_bolus_u': torch.tensor(
+            [s['bg_formula_data'].get('arm_bolus_u', 0.0) for s in samples],
+            dtype=torch.float32),
+        'arm_carb_g': torch.tensor(
+            [s['bg_formula_data'].get('arm_carb_g', 0.0) for s in samples],
+            dtype=torch.float32),
     }
 
     return {

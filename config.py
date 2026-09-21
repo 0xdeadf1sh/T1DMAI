@@ -121,6 +121,9 @@ LR_MIN_RATIO = 0.01  # cosine decay floor as a fraction of peak LR
 # Must stay 0.0: loader equality-checks it against the cache's patient_uniform_sample_prob.
 PATIENT_UNIFORM_SAMPLE_PROB = 0.0
 
+# Experiment: TRAINING draws above this intended bolus redraw off arm bolus. None = off.
+MAX_BOLUS_ONLY_U = None
+
 MUON_LR = 0.02  # 2D weight matrices
 MUON_MOMENTUM = 0.95
 MUON_NS_ITERATIONS = 5  # quintic Newton-Schulz steps
