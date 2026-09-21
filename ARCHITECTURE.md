@@ -668,13 +668,15 @@ Two sample sizes, not one. Everything scored inside the batched window loop read
 the whole pool. The two per-sample probes — the long-horizon BG accumulation and
 the counterfactual dose-response — read the leading `VALIDATION_PROBE_N_PATIENTS`
 windows instead, because each spends its forwards one window at a time and so
-costs per sample where the rest costs per batch. The long horizon rolls four
-forwards autoregressively; the counterfactual runs five conditioned arms over one
-fixed context. The horizon is the dividing line: a BG error at 30 / 60 / 120 min
-comes off the single forward over the whole pool, one at 180 / 360 / 480 min off
-the probe. Every figure either probe emits carries its own denominator — `cf_n`,
-`bg_rmse_{h}_n`, `night_bg_rmse_{h}_n` — so the narrower sample is read off the
-row rather than assumed.
+costs per sample where the rest costs per batch. The counterfactual runs five
+conditioned arms over one fixed context. The long-horizon probe rolls four
+forwards autoregressively only where the ground truth outlasts one forward;
+every window ends at its row's boundary, so it rolls nothing today and the
+180 / 360 / 480 min rows read empty. A BG error at 30 / 60 / 120 min comes off
+the single forward over the whole pool. Every figure either probe emits carries
+its own denominator — `cf_n`, `bg_rmse_{h}_n`, `night_bg_rmse_{h}_n` — so the
+narrower sample is read off the row rather than assumed, and a row at `n = 0` is
+a probe that did not run.
 
 Two artifacts: a row appended to `logs/validation_log.csv`, and a table printed
 to stdout with columns `Metric | Value | Prev`, coloured against published
@@ -759,7 +761,7 @@ The module defines no pass/fail threshold on any of them, and
 | --- | --- |
 | Training & internal losses | `val_loss_total` and `val_loss_Q`, the selection scalar and its pinball half |
 | BG forecast (RMSE / MAE) | Single-pass horizons, 30 / 60 / 120 min, both error measures |
-| BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample, each with the count it was scored over, plus the roll's mean context and the two short-window skip counts against their own denominators |
+| BG forecast — night only @ 180+ | The rolled long horizons, 180 / 360 / 480 min, night-filtered per sample, each with the count it was scored over, plus the roll's mean context and the two short-window skip counts against their own denominators — every count is 0 while each row's truth stops at one forward |
 | Quantile calibration | Marginal 90 % band coverage and inner-50 % coverage with their widths, `sign_balance` at the far horizon, the one-sided against two-sided pair at `d = 1` — both arms `coverage_sharpness_by_d` over their own protocol's fan, so only sidedness separates them — and joint coverage of the whole path |
 | Relative error & derivative tracking | MARD per horizon, the rate-of-change correlation, and median roughness pooled and at the far patch |
 | Amplitude & excursion shape | The mean-collapse detectors: per-patch and per-excursion amplitude ratio, gain, correlation, and the overshoot/undershoot split |
