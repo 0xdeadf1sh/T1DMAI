@@ -459,6 +459,135 @@ def test_families_restored_to_the_table_are_rendered_and_still_recorded(val_metr
           f"page and are still declared columns ✓")
 
 
+def _synthetic_arm_metrics(n: float = 7.0) -> dict:
+    """A render input where every breakdown group drew ``n`` windows."""
+    out: dict = {}
+    for gid in train.arm_group_ids():
+        out[f'arm_{gid}_n'] = n
+        for name, _dec in train.ARM_GROUP_COLUMNS[1:]:
+            out[f'arm_{gid}_{name}'] = 0.25
+    out |= {'arm_rescue_true_share': 0.6, 'arm_rescue_true_n': 15.0,
+            'arm_rescue_model_share': 0.2, 'arm_rescue_model_n': 9.0}
+    return out
+
+
+def test_arm_group_masks_split_a_tiny_synthetic_batch():
+    """A window joins its arm and its own dose bin; bin edges are half-open but the top
+    edge of the last bin is reachable, and NO_TAIL_ARM joins nothing."""
+    arm = np.array([data_mod.NO_TAIL_ARM, 0, 1, 1, 1, 2, 3, 3])
+    bolus = np.array([9.0, 0.0, 0.5, 2.0, 20.0, 0.0, 6.0, 11.9])
+    carb = np.array([9.0, 0.0, 0.0, 0.0, 0.0, 15.0, 5.0, 120.0])
+    m = train.arm_group_masks(arm, bolus, carb)
+
+    assert set(m) == set(train.arm_group_ids())
+    assert not any(mask[0] for mask in m.values()), (
+        'a NO_TAIL_ARM window joined a group, so a non-cache sample is being pooled in')
+    assert m['none'].nonzero()[0].tolist() == [1]
+    assert m['bolus'].nonzero()[0].tolist() == [2, 3, 4]
+    assert m['carbs'].nonzero()[0].tolist() == [5]
+    assert m['bolus_carbs'].nonzero()[0].tolist() == [6, 7]
+    # 0.5 sits on the lower edge of the first bin, 2.0 opens the second, 20.0 closes the last
+    assert m['bolus_u0p5_2'].nonzero()[0].tolist() == [2]
+    assert m['bolus_u2_6'].nonzero()[0].tolist() == [3]
+    assert m['bolus_u12_20'].nonzero()[0].tolist() == [4]
+    assert m['bolus_carbs_u6_12'].nonzero()[0].tolist() == [6, 7]
+    assert m['carbs_g15_40'].nonzero()[0].tolist() == [5]
+    assert m['bolus_carbs_g5_15'].nonzero()[0].tolist() == [6]
+    assert m['bolus_carbs_g40_120'].nonzero()[0].tolist() == [7]
+    # every dose bin of an arm is disjoint, and no window lands in two bins of one family
+    for family in ('bolus_u', 'bolus_carbs_u', 'carbs_g', 'bolus_carbs_g'):
+        bins = [v for k, v in m.items() if k.startswith(family) and k not in train.TAIL_ARMS]
+        assert np.stack(bins).sum(axis=0).max() <= 1, f'{family} bins overlap'
+    print(f"[DUMP] arm groups | {len(m)} groups split an 8-window batch, "
+          f"1 NO_TAIL_ARM window excluded ✓")
+
+
+def test_arm_window_stats_reproduce_the_headline_roughness():
+    """The per-group roughness must BE the headline statistic, not a second definition:
+    same risk space, same ``|second difference|``, same far-patch slice."""
+    B, P, S = 5, PREDICTION_PATCHES, PATCH_SIZE
+    g = torch.Generator().manual_seed(11)
+    median = torch.randn(B, P, S, generator=g) * 0.3
+    true_bg = 90.0 + 60.0 * torch.rand(B, P * S, generator=g)
+    pred_bg = true_bg + torch.randn(B, P * S, generator=g)
+    q_lo, q_hi = true_bg - 20.0, true_bg + 20.0
+
+    w, c = train._arm_window_stats(median, pred_bg, q_lo, q_hi, true_bg)
+    finished = train._finalize_arm_groups(
+        {'none': w.sum(axis=0)}, {'none': float(B)}, c)
+    assert finished['arm_none_n'] == float(B)
+
+    def _figure(name: str) -> float:
+        return finished[f'arm_none_{name}']
+
+    m_flat = median.reshape(B, -1)
+    d2 = (m_flat[:, 2:] - 2.0 * m_flat[:, 1:-1] + m_flat[:, :-2]).abs()
+    far0 = (P - 1) * S - 1
+    assert _figure('median_roughness') == pytest.approx(
+        float(d2.sum()) / d2.numel(), rel=1e-6)
+    assert _figure('median_roughness_far') == pytest.approx(
+        float(d2[:, far0:].sum()) / d2[:, far0:].numel(), rel=1e-6)
+    # the truth's own figure is the floor the model's is read against, and the MA lowers it
+    assert _figure('true_roughness') > 0.0
+    assert _figure('true_roughness_ma3') < _figure('true_roughness')
+    assert _figure('true_roughness_far_ma3') < _figure('true_roughness_far')
+    # the rest: bands chosen to cover, the deepest truth well above 40, +120 the last step
+    assert _figure('coverage90@120') == pytest.approx(1.0)
+    assert _figure('width90@120') == pytest.approx(40.0, rel=1e-5)
+    assert _figure('true_min_lt40') == 0.0
+    assert _figure('true_bg_120') == pytest.approx(float(true_bg[:, -1].mean()), rel=1e-5)
+    assert _figure('bg_rmse_30') == pytest.approx(
+        float((pred_bg[:, 5] - true_bg[:, 5]).pow(2).mean()) ** 0.5, rel=1e-5)
+    print(f"[DUMP] arm stats | roughness {_figure('median_roughness'):.4f} model vs "
+          f"{_figure('true_roughness'):.4f} truth ({_figure('true_roughness_ma3'):.4f} MA3) ✓")
+
+
+def test_every_tail_arm_column_is_declared_and_written(val_metrics):
+    """The breakdown is a CSV family first: an unwritten column is an empty cell forever."""
+    declared = {c for c, _ in train._val_log_columns()}
+    expected = {f'arm_{g}_{m}' for g in train.arm_group_ids()
+                for m, _d in train.ARM_GROUP_COLUMNS} | set(train.ARM_RESCUE_COLUMNS)
+    assert expected <= declared, f'undeclared: {sorted(expected - declared)}'
+    missing = sorted(k for k in expected if k not in val_metrics)
+    assert not missing, f'declared but never written: {missing}'
+    print(f"[DUMP] arm columns | {len(expected)} declared and written ✓")
+
+
+def test_a_non_cache_window_joins_no_tail_arm_group(val_metrics):
+    """The fixture runs on simulated rows, which carry NO_TAIL_ARM: every group is empty,
+    every figure absent rather than 0, and the section does not render at all."""
+    for gid in train.arm_group_ids():
+        assert val_metrics[f'arm_{gid}_n'] == 0.0
+        for name, _d in train.ARM_GROUP_COLUMNS[1:]:
+            assert val_metrics[f'arm_{gid}_{name}'] is None, (
+                f'arm_{gid}_{name} reads as a measurement on a group with no windows')
+    assert train._render_arm_table(val_metrics) == ''
+    assert 'By tail arm' not in train._strip_ansi(
+        train._render_validation_table(1, val_metrics, None))
+    # The paired reading is cache-only too: re-simulating a row twice buys no new arm.
+    for tag in ('true', 'model'):
+        assert val_metrics[f'arm_rescue_{tag}_n'] == 0.0
+        assert val_metrics[f'arm_rescue_{tag}_share'] is None
+    print("[DUMP] empty breakdown | no group, no section, no rescue reading ✓")
+
+
+def test_the_arm_table_renders_every_populated_group_and_its_rescue_line():
+    metrics = _synthetic_arm_metrics()
+    table = train._render_arm_table(metrics)
+    assert table, 'a fully populated breakdown rendered nothing'
+    for gid in train.arm_group_ids():
+        assert gid in table, f'{gid} is missing from the breakdown'
+    assert len({len(line) for line in table.splitlines()}) == 1, (
+        'the breakdown box is ragged')
+    assert 'low rescue by carbs' in table
+    assert 'true 60.0% (n=15)' in table and 'model 20.0% (n=9)' in table, (
+        'a rescue share is rendered without the n it was measured on')
+    full = train._strip_ansi(train._render_validation_table(1, metrics, None))
+    assert full.index('By tail arm') > full.index('└'), (
+        'the breakdown must sit after the existing table, not inside it')
+    print(f"[DUMP] arm table | {len(train.arm_group_ids())} groups + rescue line rendered ✓")
+
+
 def test_every_bg_horizon_is_inside_one_forward_and_is_scored(val_metrics):
     """A row ends at its tail, so the scored horizons are exactly those one forward reaches."""
     single_pass_min = PREDICTION_PATCHES * PATCH_SIZE * 5
