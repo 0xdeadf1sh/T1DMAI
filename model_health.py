@@ -1025,8 +1025,7 @@ def run_data_pass(
                 setattr(config, k.upper(), tc[k])
         if tc.get('mask_span_lengths') is not None:
             config.MASK_SPAN_LENGTHS = tuple(tc['mask_span_lengths'])
-        config.MAX_SEQ_LEN = (config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
-                              + config.GHOST_PATCHES)
+        config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
         for m in ('model', 'data', 'risk_loss', 'attribution', 'inference'):
             sys.modules.pop(m, None)
         from model import T1DMAI

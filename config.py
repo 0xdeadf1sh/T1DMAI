@@ -82,44 +82,6 @@ BG_HEAD_INIT_SCALE = (
 )
 BG_QUANTILE_SPREAD_MIN = 1e-3  # additive floor per softplus spread; anti σ-collapse
 
-# EXPERIMENT: step_states' virtual node at a span edge; the phone implements "repeat" only.
-SPLINE_EDGE_DEFAULT = "repeat"
-SPLINE_EDGE_RULES = (SPLINE_EDGE_DEFAULT, "extrapolate")
-SPLINE_EDGE_ENV = "T1DMAI_SPLINE_EDGE"
-
-
-def set_spline_edge(rule: str) -> None:
-    """Switch the edge rule; utils re-reads it per call, so import order does not matter."""
-    global SPLINE_EDGE
-    assert rule in SPLINE_EDGE_RULES, f"unknown spline edge rule {rule!r}"
-    SPLINE_EDGE = rule
-
-
-set_spline_edge(_os.environ.get(SPLINE_EDGE_ENV, SPLINE_EDGE_DEFAULT))
-
-# EXPERIMENT: extra masked patches past the horizon, predicted then discarded.
-GHOST_PATCHES_DEFAULT = 0
-GHOST_PATCHES_CHOICES = (GHOST_PATCHES_DEFAULT, 1)
-GHOST_PATCHES_ENV = "T1DMAI_GHOST_PATCHES"
-_MAX_MASKED_PATCHES_BASE = MAX_MASKED_PATCHES
-
-
-def set_ghost_patches(n: int) -> None:
-    """Switch the ghost count; M, MAX_SEQ_LEN and the pinned span all grow by it.
-
-    The scored budget stays _MAX_MASKED_PATCHES_BASE, so the sampler's rejection
-    boundary on the unpinned spans does not move.
-    """
-    global GHOST_PATCHES, MAX_MASKED_PATCHES, MAX_SEQ_LEN, FORECAST_SPAN_PATCHES
-    assert n in GHOST_PATCHES_CHOICES, f"unknown ghost patch count {n!r}"
-    GHOST_PATCHES = n
-    MAX_MASKED_PATCHES = _MAX_MASKED_PATCHES_BASE + n
-    MAX_SEQ_LEN = MAX_CONTEXT_PATCHES + PREDICTION_PATCHES + n
-    FORECAST_SPAN_PATCHES = PREDICTION_PATCHES + n
-
-
-set_ghost_patches(int(_os.environ.get(GHOST_PATCHES_ENV, GHOST_PATCHES_DEFAULT)))
-
 # Per-slot hour-of-day probe (no mean-pool); its loss never enters risk_total_loss or selection.
 TIME_PROBE_ENABLED = True  # False ⇒ head not built
 TIME_PROBE_HIDDEN = 1 * D_MODEL  # 2-layer SiLU probe MLP

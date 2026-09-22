@@ -12,13 +12,11 @@ import torch
 from torch.utils.data import Dataset
 from typing import Any
 
-# MAX_MASKED_PATCHES moves with GHOST_PATCHES, so it is read off the module, never bound here.
-import config
 from config import (
     PATCH_SIZE, N_INPUT_FEATURES, PATCH_DIM, INPUT_LAYOUT, INPUT_LAYOUTS,
     CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, MASKABLE_FEATS,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
-    MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS,
+    MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
     PATIENT_UNIFORM_SAMPLE_PROB, N_SKILLS, SKILL_NAMES,
     SIMULATOR_WARMUP_HOURS,
     TIME_PROBE_ENABLED, TIME_PROBE_CROSS_WINDOW_WEIGHT,
@@ -658,9 +656,8 @@ def sample_mask_spans(
     ``(start_patch, length)`` pairs; semantics in this repo's CLAUDE.md, mirrored in
     ``d_balance``. ``pin_right`` fixes the last span flush right at that length.
     """
-    budget = config.MAX_MASKED_PATCHES
-    assert pin_right is None or 0 < pin_right <= budget, (
-        f"pin_right={pin_right} must fit MAX_MASKED_PATCHES={budget}")
+    assert pin_right is None or 0 < pin_right <= MAX_MASKED_PATCHES, (
+        f"pin_right={pin_right} must fit MAX_MASKED_PATCHES={MAX_MASKED_PATCHES}")
     lengths_pool = np.asarray(MASK_SPAN_LENGTHS, dtype=np.int64)
     n_spans = int(rng.integers(1, MASK_MAX_SPANS + 1))
 
@@ -669,7 +666,7 @@ def sample_mask_spans(
         span_lengths = rng.choice(lengths_pool, size=n_spans, replace=True)
         if pin_right is not None:
             span_lengths[-1] = pin_right
-        if int(span_lengths.sum()) <= budget:
+        if int(span_lengths.sum()) <= MAX_MASKED_PATCHES:
             break
 
     total_masked = int(span_lengths.sum())
@@ -751,7 +748,7 @@ def _mask_slots(
     ``(mask_idx, valid, d, anchor_step)``, length M; padded slots gather patch 0, valid=False.
     ``d`` (nearest-side) and the anchor (ONE-SIDED left-preferring) disagree by construction.
     """
-    M = config.MAX_MASKED_PATCHES
+    M = MAX_MASKED_PATCHES
     mask_idx = np.zeros(M, dtype=np.int64)
     valid = np.zeros(M, dtype=bool)
     d = np.zeros(M, dtype=np.int64)
@@ -772,47 +769,6 @@ def _mask_slots(
             slot += 1
     assert slot <= M, f"{slot} masked patches exceeds MAX_MASKED_PATCHES={M}"
     return mask_idx, valid, d, anchor_step
-
-
-def ghost_slot_mask(present: np.ndarray) -> np.ndarray:
-    """The GHOST slots of an occupied-slot mask: the trailing ``config.GHOST_PATCHES`` of them.
-
-    The pinned right-edge span is the last span, so its tail is the last occupied slots.
-    Ghost slots are predicted, never scored: ``valid = present & ~ghost``.
-    """
-    ghost = np.zeros_like(np.asarray(present, dtype=bool))
-    n_ghost = int(config.GHOST_PATCHES)
-    if n_ghost:
-        n = int(np.asarray(present, dtype=bool).sum())
-        assert n > n_ghost, f"{n} occupied slots cannot hold {n_ghost} ghost patches"
-        ghost[n - n_ghost:n] = True
-    return ghost
-
-
-def ghost_window_steps(
-    window: np.ndarray,
-    bg_window: np.ndarray,
-    hour_window: np.ndarray,
-    stats: dict[str, dict[str, float]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``(window, bg_window, hour_window)`` extended by ``config.GHOST_PATCHES`` patches.
-
-    Nothing is measured past the tail: the dose feats take normalize(0) (raw zero, not z=0),
-    bg repeats the last reading — masked, and invalid everywhere — and the clock runs on.
-    """
-    from T1DMSIM.simulator import DT_MINUTES
-    n = int(config.GHOST_PATCHES) * PATCH_SIZE
-    if n == 0:
-        return window, bg_window, hour_window
-    rows = np.zeros((n, N_INPUT_FEATURES), dtype=window.dtype)
-    for feat_idx, z in zero_dose_fill(stats).items():
-        rows[:, feat_idx] = z
-    hours = (hour_window[-1] + np.arange(1, n + 1) * (DT_MINUTES / 60.0)) % 24.0
-    return (
-        np.concatenate([window, rows]),
-        np.concatenate([bg_window, np.full(n, bg_window[-1], dtype=bg_window.dtype)]),
-        np.concatenate([hour_window, hours.astype(hour_window.dtype)]),
-    )
 
 
 def _build_sample(
@@ -875,14 +831,6 @@ def _build_sample(
     # Multiple of PATCH_SIZE for a clean reshape.
     N_trimmed = (N // PATCH_SIZE) * PATCH_SIZE
 
-    n_ghost = int(config.GHOST_PATCHES)
-    if n_ghost and not boundary:
-        raise RuntimeError(
-            "--ghost-patches extends the span pinned flush right, and a random-window "
-            "sample draws its masked set instead of pinning one, so there is no span to "
-            "extend. Run this path with T1DMAI_GHOST_PATCHES=0."
-        )
-
     if boundary:
         # The tails end the row, so the horizon is fixed and the context is what precedes it.
         pred_start_step = N_trimmed - n_pred_steps
@@ -917,16 +865,10 @@ def _build_sample(
 
     window = features[start_step:end_step]
     bg_window = bg[start_step:end_step]
-    hour_window = hour_of_day[start_step:end_step]
     # Announced horizon doses for the counterfactual probe's baseline arm.
     _dose_feats = [CHANNEL_TO_FEAT[ch] for ch in sorted(CHANNEL_TO_FEAT)]
     dose_norm_window = features[start_step:end_step][:, _dose_feats]
     dose_raw_window = dose_raw[start_step:end_step]
-
-    # The ghost patches sit past the row, so they are synthesized rather than sliced.
-    window, bg_window, hour_window = ghost_window_steps(
-        window, bg_window, hour_window, stats)
-    total_patches_needed += n_ghost
 
     # A leading-axis slice of a C-contiguous array stays contiguous, so this reshape is a view.
     patches_3d = window.reshape(total_patches_needed, PATCH_SIZE, N_INPUT_FEATURES)
@@ -934,14 +876,11 @@ def _build_sample(
     seq_len = total_patches_needed
     # The tail is a behaviour-off counterfactual, so it is the horizon and never model input.
     spans = sample_mask_spans(
-        seq_len, rng, pin_right=PREDICTION_PATCHES + n_ghost if boundary else None)
+        seq_len, rng, pin_right=PREDICTION_PATCHES if boundary else None)
     masked_patches = np.concatenate(
         [np.arange(s, s + L, dtype=np.int64) for s, L in spans]
     )
-    mask_idx, present, mask_d, anchor_step = _mask_slots(spans, seq_len)
-    # A ghost slot is predicted so the last real patch has a right neighbour, and scored nowhere.
-    ghost = ghost_slot_mask(present)
-    valid = present & ~ghost
+    mask_idx, valid, mask_d, anchor_step = _mask_slots(spans, seq_len)
 
     # step-major PATCH_DIM: a feature's columns are the f::N_INPUT_FEATURES stride.
     all_patches_t = torch.from_numpy(
@@ -974,11 +913,11 @@ def _build_sample(
     ]
     # Padded slots hold last_bg (a LEGAL mg/dL), so the forward's units tripwire never fires.
     last_bg = float(bg_window[_anchor_step_for_span(n_ctx, PREDICTION_PATCHES)])
-    anchor_bg = np.full(config.MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
-    anchor_bg[present] = bg_window[anchor_step[present]]
+    anchor_bg = np.full(MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
+    anchor_bg[valid] = bg_window[anchor_step[valid]]
 
     # Per-slot TRUE hour of day, at the masked patch's own first step (not derived/interpolated).
-    slot_hour = hour_window[mask_idx * PATCH_SIZE].astype(np.float32)
+    slot_hour = hour_of_day[start_step + mask_idx * PATCH_SIZE].astype(np.float32)
 
     # Announced horizon carbs and insulin, (steps, dose channels) in CHANNEL_TO_FEAT order.
     _hz = slice(pred_start_in_window, pred_start_in_window + n_pred_steps)
@@ -991,8 +930,7 @@ def _build_sample(
     bg_formula_data = {
         # (M,) with M=MAX_MASKED_PATCHES; padded slots gather patch 0, valid is what drops them.
         'mask_idx': mask_idx,          # (M,) int64  patch index per head slot
-        'valid': valid,                # (M,) bool   SCORED slots: no pad, no ghost
-        'present': present,            # (M,) bool   occupied slots: valid | ghost
+        'valid': valid,                # (M,) bool
         'anchor_bg': anchor_bg,        # (M,) float32 mg/dL
         'd': mask_d,                   # (M,) int64  patches to nearest visible, EITHER side
         'slot_hour': slot_hour,        # (M,) float32 true hour of day per slot
@@ -1028,11 +966,11 @@ def _build_sample(
             next_start = start_step - _step
         next_offset = next_start - start_step
         next_valid = next_start >= 0 and next_start + seq_len * PATCH_SIZE <= N_trimmed
-        next_spans = [(n_ctx, PREDICTION_PATCHES + n_ghost)]
+        next_spans = [(n_ctx, PREDICTION_PATCHES)]
         next_mask_idx, next_slot_valid, next_d, next_anchor_step = _mask_slots(
             next_spans, seq_len
         )
-        next_masked_rows = torch.arange(n_ctx, n_ctx + PREDICTION_PATCHES + n_ghost)
+        next_masked_rows = torch.arange(n_ctx, n_ctx + PREDICTION_PATCHES)
         if next_valid:
             next_bg_window = bg[next_start:next_start + seq_len * PATCH_SIZE]
             next_patches_t = torch.from_numpy(
@@ -1046,7 +984,7 @@ def _build_sample(
             next_last_bg = float(
                 next_bg_window[_anchor_step_for_span(n_ctx, PREDICTION_PATCHES)]
             )                                                # raw mg/dL (clamped, physical)
-            next_anchor_bg = np.full(config.MAX_MASKED_PATCHES, next_last_bg, dtype=np.float32)
+            next_anchor_bg = np.full(MAX_MASKED_PATCHES, next_last_bg, dtype=np.float32)
             next_anchor_bg[next_slot_valid] = next_bg_window[
                 next_anchor_step[next_slot_valid]
             ]
@@ -1059,9 +997,9 @@ def _build_sample(
             next_patches_t = torch.zeros(seq_len, PATCH_DIM, dtype=torch.float32)
             next_patches_t[next_masked_rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
             next_last_bg = last_bg
-            next_anchor_bg = np.full(config.MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
+            next_anchor_bg = np.full(MAX_MASKED_PATCHES, last_bg, dtype=np.float32)
             next_pred_start_hour = pred_start_hour
-            next_slot_hour = np.full(config.MAX_MASKED_PATCHES, pred_start_hour, dtype=np.float32)
+            next_slot_hour = np.full(MAX_MASKED_PATCHES, pred_start_hour, dtype=np.float32)
         # Both windows of the pair are drawn under one convention, placeholder branch included.
         if blind_fill is not None:
             next_blind_flags = torch.zeros(seq_len, dtype=torch.bool)
@@ -1090,9 +1028,9 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     ``p`` rebases to ``n_pad + p``; padded slots keep index 0, discarded by ``valid``.
     """
     B = len(samples)
-    M = config.MAX_MASKED_PATCHES
+    M = MAX_MASKED_PATCHES
     n_contexts = [s['n_context_patches'] for s in samples]
-    seq_lens = [n + PREDICTION_PATCHES + config.GHOST_PATCHES for n in n_contexts]
+    seq_lens = [n + PREDICTION_PATCHES for n in n_contexts]
     max_T = max(seq_lens)
     n_pads = [max_T - sl for sl in seq_lens]
 
@@ -1103,12 +1041,6 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
 
     valid_batch = torch.from_numpy(
         np.stack([s['bg_formula_data']['valid'] for s in samples])
-    )                                                                      # (B, M) bool
-    # Occupied, not scored: a ghost slot is masked, announced and attended like any other.
-    present_batch = torch.from_numpy(
-        np.stack([s['bg_formula_data'].get('present',
-                                           s['bg_formula_data']['valid'])
-                  for s in samples])
     )                                                                      # (B, M) bool
     mask_idx_batch = torch.zeros(B, M, dtype=torch.long)
     is_pad = torch.zeros(B, max_T, dtype=torch.bool)
@@ -1121,7 +1053,7 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         patches_batch[i, n_pad:, :] = s['patches']
 
         is_pad[i, :n_pad] = True
-        row_valid = present_batch[i]
+        row_valid = valid_batch[i]
         idx = torch.from_numpy(s['bg_formula_data']['mask_idx']) + n_pad
         mask_idx_batch[i, row_valid] = idx[row_valid]
         masked[i, mask_idx_batch[i, row_valid]] = True
@@ -1210,7 +1142,6 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         # The masked set, on the PADDED patch axis. Every one of these is (B, M).
         'mask_idx': mask_idx_batch,
         'valid': valid_batch,
-        'present': present_batch,
         'anchor_bg': torch.from_numpy(
             np.stack([s['bg_formula_data']['anchor_bg'] for s in samples])),   # mg/dL
         'd': torch.from_numpy(

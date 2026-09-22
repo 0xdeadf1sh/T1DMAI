@@ -47,14 +47,6 @@ def load_model(device, path: str = CKPT):
     The EMA shadow is merged over the live weights below.
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    import config as _cfg
-    from utils import checkpoint_ghost_patches, checkpoint_spline_edge
-    edge = checkpoint_spline_edge(ckpt)
-    assert edge == _cfg.SPLINE_EDGE, (
-        f"{path}: trained under --spline-edge {edge}, this process reads {_cfg.SPLINE_EDGE}")
-    ghost = checkpoint_ghost_patches(ckpt)
-    assert ghost == _cfg.GHOST_PATCHES, (
-        f"{path}: trained under --ghost-patches {ghost}, this process reads {_cfg.GHOST_PATCHES}")
     m = T1DMAI().to(device)
     sd = ckpt['model_state_dict']
     ema = ckpt.get('model_ema_state_dict')

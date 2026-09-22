@@ -655,13 +655,6 @@ def _assemble_sample(feats: np.ndarray, bg: np.ndarray, spans: list[tuple[int, i
                      gap_patches: np.ndarray, seq_len: int,
                      n_ctx: int) -> dict[str, Any]:
     """Shared tail of the train/eval sample builders. ``bg`` raw mg/dL with NaN gaps."""
-    import config
-    if config.GHOST_PATCHES:
-        raise RuntimeError(
-            "--ghost-patches extends the span pinned flush right, and a finetune window "
-            "draws its masked set instead of pinning one, so there is no span to extend. "
-            "Run this path with T1DMAI_GHOST_PATCHES=0."
-        )
     mask_idx, valid, mask_d, anchor_step = _mask_slots(spans, seq_len)
     span_patches = np.concatenate(
         [np.arange(s, s + L, dtype=np.int64) for s, L in spans])

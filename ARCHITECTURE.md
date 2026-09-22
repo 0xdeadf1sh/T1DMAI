@@ -384,39 +384,6 @@ differs. A patch seam is interior to the same spline as the steps around it, so
 the input path carries no jump in value or slope there and the loss needs no seam
 penalty. The head sees no position input.
 
-**The span-edge rule is a flag, and only one value is exportable.**
-`config.SPLINE_EDGE` — `train.py --spline-edge {repeat,extrapolate}`, env
-`T1DMAI_SPLINE_EDGE`, default `repeat` — chooses the virtual node past a *missing*
-neighbour. `repeat` clamps to the edge node, which is `SPEC/inference.md` §8.2 and
-what the phone's head implements; on a straight line in hidden space it decays the
-last patch's step spacing from `1/S` to `0.22/S`. `extrapolate` continues the last
-segment instead — `node(L+1) = 2·node(L) − node(L−1)`, `node(L+2) = 3·node(L) −
-2·node(L−1)`, mirrored on the left, falling back to `repeat` where the span has no
-second node — which carries that line at constant spacing. Interior spans are
-untouched and the two rules are bit-identical there. The value is stamped into the
-checkpoint's `training_config` and `resolved_config.json`; resuming, validating or
-scoring a checkpoint under the other rule exits, and exporting one trained
-`extrapolate` fails in `exporters/modified_forward.load_model`. It is an
-experiment: `ARCH_VERSION`, the descriptor and the goldens are untouched.
-
-**Ghost patches are a flag, and only zero is exportable.** `config.GHOST_PATCHES` —
-`train.py --ghost-patches {0,1}`, env `T1DMAI_GHOST_PATCHES`, default `0` — appends
-that many masked patches past the horizon. They are predicted and discarded: the span
-pinned flush right becomes `PREDICTION_PATCHES + GHOST_PATCHES` long, the head's slot
-count `M` and `MAX_SEQ_LEN` grow by the same amount so the scored budget and the
-sampler's rejection boundary do not move, and a ghost slot is `present` but not
-`valid`, which keeps it out of every loss term and every metric. Nothing is measured
-past the tail, so a ghost patch's dose inputs are `normalize(0)` and its target is
-absent; the decoded fan a caller receives is still `PREDICTION_PATCHES · PATCH_SIZE`
-steps. What it buys is the last *scored* patch: with a real node at `i+1` its steps
-blend as an interior patch's do rather than against a repeat of the patch's own state,
-and the span-edge rule's reach into that patch falls by more than an order of
-magnitude. The count is stamped into the checkpoint's `training_config` and
-`resolved_config.json`; resuming, validating or scoring under a different count exits,
-and `exporters/modified_forward.load_model` refuses any checkpoint trained above zero.
-A random-window sample draws its masked set rather than pinning one, so it has no span
-to extend and `data._build_sample` refuses the flag on that path.
-
 The final layer initialises at `std = BG_HEAD_INIT_SCALE`, so at step 0 the head
 output is near zero, the median offset is near zero, and every slot's forecast is
 a flat persistence line at its own anchor.
