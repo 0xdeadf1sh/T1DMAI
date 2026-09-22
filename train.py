@@ -19,15 +19,18 @@ from torch.utils.data import DataLoader, Sampler
 
 
 def _layout_from_argv() -> None:
-    """--inputs / --spline-edge set their env var before config binds it; workers inherit it."""
+    """Experiment flags set their env var before config binds it; workers inherit it."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--inputs', choices=('curves', 'events'), default=None)
     pre.add_argument('--spline-edge', default=None)
+    pre.add_argument('--ghost-patches', type=int, default=None)
     pre_args = pre.parse_known_args()[0]
     if pre_args.inputs is not None:
         os.environ['T1DMAI_INPUT_LAYOUT'] = pre_args.inputs
     if pre_args.spline_edge is not None:
         os.environ['T1DMAI_SPLINE_EDGE'] = pre_args.spline_edge
+    if pre_args.ghost_patches is not None:
+        os.environ['T1DMAI_GHOST_PATCHES'] = str(pre_args.ghost_patches)
 
 
 if __name__ == '__main__':
@@ -59,10 +62,14 @@ from config import (                                           # noqa: E402
     SKILL_HEAD_LOSS_WEIGHT,
 )
 
-from config import ARCH_VERSION, LOSS_SCHEMA, SPLINE_EDGE_RULES
+import config as _config                                       # noqa: E402
+from config import (                                           # noqa: E402
+    ARCH_VERSION, GHOST_PATCHES_CHOICES, LOSS_SCHEMA, SPLINE_EDGE_RULES,
+)
 
 from utils import (
-    ModelEMA, checkpoint_spline_edge, kovatchev_f_inv, kovatchev_f_target,
+    ModelEMA, checkpoint_ghost_patches, checkpoint_spline_edge,
+    kovatchev_f_inv, kovatchev_f_target,
     create_attention_mask_from_visible,
     time_of_day_bin_ce, time_of_day_decode_bins, time_of_day_resultant,
     circular_hour_error, circular_hour_residual, circular_bias_hours, circular_std_hours,
@@ -1903,19 +1910,21 @@ def _forecast_protocol(
 ) -> "dict[str, torch.Tensor] | None":
     """FORECAST protocol, rebuilt from a collated batch: trailing PREDICTION_PATCHES masked/scored,
     the deployed 2h forecast case. A batch mask is NOT this (slot j = mask_idx[j], not j patches
-    past the edge); left-padding puts the zone at [T-P, T) regardless of n_ctx. Rows whose
-    context-edge patch (T-P-1) is masked are DROPPED, else last_bg leaks a withheld true value.
+    past the edge); left-padding puts the zone at [T-W, T) regardless of n_ctx. Rows whose
+    context-edge patch (T-W-1) is masked are DROPPED, else last_bg leaks a withheld true value.
     """
     B, T, _ = patches.shape
     P = PREDICTION_PATCHES
+    # W masked patches are emitted, P scored: the trailing GHOST_PATCHES are discarded.
+    W = P + _config.GHOST_PATCHES
     device = patches.device
-    assert T > P, f"window of {T} patches cannot hold a {P}-patch forecast zone"
+    assert T > W, f"window of {T} patches cannot hold a {W}-patch forecast zone"
 
     masked = torch.zeros(B, T, dtype=torch.bool, device=device)
     v_rows, v_cols = valid.nonzero(as_tuple=True)
     masked[v_rows, mask_idx[v_rows, v_cols]] = True
 
-    keep = ~masked[:, T - P - 1]
+    keep = ~masked[:, T - W - 1]
     if not bool(keep.any()):
         return None
     rows = keep.nonzero(as_tuple=True)[0]
@@ -1923,20 +1932,20 @@ def _forecast_protocol(
 
     fc_patches = patches[rows].clone()
     for feat_idx in NON_MASKABLE_FEATS:
-        fc_patches[:, T - P:, feat_idx::N_INPUT_FEATURES] = 0.0
-    fc_patches[:, T - P:, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
+        fc_patches[:, T - W:, feat_idx::N_INPUT_FEATURES] = 0.0
+    fc_patches[:, T - W:, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
 
     fc_masked = masked[rows].clone()
-    fc_masked[:, T - P:] = True
-    lens = n_context_patches.to(device).reshape(-1) + P
+    fc_masked[:, T - W:] = True
+    lens = n_context_patches.to(device).reshape(-1) + W
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
               < (T - lens).unsqueeze(1))[rows]
     attn = create_attention_mask_from_visible(~fc_masked, is_pad)
 
-    fc_mask_idx = (torch.arange(T - P, T, device=device, dtype=torch.long)
-                   .unsqueeze(0).expand(n, P).contiguous())
+    fc_mask_idx = (torch.arange(T - W, T, device=device, dtype=torch.long)
+                   .unsqueeze(0).expand(n, W).contiguous())
     return {'rows': rows, 'patches': fc_patches, 'attn_mask': attn,
-            'mask_idx': fc_mask_idx}
+            'mask_idx': fc_mask_idx, 'n_scored': P}
 
 
 def _window_bg_mgdl(
@@ -1984,7 +1993,7 @@ def _infill_protocol(
 
     B, T, _ = patches.shape
     S = PATCH_SIZE
-    M = MAX_MASKED_PATCHES
+    M = _config.MAX_MASKED_PATCHES
     P = PREDICTION_PATCHES
     device = patches.device
 
@@ -2047,7 +2056,7 @@ def _infill_protocol(
                  == withheld).all()), (
         "the bg_masked feat does not reproduce the infill protocol's masked set")
 
-    lens = n_context_patches.to(device).reshape(-1)[rows] + P
+    lens = n_context_patches.to(device).reshape(-1)[rows] + P + _config.GHOST_PATCHES
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
               < (T - lens).unsqueeze(1))
     attn = create_attention_mask_from_visible(~inf_masked, is_pad)
@@ -2509,8 +2518,10 @@ def _run_paired_rescue_probe(
                 _, median = model(
                     fc['patches'], fc['attn_mask'],
                     bf['last_bg'].float().to(device, non_blocking=True)[fc['rows']]
-                    .unsqueeze(1).expand(-1, PREDICTION_PATCHES),
+                    .unsqueeze(1).expand(-1, fc['mask_idx'].shape[1]),
                     fc['mask_idx'])
+                # The ghost slots are predicted, then dropped before anything reads them.
+                median = median[:, :fc['n_scored']]
                 pred = _median_to_mgdl(median.float()).detach().cpu().numpy()
                 true = (bf['true_bg_trajectory'][:, :n_steps].float().numpy())[rows_np]
                 pos = {int(r): j for j, r in enumerate(rows_np)}
@@ -2676,11 +2687,12 @@ def _run_validation(
             fc_rows = fc['rows']
             q_tau, median = model(
                 fc['patches'], fc['attn_mask'], bg_formula['last_bg'].float()[fc_rows]
-                .unsqueeze(1).expand(-1, PREDICTION_PATCHES),
+                .unsqueeze(1).expand(-1, fc['mask_idx'].shape[1]),
                 fc['mask_idx'],
             )
-            q_tau = q_tau.float()
-            median = median.float()
+            # The ghost slots are predicted, then dropped before any metric reads them.
+            q_tau = q_tau[:, :fc['n_scored']].float()
+            median = median[:, :fc['n_scored']].float()
             B_fc = median.shape[0]
             agg['fc_n'] = agg.get('fc_n', 0.0) + float(B_fc)
             # Every metric reads the forecast subset, so bg_formula is narrowed once, not per use.
@@ -3167,6 +3179,10 @@ def _check_resume_architecture(ckpt: dict, path: str) -> None:
     if edge != _cfg.SPLINE_EDGE:
         sys.exit(f"--checkpoint {path}: trained under --spline-edge {edge}; this run reads "
                  f"{_cfg.SPLINE_EDGE} (step_states forms a different node set)")
+    ghost = checkpoint_ghost_patches(ckpt)
+    if ghost != _cfg.GHOST_PATCHES:
+        sys.exit(f"--checkpoint {path}: trained under --ghost-patches {ghost}; this run reads "
+                 f"{_cfg.GHOST_PATCHES} (the span pinned right is a different length)")
     # The restored log_sigma_D was fitted to the D slot this value defines.
     if tc.get('mse_alpha') is not None and float(tc['mse_alpha']) != float(_cfg.MSE_ALPHA):
         sys.exit(f"--checkpoint {path}: mse_alpha {tc['mse_alpha']} != config.py "
@@ -3540,6 +3556,8 @@ def train(
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
         # EXPERIMENT: step_states' span-edge node rule; only 'repeat' is exportable.
         'spline_edge': _CFG_SPLINE_EDGE,
+        # EXPERIMENT: masked patches past the horizon, predicted then discarded; 0 is exportable.
+        'ghost_patches': _config.GHOST_PATCHES,
         # The sampler constants the run trained under — the provenance a loader compares against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
@@ -4185,6 +4203,10 @@ if __name__ == '__main__':
                         help='Experimental: virtual node where a span has no readable '
                              'neighbour. repeat (default) clamps to the edge node; extrapolate '
                              'continues the last segment. Only repeat is exportable.')
+    parser.add_argument('--ghost-patches', type=int, choices=GHOST_PATCHES_CHOICES, default=None,
+                        help='Experimental: extra masked patches predicted past the horizon and '
+                             'discarded, so the last scored patch has a right neighbour. M and '
+                             'MAX_SEQ_LEN grow by the same count. Only 0 is exportable.')
     parser.add_argument('--run-dir', type=str, default=None,
                         help="This run's own directory for checkpoints/ and logs/.")
     args = parser.parse_args()
@@ -4261,6 +4283,8 @@ if __name__ == '__main__':
     import config as _cfg_edge
     rows.append(('spline_edge', str(_cfg_edge.SPLINE_EDGE),
                  'CLI' if args.spline_edge is not None else 'config.py'))
+    rows.append(('ghost_patches', str(_cfg_edge.GHOST_PATCHES),
+                 'CLI' if args.ghost_patches is not None else 'config.py'))
     key_w = max(len(k) for k, _, _ in rows)
     val_w = max(len(v) for _, v, _ in rows)
     body = [f"  {k:<{key_w}}  {v:<{val_w}}  [{s}]" for k, v, s in rows]

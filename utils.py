@@ -453,6 +453,16 @@ def checkpoint_spline_edge(ckpt: "dict | None") -> str:
     return str(tc.get('spline_edge', SPLINE_EDGE_DEFAULT))
 
 
+def checkpoint_ghost_patches(ckpt: "dict | None") -> int:
+    """The ``config.GHOST_PATCHES`` count a checkpoint trained under.
+
+    Sole reader of the absent-key convention: absent means the default, never "unknown".
+    """
+    from config import GHOST_PATCHES_DEFAULT
+    tc = (ckpt or {}).get('training_config') or {}
+    return int(tc.get('ghost_patches', GHOST_PATCHES_DEFAULT))
+
+
 _BSPLINE_STEP_WEIGHT_CACHE: "dict[tuple[int, bool, bool, str], torch.Tensor]" = {}
 
 

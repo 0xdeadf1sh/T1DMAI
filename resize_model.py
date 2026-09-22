@@ -178,7 +178,8 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
             config.PATCH_DIM = patch_size * config.N_INPUT_FEATURES
             config._PATCHES_PER_HOUR = pph
             config.PREDICTION_PATCHES = config.PREDICTION_HORIZON_HOURS * pph
-            config.MAX_SEQ_LEN = config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
+            config.MAX_SEQ_LEN = (config.MAX_CONTEXT_PATCHES + config.PREDICTION_PATCHES
+                                  + config.GHOST_PATCHES)
         sys.modules.pop('model', None)
         from model import T1DMAI
         with torch.device('meta'):

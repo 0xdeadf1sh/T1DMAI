@@ -116,8 +116,8 @@ class MaskSpan:
 
 def user_mask_capacity(n_pred: int) -> int:
     """CONTEXT patches the user may still mask: the head's ``MAX_MASKED_PATCHES`` slots less
-    the ``n_pred`` the mandatory trailing forecast span already spends."""
-    return max(0, int(config.MAX_MASKED_PATCHES) - int(n_pred))
+    the ``n_pred`` the mandatory trailing forecast span already spends, and any ghost patch."""
+    return max(0, int(config.MAX_MASKED_PATCHES) - int(config.GHOST_PATCHES) - int(n_pred))
 
 
 def merge_mask_spans(spans: list[MaskSpan]) -> list[MaskSpan]:
@@ -224,10 +224,10 @@ def mask_span_ood(
     seq_len = int(n_ctx) + int(n_pred)
     out: dict[int, str] = {}
     total = sum(int(L) for _s, L in spans)
-    if total > config.MAX_MASKED_PATCHES:
+    if total > config.MAX_MASKED_PATCHES - config.GHOST_PATCHES:
         # unemittable, not unsupervised — no slot for the surplus in _mask_slots, so say so instead
         return {i: (f"{total} masked patches exceeds the head's "
-                    f"{config.MAX_MASKED_PATCHES} slots")
+                    f"{config.MAX_MASKED_PATCHES - config.GHOST_PATCHES} slots")
                 for i in range(len(spans))}
     _mask_idx, _valid, d, _anchor = _mask_slots(list(spans), seq_len)
     if len(spans) > config.MASK_MAX_SPANS:

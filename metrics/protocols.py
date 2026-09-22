@@ -19,6 +19,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import config                                            # noqa: E402
 from config import (                                     # noqa: E402
     PATCH_SIZE, PREDICTION_PATCHES, MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
     MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
@@ -65,8 +66,8 @@ INFILL = Protocol(
     name='infill', prefix='infill_', baseline='interpolation', sided='two-sided')
 PROTOCOLS = (FORECAST, INFILL)
 
-# Trailing forecast span costs PREDICTION_PATCHES, rides unscored (else one-sided in infill).
-INFILL_BUDGET_PATCHES = MAX_MASKED_PATCHES - PREDICTION_PATCHES
+# Trailing forecast span costs PREDICTION_PATCHES + a ghost, rides unscored (else one-sided).
+INFILL_BUDGET_PATCHES = MAX_MASKED_PATCHES - PREDICTION_PATCHES - config.GHOST_PATCHES
 assert INFILL_BUDGET_PATCHES >= min(MASK_SPAN_LENGTHS), (
     f"the head's {MAX_MASKED_PATCHES} slots leave {INFILL_BUDGET_PATCHES} for "
     f"interior spans after the mandatory {PREDICTION_PATCHES}-patch forecast "
@@ -136,7 +137,7 @@ class MaskedSet:
 
     @property
     def seq_len(self) -> int:
-        return self.n_ctx + PREDICTION_PATCHES
+        return self.n_ctx + PREDICTION_PATCHES + config.GHOST_PATCHES
 
     def scored_d(self) -> np.ndarray:
         """``d`` of every scored slot, in slot order."""
@@ -166,7 +167,7 @@ class MaskedSet:
 def _expand(protocol: Protocol, n_ctx: int,
             spans: Sequence[tuple[int, int]],
             scored: Sequence[tuple[int, int]]) -> MaskedSet:
-    seq_len = n_ctx + PREDICTION_PATCHES
+    seq_len = n_ctx + PREDICTION_PATCHES + config.GHOST_PATCHES
     spans_t = tuple((int(s), int(L)) for s, L in spans)
     scored_t = tuple((int(s), int(L)) for s, L in scored)
     mask_idx, valid, d, anchor_step = _mask_slots(list(spans_t), seq_len)
@@ -184,8 +185,9 @@ def _expand(protocol: Protocol, n_ctx: int,
 def forecast_masked_set(n_ctx: int) -> MaskedSet:
     """The FORECAST protocol at ``n_ctx``: one right-edge span, whole context visible; one masked
     patch lands at each of d = 1..PREDICTION_PATCHES, so every window fills every bin once."""
-    spans = [(int(n_ctx), PREDICTION_PATCHES)]
-    ms = _expand(FORECAST, n_ctx, spans, spans)
+    scored = [(int(n_ctx), PREDICTION_PATCHES)]
+    spans = [(int(n_ctx), PREDICTION_PATCHES + config.GHOST_PATCHES)]
+    ms = _expand(FORECAST, n_ctx, spans, scored)
     assert tuple(int(x) for x in ms.scored_d()) == reachable_d(FORECAST), (
         f"forecast d {ms.scored_d().tolist()} is not one-sided "
         f"1..{PREDICTION_PATCHES} — the right-edge span lost its geometry")
@@ -210,7 +212,7 @@ def infill_masked_set(n_ctx: int, rng: np.random.Generator) -> MaskedSet:
         if sum(L for _s, L in drawn) <= INFILL_BUDGET_PATCHES:
             break
     interior = [(int(s) + 1, int(L)) for s, L in drawn]
-    spans = interior + [(int(n_ctx), PREDICTION_PATCHES)]
+    spans = interior + [(int(n_ctx), PREDICTION_PATCHES + config.GHOST_PATCHES)]
     ms = _expand(INFILL, n_ctx, spans, interior)
     allowed = reachable_d(INFILL)
     assert all(int(x) in allowed for x in ms.scored_d()), (

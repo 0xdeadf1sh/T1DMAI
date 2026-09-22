@@ -11,14 +11,16 @@ from typing import Any
 import numpy as np
 import torch
 
+# MAX_MASKED_PATCHES moves with GHOST_PATCHES, so it is read off the module, never bound here.
+import config
 from config import (
     PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES, N_QUANTILES, N_SPREADS,
-    MAX_CONTEXT_PATCHES, MAX_MASKED_PATCHES,
+    MAX_CONTEXT_PATCHES,
     CHANNEL_TO_FEAT, MASKABLE_FEATS, NON_MASKABLE_FEATS, QUANTILE_LEVELS,
     TIME_PROBE_N_BINS,
 )
 # Slot expansion, anchor rule, bg_masked index: single definition in data.py — never re-derive.
-from data import BG_MASKED_FEAT, _mask_slots
+from data import BG_MASKED_FEAT, _mask_slots, ghost_slot_mask
 from model import T1DMAI
 from normalization import (
     load_normalization_stats, CHANNEL_NAMES, normalize,
@@ -49,15 +51,19 @@ def _resolve_mask_spans(mask_spans: MaskSpans | None, n_ctx: int) -> list[tuple[
     Rules: spans strictly increase and never abut (one visible separator patch is required
     between spans); sum(length) <= MAX_MASKED_PATCHES; every patch of [n_ctx, T) is masked
     (no visible future BG); at least one patch stays visible so every span has an anchor."""
-    seq_len = n_ctx + PREDICTION_PATCHES
+    n_ghost = int(config.GHOST_PATCHES)
+    seq_len = n_ctx + PREDICTION_PATCHES + n_ghost
     if mask_spans is None:
-        return [(n_ctx, PREDICTION_PATCHES)]
+        return [(n_ctx, PREDICTION_PATCHES + n_ghost)]
     spans = [(int(s), int(L)) for s, L in mask_spans]
     assert spans, "mask_spans is empty — the head must be given at least one masked patch"
+    # Idempotent: a set already reaching the ghost patch is not extended a second time.
+    if n_ghost and spans[-1][0] + spans[-1][1] == n_ctx + PREDICTION_PATCHES:
+        spans[-1] = (spans[-1][0], spans[-1][1] + n_ghost)
     total = sum(L for _s, L in spans)
-    assert total <= MAX_MASKED_PATCHES, (
+    assert total <= config.MAX_MASKED_PATCHES, (
         f"masked set of {total} patches exceeds the head's "
-        f"MAX_MASKED_PATCHES={MAX_MASKED_PATCHES} slots"
+        f"MAX_MASKED_PATCHES={config.MAX_MASKED_PATCHES} slots"
     )
     prev_end = -1
     for start, length in spans:
@@ -151,21 +157,22 @@ def _build_patches_tensor(
         f"context must be (n_ctx, PATCH_SIZE, {N_INPUT_FEATURES}), got {tuple(context.shape)}"
     )
     n_ctx = context.shape[0]
-    seq_len = n_ctx + PREDICTION_PATCHES
+    n_pred = PREDICTION_PATCHES + int(config.GHOST_PATCHES)
+    seq_len = n_ctx + n_pred
     spans = _resolve_mask_spans(mask_spans, n_ctx)
 
     # Flatten (PATCH_SIZE, N_INPUT_FEATURES) -> PATCH_DIM; feature values pass through verbatim.
     ctx_patches = context.reshape(n_ctx, PATCH_SIZE * N_INPUT_FEATURES)  # (n_ctx, PATCH_DIM)
 
     # bg stays 0 (predicted); MASKABLE_FEATS dose slots seed normalize(0), not z=0 (phantom dose).
-    pred_features = torch.zeros(PREDICTION_PATCHES, PATCH_SIZE, N_INPUT_FEATURES)
+    pred_features = torch.zeros(n_pred, PATCH_SIZE, N_INPUT_FEATURES)
     if normalization_stats is not None:
         zero_raw = normalize(
             np.zeros((1, len(CHANNEL_NAMES)), dtype=np.float32), normalization_stats,
         )[0]
         for feat_idx in MASKABLE_FEATS:
             pred_features[:, :, feat_idx] = float(zero_raw[feat_idx])
-    pred_patches = pred_features.reshape(PREDICTION_PATCHES, PATCH_SIZE * N_INPUT_FEATURES)
+    pred_patches = pred_features.reshape(n_pred, PATCH_SIZE * N_INPUT_FEATURES)
 
     # CHANNEL_TO_FEAT routes ch_idx to its feature slot, same mapping data.py uses.
     if overrides:
@@ -173,10 +180,10 @@ def _build_patches_tensor(
             if ch_idx not in CHANNEL_TO_FEAT:
                 continue
             feat_idx = CHANNEL_TO_FEAT[ch_idx]
-            # override_vals: (PREDICTION_PATCHES, PATCH_SIZE)
+            # override_vals: (PREDICTION_PATCHES, PATCH_SIZE); a ghost patch keeps normalize(0).
             for t in range(PATCH_SIZE):
                 flat_col = t * N_INPUT_FEATURES + feat_idx
-                pred_patches[:, flat_col] = override_vals[:, t]
+                pred_patches[:PREDICTION_PATCHES, flat_col] = override_vals[:, t]
 
     # ``cat`` allocates, so the writes below never reach back into the caller's context.
     patches = torch.cat([ctx_patches, pred_patches], dim=0)  # (T, PATCH_DIM)
@@ -217,7 +224,7 @@ def _run_forward(
         device = next(model.parameters()).device
     n_ctx = int(context.shape[0])
     spans = _resolve_mask_spans(mask_spans, n_ctx)
-    seq_len = n_ctx + PREDICTION_PATCHES
+    seq_len = n_ctx + PREDICTION_PATCHES + int(config.GHOST_PATCHES)
 
     patches, attn_mask = _build_patches_tensor(
         context, overrides=overrides, normalization_stats=anchor_stats,
@@ -226,8 +233,10 @@ def _run_forward(
     patches = patches.unsqueeze(0).to(device)    # (1, T, PATCH_DIM)
     attn_mask = attn_mask.to(device)             # (T, T)
 
-    mask_idx, valid, _d, anchor_step = _mask_slots(spans, seq_len)
-    anchor_patch, anchor_within = _anchor_cells(mask_idx, valid, anchor_step, n_ctx)
+    mask_idx, present, _d, anchor_step = _mask_slots(spans, seq_len)
+    # A ghost slot is masked, announced and anchored like any other; only scoring drops it.
+    valid = present & ~ghost_slot_mask(present)
+    anchor_patch, anchor_within = _anchor_cells(mask_idx, present, anchor_step, n_ctx)
     # M anchors + edge (-1,-1), one transfer; edge = last_bg = bg_window[n_ctx*PATCH_SIZE-1].
     cells_p = np.concatenate([anchor_patch, np.array([-1], dtype=np.int64)])
     cells_s = np.concatenate([anchor_within, np.array([-1], dtype=np.int64)])
@@ -239,9 +248,10 @@ def _run_forward(
     last_bg = float(anchors[M].item())
     mask_idx_t = torch.from_numpy(mask_idx).to(device).unsqueeze(0)  # (1, M) int64
     valid_t = torch.from_numpy(valid).to(device).unsqueeze(0)        # (1, M) bool
+    present_t = torch.from_numpy(present).to(device).unsqueeze(0)    # (1, M) bool
 
     # The bit must match the requested masked set — checked here, not trusted from the builder.
-    _assert_mask_announced(patches, mask_idx_t, valid_t)
+    _assert_mask_announced(patches, mask_idx_t, present_t)
 
     if grad:
         patches.requires_grad_(True)
@@ -261,7 +271,8 @@ def _run_forward(
         'median': median.squeeze(0),                        # (M, PATCH_SIZE)
         'time_pred': None if time_pred is None else time_pred.squeeze(0),
         'mask_idx': mask_idx_t.squeeze(0),                  # (M,) patch index per slot
-        'valid': valid_t.squeeze(0),                        # (M,) bool
+        'valid': valid_t.squeeze(0),                        # (M,) bool, ghost slots excluded
+        'present': present_t.squeeze(0),                    # (M,) bool, ghost slots included
         'anchor_bg': anchor_bg.squeeze(0),                  # (M,) mg/dL
         'last_bg': last_bg,
         'patches': patches,                                 # (1, T, PATCH_DIM)

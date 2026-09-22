@@ -323,7 +323,7 @@ def main() -> None:
     )
     from model import T1DMAI
     from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
-    from utils import checkpoint_spline_edge, kovatchev_f_inv
+    from utils import checkpoint_ghost_patches, checkpoint_spline_edge, kovatchev_f_inv
 
     if ckpt.get("arch_version") != ARCH_VERSION:
         sys.exit(
@@ -335,6 +335,10 @@ def main() -> None:
     if edge != _cfg.SPLINE_EDGE:
         sys.exit(f"--checkpoint {args.checkpoint}: trained under --spline-edge {edge}, "
                  f"this process reads {_cfg.SPLINE_EDGE}")
+    ghost = checkpoint_ghost_patches(ckpt)
+    if ghost != _cfg.GHOST_PATCHES:
+        sys.exit(f"--checkpoint {args.checkpoint}: trained under --ghost-patches {ghost}, "
+                 f"this process reads {_cfg.GHOST_PATCHES}")
     stats = ckpt["normalization_stats"]
 
     table, t_src, t_sid, t_epoch = _read_template(args.template, args.every, HORIZON_MINUTES)

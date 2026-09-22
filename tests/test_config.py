@@ -2,7 +2,7 @@ def test_config_imports():
     from config import (D_MODEL, N_LAYERS, N_HEADS, HEAD_DIM, FFN_DIM,
                         PATCH_SIZE, N_INPUT_FEATURES, N_QUANTILES,
                         MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
-                        PREDICTION_PATCHES, MAX_SEQ_LEN,
+                        PREDICTION_PATCHES, MAX_SEQ_LEN, GHOST_PATCHES,
                         PREDICTION_HORIZON_HOURS)
     # dims are tunable via resize_model.py; assert only the invariants
     assert D_MODEL == N_HEADS * HEAD_DIM
@@ -12,7 +12,7 @@ def test_config_imports():
     assert 60 % (PATCH_SIZE * 5) == 0
     assert N_INPUT_FEATURES == 4
     assert N_QUANTILES == 7
-    assert MAX_SEQ_LEN == MAX_CONTEXT_PATCHES + PREDICTION_PATCHES
+    assert MAX_SEQ_LEN == MAX_CONTEXT_PATCHES + PREDICTION_PATCHES + GHOST_PATCHES
     assert PREDICTION_PATCHES == PREDICTION_HORIZON_HOURS * (60 // (PATCH_SIZE * 5))
     # the 24 h cycle bounds the horizon
     assert 0 < PREDICTION_HORIZON_HOURS <= 24

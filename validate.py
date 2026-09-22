@@ -110,11 +110,18 @@ def main() -> None:
     if ckpt.get('arch_version') != config.ARCH_VERSION:
         sys.exit(f"{a.checkpoint}: arch_version {ckpt.get('arch_version')!r} != "
                  f"config.py {config.ARCH_VERSION!r}")
-    from utils import checkpoint_spline_edge
+    from utils import checkpoint_ghost_patches, checkpoint_spline_edge
     edge = checkpoint_spline_edge(ckpt)
     if edge != config.SPLINE_EDGE:
         sys.exit(f"{a.checkpoint}: trained under --spline-edge {edge}, evaluated under "
                  f"{config.SPLINE_EDGE}; rerun with {config.SPLINE_EDGE_ENV}={edge}")
+    ghost = checkpoint_ghost_patches(ckpt)
+    if ghost != config.GHOST_PATCHES:
+        sys.exit(f"{a.checkpoint}: trained under --ghost-patches {ghost}, evaluated under "
+                 f"{config.GHOST_PATCHES}; rerun with {config.GHOST_PATCHES_ENV}={ghost}")
+    if ghost and a.backup is not None:
+        sys.exit(f"{a.checkpoint}: --ghost-patches {ghost} extends the span pinned flush right, "
+                 f"which a --backup random window never has; score simulator patients instead")
     stats = ckpt.get('normalization_stats')
     if stats is None:
         sys.exit(f'{a.checkpoint}: no normalization_stats')

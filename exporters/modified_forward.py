@@ -11,7 +11,10 @@ import torch.nn as nn
 
 from config import HEAD_DIM, MAX_MASKED_PATCHES, PREDICTION_PATCHES, MAX_SEQ_LEN
 from model import T1DMAI, build_rope_cache
-from utils import checkpoint_spline_edge, create_attention_mask_from_visible, step_states
+from utils import (
+    checkpoint_ghost_patches, checkpoint_spline_edge,
+    create_attention_mask_from_visible, step_states,
+)
 
 # fp16-safe additive block fill; exp(-30000) underflows to 0.0 in fp32/fp64, matching a -inf mask
 NEG_FILL: float = -30000.0
@@ -172,6 +175,12 @@ def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
     assert edge == _cfg.SPLINE_EDGE == _cfg.SPLINE_EDGE_DEFAULT, (
         f"spline edge {edge!r} (checkpoint) / {_cfg.SPLINE_EDGE!r} (process): the phone's head "
         f"implements {_cfg.SPLINE_EDGE_DEFAULT!r} only, so this checkpoint is not exportable"
+    )
+    ghost = checkpoint_ghost_patches(ck)
+    assert ghost == _cfg.GHOST_PATCHES == _cfg.GHOST_PATCHES_DEFAULT, (
+        f"ghost patches {ghost} (checkpoint) / {_cfg.GHOST_PATCHES} (process): the phone's head "
+        f"implements {_cfg.GHOST_PATCHES_DEFAULT} ghost patches only, so this checkpoint is not "
+        f"exportable"
     )
     for cfg_name, tc_key in (
         ("D_MODEL", "d_model"), ("N_LAYERS", "n_layers"), ("N_HEADS", "n_heads"),
