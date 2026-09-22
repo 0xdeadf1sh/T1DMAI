@@ -187,9 +187,9 @@ def risk_total_loss(
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Pinball + per-span DILATE/MSE, Kendall-Gal weighted; target f-transformed once, here.
 
-    DILATE runs on the MEDIAN once per span (not per sample), bucketed by length ``L``,
-    patch-major. An empty bucket is NEVER dispatched — ``(0,H)`` means to NaN, killing
-    checkpoint selection. Buckets combine by a SPAN-COUNT-WEIGHTED mean, never concatenated."""
+    DILATE runs on the MEDIAN once per span, bucketed by length ``L``, patch-major. An empty
+    bucket is NEVER dispatched — ``(0,H)`` means to NaN. Buckets combine by a SPAN-COUNT-WEIGHTED
+    mean. ``L_C``, the mean squared second difference per span, is added OUTSIDE the fusion."""
     assert q_tau.dim() == 4, f"q_tau must be (B,M,S,Q), got {tuple(q_tau.shape)}"
     assert median.dim() == 3, f"median must be (B,M,S), got {tuple(median.shape)}"
     assert true_bg_mgdl.shape == median.shape, (
@@ -224,8 +224,11 @@ def risk_total_loss(
     n_masked_total = sum(len(rows_l) * length for length, (rows_l, _) in buckets.items())
     dev = median.device
     per_bucket: Dict[int, torch.Tensor] = {}
-    num_loss = num_shape = num_tdi = None
-    for length in (sorted(buckets) if alpha < 1.0 else ()):
+    num_loss = num_shape = num_tdi = num_curv = None
+    lam = float(config.CURVATURE_LAMBDA)
+    assert lam >= 0.0, f"CURVATURE_LAMBDA must be non-negative, got {lam}"
+    # MSE-only still walks the buckets when lam > 0: the penalty is per span, like DILATE.
+    for length in (sorted(buckets) if (alpha < 1.0 or lam > 0.0) else ()):
         rows_l, starts_l = buckets[length]
         n_b = len(rows_l)
         if n_b == 0:
@@ -237,13 +240,20 @@ def risk_total_loss(
         # Gathering only the span's slots leaves a padded slot NO grad path, not one zeroed.
         m_b = _to_patch_major(median[rows.unsqueeze(1), slots])           # (n_b, L*S)
         y_b = _to_patch_major(y_risk[rows.unsqueeze(1), slots])
+        w = float(n_b)
+        if lam > 0.0:
+            # Second difference along the span's own time axis; never across the separator.
+            d2 = m_b[:, 2:] - 2.0 * m_b[:, 1:-1] + m_b[:, :-2]
+            c_b = (d2 ** 2).mean()
+            num_curv = c_b * w if num_curv is None else num_curv + c_b * w
+        if alpha >= 1.0:
+            continue
         l_b, s_b, t_b = dilate_loss(
             m_b,
             y_b,
             alpha=config.DILATE_ALPHA,
             gamma=config.DILATE_GAMMA,
         )
-        w = float(n_b)
         num_loss = l_b * w if num_loss is None else num_loss + l_b * w
         num_shape = s_b * w if num_shape is None else num_shape + s_b * w
         num_tdi = t_b * w if num_tdi is None else num_tdi + t_b * w
@@ -255,10 +265,13 @@ def risk_total_loss(
         loss_D_shape = median.new_zeros(())
         loss_D_tdi = median.new_zeros(())
     else:
+        assert num_shape is not None and num_tdi is not None, "shape/tdi accumulate with num_loss"
         denom = float(n_spans_total)
         loss_D = num_loss / denom
         loss_D_shape = num_shape / denom
         loss_D_tdi = num_tdi / denom
+
+    loss_C = (num_curv / float(n_spans_total)) if num_curv is not None else median.new_zeros(())
 
     loss_M = (mse_loss(median, y_risk, valid=valid) if alpha > 0.0
               else median.new_zeros(()))
@@ -266,11 +279,13 @@ def risk_total_loss(
 
     log_sigma_Q, log_sigma_D = weighting.clamped()
     total = (0.5 * torch.exp(-2.0 * log_sigma_Q) * loss_Q + log_sigma_Q
-             + 0.5 * torch.exp(-2.0 * log_sigma_D) * loss_DR + log_sigma_D)
+             + 0.5 * torch.exp(-2.0 * log_sigma_D) * loss_DR + log_sigma_D
+             + lam * loss_C)
 
     components: Dict[str, torch.Tensor] = {
         "loss_Q": loss_Q.detach(),
         "loss_D": loss_D.detach(),
+        "loss_C": loss_C.detach(),
         "loss_M": loss_M.detach(),
         "loss_D_shape": loss_D_shape.detach(),
         "loss_D_tdi": loss_D_tdi.detach(),

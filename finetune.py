@@ -248,6 +248,7 @@ def main() -> None:
         MAX_MASKED_PATCHES,
         METRIC_BAND_TAU_HI,
         METRIC_BAND_TAU_LO,
+        CURVATURE_LAMBDA,
         MSE_ALPHA,
         MUON_LR,
         MUON_MOMENTUM,
@@ -660,6 +661,7 @@ def main() -> None:
                     ckpt.get("training_config", {}) if ckpt is not None else {},
                     finetune=vars(args) | {"init_from": init_from},
                     mse_alpha=MSE_ALPHA,
+                    curvature_lambda=CURVATURE_LAMBDA,
                 ),
                 "finetune_step": step,
                 "finetune_metrics": {

@@ -32,6 +32,7 @@ from config import (                                           # noqa: E402
     VALIDATION_N_PATIENTS, VALIDATION_PROBE_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
     N_INPUT_FEATURES, NON_MASKABLE_FEATS, MASKABLE_FEATS,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
+    CURVATURE_LAMBDA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     EMA_DECAY,
     BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD,
@@ -1818,7 +1819,8 @@ def _run_validation(
     infill_* columns vs LINEAR INTERPOLATION, never persistence). Fans decode to mg/dL once;
     every figure bins on d, no pooled masked-BG scalar; pred_bg=f_inv(median) is the only one."""
     model.eval()
-    totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0, 'pinball': 0.0}
+    totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0,
+                                'loss_C': 0.0, 'pinball': 0.0}
     n_samples = 0
 
     agg: dict[str, float] = {}
@@ -1886,6 +1888,7 @@ def _run_validation(
             totals['loss_Q'] += float(parts.get('loss_Q', float('nan'))) * B_batch
             totals['loss_D'] += float(parts.get('loss_D', float('nan'))) * B_batch
             totals['loss_M'] += float(parts.get('loss_M', float('nan'))) * B_batch
+            totals['loss_C'] += float(parts.get('loss_C', float('nan'))) * B_batch
             totals['pinball'] += float(parts.get('pinball', parts.get('loss_Q', float('nan')))) * B_batch
 
             # Diagnostic only, never in loss/selection; slot 0 decodes to hour+confidence R.
@@ -2064,6 +2067,7 @@ def _run_validation(
         'val_loss_Q': totals['loss_Q'] / n,
         'val_loss_D': totals['loss_D'] / n,
         'val_loss_M': totals['loss_M'] / n,
+        'val_loss_C': totals['loss_C'] / n,
         'val_pinball': totals['pinball'] / n,
         'log_sigma_Q': float(weighting.log_sigma_Q.detach()),
         'log_sigma_D': float(weighting.log_sigma_D.detach()),
@@ -2399,6 +2403,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
     return [
         ('step', 0), ('loss_total', 6), ('loss_ema', 6),
         ('loss_Q', 6), ('loss_D', 6), ('loss_D_shape', 6), ('loss_D_tdi', 6), ('loss_M', 6),
+        ('loss_C', 6),
         *[(f'loss_D_L{L}', 6) for L in MASK_SPAN_LENGTHS],
         *[(f'n_spans_L{L}', 3) for L in MASK_SPAN_LENGTHS],
         ('n_masked_mean', 3), ('n_spans_mean', 3),
@@ -2429,6 +2434,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
     return [
         ('step', 0),
         ('val_loss_total', 6), ('val_loss_Q', 6), ('val_loss_D', 6), ('val_loss_M', 6),
+        ('val_loss_C', 6),
         ('train_loss_ema', 6), ('overfit_ratio', 6),
         *[(f'coverage90@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
         *[(f'sign_balance@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
@@ -2658,6 +2664,7 @@ def train(
     )
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
+        'curvature_lambda': CURVATURE_LAMBDA,
         # Sampler constants the run trained under, for a loader to compare its live config against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
@@ -2916,6 +2923,7 @@ def train(
             loss_d_shape = float(parts.get('loss_D_shape', float('nan')))
             loss_d_tdi = float(parts.get('loss_D_tdi', float('nan')))
             loss_m = float(parts.get('loss_M', float('nan')))
+            loss_c = float(parts.get('loss_C', float('nan')))
             log_sigma_q = float(parts.get('log_sigma_Q', float('nan')))
             log_sigma_d = float(parts.get('log_sigma_D', float('nan')))
             loss_tod = _tod_loss_val
@@ -2926,6 +2934,7 @@ def train(
                 f"Loss: {loss_val:.4f} (ema={loss_ema:.4f}) | "
                 f"L_Q: {loss_q:.4f}  L_D: {loss_d:.4f} "
                 f"(sh={loss_d_shape:.4f} tdi={loss_d_tdi:.4f})  L_M: {loss_m:.4f} | "
+                + (f"L_C: {loss_c:.4f} | " if CURVATURE_LAMBDA > 0.0 else "") +
                 f"logσ: Q={log_sigma_q:+.4f} D={log_sigma_d:+.4f} | "
                 f"L_tod: {loss_tod:.4f} (xwin {loss_tod_xwin:.4f}) | "
                 f"Grad: {grad_norm_val:.3f} | "
@@ -2938,6 +2947,7 @@ def train(
                 'loss_total': loss_val, 'loss_ema': loss_ema,
                 'loss_Q': loss_q, 'loss_D': loss_d,
                 'loss_D_shape': loss_d_shape, 'loss_D_tdi': loss_d_tdi, 'loss_M': loss_m,
+                'loss_C': loss_c,
                 # Per-bucket DILATE/histogram: effective Q:D balance moves with span mixture.
                 **{k: float(v) for k, v in parts.items()
                    if k.startswith('loss_D_L') or k.startswith('n_spans_L')},
@@ -2992,6 +3002,7 @@ def train(
                 'val_loss_Q': round(val_metrics['val_loss_Q'], 6),
                 'val_loss_D': round(val_metrics['val_loss_D'], 6),
                 'val_loss_M': round(val_metrics['val_loss_M'], 6),
+                'val_loss_C': round(val_metrics['val_loss_C'], 6),
                 'train_loss_ema': round(train_ema, 6),
                 'overfit_ratio': round(overfit_ratio, 4),
                 **{f'coverage90@{h}': _r(val_metrics.get(f'coverage90@{h}'))
@@ -3303,6 +3314,7 @@ if __name__ == '__main__':
     rows.append(('arch_version', str(ARCH_VERSION), 'config.py'))
     rows.append(('loss_schema', str(LOSS_SCHEMA), 'config.py'))
     rows.append(('mse_alpha', str(MSE_ALPHA), 'config.py'))
+    rows.append(('curvature_lambda', str(CURVATURE_LAMBDA), 'config.py'))
     # Read back off config: what the run trains with matches what the checkpoint records.
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
     rows.append(('max_masked_patches', str(MAX_MASKED_PATCHES), 'config.py'))

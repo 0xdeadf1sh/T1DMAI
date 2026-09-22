@@ -569,6 +569,33 @@ L_DR = (1 − MSE_ALPHA) · L_D + MSE_ALPHA · L_M
 `MSE_ALPHA = 0` skips the MSE. `MSE_ALPHA = 1` skips the soft-DTW, and
 `loss_D` and every `loss_D_L{L}` log as zero.
 
+### Curvature
+
+The median's mean squared second difference, per span, patch-major, combined by
+the same span-count-weighted mean DILATE uses:
+
+```
+L_C = mean over spans of mean over the span of (m[t+1] − 2·m[t] + m[t−1])²
+```
+
+It is added to the total **outside** the Kendall-Gal fusion:
+
+```
+total = fused(L_Q, L_DR) + CURVATURE_LAMBDA · L_C
+```
+
+so its trade against `L_D` is `CURVATURE_LAMBDA`, not `log_σ_D`, which moves
+during training. The second difference runs within a span and never across the
+visible separator between two spans. `CURVATURE_LAMBDA = 0`, the default, leaves
+the total unchanged and logs `loss_C` as zero; a positive value walks the span
+buckets even at `MSE_ALPHA = 1`, where the soft-DTW is skipped.
+
+Soft-DTW is warping-invariant, so per-step placement is nearly free and the shape
+term will buy texture the physiology does not have, most cheaply at a span's last
+steps. `L_C` is what prices that texture. Its scale reference is the simulator's
+own noise-free tail — `median_roughness` in `sim_dose_reference.json`, which the
+validation table prints as the target beside the model's.
+
 ### Kendall-Gal weighting
 
 The two terms are fused by learned homoscedastic-uncertainty weights rather than

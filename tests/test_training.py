@@ -248,6 +248,48 @@ def test_mse_alpha_mixes_dilate_and_mse(monkeypatch, alpha):
           f"total={float(total):.4f} ✓")
 
 
+@pytest.mark.parametrize("alpha", [0.0, 1.0])
+def test_curvature_lambda_penalises_the_median_second_difference(monkeypatch, alpha):
+    """``CURVATURE_LAMBDA`` adds ``λ·L_C`` OUTSIDE the Kendall fusion, at every ``MSE_ALPHA``.
+
+    ``L_C`` is the median's mean squared second difference per span, patch-major; λ=0 leaves
+    the total bit-identical, and a kinked median scores above a straight one."""
+    import config
+    from risk_loss import risk_total_loss, KendallGalWeighting
+    from utils import assemble_quantiles
+
+    B, P, S = 2, config.PREDICTION_PATCHES, config.PATCH_SIZE
+    torch.manual_seed(2)
+    head_raw = torch.randn(B, P, S, 1 + 2 * ((config.N_QUANTILES - 1) // 2))
+    q_tau, median = assemble_quantiles(head_raw, torch.full((B,), 120.0))
+    true_bg = 90.0 + 80.0 * torch.rand(B, P, S)
+    monkeypatch.setattr(config, 'MSE_ALPHA', alpha)
+
+    monkeypatch.setattr(config, 'CURVATURE_LAMBDA', 0.0)
+    base, comp0 = risk_total_loss(q_tau, median, true_bg, KendallGalWeighting())
+    assert float(comp0['loss_C']) == 0.0, "λ=0 must not spend a soft-DTW-free bucket walk"
+
+    lam = 3.0
+    monkeypatch.setattr(config, 'CURVATURE_LAMBDA', lam)
+    total, comp = risk_total_loss(q_tau, median, true_bg, KendallGalWeighting())
+    flat = median.reshape(B, P * S)
+    d2 = flat[:, 2:] - 2.0 * flat[:, 1:-1] + flat[:, :-2]
+    assert torch.allclose(comp['loss_C'], (d2 ** 2).mean(), atol=1e-6), (
+        f"L_C {float(comp['loss_C'])} != hand-computed {float((d2 ** 2).mean())}")
+    assert torch.allclose(total, base + lam * comp['loss_C'], atol=1e-6), (
+        f"λ·L_C must ride outside the fusion: {float(total)} != {float(base)} + "
+        f"{lam}·{float(comp['loss_C'])}")
+
+    # A sawtooth median is the shape the penalty exists to price out.
+    kinked = median.clone()
+    kinked[:, -1, ::2] += 0.5
+    _, comp_k = risk_total_loss(q_tau, kinked, true_bg, KendallGalWeighting())
+    assert float(comp_k['loss_C']) > float(comp['loss_C']), (
+        f"kinked L_C {float(comp_k['loss_C'])} must exceed smooth {float(comp['loss_C'])}")
+    print(f"\n[DUMP] curvature α={alpha} | L_C={float(comp['loss_C']):.6f} "
+          f"kinked={float(comp_k['loss_C']):.6f} outside-fusion ✓")
+
+
 def test_risk_total_loss_f_applied_once_and_finite():
     """The target arrives as mg/dL, NOT f-transformed; ``kovatchev_f_target`` is applied
     exactly once inside."""

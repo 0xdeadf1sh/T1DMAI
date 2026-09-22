@@ -150,6 +150,8 @@ DILATE_TDI_FD_EPS = (
     0.05  # FD step for TDI = d/dε sDTW(C+εΩ)|0; median grad exact to O(ε)
 )
 MSE_ALPHA = 0.0  # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
+# Outside the Kendall fusion, so the trade against L_D is this number and not log_sigma_D's.
+CURVATURE_LAMBDA = 0.0  # weight on the median's mean squared second difference, per span
 KENDALL_LOGVAR_INIT = 0.0  # init for log_sigma_Q / log_sigma_D; clamped [-7, 7]
 
 # Provenance only: stamped into checkpoint/JSON/descriptor, compared by nothing at load time.

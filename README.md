@@ -234,7 +234,7 @@ spans are drawn per sample. Day and night are learned by one model without a
 band restriction, because each row starts at a random hour, so the boundaries
 spread over the clock.
 
-The loss has three terms, all in risk space:
+The loss has four terms, all in risk space:
 
 - **Pinball loss** over all seven quantile levels, which calibrates each level to
   its coverage and pins the median pointwise.
@@ -246,6 +246,11 @@ The loss has three terms, all in risk space:
 - **MSE** on the median, in risk space, sharing DILATE's slot as
   `(1 − MSE_ALPHA)·DILATE + MSE_ALPHA·MSE`. `MSE_ALPHA` in `config.py`:
   0 is DILATE only, 1 is MSE only.
+- **Curvature** on the median — its mean squared second difference per span,
+  weighted by `CURVATURE_LAMBDA` in `config.py`. Soft-DTW is warping-invariant,
+  so it will buy per-step texture the physiology does not have; this term prices
+  it, against the simulator's own noise-free roughness. It is added outside the
+  fusion below, so that weight is the whole trade. At the default 0 it is inert.
 
 Pinball and the DILATE/MSE slot are fused by learned Kendall-Gal homoscedastic
 uncertainty weights: two log-variance scalars, trained alongside the model, so the trade-off is learned
