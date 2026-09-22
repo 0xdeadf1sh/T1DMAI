@@ -69,7 +69,13 @@ from utils import (
 )
 
 from T1DMSIM.simulator import (
-    BG_CLAMP_MIN, BG_CLAMP_MAX, BG_SCALE_FACTOR, DT_MINUTES, bolus_pk_for_dose, gamma_curve,
+    BG_CLAMP_MIN, BG_CLAMP_MAX, BG_SCALE_FACTOR, DT_MINUTES,
+)
+
+import sim_dose_reference
+from sim_dose_reference import (
+    _CF_LADDER, _CF_LINEARITY_FLOOR_MGDL, _CF_ONSET_MGDL, _CF_PRE_ACTION_STEPS,
+    _CF_REF_RUNG, _cf_bolus_curve, _cf_median, _cf_onset_step,
 )
 
 # Band-edge indices on the ascending QUANTILE_LEVELS axis, never a bare literal.
@@ -139,7 +145,7 @@ from normalization import (
 from data import (
     T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy,
     checkpoint_masked_channel_policy, NO_TAIL_ARM, TAIL_ARMS,
-    TAIL_ARM_NONE, TAIL_ARM_CARBS,
+    TAIL_ARM_NONE, TAIL_ARM_BOLUS, TAIL_ARM_CARBS,
 )
 from risk_loss import risk_total_loss, KendallGalWeighting
 import cg_ega
@@ -653,6 +659,24 @@ def _render_validation_table(
             return _colored(sym, _ANSI_GREEN) if improved else _colored(sym, _ANSI_RED)
         return _colored('—', _ANSI_GRAY)
 
+    sim_ref = sim_dose_reference.load_reference()
+
+    def _sim_ref_value(key: str) -> float | None:
+        fig = sim_dose_reference.figure(sim_ref, key)
+        return None if fig is None else float(fig['value'])
+
+    def _sim_ref_label(base: str, key: str, fmt: str = '{:.2f}', unit: str = '',
+                       suffix: str = '') -> str:
+        """``base`` with the measured simulator reference, its p10–p90 where the file has one."""
+        fig = sim_dose_reference.figure(sim_ref, key)
+        if fig is None:
+            return f'{base} (ref unknown{suffix})'
+        text = f"ref {fmt.format(float(fig['value']))}{unit}"
+        if fig.get('p10') is not None and fig.get('p90') is not None:
+            text += (f", p10–p90 {fmt.format(float(fig['p10']))}"
+                     f" … {fmt.format(float(fig['p90']))}")
+        return f'{base} ({text}{suffix})'
+
     rows: list[tuple[str, str, str, str, str, str]] = []
     # (metric, value, prev, trend, target, unit); value carries NO unit, layout appends it once.
 
@@ -900,11 +924,16 @@ def _render_validation_table(
     higher_row('direction (roc_corr)', val_metrics.get('roc_corr'),
                0.650, fmt='{:+.3f}', warn_gap=0.20,
                prev_key='roc_corr')
-    # The anti-oscillation witness the headline RMSE structurally masks.
-    lower_row('median_roughness', val_metrics.get('median_roughness'),
-              0.010, fmt='{:.6f}', warn_mult=2.0, prev_key='median_roughness')
-    lower_row('  ↳ far (last patch)', val_metrics.get('median_roughness_far'),
-              0.010, fmt='{:.6f}', warn_mult=2.0, prev_key='median_roughness_far')
+    # The anti-oscillation witness the headline RMSE structurally masks; sim's own tail is target.
+    for _label, _key in (('median_roughness', 'median_roughness'),
+                         ('  ↳ far (last patch)', 'median_roughness_far')):
+        _rough_ref = _sim_ref_value(_key)
+        if _rough_ref is None:
+            info_row(_label, val_metrics.get(_key), fmt='{:.6f}', target='ref unknown',
+                     prev_key=_key, direction='lower')
+        else:
+            lower_row(_label, val_metrics.get(_key), _rough_ref, fmt='{:.6f}',
+                      warn_mult=2.0, prev_key=_key)
     _blank()
 
     # Mean-collapse detectors, none a selection metric: a mean forecaster scores well, ratio~0.
@@ -1128,8 +1157,6 @@ def _render_validation_table(
     _blank()
 
     _cf_n = int(val_metrics.get('cf_n', 0) or 0)
-    _cf_hypo_n = int(val_metrics.get('cf_hypo_n', 0) or 0)
-    _cf_hyper_n = int(val_metrics.get('cf_hyper_n', 0) or 0)
     _cf_horizon_min = PREDICTION_PATCHES * PATCH_SIZE * DT_MINUTES
 
     def _pct_row(label: str, key: str) -> None:
@@ -1144,35 +1171,38 @@ def _render_validation_table(
     def _ref(v: float | None, fmt: str = '{:.2f}') -> str:
         return fmt.format(v) if v is not None else '?'
 
-    # Terminal-step ΔBG against the baseline; the label carries the sim open-loop reference.
+    # Terminal-step ΔBG against the baseline; the label carries the measured sim reference.
     _section(f'Counterfactual Dose-Response ({_cf_n} samples, Δ @{_cf_horizon_min} min)')
     _pct_row(f'carb sign (+{CF_CARB_BOLUS_G:g} g; ref 100%)', 'cf_carb_sign')
     _pct_row(f'insulin sign (+{CF_INSULIN_BOLUS_U:g} U; ref 100%)', 'cf_insulin_sign')
     _pct_row('carb monotonic (0/½/1/2×; ref 100%)', 'cf_carb_monotonic')
     _pct_row('insulin monotonic (0/½/1/2×; ref 100%)', 'cf_insulin_monotonic')
-    _ratio_row('carb gain (ref 1×, Sg pulls <1)', 'cf_carb_gain')
-    _ratio_row('insulin gain (ref 1×, ≈1/IR)', 'cf_insulin_gain')
-    _ratio_row('carb linearity 2×/1× (ref 2.00×)', 'cf_carb_linearity')
-    _ratio_row(f"insulin linearity 2×/1× (ref {_ref(val_metrics.get('cf_insulin_linearity_ref'))}× PK)",
+    _ratio_row(_sim_ref_label('carb gain', 'cf_carb_gain', unit='×'), 'cf_carb_gain')
+    _ratio_row(_sim_ref_label('insulin gain', 'cf_insulin_gain', unit='×'), 'cf_insulin_gain')
+    _ratio_row(_sim_ref_label('carb linearity 2×/1×', 'cf_carb_linearity', unit='×'),
+               'cf_carb_linearity')
+    _ratio_row(_sim_ref_label('insulin linearity 2×/1×', 'cf_insulin_linearity', unit='×'),
                'cf_insulin_linearity')
-    info_row(f'insulin pre-action Δ 0–{_CF_PRE_ACTION_STEPS * DT_MINUTES} min (ref 0)',
+    info_row(_sim_ref_label(f'insulin pre-action Δ 0–{_CF_PRE_ACTION_STEPS * DT_MINUTES} min',
+                            'cf_insulin_preaction_dbg', fmt='{:+.2f}', unit=' mg/dL'),
              val_metrics.get('cf_insulin_preaction_dbg'), fmt='{:+.2f}', unit=' mg/dL',
              prev_key='cf_insulin_preaction_dbg', direction='none')
     _cof = val_metrics.get('cf_carb_onset_frac')
-    info_row(f'carb onset lag to ±{_CF_ONSET_MGDL:g} mg/dL ({_ref(_cof, "{:.0%}")} reached; ref 0)',
+    info_row(_sim_ref_label(f'carb onset lag to ±{_CF_ONSET_MGDL:g} mg/dL',
+                            'cf_carb_onset_lag_min', fmt='{:+.0f}', unit=' min',
+                            suffix=f'; {_ref(_cof, "{:.0%}")} reached'),
              val_metrics.get('cf_carb_onset_lag_min'), fmt='{:+.0f}', unit=' min',
              prev_key='cf_carb_onset_lag_min', direction='none')
     _iof = val_metrics.get('cf_insulin_onset_frac')
-    info_row(f'insulin onset lag to ±{_CF_ONSET_MGDL:g} mg/dL ({_ref(_iof, "{:.0%}")} reached; ref 0)',
+    info_row(_sim_ref_label(f'insulin onset lag to ±{_CF_ONSET_MGDL:g} mg/dL',
+                            'cf_insulin_onset_lag_min', fmt='{:+.0f}', unit=' min',
+                            suffix=f'; {_ref(_iof, "{:.0%}")} reached'),
              val_metrics.get('cf_insulin_onset_lag_min'), fmt='{:+.0f}', unit=' min',
              prev_key='cf_insulin_onset_lag_min', direction='none')
-    info_row(f"matched-bolus coverage (ref {_ref(val_metrics.get('cf_meal_coverage_ref'))} PK/ICR)",
+    info_row(_sim_ref_label('matched-bolus coverage', 'cf_meal_coverage'),
              val_metrics.get('cf_meal_coverage'), fmt='{:.2f}',
              prev_key='cf_meal_coverage', direction='none')
-    _lag = _CF_RESCUE_LAG_STEPS * DT_MINUTES
-    _pct_row(f'hypo rescue by carb ({_cf_hypo_n} hypo; after {_lag} min)', 'cf_hypo_rescue')
-    _pct_row(f'hyper rescue by insulin ({_cf_hyper_n} hyper; after {_lag} min)',
-             'cf_hyper_rescue')
+    # Rescue is the arm box's paired reading alone: this probe's baseline is the model's own.
     _blank()
 
     # Diagnostic, co-trains trunk, feeds no loss; thresholds are clock-usability, not external SOTA.
@@ -1358,27 +1388,32 @@ def _render_arm_table(val_metrics: dict[str, Any]) -> str:
         return left + mid.join('─' * (w + 2) for w in widths) + right
 
     inner = sum(w + 3 for w in widths) - 3
-    rescue = _arm_rescue_line(val_metrics)
     title = f'By tail arm - forecast protocol, {PREDICTION_HORIZON_HOURS}h horizon'
     out = [rule('┌', '─', '┐'),
            '│ ' + title.ljust(inner) + ' │',
            rule('├', '┬', '┤'), _row(header), rule('├', '┼', '┤'),
            *[_row(r) for r in body], rule('├', '┴', '┤'),
-           '│ ' + rescue.ljust(inner) + ' │',
+           *[f'│ {line.ljust(inner)} │' for line in _arm_rescue_lines(val_metrics)],
            rule('└', '─', '┘')]
     return '\n'.join(out)
 
 
-def _arm_rescue_line(val_metrics: dict[str, Any]) -> str:
-    """The paired-arm low-rescue reading as one line, each share with its own n."""
-    def _cell(tag: str) -> str:
-        share = val_metrics.get(f'arm_rescue_{tag}_share')
-        n = int(float(val_metrics.get(f'arm_rescue_{tag}_n') or 0.0))
+def _arm_rescue_lines(val_metrics: dict[str, Any]) -> "list[str]":
+    """The paired-arm rescue readings, one line per side, each share with its own n."""
+    def _cell(side: str, tag: str) -> str:
+        share = val_metrics.get(f'arm_rescue_{side}_{tag}_share')
+        n = int(float(val_metrics.get(f'arm_rescue_{side}_{tag}_n') or 0.0))
         v = f'{float(share) * 100.0:.1f}%' if isinstance(share, (int, float)) else '—'
         return f'{tag} {v} (n={n})'
-    return (f'low rescue by carbs, paired none arm <{BG_HYPO_THRESHOLD:.0f} mg/dL after '
-            f'{ARM_RESCUE_LAG_STEPS * DT_MINUTES:.0f} min: '
-            f'{_cell("true")}, {_cell("model")}')
+
+    lag = ARM_RESCUE_LAG_STEPS * DT_MINUTES
+    out = []
+    for side, _arm, label in ARM_RESCUE_SIDES:
+        edge = (f'<{BG_HYPO_THRESHOLD:.0f}' if side == 'low'
+                else f'>{BG_HYPER_THRESHOLD:.0f}')
+        out.append(f'{label}, paired none arm {edge} mg/dL after {lag:.0f} min: '
+                   f'{_cell(side, "true")}, {_cell(side, "model")}')
+    return out
 
 
 def _build_optimizers(
@@ -1629,55 +1664,17 @@ def _is_nocturnal(hour: float) -> bool:
         return hour >= NOCTURNAL_START_HOUR or hour < NOCTURNAL_END_HOUR
 
 
-def _cf_bolus_curve(channel: str, total: float, n_steps: int) -> np.ndarray:
-    """Per-step curve for a counterfactual bolus of total, truncated to n_steps.
-    Carb at GI 100, insulin under dose-scaled PK (SPEC/invariants.md §5), so the probe
-    injects the shape the model was pretrained on.
-    """
-    if channel == 'carb':
-        curve = gamma_curve(total, 2.0, 15.0, 120.0)
-    elif channel == 'insulin':
-        curve = gamma_curve(total, *bolus_pk_for_dose(total))
-    else:
-        raise ValueError(f"unknown counterfactual channel {channel!r}")
-    out = np.zeros(n_steps, dtype=np.float32)
-    n = min(n_steps, int(curve.shape[0]))
-    out[:n] = curve[:n]
-    return out
-
-
-# Dose ladder, in multiples of the CF_* dose; every rung carries its own dose-scaled curve.
-_CF_LADDER = (0.5, 1.0, 2.0)
-_CF_REF_RUNG = _CF_LADDER.index(1.0)
-_CF_ONSET_MGDL = 5.0                                # response reached = |ΔBG| past this
-_CF_PRE_ACTION_STEPS = 15 // DT_MINUTES             # window in which a bolus cannot yet act
-_CF_RESCUE_LAG_STEPS = 30 // DT_MINUTES             # rescue scored only after a dose can act
-_CF_LINEARITY_FLOOR_MGDL = 5.0                      # |Δ| at the 1× rung below which no ratio
-
-
-def _cf_onset_step(signed: np.ndarray) -> int | None:
-    """First step where the intended-direction response reaches _CF_ONSET_MGDL, else None."""
-    hit = np.nonzero(signed >= _CF_ONSET_MGDL)[0]
-    return int(hit[0]) if hit.size else None
-
-
-def _cf_median(v: list[float]) -> float | None:
-    return float(np.median(v)) if v else None
-
-
 def _run_counterfactual_probe(
     model: T1DMAI,
     val_dataset: T1DMDataset,
     norm_stats: dict,
     device: torch.device,
-    hypo_threshold: float = BG_HYPO_THRESHOLD,
-    hyper_threshold: float = BG_HYPER_THRESHOLD,
     samples: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Counterfactual dose-response probe over up to VALIDATION_PROBE_N_PATIENTS samples.
     Arms on one context: baseline, carb and insulin at _CF_LADDER multiples of the CF_*
-    dose (each rung its own curve, SPEC/invariants.md §5), the carb dose with its
-    ICR-matched bolus. Terminal-step differences; gains divide by the sim's open loop.
+    dose (each rung its own curve, SPEC/invariants.md §5), the carb dose with its ICR-matched
+    bolus. Terminal Δ; gains divide by the open loop. No rescue: see _run_paired_rescue_probe.
     """
     from inference import predict
 
@@ -1728,10 +1725,6 @@ def _run_counterfactual_probe(
     preaction: list[float] = []
     coverage: list[float] = []
     coverage_ref: list[float] = []
-    hypo_n = 0
-    hypo_rescue_hits = 0
-    hyper_n = 0
-    hyper_rescue_hits = 0
     n_probed = 0
 
     was_training = model.training
@@ -1821,17 +1814,6 @@ def _run_counterfactual_probe(
                     coverage_ref.append(float(BG_SCALE_FACTOR * matched_curve.sum() * icr
                                               / carb_ref[_CF_REF_RUNG][term]))
 
-            # Rescue, scored after the lag: a dose cannot move the first half hour.
-            base_late = baseline[_CF_RESCUE_LAG_STEPS:]
-            if float(base_late.min()) < hypo_threshold:
-                hypo_n += 1
-                hypo_rescue_hits += int(
-                    float((base_late + carb_1[_CF_RESCUE_LAG_STEPS:]).min()) >= hypo_threshold)
-            if float(base_late.max()) > hyper_threshold:
-                hyper_n += 1
-                hyper_rescue_hits += int(
-                    float((base_late + ins_1[_CF_RESCUE_LAG_STEPS:]).max()) <= hyper_threshold)
-
             n_probed += 1
 
     model.train(was_training)
@@ -1858,11 +1840,7 @@ def _run_counterfactual_probe(
         'cf_insulin_onset_lag_min': _cf_median(onset_lag['insulin']),
         'cf_meal_coverage': _cf_median(coverage),
         'cf_meal_coverage_ref': _cf_median(coverage_ref),
-        'cf_hypo_rescue': (hypo_rescue_hits / hypo_n) if hypo_n > 0 else None,
-        'cf_hyper_rescue': (hyper_rescue_hits / hyper_n) if hyper_n > 0 else None,
         'cf_n': n_probed,
-        'cf_hypo_n': hypo_n,
-        'cf_hyper_n': hyper_n,
     }
 
 
@@ -2328,8 +2306,13 @@ ARM_CARB_CARRYING: tuple[str, ...] = ('carbs', 'bolus_carbs')
 ARM_TRUE_MA_WINDOW = 3
 # A tail this low has nobody left to rescue it.
 ARM_DEEP_LOW_MGDL = 40.0
-# Rescue is scored only once a carbohydrate dose can act, as the counterfactual probe does.
+# Rescue is scored only once the boundary dose can act.
 ARM_RESCUE_LAG_STEPS = 30 // DT_MINUTES
+# The two paired readings: side, the arm that carries the rescuing dose, and its label.
+ARM_RESCUE_SIDES: "tuple[tuple[str, int, str], ...]" = (
+    ('low', TAIL_ARM_CARBS, 'low rescue by carbs'),
+    ('high', TAIL_ARM_BOLUS, 'high rescue by bolus'),
+)
 
 # Per group, in table and column order; every one but n is a mean over its own element count.
 ARM_GROUP_COLUMNS: "tuple[tuple[str, int], ...]" = (
@@ -2343,9 +2326,10 @@ ARM_GROUP_COLUMNS: "tuple[tuple[str, int], ...]" = (
 )
 # Accumulated as a squared error, reported as a root; every other column is a plain mean.
 _ARM_STAT_SQRT = frozenset({'bg_rmse_30', 'bg_rmse_60', 'bg_rmse_120'})
-ARM_RESCUE_COLUMNS: tuple[str, ...] = (
-    'arm_rescue_true_share', 'arm_rescue_true_n',
-    'arm_rescue_model_share', 'arm_rescue_model_n')
+ARM_RESCUE_COLUMNS: tuple[str, ...] = tuple(
+    f'arm_rescue_{side}_{tag}_{stat}'
+    for side, _arm, _label in ARM_RESCUE_SIDES
+    for tag in ('true', 'model') for stat in ('share', 'n'))
 
 
 def _arm_edge_tag(v: float) -> str:
@@ -2474,22 +2458,24 @@ def _finalize_arm_groups(
     return out
 
 
-def _run_low_rescue_probe(
+def _run_paired_rescue_probe(
     model: T1DMAI,
     val_dataset: T1DMDataset,
     device: torch.device,
     n_rows: int,
-    threshold: float = BG_HYPO_THRESHOLD,
+    hypo_threshold: float = BG_HYPO_THRESHOLD,
+    hyper_threshold: float = BG_HYPER_THRESHOLD,
     forecast_protocol: Any = None,
 ) -> dict[str, Any]:
-    """Paired ``none``/``carbs`` low-rescue reading, probe-independent.
+    """The two paired-arm rescue readings, probe-independent: ``none`` against its dosed twin.
 
-    Of the rows whose ``none`` tail dips under ``threshold`` past the lag, the share whose
-    ``carbs`` tail does not — truth, then model medians; the blind fork passes its own builder.
+    Of the rows whose ``none`` tail crosses the threshold past the lag, the share whose dosed
+    tail does not — truth, then model medians; the blind fork passes its own builder.
     """
     out: dict[str, Any] = {k: None for k in ARM_RESCUE_COLUMNS}
-    out['arm_rescue_true_n'] = 0.0
-    out['arm_rescue_model_n'] = 0.0
+    for side, _arm, _label in ARM_RESCUE_SIDES:
+        out[f'arm_rescue_{side}_true_n'] = 0.0
+        out[f'arm_rescue_{side}_model_n'] = 0.0
     builder = getattr(val_dataset, 'sample_for_arm', None)
     # Cache only: an on-the-fly row would be re-simulated twice per reading, for no new arm.
     if builder is None or n_rows <= 0 or getattr(val_dataset, 'cache_path', None) is None:
@@ -2498,53 +2484,59 @@ def _run_low_rescue_probe(
     lag = ARM_RESCUE_LAG_STEPS
     n_steps = PREDICTION_PATCHES * PATCH_SIZE
     pair_step = max(1, VAL_BATCH_SIZE // 2)
-    true_pairs: list[np.ndarray] = []
-    pred_pairs: list[np.ndarray] = []
 
     was_training = model.training
     model.eval()
-    with torch.no_grad():
-        for start in range(0, n_rows, pair_step):
-            idxs = list(range(start, min(start + pair_step, n_rows)))
-            k = len(idxs)
-            batch = collate_fn(
-                [builder(i, TAIL_ARM_NONE) for i in idxs]
-                + [builder(i, TAIL_ARM_CARBS) for i in idxs])
-            patches = batch['patches'].to(device, non_blocking=True)
-            bf = batch['bg_formula_data']
-            mask_idx = bf['mask_idx'].long().to(device, non_blocking=True)
-            build = forecast_protocol or _forecast_protocol
-            fc = build(patches, mask_idx, bf['valid'].to(device, non_blocking=True),
-                       batch['n_context_patches'])
-            if fc is None:
-                continue
-            rows_np = fc['rows'].detach().cpu().numpy()
-            _, median = model(
-                fc['patches'], fc['attn_mask'],
-                bf['last_bg'].float().to(device, non_blocking=True)[fc['rows']]
-                .unsqueeze(1).expand(-1, PREDICTION_PATCHES),
-                fc['mask_idx'])
-            pred = _median_to_mgdl(median.float()).detach().cpu().numpy()
-            true = (bf['true_bg_trajectory'][:, :n_steps].float().numpy())[rows_np]
-            pos = {int(r): j for j, r in enumerate(rows_np)}
-            for i in range(k):
-                a, b = pos.get(i), pos.get(i + k)
-                if a is None or b is None:
+    for side, dosed_arm, _label in ARM_RESCUE_SIDES:
+        true_pairs: list[np.ndarray] = []
+        pred_pairs: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, n_rows, pair_step):
+                idxs = list(range(start, min(start + pair_step, n_rows)))
+                k = len(idxs)
+                batch = collate_fn(
+                    [builder(i, TAIL_ARM_NONE) for i in idxs]
+                    + [builder(i, dosed_arm) for i in idxs])
+                patches = batch['patches'].to(device, non_blocking=True)
+                bf = batch['bg_formula_data']
+                mask_idx = bf['mask_idx'].long().to(device, non_blocking=True)
+                build = forecast_protocol or _forecast_protocol
+                fc = build(patches, mask_idx, bf['valid'].to(device, non_blocking=True),
+                           batch['n_context_patches'])
+                if fc is None:
                     continue
-                true_pairs.append(np.stack([true[a], true[b]]))
-                pred_pairs.append(np.stack([pred[a], pred[b]]))
+                rows_np = fc['rows'].detach().cpu().numpy()
+                _, median = model(
+                    fc['patches'], fc['attn_mask'],
+                    bf['last_bg'].float().to(device, non_blocking=True)[fc['rows']]
+                    .unsqueeze(1).expand(-1, PREDICTION_PATCHES),
+                    fc['mask_idx'])
+                pred = _median_to_mgdl(median.float()).detach().cpu().numpy()
+                true = (bf['true_bg_trajectory'][:, :n_steps].float().numpy())[rows_np]
+                pos = {int(r): j for j, r in enumerate(rows_np)}
+                for i in range(k):
+                    a, b = pos.get(i), pos.get(i + k)
+                    if a is None or b is None:
+                        continue
+                    true_pairs.append(np.stack([true[a], true[b]]))
+                    pred_pairs.append(np.stack([pred[a], pred[b]]))
+        if not true_pairs:
+            continue
+        for tag, stacked in (('true', np.stack(true_pairs)),
+                             ('model', np.stack(pred_pairs))):
+            tail = stacked[:, :, lag:]
+            if side == 'low':
+                peak = tail.min(axis=2)                          # (N, 2) mg/dL
+                cond, rescued = peak[:, 0] < hypo_threshold, peak[:, 1] >= hypo_threshold
+            else:
+                peak = tail.max(axis=2)
+                cond, rescued = peak[:, 0] > hyper_threshold, peak[:, 1] <= hyper_threshold
+            n_cond = int(cond.sum())
+            out[f'arm_rescue_{side}_{tag}_n'] = float(n_cond)
+            out[f'arm_rescue_{side}_{tag}_share'] = (
+                float(rescued[cond].mean()) if n_cond else None)
     if was_training:
         model.train()
-    if not true_pairs:
-        return out
-
-    for tag, stacked in (('true', np.stack(true_pairs)), ('model', np.stack(pred_pairs))):
-        low = stacked[:, :, lag:].min(axis=2)                    # (N, 2) mg/dL
-        cond = low[:, 0] < threshold
-        n_cond = int(cond.sum())
-        out[f'arm_rescue_{tag}_n'] = float(n_cond)
-        out[f'arm_rescue_{tag}_share'] = (
-            float((low[cond, 1] >= threshold).mean()) if n_cond else None)
     return out
 
 
@@ -3087,17 +3079,16 @@ def _run_validation(
 
     # Tail-arm breakdown of the same forecast forward, plus the paired-arm low-rescue reading.
     result.update(_finalize_arm_groups(arm_sums, arm_ns, arm_counts))
-    result.update(_run_low_rescue_probe(
+    result.update(_run_paired_rescue_probe(
         model, val_dataset, device,
         min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS),
-        threshold=bg_hypo_threshold,
+        hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
     ))
 
     # Counterfactual probe (diagnostic); its arms add action curves, so curves layout only.
     if INPUT_LAYOUT == 'curves':
         result.update(_run_counterfactual_probe(
             model, val_dataset, norm_stats, device,
-            hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
             samples=val_samples_ordered,
         ))
 
@@ -3305,9 +3296,8 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('median_roughness', 6), ('median_roughness_far', 6),
         # The same figures by tail arm and boundary-dose size, truth beside model; n per group.
         *[(f'arm_{g}_{m}', d) for g in arm_group_ids() for m, d in ARM_GROUP_COLUMNS],
-        # Paired none/carbs low rescue: truth and model each carry their own conditioning count.
-        ('arm_rescue_true_share', 4), ('arm_rescue_true_n', 0),
-        ('arm_rescue_model_share', 4), ('arm_rescue_model_n', 0),
+        # Paired rescue, both sides: truth and model each carry their own conditioning count.
+        *[(c, 0 if c.endswith('_n') else 4) for c in ARM_RESCUE_COLUMNS],
         # Counterfactual dose-response probe (diagnostic).
         ('cf_carb_sign', 4), ('cf_insulin_sign', 4),
         ('cf_carb_monotonic', 4), ('cf_insulin_monotonic', 4),
@@ -3317,8 +3307,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('cf_carb_onset_frac', 4), ('cf_insulin_onset_frac', 4),
         ('cf_carb_onset_lag_min', 4), ('cf_insulin_onset_lag_min', 4),
         ('cf_meal_coverage', 4), ('cf_meal_coverage_ref', 4),
-        ('cf_hypo_rescue', 4), ('cf_hyper_rescue', 4),
-        ('cf_n', 4), ('cf_hypo_n', 4), ('cf_hyper_n', 4),
+        ('cf_n', 4),
         # Time-of-day probe (point accuracy + clock reliability + no-jumping witness).
         ('tod_mae_h', 4), ('tod_acc_1h', 4), ('tod_acc_2h', 4), ('tod_acc_bin', 4), ('tod_conf', 4),
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),
@@ -3975,11 +3964,8 @@ def train(
                     'cf_insulin_preaction_dbg',
                     'cf_carb_onset_frac', 'cf_insulin_onset_frac',
                     'cf_carb_onset_lag_min', 'cf_insulin_onset_lag_min',
-                    'cf_meal_coverage', 'cf_meal_coverage_ref',
-                    'cf_hypo_rescue', 'cf_hyper_rescue')},
+                    'cf_meal_coverage', 'cf_meal_coverage_ref')},
                 'cf_n': val_metrics.get('cf_n'),
-                'cf_hypo_n': val_metrics.get('cf_hypo_n'),
-                'cf_hyper_n': val_metrics.get('cf_hyper_n'),
                 'tod_mae_h': _r(val_metrics.get('tod_mae_h')),
                 'tod_acc_1h': _r(val_metrics.get('tod_acc_1h')),
                 'tod_acc_2h': _r(val_metrics.get('tod_acc_2h')),

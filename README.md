@@ -418,6 +418,7 @@ python metrics/protocols.py    # sampler audit and both protocols' d histograms
 python calibrate_conformal.py --checkpoint checkpoints/t1dmai_best.pt
 python model_health.py --data 128
 python validate.py checkpoints/t1dmai_best.pt [--backup record.t1dmbak]
+python sim_dose_reference.py --rows 240 --workers 8
 python make_figures.py && python make_card.py
 ```
 
@@ -440,6 +441,16 @@ verdict implies. With `--data N` it streams cached windows through the model and
 scores every head, sublayer and block by ablation, the context by truncation and
 every width by a keep-top-k ladder, each as the change in pinball loss on the
 same windows.
+
+`sim_dose_reference.py` measures the simulator's own dose response and the
+roughness of its noise-free expected tail, and writes them to
+`sim_dose_reference.json`. It deep-copies the simulator at each of 240 cache-row
+boundaries, turns patient behaviour off, injects one arm against an undosed twin
+that carries identical noise, and divides the 120-minute difference by the same
+open-loop formula the validation table's counterfactual probe uses. Every `ref`
+that table prints, and the target on both roughness rows, is read from that file,
+so none of them is a written-down number; the rows read `ref unknown` while the
+file is absent. It is checked in, and is regenerated after any change to T1DMSIM.
 
 `validate.py` prints the training-time validation table for one checkpoint, at
 its own architecture, masked-channel policy and normalization statistics.

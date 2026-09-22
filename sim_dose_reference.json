@@ -1,0 +1,78 @@
+{
+  "schema": "sim-dose-reference-v1",
+  "t1dmsim_commit": "65f246e674c8c642a30f200b0cae7ec27671c9ef",
+  "t1dmsim_dirty": false,
+  "n_rows": 240,
+  "tail_steps": 24,
+  "context_steps": 2016,
+  "seed_salt": 42,
+  "carb_bolus_g": 40.0,
+  "insulin_bolus_u": 2.0,
+  "ladder": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "figures": {
+    "cf_carb_gain": {
+      "value": 0.3476605742658022,
+      "p10": 0.18751606114497582,
+      "p90": 0.49986268793916305,
+      "n": 240
+    },
+    "cf_insulin_gain": {
+      "value": 0.5163143262372101,
+      "p10": 0.2589928639105231,
+      "p90": 0.8809283856791705,
+      "n": 240
+    },
+    "cf_carb_linearity": {
+      "value": 1.9282263604268217,
+      "p10": 1.8263743097997394,
+      "p90": 1.9958693257613327,
+      "n": 239
+    },
+    "cf_insulin_linearity": {
+      "value": 1.8973751750044794,
+      "p10": 1.7091543434720795,
+      "p90": 1.9393592141261498,
+      "n": 226
+    },
+    "cf_meal_coverage": {
+      "value": 1.1701435588875202,
+      "p10": 0.610366420985324,
+      "p90": 2.123742024609509,
+      "n": 239
+    },
+    "cf_carb_onset_lag_min": {
+      "value": 5.0,
+      "p10": 0.0,
+      "p90": 5.0,
+      "n": 240
+    },
+    "cf_insulin_onset_lag_min": {
+      "value": 5.0,
+      "p10": -5.0,
+      "p90": 30.0,
+      "n": 230
+    },
+    "cf_insulin_preaction_dbg": {
+      "value": -0.22419314805695828,
+      "p10": -0.4619758002283161,
+      "p90": -0.05781971994887651,
+      "n": 240
+    },
+    "median_roughness": {
+      "value": 0.014435167648143683,
+      "p10": null,
+      "p90": null,
+      "n": 21120
+    },
+    "median_roughness_far": {
+      "value": 0.011796484557370932,
+      "p10": null,
+      "p90": null,
+      "n": 4800
+    }
+  }
+}

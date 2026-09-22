@@ -1839,7 +1839,7 @@ def _run_validation(
 
     # Tail-arm breakdown: running per-window sums per group, at one shared element-count vector.
     from train import (
-        _arm_window_stats, _finalize_arm_groups, _run_low_rescue_probe, arm_group_masks,
+        _arm_window_stats, _finalize_arm_groups, _run_paired_rescue_probe, arm_group_masks,
     )
     arm_sums: dict[str, np.ndarray] = {}
     arm_ns: dict[str, float] = {}
@@ -2333,12 +2333,12 @@ def _run_validation(
     for _k, _v in cg_ega.cg_ega_fractions(_night_cgega_counts).items():
         result[f'night_cgega_{_k}'] = _v
 
-    # Tail-arm breakdown of the same forecast forward, plus the paired-arm low-rescue reading.
+    # Tail-arm breakdown of the same forecast forward, plus the paired-arm rescue readings.
     result.update(_finalize_arm_groups(arm_sums, arm_ns, arm_counts))
-    result.update(_run_low_rescue_probe(
+    result.update(_run_paired_rescue_probe(
         model, val_dataset, device,
         min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS),
-        threshold=bg_hypo_threshold,
+        hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
         # The blind fork's own builder: the forecast zone withholds doses as well as bg.
         forecast_protocol=lambda p, mi, v, nc: _forecast_protocol(p, mi, v, nc, blind_fill),
     ))
@@ -2429,6 +2429,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
     reachable infill is narrower than the span knob suggests (two-sided L caps at d=ceil(L/2))."""
     from metrics.protocols import FORECAST, INFILL, column, reachable_d
     from train import ARM_GROUP_COLUMNS, arm_group_ids
+    from train import ARM_RESCUE_COLUMNS as _ARM_RESCUE_COLUMNS_DECL
 
     eh = _excursion_bucket_horizons(PREDICTION_PATCHES)
     at = _alarm_curve_taus()
@@ -2476,9 +2477,8 @@ def _val_log_columns() -> "list[tuple[str, int]]":
         ('median_roughness', 6), ('median_roughness_far', 6),
         # The same figures by tail arm and boundary-dose size, truth beside model; n per group.
         *[(f'arm_{g}_{m}', d) for g in arm_group_ids() for m, d in ARM_GROUP_COLUMNS],
-        # Paired none/carbs low rescue: truth and model each carry their own conditioning count.
-        ('arm_rescue_true_share', 4), ('arm_rescue_true_n', 0),
-        ('arm_rescue_model_share', 4), ('arm_rescue_model_n', 0),
+        # Paired rescue, both sides: truth and model each carry their own conditioning count.
+        *[(c, 0 if c.endswith('_n') else 4) for c in _ARM_RESCUE_COLUMNS_DECL],
         # train.py's cf_* block is absent: a dose perturbation is invisible to a blind model.
         ('tod_mae_h', 4), ('tod_acc_1h', 4), ('tod_acc_2h', 4), ('tod_acc_bin', 4), ('tod_conf', 4),
         ('tod_bias_h', 4), ('tod_std_h', 4), ('tod_p90_h', 4), ('tod_gross_rate', 4),

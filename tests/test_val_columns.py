@@ -17,6 +17,7 @@ from model import T1DMAI
 from normalization import load_normalization_stats
 from risk_loss import KendallGalWeighting
 
+import sim_dose_reference
 import train
 
 # glycemic-region bins need a window with TRUE BG<70: empty at 12, real at 48.
@@ -466,8 +467,10 @@ def _synthetic_arm_metrics(n: float = 7.0) -> dict:
         out[f'arm_{gid}_n'] = n
         for name, _dec in train.ARM_GROUP_COLUMNS[1:]:
             out[f'arm_{gid}_{name}'] = 0.25
-    out |= {'arm_rescue_true_share': 0.6, 'arm_rescue_true_n': 15.0,
-            'arm_rescue_model_share': 0.2, 'arm_rescue_model_n': 9.0}
+    out |= {'arm_rescue_low_true_share': 0.6, 'arm_rescue_low_true_n': 15.0,
+            'arm_rescue_low_model_share': 0.2, 'arm_rescue_low_model_n': 9.0,
+            'arm_rescue_high_true_share': 0.4, 'arm_rescue_high_true_n': 31.0,
+            'arm_rescue_high_model_share': 0.1, 'arm_rescue_high_model_n': 25.0}
     return out
 
 
@@ -565,9 +568,10 @@ def test_a_non_cache_window_joins_no_tail_arm_group(val_metrics):
     assert 'By tail arm' not in train._strip_ansi(
         train._render_validation_table(1, val_metrics, None))
     # The paired reading is cache-only too: re-simulating a row twice buys no new arm.
-    for tag in ('true', 'model'):
-        assert val_metrics[f'arm_rescue_{tag}_n'] == 0.0
-        assert val_metrics[f'arm_rescue_{tag}_share'] is None
+    for side, _arm, _label in train.ARM_RESCUE_SIDES:
+        for tag in ('true', 'model'):
+            assert val_metrics[f'arm_rescue_{side}_{tag}_n'] == 0.0
+            assert val_metrics[f'arm_rescue_{side}_{tag}_share'] is None
     print("[DUMP] empty breakdown | no group, no section, no rescue reading ✓")
 
 
@@ -579,13 +583,74 @@ def test_the_arm_table_renders_every_populated_group_and_its_rescue_line():
         assert gid in table, f'{gid} is missing from the breakdown'
     assert len({len(line) for line in table.splitlines()}) == 1, (
         'the breakdown box is ragged')
-    assert 'low rescue by carbs' in table
+    assert 'low rescue by carbs' in table and 'high rescue by bolus' in table
     assert 'true 60.0% (n=15)' in table and 'model 20.0% (n=9)' in table, (
         'a rescue share is rendered without the n it was measured on')
+    assert 'true 40.0% (n=31)' in table and 'model 10.0% (n=25)' in table
     full = train._strip_ansi(train._render_validation_table(1, metrics, None))
     assert full.index('By tail arm') > full.index('└'), (
         'the breakdown must sit after the existing table, not inside it')
-    print(f"[DUMP] arm table | {len(train.arm_group_ids())} groups + rescue line rendered ✓")
+    print(f"[DUMP] arm table | {len(train.arm_group_ids())} groups + "
+          f"{len(train.ARM_RESCUE_SIDES)} rescue lines rendered ✓")
+
+
+def test_the_checked_in_dose_reference_carries_every_key_the_table_reads():
+    """The table's every ``ref`` comes off this file; a missing key silently reads unknown."""
+    doc = sim_dose_reference.load_reference()
+    assert doc is not None, (
+        f"{sim_dose_reference.REFERENCE_FILE} is absent or not "
+        f"{sim_dose_reference.SCHEMA}: regenerate it with sim_dose_reference.py")
+    assert doc['t1dmsim_commit'], 'the reference does not name the T1DMSIM it was measured on'
+    for key in sim_dose_reference.REFERENCE_KEYS:
+        fig = sim_dose_reference.figure(doc, key)
+        assert fig is not None, f'{key} carries no measured value'
+        assert math.isfinite(float(fig['value'])), f'{key} is non-finite'
+        assert int(fig['n']) > 0, f'{key} was measured on no rows'
+        if fig['p10'] is not None:
+            assert float(fig['p10']) <= float(fig['p90']), f'{key} p10 above its p90'
+    print(f"[DUMP] dose reference | {len(sim_dose_reference.REFERENCE_KEYS)} keys at "
+          f"T1DMSIM {doc['t1dmsim_commit'][:7]}, {doc['n_rows']} rows ✓")
+
+
+def test_every_probe_ref_on_the_page_is_measured_not_a_literal():
+    """Each cf_* row the file backs renders its measured ref, and 'ref unknown' without it."""
+    metrics = {k: 0.5 for k in sim_dose_reference.REFERENCE_KEYS} | {'cf_n': 9.0}
+    labelled = ('carb gain', 'insulin gain', 'carb linearity', 'insulin linearity',
+                'matched-bolus coverage', 'carb onset lag', 'insulin onset lag',
+                'insulin pre-action')
+    page = train._strip_ansi(train._render_validation_table(1, metrics, None))
+    for label in labelled:
+        line = next((ln for ln in page.splitlines() if label in ln), None)
+        assert line is not None, f'{label!r} is not on the page'
+        assert 'ref ' in line and 'ref unknown' not in line, (
+            f'{label!r} renders no measured reference: {line!r}')
+    mp = pytest.MonkeyPatch()
+    mp.setattr(sim_dose_reference, 'load_reference', lambda *a, **k: None)
+    blind = train._strip_ansi(train._render_validation_table(1, metrics, None))
+    mp.undo()
+    for label in labelled:
+        line = next(ln for ln in blind.splitlines() if label in ln)
+        assert 'ref unknown' in line, (
+            f'{label!r} invented a reference with no file: {line!r}')
+    print(f"[DUMP] probe refs | {len(labelled)} rows read the file, "
+          f"{len(labelled)} say unknown without it ✓")
+
+
+def test_exactly_one_rescue_metric_per_side_and_it_names_its_reference():
+    """The cf probe's model-conditioned rescue is gone; the paired arm reading is the only one."""
+    declared = {c for c, _ in train._val_log_columns()}
+    assert not [c for c in declared if c.startswith('cf_') and 'rescue' in c], (
+        'a cf_*_rescue column is back: its denominator is the model, not a truth')
+    for side, _arm, label in train.ARM_RESCUE_SIDES:
+        assert {f'arm_rescue_{side}_{t}_{s}' for t in ('true', 'model')
+                for s in ('share', 'n')} <= declared, f'{side} rescue is not fully declared'
+    lines = train._arm_rescue_lines(_synthetic_arm_metrics())
+    assert len(lines) == len(train.ARM_RESCUE_SIDES)
+    for line in lines:
+        assert 'true' in line and 'model' in line, (
+            f'a rescue line reports a share with no reference beside it: {line!r}')
+    print(f"[DUMP] rescue | {len(lines)} paired readings, each against truth, "
+          f"no cf_* twin ✓")
 
 
 def test_every_bg_horizon_is_inside_one_forward_and_is_scored(val_metrics):

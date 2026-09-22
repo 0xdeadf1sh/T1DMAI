@@ -21,7 +21,6 @@ def test_counterfactual_probe_smoke():
     from train import _run_counterfactual_probe
     from model import T1DMAI
     from data import T1DMDataset
-    from config import BG_HYPO_THRESHOLD, BG_HYPER_THRESHOLD
 
     stats = _get_stats()
     device = torch.device('cpu')
@@ -33,10 +32,7 @@ def test_counterfactual_probe_smoke():
     model = T1DMAI().to(device)
     model.eval()
 
-    result = _run_counterfactual_probe(
-        model, val_dataset, stats, device,
-        hypo_threshold=BG_HYPO_THRESHOLD, hyper_threshold=BG_HYPER_THRESHOLD,
-    )
+    result = _run_counterfactual_probe(model, val_dataset, stats, device)
 
     fractions = ('cf_carb_sign', 'cf_insulin_sign',
                  'cf_carb_monotonic', 'cf_insulin_monotonic',
@@ -44,26 +40,26 @@ def test_counterfactual_probe_smoke():
     # Conditional on a response, a baseline excursion or an ICR existing: None is a legal reading.
     conditional = ('cf_carb_linearity', 'cf_insulin_linearity',
                    'cf_carb_onset_lag_min', 'cf_insulin_onset_lag_min',
-                   'cf_insulin_gain', 'cf_meal_coverage', 'cf_meal_coverage_ref',
-                   'cf_hypo_rescue', 'cf_hyper_rescue')
+                   'cf_insulin_gain', 'cf_meal_coverage', 'cf_meal_coverage_ref')
     expected_keys = set(fractions) | set(conditional) | {
         'cf_carb_gain',
         'cf_insulin_linearity_ref', 'cf_insulin_preaction_dbg',
-        'cf_n', 'cf_hypo_n', 'cf_hyper_n',
+        'cf_n',
     }
+    # Rescue belongs to the paired-arm reading: this probe's own baseline is the model's forecast.
+    assert not any(k.endswith('_rescue') for k in result), (
+        'the cf probe reports a rescue share again; its denominator is the model, not a truth')
     # Simulator samples carry an ICR, so the unconditional ICR-scaled reading is present.
     assert result['cf_insulin_gain'] is not None
     assert set(result.keys()) == expected_keys, (
         f"cf_* key set mismatch: got {sorted(result.keys())}")
-    assert len(expected_keys) == 21
+    assert len(expected_keys) == 17
 
     assert isinstance(result['cf_n'], int) and result['cf_n'] >= 1, (
         f"cf_n must be a positive probe count, got {result['cf_n']!r}")
-    assert isinstance(result['cf_hypo_n'], int) and result['cf_hypo_n'] >= 0
-    assert isinstance(result['cf_hyper_n'], int) and result['cf_hyper_n'] >= 0
 
     for k, v in result.items():
-        if k in ('cf_n', 'cf_hypo_n', 'cf_hyper_n'):
+        if k == 'cf_n':
             continue
         if v is None:
             assert k in conditional, f"{k} unexpectedly None"
@@ -75,8 +71,7 @@ def test_counterfactual_probe_smoke():
     # 4 U carries a longer DIA than 2 U, so less of it lands inside the horizon: below 2.
     assert 1.0 < float(result['cf_insulin_linearity_ref']) < 2.0, result['cf_insulin_linearity_ref']
 
-    print(f"\n[DUMP] cf_probe | n={result['cf_n']} "
-          f"hypo_n={result['cf_hypo_n']} hyper_n={result['cf_hyper_n']}")
+    print(f"\n[DUMP] cf_probe | n={result['cf_n']}")
     print(f"[DUMP] cf_probe | carb_gain={result['cf_carb_gain']:.3f} "
           f"insulin_gain={result['cf_insulin_gain']:.3f} "
           f"carb_sign={result['cf_carb_sign']:.2f} insulin_sign={result['cf_insulin_sign']:.2f} "
@@ -88,7 +83,7 @@ def test_counterfactual_probe_smoke():
 
 def test_cf_reference_response_is_the_sim_open_loop():
     """A rung's reference is BG_SCALE_FACTOR × the curve's mass inside the horizon."""
-    from train import _cf_bolus_curve, _CF_LADDER
+    from sim_dose_reference import _cf_bolus_curve, _CF_LADDER
     from config import CF_INSULIN_BOLUS_U, PREDICTION_PATCHES, PATCH_SIZE
     from T1DMSIM.simulator import bolus_pk_for_dose
 
@@ -106,7 +101,7 @@ def test_cf_reference_response_is_the_sim_open_loop():
 
 
 def test_cf_bolus_curve_is_the_spec_curve_not_a_rectangle():
-    from train import _cf_bolus_curve
+    from sim_dose_reference import _cf_bolus_curve
     from config import (CF_CARB_BOLUS_G, CF_INSULIN_BOLUS_U,
                         PREDICTION_PATCHES, PATCH_SIZE)
 

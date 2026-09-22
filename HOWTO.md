@@ -237,9 +237,21 @@ evidence. A parenthesised count such as `(76st)` is that row's event count; some
 bins are small enough that the count changes how the percentage reads.
 
 A second box follows it from a cache run: the forecast figures by tail arm and by
-boundary-dose size, the truth's own roughness beside the model's, and the paired
-`none`/`carbs` low-rescue line with an n for each share. Its columns are
-`arm_<group>_<metric>` in the CSV.
+boundary-dose size, the truth's own roughness beside the model's, and the two
+paired rescue lines — `none` against `carbs` below 70 mg/dL, `none` against
+`bolus` above 180 — each carrying the truth's share, the model's, and an n for
+both. Those are the run's only rescue figures. Its columns are
+`arm_<group>_<metric>` and `arm_rescue_<side>_<tag>_<stat>` in the CSV.
+
+Every `ref` on a counterfactual row, and the target on both `median_roughness`
+rows, comes from `sim_dose_reference.json` — the simulator's own dose response and
+noise-free tail roughness, measured rather than written down. Regenerate it after
+any change to T1DMSIM, from the T1DMAI checkout, and commit the result; the table
+prints `ref unknown` while the file is missing.
+
+```bash
+venv/bin/python sim_dose_reference.py --rows 240 --workers 8
+```
 
 The table is a reading surface, not the record: `logs/validation_log.csv` carries
 every metric on every row, including the families the table does not print.

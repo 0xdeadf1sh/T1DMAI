@@ -170,8 +170,7 @@ def test_no_counterfactual_column_survives(blind_batch):
                  'cf_insulin_preaction_dbg': 0.3, 'cf_carb_onset_frac': 1.0,
                  'cf_insulin_onset_frac': 0.9, 'cf_carb_onset_lag_min': 5.0,
                  'cf_insulin_onset_lag_min': -5.0, 'cf_meal_coverage': 0.7,
-                 'cf_meal_coverage_ref': 0.8, 'cf_hypo_rescue': 0.5,
-                 'cf_hyper_rescue': 0.4, 'cf_hypo_n': 20, 'cf_hyper_n': 18}
+                 'cf_meal_coverage_ref': 0.8}
     blind_page = train_blind._render_validation_table(1, dict(synthetic))
     plain_page = train._render_validation_table(1, dict(synthetic))
     for label in ('Counterfactual', 'carb sign', 'insulin sign',

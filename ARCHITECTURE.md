@@ -857,9 +857,31 @@ visible, along with over- and under-shoot fractions.
 
 **Counterfactual.** Perturbs the doses announced over a right-edge forecast span
 against a baseline forecast and checks the response is physiologically right:
-carbohydrate must raise glucose, insulin must lower it, a dose sweep must move it
-monotonically, and the opposing dose must clear a baseline excursion. This is
-what makes the always-on what-if path trustworthy. Diagnostic only.
+carbohydrate must raise glucose, insulin must lower it, and a dose sweep must move
+it monotonically. This is what makes the always-on what-if path trustworthy.
+Diagnostic only.
+
+Each dose-response row carries the simulator's own answer beside the model's.
+`sim_dose_reference.py` injects the same two doses into a deep copy of the
+simulator at 240 cache-row boundaries, behaviour off, against an undosed twin
+carrying identical noise; it divides the difference at 120 minutes by the same
+open-loop formula the probe uses and writes the median with its 10th and 90th
+percentiles to `sim_dose_reference.json`, stamped with the T1DMSIM commit it was
+measured on. The table reads every `ref` from that file and prints `ref unknown`
+where the file is absent. The same script measures the noise-free expected tail's
+roughness — the four arms run with the simulator's generator replaced by one whose
+normal draws are their own mean — and `median_roughness` and its far-patch
+companion are targeted at that figure rather than a fixed bar. Regenerate it after
+any T1DMSIM change:
+
+```bash
+python sim_dose_reference.py --rows 240 --workers 8
+```
+
+The probe reports no rescue share. Its baseline is the model's own undosed
+forecast, so the denominator would be the windows the model predicts will go low
+rather than the windows that do; the paired-arm reading below is the rescue
+metric, and it is the only one.
 
 **Conformal coverage.** Fits on a deterministic 60 % of the collected validation
 windows and measures excursion-peak coverage on the disjoint 40 %, reporting raw
@@ -890,14 +912,17 @@ its figure is the floor the model's is read against. The columns are
 `arm_<group>_<metric>` in the CSV and in `val_history`, and the table prints one
 row per populated group after the existing sections.
 
-**Low rescue.** Beside the breakdown, a paired reading that no probe dose enters.
-Over up to `VALIDATION_PROBE_N_PATIENTS` validation rows, both the `none` and the
-`carbs` sample of the same row are built — they share context, width and mask, so
-only the boundary carbohydrate differs. Of the rows whose `none` tail drops below
-`BG_HYPO_THRESHOLD` past the 30-minute rescue lag, it reports the share whose
-`carbs` tail does not, once off the truth and once off the model's own two median
-forecasts. Each share carries its own conditioning count, since the two
-conditions select different rows.
+**Rescue.** Beside the breakdown, two paired readings that no probe dose enters —
+the suite's only rescue figures. Over up to `VALIDATION_PROBE_N_PATIENTS`
+validation rows, the `none` sample of a row is built alongside its dosed twin —
+`carbs` for the low side, `bolus` for the high — and the two share context, width
+and mask, so only the boundary dose differs. Of the rows whose `none` tail crosses
+the threshold past the 30-minute rescue lag, each side reports the share whose
+dosed tail does not: low is `< BG_HYPO_THRESHOLD` rescued by carbohydrate, high is
+`> BG_HYPER_THRESHOLD` rescued by the bolus. Both are measured once off the truth
+and once off the model's own two median forecasts, so the simulator's own share is
+the stated reference on the same rows. Each share carries its own conditioning
+count, since the four conditions select different rows.
 
 
 ## Conformal calibration
