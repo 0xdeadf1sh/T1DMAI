@@ -42,9 +42,9 @@ def test_uniform_skill_patch_is_restored():
     """The skill override is scoped to its block: the next row is the ordinary population."""
     from data import simulate_row
 
-    _a, _i, plain = simulate_row(1000005)
-    _b, _j, forced = simulate_row(1000005, uniform_skills=True)
-    _c, _k, again = simulate_row(1000005)
+    plain = simulate_row(1000005)[0]['bg_observed']
+    forced = simulate_row(1000005, uniform_skills=True)[0]['bg_observed']
+    again = simulate_row(1000005)[0]['bg_observed']
     assert not np.array_equal(plain, forced)
     np.testing.assert_array_equal(plain, again)
 
@@ -259,10 +259,10 @@ def test_masked_set_always_conditioned():
     assert CHANNEL_TO_FEAT == {0: 1, 1: 2}, "carb -> feat1, insulin -> feat2"
 
     stats = _get_stats()
-    row, icr, skills = simulate_row(321)
+    row, icr = simulate_row(321)
 
     s = _build_sample(data=row_trajectory(row, 0), icr=icr, stats=stats,
-                      rng=np.random.default_rng(7), boundary=True, skills=skills)
+                      rng=np.random.default_rng(7), boundary=True)
     assert 'reveal_mask' not in s, "a built sample must carry no reveal_mask"
     patches = s['patches'].numpy()
     assert patches.shape[1] == PATCH_DIM == PATCH_SIZE * N_INPUT_FEATURES, \

@@ -283,8 +283,8 @@ def test_init_median_is_persistence():
 
 
 def test_gradient_flow():
-    """``time_head.*`` and ``skill_head.*`` sit off the forecast path and are excluded;
-    the probe's isolation is ``test_time_probe.test_detach_isolates_trunk``'s subject."""
+    """``time_head.*`` sits off the forecast path and is excluded; its isolation is
+    ``test_time_probe.test_detach_isolates_trunk``'s subject."""
     from model import T1DMAI
     model = T1DMAI()
 
@@ -299,7 +299,7 @@ def test_gradient_flow():
 
     no_grad_params = []
     for name, param in model.named_parameters():
-        if name.startswith(('time_head.', 'skill_head.')):
+        if name.startswith('time_head.'):
             continue
         if param.grad is None:
             no_grad_params.append(name)

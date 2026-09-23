@@ -10,11 +10,6 @@ from T1DMSIM.simulator import (
     SIMULATOR_WARMUP_HOURS,
 )
 
-# Owned by T1DMSIM (SPEC/cache.md §6): the skill columns of the cache's skills.npy, in order.
-from T1DMSIM.cache_simulator import (
-    SKILL_NAMES,
-)
-
 # resize_model.py rewrites these; don't bake values elsewhere. PATCH_SIZE must divide 12.
 D_MODEL = 16
 N_LAYERS = 16
@@ -97,13 +92,6 @@ TIME_PROBE_CROSS_WINDOW_WEIGHT = 1.0
 TIME_PROBE_CROSS_WINDOW_FRACTION = (
     1.0  # 2nd forward on first ceil(frac*B) rows; val uses all
 )
-
-# Patient-skill probe over the mean-pooled visible context; its loss never enters selection.
-SKILL_HEAD_ENABLED = True  # False ⇒ head not built
-SKILL_HEAD_HIDDEN = 1 * D_MODEL  # 2-layer SiLU probe MLP, then N_SKILLS sigmoids
-N_SKILLS = len(SKILL_NAMES)
-SKILL_HEAD_LOSS_WEIGHT = 0.1  # scales the skill MSE, backward only
-SKILL_HEAD_INIT_SCALE = 1e-2  # probe final-layer weight init std
 
 ROPE_BASE = 1000
 

@@ -56,10 +56,10 @@ def test_build_sample_no_reveal_mask_and_patch_width():
     from config import PATCH_DIM, PATCH_SIZE, N_INPUT_FEATURES
 
     stats = _get_stats()
-    row, icr, skills = simulate_row(321)
+    row, icr = simulate_row(321)
 
     s = _build_sample(data=row_trajectory(row, 0), icr=icr, stats=stats,
-                      rng=np.random.default_rng(7), boundary=True, skills=skills)
+                      rng=np.random.default_rng(7), boundary=True)
 
     assert 'reveal_mask' not in s, "a built sample must not carry reveal_mask"
     assert 'loss_mask' not in s, "a built sample must not carry loss_mask"

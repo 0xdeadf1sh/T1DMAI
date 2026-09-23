@@ -19,7 +19,6 @@ from config import (
     MAX_CONTEXT_PATCHES,
     MAX_MASKED_PATCHES,
     MIN_CONTEXT_PATCHES,
-    N_SKILLS,
     PATCH_DIM,
     PATCH_SIZE,
     PREDICTION_PATCHES,
@@ -119,10 +118,6 @@ def test_cache_layout(blosc2_cache: str) -> None:
     assert meta['patient_uniform_sample_prob'] == _TINY_UNIFORM_PROB
     assert tuple(meta['channels']) == CHANNEL_NAMES
 
-    skills = np.load(os.path.join(out_dir, SKILLS_FILE))
-    assert skills.shape == (_TINY_POOL, N_SKILLS) and skills.dtype == np.float32
-    assert ((skills >= 0.0) & (skills <= 1.0)).all()
-
     # the builder's emitted {mean, std} must COVER the model's input stack, nothing left over
     from normalization import CHANNEL_NAMES as NORM_CHANNEL_NAMES
     stats = _cache_stats(out_dir)
@@ -202,7 +197,7 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
     for i in range(len(dataset)):
         sample = dataset[i]
         assert set(sample) >= {'patches', 'targets', 'n_context_patches',
-                               'bg_formula_data', 'skills'}
+                               'bg_formula_data'}
         patches = sample['patches']
         targets = sample['targets']
         n_ctx = sample['n_context_patches']
@@ -214,7 +209,6 @@ def test_cache_reads_back_via_dataset(blosc2_cache: str) -> None:
         assert patches.dtype == torch.float32 and targets.dtype == torch.float32
         assert torch.isfinite(patches).all(), f"non-finite patches at {i}"
         assert torch.isfinite(targets).all(), f"non-finite targets at {i}"
-        assert sample['skills'].shape == (N_SKILLS,)
 
         # the target is the true BG label, in physical mg/dL
         tnp = targets.numpy()

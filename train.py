@@ -54,7 +54,6 @@ from config import (                                           # noqa: E402
     QUANTILE_LEVELS, N_QUANTILES,
     TIME_PROBE_LOSS_WEIGHT, TIME_PROBE_N_BINS,
     TIME_PROBE_LABEL_SMOOTH_BINS, TIME_PROBE_CROSS_WINDOW_WEIGHT, TIME_PROBE_CROSS_WINDOW_FRACTION,
-    SKILL_HEAD_LOSS_WEIGHT,
 )
 
 from config import ARCH_VERSION, LOSS_SCHEMA
@@ -3241,7 +3240,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
         *[(f'loss_D_L{L}', 6) for L in MASK_SPAN_LENGTHS],
         *[(f'n_spans_L{L}', 3) for L in MASK_SPAN_LENGTHS],
         ('n_masked_mean', 3), ('n_spans_mean', 3),
-        ('loss_tod', 6), ('loss_tod_xwin', 6), ('loss_skill', 6),
+        ('loss_tod', 6), ('loss_tod_xwin', 6),
         ('log_sigma_Q', 6), ('log_sigma_D', 6),
         ('grad_norm', 6), ('lr_muon', 8), ('lr_adam', 8),
         ('step_time_seconds', 4), ('gpu_memory_mb', 1),
@@ -3635,10 +3634,6 @@ def train(
         anchor_bg = bg_formula['anchor_bg'].float()                   # (B, M) mg/dL
         slot_hour = bg_formula['slot_hour'].float()                   # (B, M) hours
         targets = batch['targets'].to(device, non_blocking=True).float()   # (B, M, S)
-        # Skill probe: pooled over the visible non-pad patches; absent skills score zero loss.
-        pool_mask = batch['pool_mask'].to(device, non_blocking=True)       # (B, T) bool
-        skills_true = batch['skills'].to(device, non_blocking=True).float()  # (B, N_SKILLS)
-        skills_valid = batch['skills_valid'].to(device, non_blocking=True)   # (B,) bool
 
         # Cross-window probe input (window k+1), probe-only overhead, skipped when penalty is off.
         next_window = None
@@ -3699,9 +3694,8 @@ def train(
         # Wrapped so a non-finite loss or exception (CUDA fault from NaN) routes to skip/restore.
         try:
             # Forward (fp32-native — no autocast).
-            q_tau, median, time_pred, skill_pred = model(
-                patches, attn_mask, anchor_bg, mask_idx,
-                return_time=True, return_skills=True, pool_mask=pool_mask)
+            q_tau, median, time_pred = model(
+                patches, attn_mask, anchor_bg, mask_idx, return_time=True)
             q_tau = q_tau.float()
             median = median.float()
 
@@ -3763,16 +3757,7 @@ def train(
                             _tod_xwin_val = float(_tod_xwin.detach())
                 if torch.isfinite(_tod_loss):
                     _tod_extra = TIME_PROBE_LOSS_WEIGHT * _tod_loss
-
-            # Outside selection like the TOD probe; a row without skills weighs zero.
-            _skill_extra = loss_total.new_zeros(())
-            _skill_loss_val = float('nan')
-            if skill_pred is not None and bool(skills_valid.any()):
-                _skill_mse = ((skill_pred - skills_true) ** 2).mean(dim=-1)[skills_valid].mean()
-                if torch.isfinite(_skill_mse):
-                    _skill_loss_val = float(_skill_mse.detach())
-                    _skill_extra = SKILL_HEAD_LOSS_WEIGHT * _skill_mse
-            loss_backward = loss_total + _tod_extra + _skill_extra
+            loss_backward = loss_total + _tod_extra
 
             if not torch.isfinite(loss_backward):
                 _skip_nonfinite_step("NaN/Inf total loss")
@@ -3838,7 +3823,6 @@ def train(
             log_sigma_d = float(parts.get('log_sigma_D', float('nan')))
             loss_tod = _tod_loss_val
             loss_tod_xwin = _tod_xwin_val
-            loss_skill = _skill_loss_val
 
             print(
                 f"Step {step:>6}/{total_steps} | "
@@ -3848,7 +3832,6 @@ def train(
                 + (f"L_C: {loss_c:.4f} | " if CURVATURE_LAMBDA > 0.0 else "") +
                 f"logσ: Q={log_sigma_q:+.4f} D={log_sigma_d:+.4f} | "
                 f"L_tod: {loss_tod:.4f} (xwin {loss_tod_xwin:.4f}) | "
-                f"L_skill: {loss_skill:.4f} | "
                 f"Grad: {grad_norm_val:.3f} | "
                 f"LR_muon: {cur_lr_muon:.6f} | LR_adam: {cur_lr_adam:.6f} | "
                 f"Time: {step_time:.2f}s"
@@ -3866,7 +3849,6 @@ def train(
                 'n_masked_mean': float(parts.get('n_masked_mean', float('nan'))),
                 'n_spans_mean': float(parts.get('n_spans_mean', float('nan'))),
                 'loss_tod': loss_tod, 'loss_tod_xwin': loss_tod_xwin,
-                'loss_skill': loss_skill,
                 'log_sigma_Q': log_sigma_q, 'log_sigma_D': log_sigma_d,
                 'grad_norm': grad_norm_val,
                 'lr_muon': cur_lr_muon, 'lr_adam': cur_lr_adam,

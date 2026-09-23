@@ -221,7 +221,7 @@ def test_probe_construction_preserves_forecast_init_rng(monkeypatch):
     m_with = model_mod.T1DMAI()
     forecast_with = {n: p.detach().clone()
                      for n, p in m_with.named_parameters()
-                     if not n.startswith(('time_head.', 'skill_head.'))}
+                     if not n.startswith('time_head.')}
 
     monkeypatch.setattr(model_mod, 'TIME_PROBE_ENABLED', False)
     torch.manual_seed(0)
@@ -229,7 +229,7 @@ def test_probe_construction_preserves_forecast_init_rng(monkeypatch):
 
     assert m_with.time_head is not None and m_without.time_head is None
     mismatched = [n for n, p in m_without.named_parameters()
-                  if n in forecast_with and not torch.equal(p, forecast_with[n])]
+                  if not torch.equal(p, forecast_with[n])]
     print(f"\n[DUMP] I2 | {len(forecast_with)} forecast tensors, "
           f"{len(mismatched)} shifted by the probe (want 0)")
     assert not mismatched, f"probe construction shifted forecast init for: {mismatched[:6]}"

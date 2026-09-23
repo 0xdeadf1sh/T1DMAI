@@ -158,8 +158,8 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
     import config
     # Snapshot every config global this helper mutates, so it stays side-effect-free.
     _MUTATED = ('D_MODEL', 'N_HEADS', 'HEAD_DIM', 'FFN_DIM', 'BG_HEAD_HIDDEN',
-                'TIME_PROBE_HIDDEN', 'SKILL_HEAD_HIDDEN', 'N_LAYERS', 'PATCH_SIZE',
-                'PATCH_DIM', '_PATCHES_PER_HOUR', 'PREDICTION_PATCHES', 'MAX_SEQ_LEN')
+                'TIME_PROBE_HIDDEN', 'N_LAYERS', 'PATCH_SIZE', 'PATCH_DIM',
+                '_PATCHES_PER_HOUR', 'PREDICTION_PATCHES', 'MAX_SEQ_LEN')
     _saved = {k: getattr(config, k) for k in _MUTATED}
     try:
         config.D_MODEL = d_model
@@ -167,9 +167,8 @@ def _count_params(d_model: int, n_heads: int, ffn_dim: int,
         config.HEAD_DIM = d_model // n_heads
         config.FFN_DIM = ffn_dim
         config.BG_HEAD_HIDDEN = bg_head_hidden
-        # No override flag: the probe widths follow D_MODEL at config.py's own multipliers.
+        # No override flag: TIME_PROBE_HIDDEN follows D_MODEL at config.py's own multiplier.
         config.TIME_PROBE_HIDDEN = (_saved['TIME_PROBE_HIDDEN'] // _saved['D_MODEL']) * d_model
-        config.SKILL_HEAD_HIDDEN = (_saved['SKILL_HEAD_HIDDEN'] // _saved['D_MODEL']) * d_model
         config.N_LAYERS = n_layers
         if patch_size is not None:
             # PATCH_SIZE feeds PATCH_DIM; caller validated PATCH_SIZE*5 divides 60 so this is exact.

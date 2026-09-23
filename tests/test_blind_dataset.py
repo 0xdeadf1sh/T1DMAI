@@ -24,11 +24,11 @@ def _get_stats():
 def _build(blind: bool, stats, seed: int = BLIND_SEED) -> dict:
     """One sample at a fixed seed; same patient and same rng, so only ``blind`` differs."""
     from data import _build_sample, row_trajectory, simulate_row
-    row, icr, skills = simulate_row(seed)
+    row, icr = simulate_row(seed)
     return _build_sample(
         data=row_trajectory(row, 0), icr=icr, stats=stats,
         rng=np.random.default_rng(seed ^ 0xDEADBEEF), blind=blind,
-        boundary=True, skills=skills,
+        boundary=True,
     )
 
 

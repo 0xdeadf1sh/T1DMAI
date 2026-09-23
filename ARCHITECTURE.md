@@ -356,8 +356,7 @@ The glucose head and the time probe read the final-normed hidden states by
 `mask_idx`, never as a trailing slice: the masked set may sit anywhere in the
 sequence. The time probe takes the `M` slot states as they are, one `D_MODEL`
 vector per slot; the glucose head takes a per-step state interpolated from them
-and their span's visible neighbours. The skill probe reads neither, pooling the
-visible patches instead.
+and their span's visible neighbours.
 
 ### Blood-glucose quantile head
 
@@ -462,25 +461,6 @@ pygame and matplotlib renderers share one implementation.
 
 `TIME_PROBE_ENABLED = False` leaves the head unbuilt and the forward
 bit-identical to a model without it.
-
-### Patient-skill probe
-
-A 2-layer SiLU MLP over the mean-pooled final-normed trunk state, emitting
-`N_SKILLS` sigmoids in the cache's frozen `skills.npy` column order —
-dietary discipline, attentiveness, dosing competence, lifestyle consistency. The
-pool covers the VISIBLE, non-pad patches only: a masked patch's glucose was
-withheld and a pad patch is zeros, so pooling either would drag every prediction
-toward 0.5.
-
-The loss is MSE against the row's own skills, scaled by
-`SKILL_HEAD_LOSS_WEIGHT` and added to the backward loss beside the time probe's
-cross-entropy — outside `risk_total_loss`, outside checkpoint selection. A sample
-that carries no skills, which is every row of a real finetune pool, weighs zero.
-
-`forward` emits the skills only under `return_skills=True`; with the flag unset
-the 2-tuple is bit-identical to a model built without the head, because the head
-is constructed and initialised under a saved and restored RNG state, last. It
-reaches neither the descriptor nor the exported graph.
 
 
 ## Loss

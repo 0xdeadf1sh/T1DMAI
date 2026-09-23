@@ -17,7 +17,7 @@ from config import (
     CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, MASKABLE_FEATS,
     MIN_CONTEXT_PATCHES, MAX_CONTEXT_PATCHES, PREDICTION_PATCHES,
     MASK_MAX_SPANS, MASK_RIGHT_EDGE_QUOTA, MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES,
-    PATIENT_UNIFORM_SAMPLE_PROB, N_SKILLS, SKILL_NAMES,
+    PATIENT_UNIFORM_SAMPLE_PROB,
     SIMULATOR_WARMUP_HOURS,
     TIME_PROBE_ENABLED, TIME_PROBE_CROSS_WINDOW_WEIGHT,
 )
@@ -211,11 +211,11 @@ def _pick_pred_start_step(
     return int(first + PATCH_SIZE * int(rng.integers(0, n_candidates)))
 
 
-# Owned by T1DMSIM: the cache's own channel lists, arm order, format string and skills file.
+# Owned by T1DMSIM: the cache's own channel lists, arm order and format string.
 from T1DMSIM.cache_simulator import (  # noqa: E402
     CACHE_FORMAT_VERSION as CACHE_FORMAT_BLOSC2,
     CHANNEL_NAMES as CACHE_CHANNEL_NAMES,
-    N_TAIL_ARMS, SKILLS_FILE, TAIL_ARMS,
+    N_TAIL_ARMS, TAIL_ARMS,
 )
 
 # SPEC/cache.md §3: the index IS the arm's identity, so name the four rather than re-deriving.
@@ -274,15 +274,15 @@ def simulate_row(
     patient_seed: int,
     warmup_hours: float = SIMULATOR_WARMUP_HOURS,
     uniform_skills: bool = False,
-) -> tuple[dict[str, np.ndarray], float, np.ndarray]:
-    """One un-cached row through T1DMSIM's own builder: arrays, ICR, skills.
+) -> tuple[dict[str, np.ndarray], float]:
+    """One un-cached row through T1DMSIM's own builder: arrays and ICR.
 
     The cache is the same builder run ahead of time, so the two paths cannot drift.
     """
     from T1DMSIM.cache_simulator import simulate_row as _sim_row, T1DMSimulator
     with _uniform_skill_patient(uniform_skills, T1DMSimulator):
         arrays, stats = _sim_row(int(patient_seed), _row_config(warmup_hours))
-    return arrays, float(stats['icr']), np.asarray(stats['skills'], dtype=np.float32)
+    return arrays, float(stats['icr'])
 
 
 def row_trajectory(row: dict[str, Any], arm: int) -> dict[str, np.ndarray]:
@@ -343,7 +343,6 @@ class T1DMDataset(Dataset):
         # Lazy: populated on first access, so no open cache handle is pickled across the fork.
         self._cache_arrays: dict[str, Any] | None = None
         self._cache_icr: np.ndarray | None = None
-        self._cache_skills: np.ndarray | None = None
         self._cache_pool_size: int | None = None
         self._cache_n_timesteps: int | None = None
         self._cache_meta: dict[str, Any] | None = None
@@ -478,10 +477,10 @@ class T1DMDataset(Dataset):
     def __len__(self) -> int:
         return self.total_steps * self.batch_size
 
-    def _load_cache(self) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
+    def _load_cache(self) -> tuple[dict[str, Any], np.ndarray]:
         """Open the cache arrays on first use in this process.
 
-        Per-channel array dict — context plus ``tail_`` arms — with the ICR and skill tables.
+        Per-channel array dict — context plus ``tail_`` arms — with the ICR table.
         """
         if self._cache_arrays is None:
             assert self.cache_path is not None
@@ -522,16 +521,8 @@ class T1DMDataset(Dataset):
                     f"({pool},). Rebuild the cache."
                 )
             self._cache_icr = icr
-            skills = np.load(os.path.join(self.cache_path, SKILLS_FILE))
-            if skills.shape != (pool, N_SKILLS):
-                raise ValueError(
-                    f"Cache {SKILLS_FILE} has shape {skills.shape}, expected "
-                    f"({pool}, {N_SKILLS}) for {list(SKILL_NAMES)}. Rebuild the cache."
-                )
-            self._cache_skills = skills.astype(np.float32)
         assert self._cache_arrays is not None and self._cache_icr is not None
-        assert self._cache_skills is not None
-        return self._cache_arrays, self._cache_icr, self._cache_skills
+        return self._cache_arrays, self._cache_icr
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """One training sample for ``idx`` in ``[0, total_steps * batch_size)``.
@@ -565,7 +556,7 @@ class T1DMDataset(Dataset):
         sample_arm = NO_TAIL_ARM
         doses = (0.0, 0.0)
         if self.cache_path is not None:
-            cache_arrays, cache_icr, cache_skills = self._load_cache()
+            cache_arrays, cache_icr = self._load_cache()
             assert self._cache_pool_size is not None
             assert self._cache_slab is not None
             # DISJOINT band: a held-out (val/cal) seed can only resolve to a reserved tail row.
@@ -594,12 +585,11 @@ class T1DMDataset(Dataset):
                 for name in READ_TAIL_CHANNELS
             }
             icr = float(cache_icr[cache_idx])
-            skills = cache_skills[cache_idx]
             sample_arm = arm
             doses = (float(row_dose[TAIL_DOSE_BOLUS_U][arm]),
                      float(row_dose[TAIL_DOSE_CARB_G][arm]))
         else:
-            row, icr, skills = simulate_row(
+            row, icr = simulate_row(
                 patient_seed,
                 warmup_hours=self.simulator_warmup_hours,
                 uniform_skills=uniform_skill_draw(
@@ -614,7 +604,6 @@ class T1DMDataset(Dataset):
             rng=rng,
             blind=self.blind,
             boundary=True,
-            skills=skills,
             arm=sample_arm,
             arm_bolus_u=doses[0],
             arm_carb_g=doses[1],
@@ -778,15 +767,14 @@ def _build_sample(
     rng: np.random.Generator,
     blind: bool = False,
     boundary: bool = False,
-    skills: np.ndarray | None = None,
     arm: int = NO_TAIL_ARM,
     arm_bolus_u: float = 0.0,
     arm_carb_g: float = 0.0,
 ) -> dict[str, Any]:
     """One training sample from a raw simulator output dict.
 
-    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``, ``icr``,
-    ``skills``. ``boundary`` pins the horizon to the trajectory's last PREDICTION_PATCHES.
+    Keys out: ``patches``, ``targets``, ``n_context_patches``, ``bg_formula_data``, ``icr``.
+    ``boundary`` pins the horizon to the trajectory's last PREDICTION_PATCHES.
     """
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
     bg_raw = data['bg_observed'].astype(np.float32)
@@ -954,7 +942,6 @@ def _build_sample(
         'n_context_patches': n_ctx,
         'bg_formula_data': bg_formula_data,
         'icr': float(icr),
-        'skills': None if skills is None else np.asarray(skills, dtype=np.float32),
     }
 
     # Cross-window time-of-day probe: the paired window, teacher-forced, one right-edge span.
@@ -1062,16 +1049,6 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     attn_masks = utils.create_attention_mask_from_visible(~masked, is_pad)
     assert attn_masks.any(dim=-1).all(), "an all-False attention row NaNs softmax"
 
-    # The skill head pools these patches alone: real readings the model was allowed to see.
-    pool_mask = (~masked) & (~is_pad)
-    skills_valid = torch.tensor(
-        [s.get('skills') is not None for s in samples], dtype=torch.bool)
-    skills_batch = torch.zeros(B, N_SKILLS, dtype=torch.float32)
-    for i, s in enumerate(samples):
-        if skills_valid[i]:
-            skills_batch[i] = torch.from_numpy(
-                np.asarray(s['skills'], dtype=np.float32))
-
     # The bg_masked feat must agree with the set that built attn_mask; nothing else catches drift.
     _bit = patches_batch[..., BG_MASKED_FEAT::N_INPUT_FEATURES]   # (B, max_T, PATCH_SIZE)
     assert _bit.shape[-1] == PATCH_SIZE, (
@@ -1172,9 +1149,6 @@ def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         'patches': patches_batch,
         'targets': targets_batch,
         'attn_mask': attn_masks,
-        'pool_mask': pool_mask,
-        'skills': skills_batch,
-        'skills_valid': skills_valid,
         'bg_formula_data': bg_formula_batched,
         'n_context_patches': n_ctx_tensor,
         **({'next_window': next_window_batched} if next_window_batched is not None else {}),

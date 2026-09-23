@@ -274,7 +274,7 @@ def test_train_inference_anchor_identical():
         pytest.skip("normalization_stats.json required")
     stats = load_normalization_stats()
 
-    row, icr, skills = simulate_row(4242)
+    row, icr = simulate_row(4242)
     data = row_trajectory(row, 0)
 
     n_slots = n_right_edge = 0
@@ -282,7 +282,7 @@ def test_train_inference_anchor_identical():
     for seed in range(16):
         sample = _build_sample(data=data, icr=icr, stats=stats,
                                rng=np.random.default_rng(seed),
-                               boundary=True, skills=skills)
+                               boundary=True)
         n_ctx = int(sample['n_context_patches'])
         bf = sample['bg_formula_data']
         mask_idx, valid = bf['mask_idx'], bf['valid']

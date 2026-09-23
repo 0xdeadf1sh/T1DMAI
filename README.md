@@ -89,11 +89,6 @@ from the trajectory alone. It never touches the forecast, but its gradient does
 reach the shared trunk, which pushes the same representations the glucose head
 reads to encode circadian phase.
 
-A third head reads four patient skills — dietary discipline, attentiveness,
-dosing competence, lifestyle consistency — off the pooled visible context, as
-four numbers in `[0, 1]`. It is trained only where the simulator supplies the
-answers, it never touches the forecast, and it is not exported.
-
 The model is patient-agnostic. There is no learned per-patient vector; identity
 is whatever the 84–168 hour context window implies.
 
@@ -361,8 +356,8 @@ at each seam.
 ## Capacity
 
 Capacity is set by `D_MODEL`, `N_LAYERS` and `N_HEADS` alone: `FFN_DIM`,
-`BG_HEAD_HIDDEN`, `TIME_PROBE_HIDDEN` and `SKILL_HEAD_HIDDEN` are multiples of
-`D_MODEL` and follow it.
+`BG_HEAD_HIDDEN` and `TIME_PROBE_HIDDEN` are multiples of `D_MODEL` and follow
+it.
 
 `resize_model.py` instantiates a capacity and prints its exact trainable
 parameter count at `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES = 24`, computed

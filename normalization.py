@@ -129,7 +129,7 @@ def compute_normalization_stats(
         # mod 2^31-1 keeps the seed inside ``np.random.default_rng``'s legal range.
         seed = (master_seed + 1_000_000 + i) % (2**31 - 1)
         # Same draw as data.py's dataset, so the fitted pool matches the trained one.
-        row, _icr, _skills = simulate_row(
+        row, _icr = simulate_row(
             seed,
             warmup_hours=simulator_warmup_hours,
             uniform_skills=uniform_skill_draw(seed, patient_uniform_sample_prob),
