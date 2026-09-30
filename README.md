@@ -542,11 +542,14 @@ python finetune.py --inputs events --cache <dir>/cache --out-dir checkpoints_scr
     --total-steps 20000 --warmup-steps 1000
 
 python finetune.py --cache <dir>/cache --train-dataset Loop,IOBP2 --test-dataset ReplaceBG
+
+python finetune.py --cache <dir>/cache --iobp2-like
 ```
 
 Without `--checkpoint` the learning rates default to `config.py`'s from-scratch
 values; with one they default ten times lower. `--inputs` must match a
-checkpoint's layout. `--no-carbs` blanks the carbohydrate input.
+checkpoint's layout. `--no-carbs` blanks the carbohydrate input. `--iobp2-like`
+trains and validates on the closed-loop sources that log no carbohydrate.
 
 `export_submission.py` renders the leaderboard's `predictions.parquet` from a
 checkpoint and then scores it. A row's forecast zone opens one step after its

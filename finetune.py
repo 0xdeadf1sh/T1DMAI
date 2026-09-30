@@ -14,6 +14,9 @@ import time
 import numpy as np
 import torch
 
+# MetaboNet's closed-loop sources that log no carbohydrate, as IOBP2's iLet does.
+IOBP2_LIKE_SOURCES = ("DCLP3", "DCLP5", "Flair", "IOBP2")
+
 
 def _apply_checkpoint_dims(ckpt: dict) -> None:
     """Patch ``config`` to the checkpoint's architecture and drop bound modules."""
@@ -155,6 +158,12 @@ def parse_args() -> argparse.Namespace:
         metavar="A,B",
         help=f"comma-separated sub-datasets to validate on; omitted = all{known}",
     )
+    p.add_argument(
+        "--iobp2-like",
+        action="store_true",
+        help=f"train and validate on {','.join(IOBP2_LIKE_SOURCES)} only; "
+        "excludes --train-dataset and --test-dataset",
+    )
     p.add_argument("--out-dir", default="checkpoints_finetune")
     p.add_argument("--total-steps", type=int, default=10000)
     p.add_argument("--batch-size", type=int, default=64)
@@ -213,7 +222,12 @@ def parse_args() -> argparse.Namespace:
         "omitted = the checkpoint's layout, curves from scratch",
     )
     p.add_argument("--log-interval", type=int, default=100)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.iobp2_like:
+        if args.train_dataset is not None or args.test_dataset is not None:
+            p.error("--iobp2-like excludes --train-dataset and --test-dataset")
+        args.train_dataset = args.test_dataset = ",".join(IOBP2_LIKE_SOURCES)
+    return args
 
 
 def main() -> None:
