@@ -14,11 +14,21 @@ import config as cfg
 from exporters.modified_forward import NEG_FILL
 
 # normalization owns this order, and it names the keys of the ``normalization_stats`` block below
-from normalization import CHANNEL_NAMES
+from normalization import CHANNEL_NAMES, LOG_RATIO_REFS, RISK_SPACE_CHANNELS, SPARSE_LOG1P_CHANNELS
 
 # Kovatchev constants imported, not hardcoded, so Rust f/f_inv can't drift; checkpoint stores none.
 from utils import _KOVATCHEV_SCALE, _KOVATCHEV_POWER, _KOVATCHEV_OFFSET
 from T1DMSIM.simulator import BG_CLAMP_MIN as _BG_CLAMP_MIN, BG_CLAMP_MAX as _BG_CLAMP_MAX
+
+
+def _channel_spec(name: str) -> dict[str, Any]:
+    """One normalized channel's transform, the block the Rust feature builder reads."""
+    if name in RISK_SPACE_CHANNELS:
+        return {"name": name, "transform": "kovatchev"}
+    if name in SPARSE_LOG1P_CHANNELS:
+        return {"name": name, "transform": "log1p"}
+    assert name in LOG_RATIO_REFS, f"channel {name!r} has no transform"
+    return {"name": name, "transform": "log_ratio", "ref": LOG_RATIO_REFS[name]}
 
 
 def build_descriptor(
@@ -28,6 +38,7 @@ def build_descriptor(
     executorch_version: str,
     artifact_filename: str,
     normalization_stats: dict[str, dict[str, float]],
+    masked_channel_policy: str,
     precision: str = "fp32",
     model_card: dict[str, Any] | None = None,
     head: dict[str, Any] | None = None,
@@ -181,8 +192,15 @@ def build_descriptor(
             "MASKABLE_FEATS": list(cfg.MASKABLE_FEATS),
         },
 
-        # REQUIRED: BG risk-space, carb/insulin log1p
-        "normalization_stats": normalization_stats,
+        # Feats 0.. in this order, then the mask bit; absent, a reader takes curves/announced.
+        "inputs": {
+            "layout": cfg.INPUT_LAYOUT,
+            "masked_channel_policy": masked_channel_policy,
+            "channels": [_channel_spec(n) for n in CHANNEL_NAMES],
+        },
+
+        # REQUIRED, keyed by inputs.channels names: bg risk-space, doses log1p or log-ratio
+        "normalization_stats": {n: normalization_stats[n] for n in CHANNEL_NAMES},
 
         # decode-critical constants ABSENT from the checkpoint (PLAN §2.4)
         "constants": {

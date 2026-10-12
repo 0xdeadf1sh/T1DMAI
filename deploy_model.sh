@@ -23,7 +23,10 @@ remote=/sdcard/Android/data/com.t1dm.app/files/models
 cd "$root"
 py=$root/.venv-export/bin/python
 [[ -x $py ]] || { echo "no .venv-export: python3.11 -m venv .venv-export && .venv-export/bin/pip install -r requirements-export.txt" >&2; exit 1; }
-"$py" -m exporters.executorch_xnnpack --checkpoint "$ckpt" --model-id "$id" --out-dir "$out"
+# config binds the input layout at import, so it must come from the checkpoint before python starts
+layout=$("$py" -c 'import sys, torch
+print(torch.load(sys.argv[1], map_location="cpu", weights_only=False).get("input_layout", "curves"))' "$ckpt")
+T1DMAI_INPUT_LAYOUT=$layout "$py" -m exporters.executorch_xnnpack --checkpoint "$ckpt" --model-id "$id" --out-dir "$out"
 
 [[ $(adb get-state 2>/dev/null) == device ]] || { echo "no device; push skipped, export in $out" >&2; exit 1; }
 

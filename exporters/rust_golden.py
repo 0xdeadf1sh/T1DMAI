@@ -1,12 +1,13 @@
 """The pipeline golden T1DMDROID's fp64 Rust pre/post is pinned against; regenerate on change.
-Per case: raw four-channel history, masked set, patch tensor, per-slot anchors, head output,
-decoded fan. Floats carry a tolerance; the boolean attention pattern is an exact digest. Two
-cases run the real model; ladders feed synthetic head_raw through every span length.
+Per case: raw history in the checkpoint's layout, masked set, patch tensor, per-slot anchors,
+head output, decoded fan. Floats carry a tolerance; the attention pattern is an exact digest.
+Two cases run the real model; ladders feed synthetic head_raw through every span length.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -18,6 +19,10 @@ import config as cfg
 from normalization import normalize, CHANNEL_NAMES
 from utils import assemble_quantiles, last_bg_mgdl_from_context
 from inference import _build_patches_tensor, _resolve_mask_spans
+from data import (
+    MASKED_CHANNEL_POLICY_BLIND, blind_masked_doses, checkpoint_masked_channel_policy,
+    zero_dose_fill,
+)
 from exporters.modified_forward import load_model
 from exporters.head_weights import head_tensors
 from exporters.executorch_xnnpack import _slot_anchor_cells
@@ -25,7 +30,7 @@ from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
 
 def raw_history(n_steps: int) -> dict[str, np.ndarray]:
-    """A deterministic, physiologically-shaped four-channel history, fp64 throughout.
+    """A deterministic, physiologically-shaped history in the bound layout, fp64 throughout.
 
     The Rust normalizes in fp64 and rounds once at the end; fp32 would disagree in the last bit.
     """
@@ -33,21 +38,30 @@ def raw_history(n_steps: int) -> dict[str, np.ndarray]:
     bg = 120.0 + 28.0 * np.sin(2.0 * np.pi * t / 288.0) + 12.0 * np.sin(2.0 * np.pi * t / 47.0)
     for center, amp, width in ((0.22, 52.0, 20.0), (0.55, 44.0, 16.0), (0.81, 36.0, 13.0)):
         bg += amp * np.exp(-0.5 * ((t - center * n_steps) / width) ** 2)
-    carb = np.zeros(n_steps)
-    insulin = np.full(n_steps, 0.021)
-    for frac, g, u in ((0.20, 6.5, 0.26), (0.53, 5.5, 0.22), (0.79, 4.0, 0.18)):
+    out = {'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX)}
+    meals = ((0.20, 6.5, 0.26, 62.0), (0.53, 5.5, 0.22, 35.0), (0.79, 4.0, 0.18, 50.0))
+    if cfg.INPUT_LAYOUT == 'curves':
+        carb = np.zeros(n_steps)
+        insulin = np.full(n_steps, 0.021)
+        for frac, g, u, _gi in meals:
+            i = int(frac * n_steps)
+            carb[i:i + 8] = g
+            insulin[i:i + 10] += u
+        out['carb_intake'] = np.maximum(carb, 0.0)
+        out['insulin_combined'] = np.maximum(insulin, 0.0)
+        return out
+    out.update({name: np.zeros(n_steps) for name in CHANNEL_NAMES[1:]})
+    for frac, g, u, gi in meals:
         i = int(frac * n_steps)
-        carb[i:i + 8] = g
-        insulin[i:i + 10] += u
-    return {
-        'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX),
-        'carb_intake': np.maximum(carb, 0.0),
-        'insulin_combined': np.maximum(insulin, 0.0),
-    }
+        out['carb_g'][i], out['carb_gi'][i] = 8.0 * g, gi
+        out['bolus_u'][i], out['bolus_peak_min'][i], out['bolus_dur_h'][i] = 10.0 * u, 57.6, 3.6
+    for i in range(int(0.07 * n_steps), n_steps, 288):
+        out['basal_u'][i], out['basal_peak_min'][i], out['basal_dur_h'][i] = 17.0, 317.0, 73.0
+    return out
 
 
 def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: bool,
-               synthetic_head: bool = False) -> dict:
+               synthetic_head: bool = False, blind: bool = False) -> dict:
     """One golden case: the raw inputs, the built graph input, and the decoded fan."""
     n_steps = n_ctx * cfg.PATCH_SIZE
     raw = raw_history(n_steps)
@@ -88,6 +102,10 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     for q in idx_abs:
         pt[q, :, 0] = 0.0
         pt[q, :, n_ch] = 1.0
+    fill = zero_dose_fill(stats) if blind else {}
+    for q in idx_abs:
+        for feat_idx, z in fill.items():
+            pt[q, :, feat_idx] = z
 
     context = torch.from_numpy(
         np.concatenate([feats, np.zeros((n_steps, 1))], axis=-1)
@@ -101,6 +119,10 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
             normalization_stats=stats,
             mask_spans=full,
         )
+        if fill:
+            masked = torch.zeros(n_ctx + p, dtype=torch.bool)
+            masked[[q - pad0 for q in idx_abs]] = True
+            blind_masked_doses(shipped, masked, fill)
         mine = torch.from_numpy(pt[pad0:].reshape(n_ctx + p, -1)).float()
         d = float((shipped - mine).abs().max())
         assert d < 1e-5, f"the fixture's patch tensor disagrees with _build_patches_tensor by {d:.3e}"
@@ -176,8 +198,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
         "with_forecast": with_forecast,
         "mask_spans": [[int(s), int(L)] for s, L in (mask_spans or [])],
         "raw_bg": raw['bg_absolute'].tolist(),
-        "raw_carb": raw['carb_intake'].tolist(),
-        "raw_insulin": raw['insulin_combined'].tolist(),
+        "raw_doses": [raw[k].tolist() for k in CHANNEL_NAMES[1:]],
         "t": T,
         "pad0": int(pad0),
         "n_masked": int(n_masked),
@@ -195,6 +216,71 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
     }
 
 
+def dose_events_fixture() -> dict:
+    """App-shaped dose rows -> the converter's point descriptors and per-step event channels.
+
+    Covers each descriptor rule, a same-step collision, rounding onto the grid and window edges.
+    """
+    import finetune_data as fd
+    import t1dmdroid_converter as conv
+    step = conv.STEP_MS
+    t0 = step * 5_866_667
+    n = 96
+
+    def cc(values: list[float]) -> str:
+        return base64.b64encode(np.asarray(values, dtype='<f8').tobytes()).decode()
+
+    meals = [
+        {'ts': t0 + 10 * step, 'g': 45.0, 'gi': 70.0, 'dm': 150.0},
+        {'ts': t0 + 10 * step + 60_000, 'g': 15.0, 'dm': 180.0},
+        {'ts': t0 + 40 * step + 160_000, 'g': 30.0, 'gi': 35.0, 'dm': 30.0,
+         'cc': cc([2.0, 8.0, 12.0, 6.0, 2.0])},
+        {'ts': t0 - 2 * step, 'g': 20.0, 'gi': 50.0, 'dm': 180.0},
+        {'ts': t0 + n * step, 'g': 25.0, 'gi': 50.0, 'dm': 180.0},
+    ]
+    doses = [
+        {'ts': t0 + 10 * step, 'kd': 'BOLUS', 'u': 4.0, 'k': 3.0, 'th': 28.0, 'dm': 230.0},
+        {'ts': t0 + 10 * step - 90_000, 'kd': 'BOLUS', 'u': 7.5, 'dm': 300.0},
+        {'ts': t0 + 50 * step, 'kd': 'BOLUS', 'u': 2.0, 'dm': 30.0,
+         'cc': cc([0.1, 0.5, 0.8, 0.4, 0.2, 0.0])},
+        {'ts': t0 + 5 * step, 'kd': 'BASAL', 'u': 18.0, 'ka': 0.187, 'ke': 0.0277,
+         'dm': 133 * 60.0},
+        {'ts': t0 + 70 * step, 'kd': 'BASAL', 'u': 16.0, 'dm': 73 * 60.0},
+        {'ts': t0 + 70 * step, 'kd': 'BASAL', 'u': 4.0, 'dm': 20.0,
+         'cc': cc([1.0, 2.0, 1.0, 0.0])},
+    ]
+    at = lambda ts: int(round((ts - t0) / step))  # noqa: E731 — the converter's own rule
+    channels = conv.record_events({'meal': meals, 'dose': doses}, at, n)
+
+    def record(o: dict, kind: str) -> dict:
+        r = {'start_ms': o['ts'], 'kind': kind, 'amount': o['g' if kind == 'meal' else 'u'],
+             'duration_min': o['dm']}
+        for src, dst in (('gi', 'gi'), ('k', 'k'), ('th', 'theta'), ('ka', 'ka_per_hour'),
+                         ('ke', 'ke_per_hour')):
+            if src in o:
+                r[dst] = o[src]
+        c = conv.custom_curve(o)
+        if c is not None:
+            r['custom_curve'] = c.tolist()
+        if kind == 'meal':
+            r['want'] = {'gi': conv.meal_gi(o)}
+        else:
+            peak, dur = conv.dose_peak_dur(o)
+            r['want'] = {'peak_min': peak, 'dur_h': dur}
+        return r
+
+    return {
+        "grid_start_ms": t0,
+        "n_steps": n,
+        "records": [record(o, 'meal') for o in meals]
+        + [record(o, o['kd'].lower()) for o in doses],
+        "channel_names": list(fd.EVENT_CHANNELS),
+        "channels": [channels[c].astype(np.float64).tolist() for c in fd.EVENT_CHANNELS],
+        # record_events is fp32; the Rust sums in fp64.
+        "rel_tolerance": 1e-6,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="emit the Rust pipeline golden")
     ap.add_argument("--checkpoint", required=True)
@@ -203,24 +289,34 @@ def main() -> None:
 
     model, ck = load_model(args.checkpoint)
     stats = ck["normalization_stats"]
+    policy = checkpoint_masked_channel_policy(ck)
+    blind = policy == MASKED_CHANNEL_POLICY_BLIND
     n_ctx = cfg.MIN_CONTEXT_PATCHES
+    # Interior spans sit at fixed fractions of the context, so a short window still holds them.
+    at = lambda frac: int(frac * n_ctx)  # noqa: E731
 
     cases = [
-        build_case("forecast", model, stats, n_ctx, None, True),
-        build_case("infill", model, stats, n_ctx, [(60, 3), (100, 5)], True),
+        build_case("forecast", model, stats, n_ctx, None, True, blind=blind),
+        build_case("infill", model, stats, n_ctx, [(at(0.36), 3), (at(0.6), 5)], True,
+                   blind=blind),
         # No future zone: a gap repair reads real evidence on BOTH sides of the span.
-        build_case("infill_no_forecast", model, stats, n_ctx, [(80, 4)], False),
+        build_case("infill_no_forecast", model, stats, n_ctx, [(at(0.48), 4)], False,
+                   blind=blind),
         # Span lengths 1..4 pin decode vs layout; a second ladder covers MASK_SPAN_LENGTHS[-1].
         build_case("span_ladder", model, stats, n_ctx,
-                   [(10, 1), (20, 2), (40, 3), (70, 4)], False, synthetic_head=True),
+                   [(at(0.06), 1), (at(0.12), 2), (at(0.24), 3), (at(0.42), 4)], False,
+                   synthetic_head=True, blind=blind),
         build_case("span_ladder_long", model, stats, n_ctx,
-                   [(10, 5), (30, 7)], False, synthetic_head=True),
+                   [(at(0.06), 5), (at(0.18), 7)], False, synthetic_head=True, blind=blind),
     ]
 
     doc = {
         "_comment": "Golden for T1DMDROID's fp64 Rust pre/post pipeline. Regenerate with "
                     "T1DMAI/exporters/rust_golden.py whenever the contract moves.",
         "arch_version": cfg.ARCH_VERSION,
+        "input_layout": cfg.INPUT_LAYOUT,
+        "masked_channel_policy": policy,
+        "channel_names": list(CHANNEL_NAMES),
         "patch_size": cfg.PATCH_SIZE,
         "n_input_features": cfg.N_INPUT_FEATURES,
         "max_masked_patches": cfg.MAX_MASKED_PATCHES,
@@ -235,6 +331,8 @@ def main() -> None:
                             "per cell (1 attend / 0 block)",
         "cases": cases,
     }
+    if cfg.INPUT_LAYOUT == 'events':
+        doc["dose_events"] = dose_events_fixture()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(doc, f)

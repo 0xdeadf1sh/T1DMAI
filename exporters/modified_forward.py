@@ -164,9 +164,11 @@ def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
     assert ck.get("arch_version") in (None, _cfg.ARCH_VERSION), (
         f"checkpoint arch_version {ck.get('arch_version')!r} != config {_cfg.ARCH_VERSION!r}"
     )
-    # The on-device feature builder lays action curves; SPEC/inference.md has no events layout.
-    assert ck.get("input_layout", "curves") == "curves", (
-        f"checkpoint input_layout {ck.get('input_layout')!r} is not exportable"
+    # normalization/data bind the layout at import, so it cannot be switched from here.
+    layout = ck.get("input_layout", "curves")
+    assert layout == _cfg.INPUT_LAYOUT, (
+        f"checkpoint input_layout {layout!r} but config bound {_cfg.INPUT_LAYOUT!r}; "
+        f"export with {_cfg.INPUT_LAYOUT_ENV}={layout}"
     )
     for cfg_name, tc_key in (
         ("D_MODEL", "d_model"), ("N_LAYERS", "n_layers"), ("N_HEADS", "n_heads"),

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 import config as cfg
+from data import checkpoint_masked_channel_policy
 from exporters.modified_forward import HeadRawForward, load_model
 from exporters.descriptor import build_descriptor, build_model_card, write_descriptor
 # same representative input/eager refs as XNNPACK; pulls no executorch at module load
@@ -138,6 +139,7 @@ def main() -> None:
     desc = build_descriptor(
         model_id=args.model_id, engine=engine, executorch_version=aet_ver,
         artifact_filename=os.path.basename(tfl_path), normalization_stats=stats,
+        masked_channel_policy=checkpoint_masked_channel_policy(ck),
         precision="fp32", model_card=build_model_card(model, ck),
     )
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.litert.descriptor.json")

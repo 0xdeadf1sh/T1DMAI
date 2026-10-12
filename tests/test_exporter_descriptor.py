@@ -28,6 +28,41 @@ def _pretrained_ckpt() -> dict:
 
 
 
+def _unit_stats() -> dict:
+    from normalization import CHANNEL_NAMES
+    return {c: {"mean": 0.0, "std": 1.0} for c in CHANNEL_NAMES}
+
+
+def test_the_inputs_block_names_the_layout_policy_and_every_channel_transform():
+    """T1DMDROID builds the patch row from this block alone; feat order is the list order."""
+    import config as cfg
+    from normalization import (
+        CHANNEL_NAMES, LOG_RATIO_REFS, RISK_SPACE_CHANNELS, SPARSE_LOG1P_CHANNELS,
+    )
+
+    stats = {**_unit_stats(), "stray": {"mean": 0.0, "std": 1.0}}
+    desc = build_descriptor(
+        model_id="m", engine="e", executorch_version="1.3.1",
+        artifact_filename="m.pte", normalization_stats=stats, masked_channel_policy="blind",
+    )
+    inputs = desc["inputs"]
+    print(f"[DUMP] inputs={inputs}")
+
+    assert inputs["layout"] == cfg.INPUT_LAYOUT
+    assert inputs["masked_channel_policy"] == "blind"
+    assert [c["name"] for c in inputs["channels"]] == list(CHANNEL_NAMES)
+    assert len(inputs["channels"]) + 1 == desc["geometry"]["N_INPUT_FEATURES"]
+    assert list(desc["normalization_stats"]) == list(CHANNEL_NAMES), "a stray stat must not ship"
+    for c in inputs["channels"]:
+        name = c["name"]
+        if name in RISK_SPACE_CHANNELS:
+            assert c == {"name": name, "transform": "kovatchev"}
+        elif name in SPARSE_LOG1P_CHANNELS:
+            assert c == {"name": name, "transform": "log1p"}
+        else:
+            assert c == {"name": name, "transform": "log_ratio", "ref": LOG_RATIO_REFS[name]}
+
+
 def test_model_card_reads_last_val_history_entry():
     card = build_model_card(_TinyModel(), _pretrained_ckpt())
     rm = card["reference_metrics"]
@@ -53,11 +88,10 @@ def test_descriptor_kovatchev_block_tracks_the_live_transform():
     from utils import _KOVATCHEV_SCALE, _KOVATCHEV_OFFSET, _KOVATCHEV_POWER, kovatchev_f
     from T1DMSIM.simulator import BG_CLAMP_MIN, BG_CLAMP_MAX
 
-    stats = {c: {"mean": 0.0, "std": 1.0}
-             for c in ("bg_absolute", "carb_intake", "insulin_combined")}
     kov = build_descriptor(
         model_id="m", engine="e", executorch_version="1.3.1",
-        artifact_filename="m.pte", normalization_stats=stats,
+        artifact_filename="m.pte", normalization_stats=_unit_stats(),
+        masked_channel_policy="announced",
     )["kovatchev"]
     print(f"[DUMP] kovatchev={kov}")
 
@@ -80,11 +114,10 @@ def test_descriptor_drops_the_retired_head_constants_and_names_the_decoder(tmp_p
 
     torch.manual_seed(0)
     block = write_head_weights(T1DMAI(), str(tmp_path / "m.head.bin"))
-    stats = {c: {"mean": 0.0, "std": 1.0}
-             for c in ("bg_absolute", "carb_intake", "insulin_combined")}
     desc = build_descriptor(
         model_id="m", engine="e", executorch_version="1.3.1",
-        artifact_filename="m.pte", normalization_stats=stats, head=block,
+        artifact_filename="m.pte", normalization_stats=_unit_stats(),
+        masked_channel_policy="announced", head=block,
     )
     stale = sorted(k for k in desc["constants"] if k.startswith("BG_HEAD_"))
     head = desc["head"]

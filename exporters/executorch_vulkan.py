@@ -16,6 +16,7 @@ import os
 import torch
 
 import config as cfg
+from data import checkpoint_masked_channel_policy
 from exporters.modified_forward import HeadRawForward, load_model
 # same representative input as XNNPACK, so the report is about one graph on one input
 from exporters.executorch_xnnpack import build_representative_input
@@ -388,6 +389,7 @@ def main() -> None:
         desc = build_descriptor(
             model_id=args.model_id, engine=engine, executorch_version=et_ver,
             artifact_filename=os.path.basename(pte_path), normalization_stats=stats,
+            masked_channel_policy=checkpoint_masked_channel_policy(ck),
             precision=precision, model_card=build_model_card(model, ck),
         )
         desc_path = os.path.join(args.out_dir, f"{args.model_id}.vulkan.descriptor.json")

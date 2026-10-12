@@ -17,7 +17,10 @@ import torch
 
 import config as cfg
 import model as model_module
-from data import BG_MASKED_FEAT
+from data import (
+    BG_MASKED_FEAT, MASKED_CHANNEL_POLICY_BLIND, blind_masked_doses,
+    checkpoint_masked_channel_policy, zero_dose_fill,
+)
 from normalization import normalize, CHANNEL_NAMES
 from utils import bspline_step_weights, last_bg_mgdl_from_context, time_of_day_decode_bins
 from inference import _build_patches_tensor, _resolve_mask_spans
@@ -80,11 +83,32 @@ def _slot_anchor_cells(spans, n_ctx):
     return patch_idx, step_idx
 
 
+def dose_signals(n_steps: int) -> dict[str, np.ndarray]:
+    """Two meals with their boluses plus daily basal, raw, in the bound layout's channels."""
+    if cfg.INPUT_LAYOUT == 'curves':
+        carb = np.zeros(n_steps, dtype=np.float64)
+        carb[int(0.30 * n_steps):int(0.30 * n_steps) + 8] = 6.0     # ~48 g meal appearance
+        carb[int(0.68 * n_steps):int(0.68 * n_steps) + 6] = 5.0
+        insulin = np.full(n_steps, 0.02, dtype=np.float64)          # basal action
+        insulin[int(0.30 * n_steps):int(0.30 * n_steps) + 10] += 0.25
+        insulin[int(0.68 * n_steps):int(0.68 * n_steps) + 10] += 0.20
+        return {'carb_intake': carb, 'insulin_combined': insulin}
+    out = {name: np.zeros(n_steps, dtype=np.float64) for name in CHANNEL_NAMES[1:]}
+    for frac, grams, gi, units in ((0.30, 48.0, 55.0, 2.5), (0.68, 30.0, 40.0, 2.0)):
+        i = int(frac * n_steps)
+        out['carb_g'][i], out['carb_gi'][i] = grams, gi
+        out['bolus_u'][i], out['bolus_peak_min'][i], out['bolus_dur_h'][i] = units, 60.0, 4.6
+    for i in range(int(0.1 * n_steps), n_steps, 288):
+        out['basal_u'][i], out['basal_peak_min'][i], out['basal_dur_h'][i] = 18.0, 317.0, 73.0
+    return out
+
+
 def build_representative_input(
     stats: dict[str, dict[str, float]],
     n_ctx: int | None = None,
     seq_len: int | None = None,
     mask_spans=None,
+    blind: bool = False,
 ) -> Window:
     """A plausible normalized fixed-T input from a synthetic BG series; no simulator needed. Uses
     the real training preprocessing, so patches/mask/mask-bit are construction-identical to a
@@ -100,18 +124,8 @@ def build_representative_input(
     bg = 120.0 + 30.0 * np.sin(2.0 * np.pi * t / max(288.0, n_steps / 7.0))
     for center, amp, width in ((0.35 * n_steps, 55.0, 18.0), (0.72 * n_steps, 40.0, 14.0)):
         bg += amp * np.exp(-0.5 * ((t - center) / width) ** 2)
-    carb = np.zeros(n_steps, dtype=np.float64)
-    carb[int(0.30 * n_steps):int(0.30 * n_steps) + 8] = 6.0     # ~48 g meal appearance
-    carb[int(0.68 * n_steps):int(0.68 * n_steps) + 6] = 5.0
-    insulin = np.full(n_steps, 0.02, dtype=np.float64)          # basal action
-    insulin[int(0.30 * n_steps):int(0.30 * n_steps) + 10] += 0.25
-    insulin[int(0.68 * n_steps):int(0.68 * n_steps) + 10] += 0.20
     # no smoothing: bg clamped to physical range, rest floored at 0, as data._build_sample does
-    signals = {
-        'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX),
-        'carb_intake': np.maximum(carb, 0.0),
-        'insulin_combined': np.maximum(insulin, 0.0),
-    }
+    signals = {'bg_absolute': np.clip(bg, BG_CLAMP_MIN, BG_CLAMP_MAX), **dose_signals(n_steps)}
     # CHANNEL_NAMES order comes from normalization; a channel added there raises here, not misplaced
     raw = np.stack([signals[name] for name in CHANNEL_NAMES], axis=-1).astype(np.float32)
     feats = normalize(raw, stats)                                       # (N, C) z-space
@@ -128,6 +142,11 @@ def build_representative_input(
     patches, _bool_unpadded = _build_patches_tensor(
         context, normalization_stats=stats, mask_spans=mask_spans,
     )                                                                   # (n_ctx+P, PATCH_DIM)
+    if blind:
+        masked = torch.zeros(patches.shape[0], dtype=torch.bool)
+        for s, L in spans:
+            masked[s:s + L] = True
+        blind_masked_doses(patches, masked, zero_dose_fill(stats))
     pad0 = c - n_ctx
     if pad0 > 0:
         pad = torch.zeros(pad0, cfg.PATCH_DIM, dtype=patches.dtype)
@@ -394,16 +413,19 @@ def main() -> None:
 
     model, ck = load_model(args.checkpoint)
     stats = ck["normalization_stats"]
+    policy = checkpoint_masked_channel_policy(ck)
+    blind = policy == MASKED_CHANNEL_POLICY_BLIND
     wrapper = HeadRawForward(model).eval()
 
     T = int(args.seq_len or cfg.MAX_SEQ_LEN)
     c = T - cfg.PREDICTION_PATCHES
     m = cfg.MAX_MASKED_PATCHES
+    print(f"[input] layout={cfg.INPUT_LAYOUT} masked_channel_policy={policy}")
 
     # two masked sets on one geometry: the trailing forecast the app runs every cycle, plus infill
-    w_fc = build_representative_input(stats, seq_len=T)
+    w_fc = build_representative_input(stats, seq_len=T, blind=blind)
     infill_spans = [(c // 2, 4), (c, cfg.PREDICTION_PATCHES)]
-    w_inf = build_representative_input(stats, seq_len=T, mask_spans=infill_spans)
+    w_inf = build_representative_input(stats, seq_len=T, mask_spans=infill_spans, blind=blind)
     print(f"[input] T={T} patches={tuple(w_fc.patches.shape)} "
           f"struct={tuple(w_fc.struct.shape)} slot_sel={tuple(w_fc.slot_sel.shape)}")
     print(f"[input] forecast slots={w_fc.n_masked} infill slots={w_inf.n_masked}")
@@ -482,7 +504,7 @@ def main() -> None:
               f"{deltas[f'head_{name}']:.3e}")
 
     # padded-context sanity: the shortest context the artifact accepts
-    w16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES, seq_len=T)
+    w16 = build_representative_input(stats, n_ctx=cfg.MIN_CONTEXT_PATCHES, seq_len=T, blind=blind)
     o16 = run_pte_outputs(pte_work, w16.patches, w16.struct, w16.slot_sel)
     finite16 = bool(all(torch.isfinite(o).all() for o in o16))
     print(f"[verify] padded n_ctx={cfg.MIN_CONTEXT_PATCHES} pte outputs finite = {finite16}")
@@ -496,8 +518,8 @@ def main() -> None:
     # descriptor
     desc = build_descriptor(
         model_id=args.model_id, engine=ENGINE, executorch_version=et_ver,
-        artifact_filename=pte_name, normalization_stats=stats, precision="fp32",
-        model_card=build_model_card(model, ck), head=head_block, seq_len=T,
+        artifact_filename=pte_name, normalization_stats=stats, masked_channel_policy=policy,
+        precision="fp32", model_card=build_model_card(model, ck), head=head_block, seq_len=T,
     )
     # named after the artifact: several models share one out-dir; ModelStore globs *.descriptor.json
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.xnnpack.descriptor.json")

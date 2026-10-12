@@ -132,16 +132,22 @@ forecast *protocol*; it is not a region of a training sample.
   `normalization_stats_events.json` (`cache_simulator.py --events`, or `finetune_data.py build`,
   whose cache holds both layouts); there is no on-the-fly fit. A checkpoint is stamped
   `input_layout`; a mismatch with `--inputs` exits. Under `events` the counterfactual probe is
-  skipped (its arms add curves), a phone subject whose index entry lacks `events: True`
-  (converted before `t1dmdroid_converter.py` wrote point events) is refused, and the exporter
-  refuses the checkpoint.
+  skipped (its arms add curves), and a phone subject whose index entry lacks `events: True`
+  (converted before `t1dmdroid_converter.py` wrote point events) is refused. The exporter takes
+  either layout, but `exporters.modified_forward.load_model` refuses a checkpoint whose layout
+  differs from the one `config` bound at import — export under `T1DMAI_INPUT_LAYOUT`, which
+  `deploy_model.sh` reads off the checkpoint. The descriptor's `inputs` block (layout,
+  `masked_channel_policy`, per-channel transform and `ref`) is what T1DMDROID's `preproc.rs`
+  builds the patch row from; `rust_golden.py` on an events checkpoint also writes the
+  `dose_events` fixture that pins the app's `curve.rs::point_dose` / `event_channels` to
+  `t1dmdroid_converter.record_events`.
 - **Blind policy is a flag, not a fork.** `config.BLIND` / `--blind` on `train.py` and `finetune.py`:
   every masked patch withholds its doses too, at `data.zero_dose_fill` (`normalize(0)`, never
   `z = 0`), in the training sample (`data`/`finetune_data` `blind`), both validation protocols
   (`_forecast_protocol` / `_infill_protocol` `blind_fill`) and the rescue probe; the
   counterfactual probe is skipped. Logs and checkpoints go to the same `checkpoints/` / `logs/`;
   the policy lives only in the `masked_channel_policy` stamp, which resume, fine-tune,
-  `validate.py` and `calibrate_conformal.py` all read.
+  `validate.py`, `calibrate_conformal.py` and the exporter's descriptor all read.
 - **4 input features — the FROZEN index map (`curves`).** `[bg_absolute, carb_intake,
   insulin_combined, bg_masked]`, `N_INPUT_FEATURES = 4`, `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES =
   24`, **step-major**, so a feature's columns are the stride `[:, f::N_INPUT_FEATURES]`. There are no

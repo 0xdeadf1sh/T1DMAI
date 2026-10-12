@@ -210,8 +210,7 @@ Doses sharing a step are summed and their descriptors dose-weighted. A pump's
 per-step basal carries its rapid insulin's descriptors; a long-acting injection
 carries its own. The channel list is `T1DMSIM/simulator.EVENT_CHANNELS`.
 `config.INPUT_LAYOUT_DEFAULT` is the layout when `--inputs` is omitted. A
-checkpoint is stamped with its layout and accepts only that one; the on-device
-export covers the curve layout only.
+checkpoint is stamped with its layout and accepts only that one.
 
 The output is `(q_tau, median)` in risk space: a seven-level quantile fan at
 every 5-minute step of every masked patch, each anchored on its own span's
@@ -641,6 +640,11 @@ how much of the graph the backend delegates versus falls back to CPU.
 
 `./deploy_model.sh <checkpoint> [model-id]` runs the XNNPACK export and pushes
 the artifact, head file and descriptor to an attached T1DMDROID phone over `adb`.
+`config` binds the input layout at import, so an export runs under
+`T1DMAI_INPUT_LAYOUT` set to the checkpoint's layout; `deploy_model.sh` reads it
+from the checkpoint. The descriptor's `inputs` block names the layout, the
+masked-channel policy and each channel's transform (`kovatchev`, `log1p`, or
+`log_ratio` with its `ref`), in feature order.
 
 The exported graph takes the masked set as an input: a one-hot matrix naming the
 patch each head slot reads, at one fixed sequence length, with the attention mask
