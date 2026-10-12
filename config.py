@@ -11,9 +11,9 @@ from T1DMSIM.simulator import (
 )
 
 # resize_model.py rewrites these; don't bake values elsewhere. PATCH_SIZE must divide 12.
-D_MODEL = 16
-N_LAYERS = 16
-N_HEADS = 1
+D_MODEL = 32
+N_LAYERS = 4
+N_HEADS = 2
 HEAD_DIM = D_MODEL // N_HEADS
 FFN_DIM = 1 * D_MODEL
 PATCH_SIZE = 6  # 6 × 5 min = 30 min per patch
@@ -24,6 +24,11 @@ INPUT_LAYOUTS = {
     "events": ("bg_absolute", *_EVENT_CHANNELS),
 }
 INPUT_LAYOUT_ENV = "T1DMAI_INPUT_LAYOUT"
+INPUT_LAYOUT_DEFAULT = (
+    "events"  # "events": point doses; the env var / --inputs override it
+)
+# True: a masked patch withholds its doses as well as bg (masked_channel_policy 'blind').
+BLIND = True
 NON_MASKABLE_FEATS = (0,)  # bg input slot zeroed at every masked patch
 
 
@@ -43,11 +48,11 @@ def set_input_layout(layout: str) -> None:
 
 
 # The env var reaches DataLoader workers, which import this module fresh.
-set_input_layout(_os.environ.get(INPUT_LAYOUT_ENV, "curves"))
+set_input_layout(_os.environ.get(INPUT_LAYOUT_ENV, INPUT_LAYOUT_DEFAULT))
 
 # Context 84-168 h; floor is far above the sim's 5.3 h ACF (T1DMSIM/diff/README.md §0.5).
-MAX_CONTEXT_PATCHES = 336  # patches, not hours: hours = / _PATCHES_PER_HOUR
-MIN_CONTEXT_PATCHES = 168
+MAX_CONTEXT_PATCHES = 96  # patches, not hours: hours = / _PATCHES_PER_HOUR
+MIN_CONTEXT_PATCHES = 48
 
 # Fixed FORECAST protocol span: a dense right-edge run of PREDICTION_PATCHES masked patches.
 PREDICTION_HORIZON_HOURS = 2
@@ -99,11 +104,11 @@ MASTER_SEED = 42
 DETERMINISTIC = (
     False  # True: TF32 off, cuDNN deterministic; SDPA backward not bit-exact
 )
-TOTAL_STEPS = 10000
+TOTAL_STEPS = 3000
 BATCH_SIZE = 64
 NUM_WORKERS = 4
 
-WARMUP_STEPS = 2000  # steps of linear LR warmup
+WARMUP_STEPS = 300  # steps of linear LR warmup
 LR_MIN_RATIO = 0.01  # cosine decay floor as a fraction of peak LR
 
 # Must stay 0.0: loader equality-checks it against the cache's patient_uniform_sample_prob.
@@ -137,9 +142,11 @@ DILATE_GAMMA = 1.0
 DILATE_TDI_FD_EPS = (
     0.05  # FD step for TDI = d/dε sDTW(C+εΩ)|0; median grad exact to O(ε)
 )
-MSE_ALPHA = 0.0  # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
+MSE_ALPHA = 1.0  # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
 # Outside the Kendall fusion, so the trade against L_D is this number and not log_sigma_D's.
-CURVATURE_LAMBDA = 0.0  # weight on the median's mean squared second difference, per span
+CURVATURE_LAMBDA = (
+    10.0  # weight on the median's mean squared second difference, per span
+)
 KENDALL_LOGVAR_INIT = 0.0  # init for log_sigma_Q / log_sigma_D; clamped [-7, 7]
 
 # Provenance only: stamped into checkpoint/JSON/descriptor, compared by nothing at load time.
@@ -184,8 +191,8 @@ NOCTURNAL_END_HOUR = 6.0
 # theta_ema=decay*theta_ema+(1-decay)*theta; validation runs under it. 0.0 disables (no shadow).
 EMA_DECAY = 0.999
 
-CHECKPOINT_INTERVAL = 1000  # steps
-VALIDATION_INTERVAL = 1000  # steps
+CHECKPOINT_INTERVAL = 200  # steps
+VALIDATION_INTERVAL = 200  # steps
 LOG_INTERVAL = 100  # steps
 # Coverage row 95% CI: 5-11 pts at n=100 (hid a 0.83 band reading 0.905), ~1.9 pts at n=1000.
 
