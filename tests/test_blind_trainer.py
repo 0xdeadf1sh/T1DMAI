@@ -1,24 +1,21 @@
-"""``train_blind.py`` is a copy of ``train.py``; nothing keeps it honest by construction.
+"""``train.py`` under the blind policy (``config.BLIND`` / ``--blind``).
 
-Pins: both protocol forwards blind after the sample is built; no cf_* column survives;
-writes only to *_blind dirs.
+Pins: both protocol forwards blind after the sample is built; the counterfactual section
+renders only when the probe ran; a resume refuses the other policy.
 """
-
-import ast
-import re
 
 import numpy as np
 import pytest
 import torch
 
 from config import (
-    MASKABLE_FEATS, N_INPUT_FEATURES, PATCH_SIZE, PREDICTION_PATCHES,
+    ARCH_VERSION, INPUT_LAYOUT, MASKABLE_FEATS, N_INPUT_FEATURES, PATCH_SIZE,
+    PREDICTION_PATCHES,
 )
 from data import T1DMDataset, collate_fn, zero_dose_fill, masked_channel_policy
 from normalization import load_normalization_stats
 
 import train
-import train_blind
 
 N_SAMPLES = 4
 SEED = 20_260_815
@@ -56,7 +53,7 @@ def test_the_forecast_protocol_blinds_the_zone_it_masks(blind_batch, stats):
     patches = blind_batch['patches'].clone()
     for feat in MASKABLE_FEATS:
         patches[:, zone, feat::N_INPUT_FEATURES] = float(fill[feat]) + 1.0
-    fc = train_blind._forecast_protocol(
+    fc = train._forecast_protocol(
         patches, blind_batch['bg_formula_data']['mask_idx'].long(),
         blind_batch['bg_formula_data']['valid'], blind_batch['n_context_patches'],
         fill)
@@ -100,7 +97,7 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
     """
     fill = zero_dose_fill(stats)
     bf = blind_batch['bg_formula_data']
-    infill = train_blind._infill_protocol(
+    infill = train._infill_protocol(
         blind_batch['patches'], bf['mask_idx'].long(), bf['valid'],
         blind_batch['targets'].float(), blind_batch['n_context_patches'],
         stats, np.random.default_rng(0), fill)
@@ -134,34 +131,11 @@ def test_the_infill_protocol_blinds_the_spans_it_masks(blind_batch, stats):
     print(f"[DUMP] {int(_revealed.sum())} revealed patches unchanged")
 
 
-def test_no_counterfactual_column_survives(blind_batch):
-    """A blind model reads a perturbed dose as constant, so cf_insulin_dir would sit at
-    chance — train.py's signature for a model that stopped responding to insulin.
-
-    Asserted absent here AND present in train.py, or a rename passes on nothing.
+def test_the_counterfactual_section_renders_only_when_the_probe_ran():
+    """A blind model reads a perturbed dose as constant, so cf_insulin_sign would sit at
+    chance — the signature of a model that stopped responding to insulin. The probe is
+    skipped under blind, and its section must vanish rather than render as blanks.
     """
-    blind_cols = [name for name, _ in train_blind._val_log_columns()]
-    plain_cols = [name for name, _ in train._val_log_columns()]
-    assert not [c for c in blind_cols if c.startswith('cf_')], (
-        f"blind header still carries {[c for c in blind_cols if c.startswith('cf_')]}")
-    dropped = [c for c in plain_cols if c.startswith('cf_')]
-    assert dropped, "train.py's header has no cf_* column — this test has no subject"
-
-    # SEQUENCE equality, not set: a set hides a duplicate column, which shifts every later index.
-    assert len(blind_cols) == len(set(blind_cols)), (
-        "the blind header repeats a column: "
-        f"{sorted({c for c in blind_cols if blind_cols.count(c) > 1})}")
-    assert len(plain_cols) == len(set(plain_cols)), (
-        "train.py's header repeats a column: "
-        f"{sorted({c for c in plain_cols if plain_cols.count(c) > 1})}")
-    assert blind_cols == [c for c in plain_cols if not c.startswith('cf_')], (
-        "the blind header is not train.py's minus the cf_* block, in order — "
-        "the two runs' CSVs are no longer positionally comparable")
-    print(f"\n[DUMP] {len(dropped)} cf_* columns dropped, "
-          f"{len(blind_cols)} of {len(plain_cols)} columns kept, in order, "
-          "no duplicates")
-
-    # feed the values that WOULD render, so the absence is evidence
     synthetic = {'cf_n': 96, 'cf_carb_sign': 0.94, 'cf_insulin_sign': 0.88,
                  'cf_insulin_monotonic': 0.71,
                  'cf_carb_monotonic': 0.8, 'cf_carb_gain': 0.7, 'cf_insulin_gain': 0.6,
@@ -171,33 +145,31 @@ def test_no_counterfactual_column_survives(blind_batch):
                  'cf_insulin_onset_frac': 0.9, 'cf_carb_onset_lag_min': 5.0,
                  'cf_insulin_onset_lag_min': -5.0, 'cf_meal_coverage': 0.7,
                  'cf_meal_coverage_ref': 0.8}
-    blind_page = train_blind._render_validation_table(1, dict(synthetic))
-    plain_page = train._render_validation_table(1, dict(synthetic))
+    probed = train._render_validation_table(1, dict(synthetic))
+    skipped = train._render_validation_table(1, {})
     for label in ('Counterfactual', 'carb sign', 'insulin sign',
                   'insulin monotonic', 'insulin gain', 'insulin pre-action',
                   'matched-bolus coverage'):
-        assert label in plain_page, (
-            f"train.py's table does not render {label!r} — no subject")
-        assert label not in blind_page, (
-            f"the blind table still renders {label!r}")
+        assert label in probed, f"the table does not render {label!r} — no subject"
+        assert label not in skipped, f"the table renders {label!r} with no probe run"
+    print("\n[DUMP] counterfactual section: rendered with cf_n, absent without")
 
 
-def test_the_fork_never_writes_to_the_conditioned_run_s_directories():
-    """Not one ``checkpoints/`` or ``logs/`` path literal survives in the fork.
+def _resume_ckpt(blind: bool) -> dict:
+    """The fields ``_check_resume_architecture`` reads up to and including the policy."""
+    return {'arch_version': ARCH_VERSION, 'input_layout': INPUT_LAYOUT,
+            'training_config': {'masked_channel_policy': masked_channel_policy(blind=blind)}}
 
-    train.py writes its CSVs and checkpoints/t1dmai_best.pt in place, so a blind run beside
-    a live conditioned one takes its logs and best checkpoint with it.
-    """
-    src = open(train_blind.__file__).read()
-    bad = sorted({
-        node.value for node in ast.walk(ast.parse(src))
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        and re.search(r"(^|[^_a-z])(checkpoints|logs)/", node.value)
-    })
-    assert not bad, f"the blind trainer writes conditioned-run paths: {bad}"
-    # an empty file would pass the check above
-    for expected in ('checkpoints_blind', 'logs_blind'):
-        assert expected in src, f"{expected} appears nowhere in the fork"
+
+def test_a_resume_refuses_the_other_policy():
+    """Weights trained under one policy, resumed under the other, train a model whose
+    stamp names neither."""
+    for stored, run in ((True, False), (False, True)):
+        with pytest.raises(SystemExit) as exc:
+            train._check_resume_architecture(_resume_ckpt(stored), 'x.pt', blind=run)
+        msg = str(exc.value)
+        assert 'masked_channel_policy' in msg, msg
+        print(f"\n[DUMP] stored blind={stored}, run blind={run}: {msg}")
 
 
 def test_the_conformal_fit_blinds_the_interior_span(stats):
@@ -261,7 +233,7 @@ def _ckpt(policy) -> dict:
 
 
 def test_a_blind_checkpoint_is_refused_by_a_conditioned_fit():
-    """The shipping direction: ``train_blind.py`` writes 'blind', and a fit without
+    """The shipping direction: a blind ``train.py`` run writes 'blind', and a fit without
     ``--blind`` announces doses on the span it predicts."""
     F = _guard_module()
     with pytest.raises(SystemExit) as exc:

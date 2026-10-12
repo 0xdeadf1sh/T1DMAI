@@ -1,11 +1,12 @@
 """Convert a T1DMDROID ``.t1dmbak`` backup into a finetune cache, last N days held out as test.
 
 Pool ``phone`` in ``finetune_data``'s format. BG: measured, NORMAL-flagged grid samples. Carb and
-insulin: rebuilt from logged events per ``SPEC/invariants.md`` §5; the phone's ``exg`` grams are
-read past. Each sensor's own NORMAL readings form one more subject, cut at the held-out boundary."""
+insulin: logged events per ``SPEC/invariants.md`` §5, as curves and as point events; ``exg``
+grams are read past. Each sensor's NORMAL readings: one more subject, cut at the test boundary."""
 
 import argparse
 import base64
+from collections.abc import Callable
 import gzip
 import json
 import os
@@ -14,7 +15,10 @@ import numpy as np
 
 import finetune_data as fd
 from config import MIN_CONTEXT_PATCHES, PATCH_SIZE, PREDICTION_PATCHES
-from T1DMSIM.simulator import basal_curve, bolus_pk_for_dose, gamma_curve
+from T1DMSIM.simulator import (
+    BASAL_KA_PER_HOUR, BASAL_KE_PER_HOUR, basal_curve, bateman_peak_min, bolus_pk_for_dose,
+    gamma_curve, gamma_peak_min,
+)
 
 ARCHIVE_FORMAT = 't1dm.archive'
 STEP_MS = fd.STEP_S * 1000
@@ -91,6 +95,56 @@ def sensor_traces(kinds: dict[str, list[dict]], t0_ms: int, n: int) -> list[tupl
     return sorted(traces.items(), key=lambda kv: int(np.flatnonzero(np.isfinite(kv[1]))[0]))
 
 
+def _curve_peak_dur(cc: np.ndarray) -> tuple[float, float]:
+    """(peak_min, dur_h) of a stored per-step curve."""
+    return float(np.argmax(cc)) * fd.DT_MINUTES, len(cc) * fd.DT_MINUTES / 60.0
+
+
+def meal_gi(o: dict) -> float:
+    """A multi-food meal stores its summed curve with ``gi`` null (MealsController.logMeal)."""
+    return float(o.get('gi', fd.CARB_GI_DEFAULT))
+
+
+def dose_peak_dur(o: dict) -> tuple[float, float]:
+    """(peak_min, dur_h) of the curve ``dose_curve`` lays for ``o``."""
+    cc = custom_curve(o)
+    if cc is not None:
+        return _curve_peak_dur(cc)
+    if o['kd'] == 'BASAL':
+        return (bateman_peak_min(float(o.get('ka', BASAL_KA_PER_HOUR)),
+                                 float(o.get('ke', BASAL_KE_PER_HOUR))),
+                float(o['dm']) / 60.0)
+    if 'k' in o and 'th' in o:
+        return gamma_peak_min(float(o['k']), float(o['th'])), float(o['dm']) / 60.0
+    k, theta, dur = bolus_pk_for_dose(float(o['u']))
+    return gamma_peak_min(k, theta), dur / 60.0
+
+
+def record_events(events: dict[str, list[dict]], at: Callable[[int], int],
+                  n: int) -> dict[str, np.ndarray]:
+    """``fd.EVENT_CHANNELS`` per step: each dose at its onset slot, descriptors dose-weighted."""
+    carb = fd._SlotDoses(n, 'gi')
+    bolus = fd._SlotDoses(n, 'peak_min', 'dur_h')
+    basal = fd._SlotDoses(n, 'peak_min', 'dur_h')
+    for o in events['meal']:
+        if 0 <= at(o['ts']) < n:
+            carb.add(at(o['ts']), float(o['g']), gi=meal_gi(o))
+    for o in events['dose']:
+        if 0 <= at(o['ts']) < n:
+            peak, dur = dose_peak_dur(o)
+            (basal if o['kd'] == 'BASAL' else bolus).add(
+                at(o['ts']), float(o['u']), peak_min=peak, dur_h=dur)
+    out = {
+        'carb_g': carb.dose, 'carb_gi': carb.mean('gi'),
+        'bolus_u': bolus.dose, 'bolus_peak_min': bolus.mean('peak_min'),
+        'bolus_dur_h': bolus.mean('dur_h'),
+        'basal_u': basal.dose, 'basal_peak_min': basal.mean('peak_min'),
+        'basal_dur_h': basal.mean('dur_h'),
+    }
+    assert tuple(out) == fd.EVENT_CHANNELS
+    return {c: v.astype(np.float32) for c, v in out.items()}
+
+
 def _lay(dst: np.ndarray, curve: np.ndarray, start: int) -> None:
     """Add ``curve`` from grid step ``start``; steps outside the grid fall away, as on the phone."""
     lo, hi = max(0, -start), min(len(curve), len(dst) - start)
@@ -120,7 +174,7 @@ def record_channels(kinds: dict[str, list[dict]]) -> dict:
     for o in events['dose']:
         _lay(insulin, dose_curve(o), at(o['ts']))
     return {'t0_ms': t0_ms, 'tz_min': int(first['tz']), 'bg': bg, 'carb': carb,
-            'insulin': insulin,
+            'insulin': insulin, 'events': record_events(events, at, n),
             'n_meals': len(events['meal']), 'n_doses': len(events['dose']), 'n_deleted': n_deleted}
 
 
@@ -147,12 +201,13 @@ def convert(path: str, out_dir: str, test_days: int, source: str, sid: str,
 
     def add(src: str, subject: str, bg: np.ndarray, lo: int, hi: int) -> None:
         start = app.append({'bg': bg[lo:hi], 'carb': carb[lo:hi], 'insulin': insulin[lo:hi],
-                            'is_test': is_test[lo:hi]})
+                            'is_test': is_test[lo:hi],
+                            **{c: v[lo:hi] for c, v in r['events'].items()}})
         ts = test_start - lo
         index.append({
             'key': f'phone:{src}:{subject}', 'pool': 'phone', 'source': src, 'sid': subject,
             'start': start, 'n': int(hi - lo), 't0': t0 + lo * fd.STEP_S,
-            'test_start': -1 if ts >= hi - lo else max(int(ts), 0),
+            'test_start': -1 if ts >= hi - lo else max(int(ts), 0), 'events': True,
         })
 
     add(source, sid, r['bg'], 0, n)

@@ -188,15 +188,14 @@ def test_counts_and_fractions_round_trip():
         "a zone share over no points must be None, not 0.0"
 
 
-def test_both_trainers_render_every_zone_and_no_a_plus_b():
+def test_the_trainer_renders_every_zone_and_no_a_plus_b():
     """No A+B row: the paper calls presenting A+B as acceptable inappropriate; pZA alone is
-    the measure. ``train_blind.py`` copies ``train.py``; only this test keeps the grid in sync."""
+    the measure."""
     import train
-    import train_blind
 
     fed = {f'dts_{z}_pct': v for z, v in
            zip(ZONE_NAMES, (91.2, 7.4, 1.0, 0.3, 0.1))}
-    for mod in (train, train_blind):
+    for mod in (train,):
         page = mod._render_validation_table(1, dict(fed))
         assert 'Clinical Error Grid Analysis (DTS)' in page, (
             f"{mod.__name__}: the DTS section is absent from the table")
@@ -212,7 +211,7 @@ def test_both_trainers_render_every_zone_and_no_a_plus_b():
             f"{mod.__name__}: no dts_ column in the CSV header"
         assert not [c for c in cols if c.lower() in ('dts_ab_pct', 'dts_ab')], \
             f"{mod.__name__}: an A+B column exists in the CSV"
-    print(f"\n[DUMP] both trainers render all five zones; "
+    print(f"\n[DUMP] the trainer renders all five zones; "
           f"{len([c for c, _ in train._val_log_columns() if c.startswith('dts_')])} "
           "dts_ columns in the header")
 

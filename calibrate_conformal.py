@@ -87,7 +87,7 @@ def _collect(model, seeds, stats, device, infill: bool = True,
     """Run the model over fresh sim patients under both protocols.
 
     FORECAST: q/true/peak/exc/patient (N,...). INFILL: iq/itrue/ipatient (Ni,...), empty if
-    infill=False. blind matches train_blind.py's unconditioned policy; must match the ckpt.
+    infill=False. blind matches train.py's blind policy; must match the ckpt.
     """
     import sim_data as S
     from sim_data import build_sim_feature_stack, _smooth_sim_bg, _future_overrides
@@ -171,7 +171,7 @@ def main() -> None:
                     help='skip the infill protocol (halves the forward passes); the '
                          'shipped forecast delta is unaffected either way')
     ap.add_argument('--blind', action='store_true',
-                    help="fit under the unconditioned policy train_blind.py trains: "
+                    help="fit under the blind policy train.py trains with --blind: "
                          "nothing announced in the future zone, and the infill span's "
                          "doses withheld with its bg. Must match the checkpoint's "
                          "masked_channel_policy — a mismatch is refused")

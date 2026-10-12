@@ -30,7 +30,9 @@ from normalization import (
     CHANNEL_NAMES, RISK_SPACE_CHANNELS, SPARSE_LOG1P_CHANNELS,
     LOG_RATIO_REFS, LOG_RATIO_STATS, log_ratio,
 )
-from data import sample_mask_spans, _mask_slots, BG_MASKED_FEAT
+from data import (
+    sample_mask_spans, _mask_slots, BG_MASKED_FEAT, blind_masked_doses, zero_dose_fill,
+)
 import utils
 from utils import kovatchev_f_np
 from T1DMSIM.simulator import (
@@ -237,7 +239,7 @@ class _ChannelAppender:
     def append(self, arrays: dict[str, np.ndarray]) -> int:
         n = len(arrays['bg'])
         absent = [c for c in EVENT_CHANNELS if c not in arrays]
-        # None at all is a dose-free record (DiaData) or the phone pool, which has curves only.
+        # None at all is a dose-free record (DiaData) or a phone record converted before events.
         assert not absent or len(absent) == len(EVENT_CHANNELS), f'partial events: {absent}'
         zeros = np.zeros(n, dtype=np.float32)
         for c in CACHE_CHANNELS:
@@ -508,9 +510,8 @@ def fit_cache_stats(cache_dir: str) -> None:
     """Fit and write ``<cache>/normalization_stats.json`` from the built cache."""
     from normalization import save_normalization_stats
     cache = FinetuneCache(cache_dir)
-    has_phone = any(r['pool'] == 'phone' for r in cache.subjects)
     for layout, name in STATS_FILES.items():
-        if layout == 'events' and has_phone:
+        if layout == 'events' and _curves_only_phone(cache):
             continue
         save_normalization_stats(compute_cache_stats(cache, layout),
                                  os.path.join(cache_dir, name))
@@ -642,19 +643,27 @@ def _normalize_features(bg: np.ndarray, ch: dict[str, np.ndarray],
     return feats
 
 
+def _curves_only_phone(cache: 'FinetuneCache') -> bool:
+    """A phone subject converted before the converter wrote events; its event channels are 0."""
+    return any(r['pool'] == 'phone' and not r.get('events') for r in cache.subjects)
+
+
 def _require_events(cache: 'FinetuneCache') -> None:
-    """The phone pool is written with curves only; under the events layout it reads as dose-free."""
-    if INPUT_LAYOUT == 'events' and any(r['pool'] == 'phone' for r in cache.subjects):
-        raise ValueError(f'{cache.cache_dir}: phone-pool subjects carry no point events')
+    """Under the events layout a curves-only phone subject would read as dose-free."""
+    if INPUT_LAYOUT == 'events' and _curves_only_phone(cache):
+        raise ValueError(f'{cache.cache_dir}: phone-pool subjects carry no point events; '
+                         're-run t1dmdroid_converter.py')
 
 
 _BG_GAP_FILL_MGDL = 120.0  # written only into masked patches, whose bg input is zeroed
 
 
 def _assemble_sample(feats: np.ndarray, bg: np.ndarray, spans: list[tuple[int, int]],
-                     gap_patches: np.ndarray, seq_len: int,
-                     n_ctx: int) -> dict[str, Any]:
-    """Shared tail of the train/eval sample builders. ``bg`` raw mg/dL with NaN gaps."""
+                     gap_patches: np.ndarray, seq_len: int, n_ctx: int,
+                     blind_fill: dict[int, float] | None = None) -> dict[str, Any]:
+    """Shared tail of the train/eval sample builders. ``bg`` raw mg/dL with NaN gaps.
+
+    ``blind_fill``: every masked patch, CGM gaps included, withholds its doses too."""
     mask_idx, valid, mask_d, anchor_step = _mask_slots(spans, seq_len)
     span_patches = np.concatenate(
         [np.arange(s, s + L, dtype=np.int64) for s, L in spans])
@@ -666,6 +675,10 @@ def _assemble_sample(feats: np.ndarray, bg: np.ndarray, spans: list[tuple[int, i
     for feat_idx in NON_MASKABLE_FEATS:
         patches_t[rows, feat_idx::N_INPUT_FEATURES] = 0.0
     patches_t[rows, BG_MASKED_FEAT::N_INPUT_FEATURES] = 1.0
+    if blind_fill is not None:
+        withheld = torch.zeros(seq_len, dtype=torch.bool)
+        withheld[rows] = True
+        blind_masked_doses(patches_t, withheld, blind_fill)
 
     bg_filled = np.clip(np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL),
                         BG_CLAMP_MIN, BG_CLAMP_MAX).astype(np.float32)
@@ -701,7 +714,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
                  seed: int, total_steps: int, batch_size: int,
                  source_alpha: float = 0.5, diadata_frac: float = 0.2,
                  gap_budget: float = 0.2, max_interp_steps: int = 1,
-                 no_carbs: bool = False) -> None:
+                 no_carbs: bool = False, blind: bool = False) -> None:
         _require_events(cache)
         self.cache = cache
         self.stats = stats
@@ -710,6 +723,7 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
         self.gap_budget = gap_budget
         self.max_interp_steps = max_interp_steps
         self.no_carbs = no_carbs
+        self.blind_fill = zero_dose_fill(stats) if blind and stats is not None else None
 
         min_len = (MIN_CONTEXT_PATCHES + PREDICTION_PATCHES) * PATCH_SIZE
         w_patches = MIN_CONTEXT_PATCHES + PREDICTION_PATCHES
@@ -801,7 +815,8 @@ class FinetuneTrainDataset(torch.utils.data.Dataset):
         assert self.stats is not None, 'stats=None dataset is for raw draws only'
         feats = _normalize_features(
             np.nan_to_num(bg, nan=_BG_GAP_FILL_MGDL), ch, self.stats, self.no_carbs)
-        sample = _assemble_sample(feats, bg, spans, gap_patches, seq_len, n_ctx)
+        sample = _assemble_sample(feats, bg, spans, gap_patches, seq_len, n_ctx,
+                                  self.blind_fill)
         # Time-probe hour/slot: slot j reads patch mask_idx[j], step start+mask_idx[j]*PATCH_SIZE.
         abs_s = int(rec['t0']) + (start + sample['mask_idx'] * PATCH_SIZE) * STEP_S
         sample['slot_hour'] = ((abs_s % 86400) / 3600.0).astype(np.float32)
@@ -943,13 +958,14 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
 
     def __init__(self, cache: FinetuneCache, stats: dict[str, dict[str, float]],
                  windows: list[tuple[int, int]], max_interp_steps: int = 1,
-                 no_carbs: bool = False) -> None:
+                 no_carbs: bool = False, blind: bool = False) -> None:
         _require_events(cache)
         self.cache = cache
         self.stats = stats
         self.windows = windows
         self.max_interp_steps = max_interp_steps
         self.no_carbs = no_carbs
+        self.blind_fill = zero_dose_fill(stats) if blind else None
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -977,7 +993,7 @@ class FinetuneEvalDataset(torch.utils.data.Dataset):
         zone_lo = n_ctx * PATCH_SIZE
         bg_for_sample[zone_lo:] = np.nan_to_num(bg[zone_lo:], nan=_BG_GAP_FILL_MGDL)
         sample = _assemble_sample(feats, bg_for_sample, spans, gap_patches,
-                                  seq_len, n_ctx)
+                                  seq_len, n_ctx, self.blind_fill)
         sample['true_bg_horizon'] = true_horizon
         return sample
 

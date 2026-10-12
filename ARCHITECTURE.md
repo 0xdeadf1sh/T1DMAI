@@ -774,7 +774,7 @@ The module defines no pass/fail threshold on any of them, and
 | Clinical accuracy (CG-EGA) | Per-region accurate, benign and erroneous fractions |
 | Longitudinal excursions & TIR | Pooled hypo/hyper detection, time-in-range error, and the same detection per 30-minute bucket |
 | Nocturnal | Nocturnal hypo AND hyper recall/precision |
-| Counterfactual dose-response | The two dose directions and insulin monotonicity (`train.py` only — the blind fork removes the probe) |
+| Counterfactual dose-response | The two dose directions and insulin monotonicity (skipped under the events layout and under the blind policy) |
 | Time-of-day probe | The whole probe: MAE pooled and at high confidence, the three accuracies, bias / std / p90 / gross-error rate, confidence, and the within- and cross-window jump witnesses |
 
 A **pooled** grid share is over every scored step of the forecast protocol, so it

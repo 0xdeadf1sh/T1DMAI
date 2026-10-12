@@ -39,7 +39,7 @@ from config import (                                           # noqa: E402
     MAX_CONTEXT_PATCHES, MIN_CONTEXT_PATCHES,
     LOG_INTERVAL, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL,
     VALIDATION_N_PATIENTS, VALIDATION_PROBE_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
-    N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, INPUT_LAYOUT,
+    N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, INPUT_LAYOUT, BLIND,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
     CURVATURE_LAMBDA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
@@ -140,7 +140,7 @@ from normalization import (
 )
 from data import (
     T1DMDataset, collate_fn, BG_MASKED_FEAT, masked_channel_policy,
-    checkpoint_masked_channel_policy, NO_TAIL_ARM, TAIL_ARMS,
+    checkpoint_masked_channel_policy, blind_masked_doses, zero_dose_fill, NO_TAIL_ARM, TAIL_ARMS,
     TAIL_ARM_NONE, TAIL_ARM_BOLUS, TAIL_ARM_CARBS,
 )
 from risk_loss import risk_total_loss, KendallGalWeighting
@@ -1170,39 +1170,42 @@ def _render_validation_table(
     def _ref(v: float | None, fmt: str = '{:.2f}') -> str:
         return fmt.format(v) if v is not None else '?'
 
-    # Terminal-step ΔBG against the baseline; the label carries the measured sim reference.
-    _section(f'Counterfactual Dose-Response ({_cf_n} samples, Δ @{_cf_horizon_min} min)')
-    _pct_row(f'carb sign (+{CF_CARB_BOLUS_G:g} g; ref 100%)', 'cf_carb_sign')
-    _pct_row(f'insulin sign (+{CF_INSULIN_BOLUS_U:g} U; ref 100%)', 'cf_insulin_sign')
-    _pct_row('carb monotonic (0/½/1/2×; ref 100%)', 'cf_carb_monotonic')
-    _pct_row('insulin monotonic (0/½/1/2×; ref 100%)', 'cf_insulin_monotonic')
-    _ratio_row(_sim_ref_label('carb gain', 'cf_carb_gain', unit='×'), 'cf_carb_gain')
-    _ratio_row(_sim_ref_label('insulin gain', 'cf_insulin_gain', unit='×'), 'cf_insulin_gain')
-    _ratio_row(_sim_ref_label('carb linearity 2×/1×', 'cf_carb_linearity', unit='×'),
-               'cf_carb_linearity')
-    _ratio_row(_sim_ref_label('insulin linearity 2×/1×', 'cf_insulin_linearity', unit='×'),
-               'cf_insulin_linearity')
-    info_row(_sim_ref_label(f'insulin pre-action Δ 0–{_CF_PRE_ACTION_STEPS * DT_MINUTES} min',
-                            'cf_insulin_preaction_dbg', fmt='{:+.2f}', unit=' mg/dL'),
-             val_metrics.get('cf_insulin_preaction_dbg'), fmt='{:+.2f}', unit=' mg/dL',
-             prev_key='cf_insulin_preaction_dbg', direction='none')
-    _cof = val_metrics.get('cf_carb_onset_frac')
-    info_row(_sim_ref_label(f'carb onset lag to ±{_CF_ONSET_MGDL:g} mg/dL',
-                            'cf_carb_onset_lag_min', fmt='{:+.0f}', unit=' min',
-                            suffix=f'; {_ref(_cof, "{:.0%}")} reached'),
-             val_metrics.get('cf_carb_onset_lag_min'), fmt='{:+.0f}', unit=' min',
-             prev_key='cf_carb_onset_lag_min', direction='none')
-    _iof = val_metrics.get('cf_insulin_onset_frac')
-    info_row(_sim_ref_label(f'insulin onset lag to ±{_CF_ONSET_MGDL:g} mg/dL',
-                            'cf_insulin_onset_lag_min', fmt='{:+.0f}', unit=' min',
-                            suffix=f'; {_ref(_iof, "{:.0%}")} reached'),
-             val_metrics.get('cf_insulin_onset_lag_min'), fmt='{:+.0f}', unit=' min',
-             prev_key='cf_insulin_onset_lag_min', direction='none')
-    info_row(_sim_ref_label('matched-bolus coverage', 'cf_meal_coverage'),
-             val_metrics.get('cf_meal_coverage'), fmt='{:.2f}',
-             prev_key='cf_meal_coverage', direction='none')
-    # Rescue is the arm box's paired reading alone: this probe's baseline is the model's own.
-    _blank()
+    # Terminal-step ΔBG against the baseline; absent when the probe did not run (events, blind).
+    if 'cf_n' in val_metrics:
+        _section(f'Counterfactual Dose-Response ({_cf_n} samples, Δ @{_cf_horizon_min} min)')
+        _pct_row(f'carb sign (+{CF_CARB_BOLUS_G:g} g; ref 100%)', 'cf_carb_sign')
+        _pct_row(f'insulin sign (+{CF_INSULIN_BOLUS_U:g} U; ref 100%)', 'cf_insulin_sign')
+        _pct_row('carb monotonic (0/½/1/2×; ref 100%)', 'cf_carb_monotonic')
+        _pct_row('insulin monotonic (0/½/1/2×; ref 100%)', 'cf_insulin_monotonic')
+        _ratio_row(_sim_ref_label('carb gain', 'cf_carb_gain', unit='×'), 'cf_carb_gain')
+        _ratio_row(_sim_ref_label('insulin gain', 'cf_insulin_gain', unit='×'),
+                   'cf_insulin_gain')
+        _ratio_row(_sim_ref_label('carb linearity 2×/1×', 'cf_carb_linearity', unit='×'),
+                   'cf_carb_linearity')
+        _ratio_row(_sim_ref_label('insulin linearity 2×/1×', 'cf_insulin_linearity', unit='×'),
+                   'cf_insulin_linearity')
+        info_row(_sim_ref_label(
+                     f'insulin pre-action Δ 0–{_CF_PRE_ACTION_STEPS * DT_MINUTES} min',
+                     'cf_insulin_preaction_dbg', fmt='{:+.2f}', unit=' mg/dL'),
+                 val_metrics.get('cf_insulin_preaction_dbg'), fmt='{:+.2f}', unit=' mg/dL',
+                 prev_key='cf_insulin_preaction_dbg', direction='none')
+        _cof = val_metrics.get('cf_carb_onset_frac')
+        info_row(_sim_ref_label(f'carb onset lag to ±{_CF_ONSET_MGDL:g} mg/dL',
+                                'cf_carb_onset_lag_min', fmt='{:+.0f}', unit=' min',
+                                suffix=f'; {_ref(_cof, "{:.0%}")} reached'),
+                 val_metrics.get('cf_carb_onset_lag_min'), fmt='{:+.0f}', unit=' min',
+                 prev_key='cf_carb_onset_lag_min', direction='none')
+        _iof = val_metrics.get('cf_insulin_onset_frac')
+        info_row(_sim_ref_label(f'insulin onset lag to ±{_CF_ONSET_MGDL:g} mg/dL',
+                                'cf_insulin_onset_lag_min', fmt='{:+.0f}', unit=' min',
+                                suffix=f'; {_ref(_iof, "{:.0%}")} reached'),
+                 val_metrics.get('cf_insulin_onset_lag_min'), fmt='{:+.0f}', unit=' min',
+                 prev_key='cf_insulin_onset_lag_min', direction='none')
+        info_row(_sim_ref_label('matched-bolus coverage', 'cf_meal_coverage'),
+                 val_metrics.get('cf_meal_coverage'), fmt='{:.2f}',
+                 prev_key='cf_meal_coverage', direction='none')
+        # Rescue is the arm box's paired reading alone: this probe's baseline is the model's own.
+        _blank()
 
     # Diagnostic, co-trains trunk, feeds no loss; thresholds are clock-usability, not external SOTA.
 
@@ -1899,11 +1902,12 @@ def _forecast_protocol(
     mask_idx: torch.Tensor,
     valid: torch.Tensor,
     n_context_patches: torch.Tensor,
+    blind_fill: "dict[int, float] | None" = None,
 ) -> "dict[str, torch.Tensor] | None":
-    """FORECAST protocol, rebuilt from a collated batch: trailing PREDICTION_PATCHES masked/scored,
-    the deployed 2h forecast case. A batch mask is NOT this (slot j = mask_idx[j], not j patches
-    past the edge); left-padding puts the zone at [T-P, T) regardless of n_ctx. Rows whose
-    context-edge patch (T-P-1) is masked are DROPPED, else last_bg leaks a withheld true value.
+    """FORECAST protocol, rebuilt from a collated batch: trailing PREDICTION_PATCHES masked/scored.
+    A batch mask is NOT this (slot j = mask_idx[j]); left-padding puts the zone at [T-P, T)
+    regardless of n_ctx. Rows whose context-edge patch (T-P-1) is masked are DROPPED, else
+    last_bg leaks a withheld true value. ``blind_fill`` (blind policy) withholds doses too.
     """
     B, T, _ = patches.shape
     P = PREDICTION_PATCHES
@@ -1927,6 +1931,8 @@ def _forecast_protocol(
 
     fc_masked = masked[rows].clone()
     fc_masked[:, T - P:] = True
+    if blind_fill is not None:
+        blind_masked_doses(fc_patches, fc_masked, blind_fill)
     lens = n_context_patches.to(device).reshape(-1) + P
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
               < (T - lens).unsqueeze(1))[rows]
@@ -1973,11 +1979,12 @@ def _infill_protocol(
     n_context_patches: torch.Tensor,
     norm_stats: dict,
     rng: "np.random.Generator",
+    blind_fill: "dict[int, float] | None" = None,
 ) -> "dict[str, Any] | None":
     """INFILL protocol, rebuilt from a collated batch.
     Mask is sampled INTERIOR spans + the mandatory trailing forecast span; only interior spans
     are scored (spans/d-rule/anchor come from infill_masked_set). Own training mask is REPLACED,
-    not kept, so interior spans stay two-sided; rows with too-short context are DROPPED.
+    so interior spans stay two-sided; short-context rows are DROPPED. ``blind_fill``: see forecast.
     """
     from metrics.protocols import infill_masked_set
 
@@ -2045,6 +2052,9 @@ def _infill_protocol(
     assert bool(((inf_patches[:, :, BG_MASKED_FEAT::N_INPUT_FEATURES] > 0.5)
                  == withheld).all()), (
         "the bg_masked feat does not reproduce the infill protocol's masked set")
+    # Against THIS protocol's masked set, not the sample's original one.
+    if blind_fill is not None:
+        blind_masked_doses(inf_patches, inf_masked, blind_fill)
 
     lens = n_context_patches.to(device).reshape(-1)[rows] + P
     is_pad = (torch.arange(T, device=device).unsqueeze(0)
@@ -2469,7 +2479,7 @@ def _run_paired_rescue_probe(
     """The two paired-arm rescue readings, probe-independent: ``none`` against its dosed twin.
 
     Of the rows whose ``none`` tail crosses the threshold past the lag, the share whose dosed
-    tail does not — truth, then model medians; the blind fork passes its own builder.
+    tail does not — truth, then model medians; a blind run passes a dose-withholding builder.
     """
     out: dict[str, Any] = {k: None for k in ARM_RESCUE_COLUMNS}
     for side, _arm, _label in ARM_RESCUE_SIDES:
@@ -2547,13 +2557,15 @@ def _run_validation(
     weighting: KendallGalWeighting,
     bg_hypo_threshold: float = BG_HYPO_THRESHOLD,
     bg_hyper_threshold: float = BG_HYPER_THRESHOLD,
+    blind: bool = BLIND,
 ) -> dict[str, Any]:
     """Validation on a fixed patient set, in batches: THREE forwards per batch (objective,
     forecast, infill), each scoring different slots. Forecast needs trailing PREDICTION_PATCHES,
     not the objective forward's own masked set (names defined only against a right-edge zone).
-    No pooled masked-BG scalar is emitted: an average over the mask distribution improves for free.
+    No pooled masked-BG scalar. ``blind`` must match the checkpoint's masked-channel policy.
     """
     model.eval()
+    blind_fill = zero_dose_fill(norm_stats) if blind else None
     totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0,
                                 'loss_C': 0.0, 'pinball': 0.0}
     n_samples = 0
@@ -2671,7 +2683,7 @@ def _run_validation(
             n_samples += B_batch
 
             fc = _forecast_protocol(
-                patches, mask_idx, slot_valid, batch['n_context_patches'])
+                patches, mask_idx, slot_valid, batch['n_context_patches'], blind_fill)
             if fc is None:
                 continue
             fc_rows = fc['rows']
@@ -2758,7 +2770,7 @@ def _run_validation(
             # Right-edge span the inference builder requires rides along masked and UNSCORED.
             infill = _infill_protocol(
                 patches, mask_idx, slot_valid, targets,
-                batch['n_context_patches'], norm_stats, infill_rng)
+                batch['n_context_patches'], norm_stats, infill_rng, blind_fill)
             if infill is not None:
                 q_inf, median_inf = model(
                     infill['patches'], infill['attn_mask'],
@@ -3085,10 +3097,11 @@ def _run_validation(
         model, val_dataset, device,
         min(len(val_dataset), VALIDATION_PROBE_N_PATIENTS),
         hypo_threshold=bg_hypo_threshold, hyper_threshold=bg_hyper_threshold,
+        forecast_protocol=lambda p, mi, v, nc: _forecast_protocol(p, mi, v, nc, blind_fill),
     ))
 
-    # Counterfactual probe (diagnostic); its arms add action curves, so curves layout only.
-    if INPUT_LAYOUT == 'curves':
+    # Its arms add action curves (curves only); a blind model reads a masked dose as constant.
+    if INPUT_LAYOUT == 'curves' and not blind:
         result.update(_run_counterfactual_probe(
             model, val_dataset, norm_stats, device,
             samples=val_samples_ordered,
@@ -3149,7 +3162,7 @@ _RESUME_ARCH_KNOBS = (
 )
 
 
-def _check_resume_architecture(ckpt: dict, path: str) -> None:
+def _check_resume_architecture(ckpt: dict, path: str, blind: bool = BLIND) -> None:
     """Refuse to resume a checkpoint whose arch, arch_version, masked-channel policy, mse_alpha
     or normalization stats differ from what this process trains under. config.py is the single
     source; a mismatch names the resize_model.py command that aligns it."""
@@ -3162,9 +3175,9 @@ def _check_resume_architecture(ckpt: dict, path: str) -> None:
         sys.exit(f"--checkpoint {path}: trained on {ckpt.get('input_layout', 'curves')!r} "
                  f"inputs, this run reads {INPUT_LAYOUT!r} (--inputs)")
     policy = checkpoint_masked_channel_policy(ckpt)
-    if policy != masked_channel_policy(blind=False):
-        sys.exit(f"--checkpoint {path}: masked_channel_policy {policy!r}; train.py trains "
-                 f"{masked_channel_policy(blind=False)!r} (train_blind.py owns {policy!r})")
+    if policy != masked_channel_policy(blind=blind):
+        sys.exit(f"--checkpoint {path}: masked_channel_policy {policy!r}; this run trains "
+                 f"{masked_channel_policy(blind=blind)!r} (config.BLIND / --blind)")
     # The restored log_sigma_D was fitted to the D slot this value defines.
     if tc.get('mse_alpha') is not None and float(tc['mse_alpha']) != float(_cfg.MSE_ALPHA):
         sys.exit(f"--checkpoint {path}: mse_alpha {tc['mse_alpha']} != config.py "
@@ -3196,12 +3209,13 @@ def _restore_weights(
     model: T1DMAI,
     weighting: KendallGalWeighting,
     norm_stats: dict,
+    blind: bool = BLIND,
 ) -> dict:
     """Load a checkpoint's live model weights and Kendall-Gal log-σ. Returns the checkpoint
     dict so the caller can load the EMA shadow once the EMA exists. Optimizer state, step,
     histories and best_val_loss are NOT restored: a resumed run starts its own schedule."""
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    _check_resume_architecture(ckpt, path)
+    _check_resume_architecture(ckpt, path, blind)
     if ckpt.get('normalization_stats') != norm_stats:
         sys.exit(f"--checkpoint {path}: normalization_stats differ from {NORM_STATS_FILE}")
     model.load_state_dict(ckpt['model_state_dict'], strict=True)
@@ -3404,12 +3418,13 @@ def train(
     checkpoint: str | None = None,
     max_bolus_only_u: float | None = MAX_BOLUS_ONLY_U,
     run_dir: str = '.',
+    blind: bool = BLIND,
 ) -> list[float]:
     """Run the T1DMAI training loop. Returns the per-step total-loss history.
-
     ``checkpoint``: restore that file's model weights, Kendall-Gal log-σ and EMA shadow, then
     train from step 0 with fresh optimizers, schedule, histories and best_val_loss.
-    ``run_dir`` holds this run's own ``checkpoints/`` and ``logs/``, so two runs stay apart."""
+    ``run_dir`` holds this run's own ``checkpoints/`` and ``logs/``, so two runs stay apart.
+    ``blind``: a masked patch withholds its doses as well as bg, in training and validation."""
     # Must run before model/optimizer/dataloader construction, so every RNG draw is reproducible.
     if DETERMINISTIC:
         setup_determinism(master_seed)
@@ -3469,7 +3484,7 @@ def train(
 
     resume_ckpt: dict | None = None
     if checkpoint is not None:
-        resume_ckpt = _restore_weights(checkpoint, model, weighting, norm_stats)
+        resume_ckpt = _restore_weights(checkpoint, model, weighting, norm_stats, blind)
         print(f"Restored weights from {checkpoint} (saved at step {resume_ckpt.get('step')})")
 
     muon_opt, adam_opt = _build_optimizers(
@@ -3508,6 +3523,7 @@ def train(
         cache_path=cache_path,
         # TRAINING only: the val and cal slabs stay uncapped, so both runs score one window set.
         max_bolus_only_u=max_bolus_only_u,
+        blind=blind,
     )
     val_dataset = T1DMDataset(
         master_seed=master_seed + VAL_SEED_OFFSET,
@@ -3519,6 +3535,7 @@ def train(
         simulator_warmup_hours=simulator_warmup_hours,
         cache_path=cache_path,
         cache_partition='val',
+        blind=blind,
     )
 
     sampler = _OffsetSampler(len(dataset), offset=start_step * batch_size)
@@ -3547,8 +3564,8 @@ def train(
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
         'mask_right_edge_quota': MASK_RIGHT_EDGE_QUOTA,
-        # What a masked patch withheld; train_blind.py stamps 'blind'; absent key reads as this.
-        'masked_channel_policy': masked_channel_policy(blind=False),
+        # What a masked patch withheld; an absent key reads as announced.
+        'masked_channel_policy': masked_channel_policy(blind=blind),
         'master_seed': master_seed, 'total_steps': total_steps, 'batch_size': batch_size,
         'num_workers': num_workers,
         'd_model': _CFG_D_MODEL, 'n_layers': _CFG_N_LAYERS, 'n_heads': _CFG_N_HEADS,
@@ -3866,6 +3883,7 @@ def train(
                     model, val_dataset, norm_stats, device, weighting,
                     bg_hypo_threshold=bg_hypo_threshold,
                     bg_hyper_threshold=bg_hyper_threshold,
+                    blind=blind,
                 )
 
             val_total = val_metrics['val_loss_total']
@@ -4159,8 +4177,9 @@ if __name__ == '__main__':
     parser.add_argument('--ema-decay', type=float, default=None,
                         help='Decay factor for the weight-EMA shadow used at validation. 0 disables.')
     parser.add_argument('--inputs', choices=('curves', 'events'), default=None,
-                        help='Dose inputs: action curves (default), or per-step point doses '
-                             'from a cache built with cache_simulator.py --events.')
+                        help='Dose inputs: action curves, or per-step point doses from a cache '
+                             'built with cache_simulator.py --events. '
+                             'Default: config.INPUT_LAYOUT_DEFAULT.')
     parser.add_argument('--cache-path', type=str, default=None,
                         help='Path to a simulator cache directory produced by T1DMSIM/cache_simulator.py.')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -4173,6 +4192,9 @@ if __name__ == '__main__':
                              'uniformly over the other three. Validation is never capped.')
     parser.add_argument('--run-dir', type=str, default=None,
                         help="This run's own directory for checkpoints/ and logs/.")
+    parser.add_argument('--blind', action=argparse.BooleanOptionalAction, default=None,
+                        help='A masked patch withholds its doses as well as bg '
+                             '(masked_channel_policy "blind"). Default: config.BLIND.')
     args = parser.parse_args()
 
     resolved = {
@@ -4201,6 +4223,7 @@ if __name__ == '__main__':
         'checkpoint': None,
         'max_bolus_only_u': MAX_BOLUS_ONLY_U,
         'run_dir': '.',
+        'blind': BLIND,
     }
     sources = {k: 'config.py' for k in resolved}
 
@@ -4229,6 +4252,7 @@ if __name__ == '__main__':
         'checkpoint': args.checkpoint,
         'max_bolus_only_u': args.max_bolus_only_u,
         'run_dir': args.run_dir,
+        'blind': args.blind,
     }
     for key, cli_val in cli_map.items():
         if cli_val is not None:
@@ -4285,4 +4309,5 @@ if __name__ == '__main__':
         checkpoint=resolved['checkpoint'],
         max_bolus_only_u=resolved['max_bolus_only_u'],
         run_dir=resolved['run_dir'],
+        blind=resolved['blind'],
     )

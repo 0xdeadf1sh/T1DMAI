@@ -121,11 +121,7 @@ def main() -> None:
     from risk_loss import KendallGalWeighting
 
     blind = checkpoint_masked_channel_policy(ckpt) == masked_channel_policy(blind=True)
-    if blind:
-        import train_blind as trainer
-    else:
-        trainer = train
-    trainer.VALIDATION_N_PATIENTS = a.n_windows
+    train.VALIDATION_N_PATIENTS = a.n_windows
 
     if a.device is not None:
         device = torch.device(a.device)
@@ -174,14 +170,15 @@ def main() -> None:
               f'{24 * steps / STEPS_PER_DAY:.1f} h, {a.n_windows} windows',
               file=sys.stderr, flush=True)
 
-    metrics = trainer._run_validation(
+    metrics = train._run_validation(
         model, dataset, stats, device, weighting,
-        bg_hypo_threshold=a.bg_hypo_threshold, bg_hyper_threshold=a.bg_hyper_threshold)
+        bg_hypo_threshold=a.bg_hypo_threshold, bg_hyper_threshold=a.bg_hyper_threshold,
+        blind=blind)
     # The ratio compares against the simulator training stream; a phone record is another domain.
     if a.backup is None and ckpt.get('loss_ema') is not None:
         metrics['train_loss_ema'] = ckpt['loss_ema']
         metrics['overfit_ratio'] = train._overfit_ratio(metrics['val_loss_total'], ckpt['loss_ema'])
-    print(trainer._render_validation_table(int(ckpt.get('step') or 0), metrics))
+    print(train._render_validation_table(int(ckpt.get('step') or 0), metrics))
 
 
 if __name__ == '__main__':

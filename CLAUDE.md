@@ -122,7 +122,8 @@ forecast *protocol*; it is not a region of a training sample.
   `finetune.py`; `config.INPUT_LAYOUTS` lists each layout's normalized channels and
   `config.set_input_layout` derives `N_INPUT_FEATURES`, `PATCH_DIM`, `MASKABLE_FEATS` and
   `CHANNEL_TO_FEAT` from it. The flag travels as the `T1DMAI_INPUT_LAYOUT` env var, which `config`
-  reads at import, so DataLoader workers bind the same layout. The bullets below describe
+  reads at import, so DataLoader workers bind the same layout; with neither, `config.INPUT_LAYOUT_DEFAULT`
+  holds. The bullets below describe
   `curves`. `events` is `[bg_absolute, *T1DMSIM.simulator.EVENT_CHANNELS, bg_masked]` — 10
   features, `PATCH_DIM` 60: each dose at its onset step (`carb_g`, `bolus_u`, `basal_u`,
   log1p + z) with its descriptors (`carb_gi`, `*_peak_min`, `*_dur_h`) as
@@ -131,8 +132,16 @@ forecast *protocol*; it is not a region of a training sample.
   `normalization_stats_events.json` (`cache_simulator.py --events`, or `finetune_data.py build`,
   whose cache holds both layouts); there is no on-the-fly fit. A checkpoint is stamped
   `input_layout`; a mismatch with `--inputs` exits. Under `events` the counterfactual probe is
-  skipped (its arms add curves), the phone pool is refused (it carries curves only), and the
-  exporter refuses the checkpoint.
+  skipped (its arms add curves), a phone subject whose index entry lacks `events: True`
+  (converted before `t1dmdroid_converter.py` wrote point events) is refused, and the exporter
+  refuses the checkpoint.
+- **Blind policy is a flag, not a fork.** `config.BLIND` / `--blind` on `train.py` and `finetune.py`:
+  every masked patch withholds its doses too, at `data.zero_dose_fill` (`normalize(0)`, never
+  `z = 0`), in the training sample (`data`/`finetune_data` `blind`), both validation protocols
+  (`_forecast_protocol` / `_infill_protocol` `blind_fill`) and the rescue probe; the
+  counterfactual probe is skipped. Logs and checkpoints go to the same `checkpoints/` / `logs/`;
+  the policy lives only in the `masked_channel_policy` stamp, which resume, fine-tune,
+  `validate.py` and `calibrate_conformal.py` all read.
 - **4 input features — the FROZEN index map (`curves`).** `[bg_absolute, carb_intake,
   insulin_combined, bg_masked]`, `N_INPUT_FEATURES = 4`, `PATCH_DIM = PATCH_SIZE × N_INPUT_FEATURES =
   24`, **step-major**, so a feature's columns are the stride `[:, f::N_INPUT_FEATURES]`. There are no
@@ -287,7 +296,7 @@ forecast *protocol*; it is not a region of a training sample.
 - **Rolling prediction BG fill.** `predict_rolling()` is **BG-autoregressive only**: `median → f_inv → mg/dL → normalize → bg_absolute slot 0`. carb (feat 1) / insulin (feat 2) come from `overrides_fn` if supplied, else from the **zero-RAW normalized baseline** — `normalize(0.0)` per channel, NOT `torch.zeros`, whose `z = 0` is a phantom event that corrupts a no-dose roll. The caller MUST pass `normalization_stats`: `predict_rolling` raises `ValueError` on `None` rather than falling back to the CWD file.
   - **A sparse channel's `z = 0` decodes to `expm1(mean)`, NOT to `mean`.** `z = 0` is the channel's own fitted log1p-space mean, and the sparse inverse is `expm1(z·std + mean)`. Compute the phantom, never read it off `normalization_stats.json`, whose `mean` field is the log1p-space mean rather than its image. The gap is pool-dependent; the `expm1(mean)` relation is not.
   - **The rolling band carry is `predict_rolling`'s own, not `assemble_quantiles`'s.** Each roll measures its NATIVE terminal-step offsets — SIX of them, one per level, `q_tau[-1,-1,med+1+k] − m` and `m − q_tau[-1,-1,med-1-k]` — on the PRE-carry fan; re-opens that roll's fan to `hypot(carry_k, native_offset_k)` per level about the untouched median; derives `bands = f_inv(q_tau)` from the widened fan, with conformal on top of that; and only THEN folds the native offsets into the carry, also in quadrature. So roll 0 is unwidened and each level's carry grows like `√n` over `n` rolls. Two ways to get this wrong, both of which have been in the tree: ONE carry shared by the levels re-seeds every level from the outermost one's accumulation, so the next roll's .75 edge opens outside this roll's .95 edge and the fan flattens into a slab; and ADDING the carry rather than composing it in quadrature is the perfectly-correlated bound, twice too wide by the fourth roll and pinned to the physiological rails by the eighth. Note that `hypot(carry_k, native_k)` IS the terminal offset of the fan just drawn, which is what `T1DMCOMMON/SPEC/inference.md` §9 tells a consumer to read — reading it off the post-carry fan is correct, and `T1DMDROID`'s `RollingForecaster.terminalOffsets` does exactly that. What would double-count is reading it off the post-carry fan and then folding it into the carry AGAIN.
-- **No validation metric outlasts one forward.** Every cache row ends at its boundary with a `PREDICTION_HORIZON_HOURS` tail (`SPEC/cache.md`), so there is no truth past it to score. `BG_HORIZONS_MIN = (30, 60, 120)` in `train.py` and `train_blind.py`, `COVERAGE_HORIZONS_MIN = (30, 60, 90, 120)`, and the whole `night_bg_*` block is the nocturnal subset of that SAME single forward — not a second, rolled family. There is no rolling pass in validation and no `roll_n` / `roll_skipped` / `roll_ctx_patches` column. `predict_rolling` stays: it is the app contract (`inference.py`, `T1DMCOMMON/SPEC/inference.md` §9) and the GUI's `F` key, and `metrics/` rolls to `metrics.core.horizons.FIGURE_HORIZON_HOURS` for its offline figures on live-simulated patients, whose truth does outlast a forward. Do not reintroduce a validation-side roll for a `NIGHT_LONG_HORIZON_*` constant; none exists.
+- **No validation metric outlasts one forward.** Every cache row ends at its boundary with a `PREDICTION_HORIZON_HOURS` tail (`SPEC/cache.md`), so there is no truth past it to score. `BG_HORIZONS_MIN = (30, 60, 120)` in `train.py`, `COVERAGE_HORIZONS_MIN = (30, 60, 90, 120)`, and the whole `night_bg_*` block is the nocturnal subset of that SAME single forward — not a second, rolled family. There is no rolling pass in validation and no `roll_n` / `roll_skipped` / `roll_ctx_patches` column. `predict_rolling` stays: it is the app contract (`inference.py`, `T1DMCOMMON/SPEC/inference.md` §9) and the GUI's `F` key, and `metrics/` rolls to `metrics.core.horizons.FIGURE_HORIZON_HOURS` for its offline figures on live-simulated patients, whose truth does outlast a forward. Do not reintroduce a validation-side roll for a `NIGHT_LONG_HORIZON_*` constant; none exists.
 
 ## The export takes the masked set as an input
 
@@ -346,8 +355,7 @@ Markdown drift is a bug. Prefer editing sections over appending. Delete stale pa
 - `model.py` — T1DMAI model class; `build_rope_cache`, `apply_rope`, `attention_weights` (the softmax SDPA forms internally and never returns, tapped by `TemporalSelfAttention.attn_sink`)
 - `data.py` — on-the-fly and cached sample generation; `sample_mask_spans`, `_anchor_step_for_span`, `_mask_slots`, `BG_MASKED_FEAT`, `zero_dose_fill` / `blind_masked_doses`, and `stored_masked_channel_policy` / `checkpoint_masked_channel_policy` — the SINGLE reader of the stamp's absent-key convention, which every consumer goes through
 - `train.py` — training loop entry point
-- `validate.py <checkpoint>` — `train.py`'s `_run_validation` and table, standalone, at the checkpoint's dims (`finetune._apply_checkpoint_dims`), policy (dispatching to `train_blind`) and stored normalization stats; without `--backup` the `val` patients `train.py` draws for that master seed, live or from `--cache-path`; with `--backup` the gap-free runs of the trailing `t1dmdroid_converter.TEST_DAYS`. `overfit_ratio` is simulator-only
-- `train_blind.py` — the unconditioned fork of `train.py` (every signal withheld on masked patches via `data`'s `blind` flag, no counterfactual probe, own `checkpoints_blind/` + `logs_blind/`); checkpoints stamp `masked_channel_policy`, which `calibrate_conformal.py` refuses to mix
+- `validate.py <checkpoint>` — `train.py`'s `_run_validation` and table, standalone, at the checkpoint's dims (`finetune._apply_checkpoint_dims`), policy (passed as `blind`) and stored normalization stats; without `--backup` the `val` patients `train.py` draws for that master seed, live or from `--cache-path`; with `--backup` the gap-free runs of the trailing `t1dmdroid_converter.TEST_DAYS`. `overfit_ratio` is simulator-only
 - `inference.py` — prediction functions (standard, what-if, rolling), each with an opt-in `return_time`, and `predict_rolling` with an opt-in `return_rolls` (per-roll `context` / `overrides` / sliding-window `offset`, so an attribution pass re-runs ONE roll instead of restating the slide); `predict` takes an explicit `mask_spans` masked set (`None` selects the trailing forecast), what-if and rolling are right-edge by construction
 - `normalization.py` — channel statistics; `CHANNEL_NAMES`, `SPARSE_LOG1P_CHANNELS`, `RISK_SPACE_CHANNELS`, `load_normalization_stats` (validating)
 - `muon.py` — Muon optimizer implementation

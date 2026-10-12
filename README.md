@@ -208,7 +208,8 @@ each dose at the step it was taken, ten features per step:
 
 Doses sharing a step are summed and their descriptors dose-weighted. A pump's
 per-step basal carries its rapid insulin's descriptors; a long-acting injection
-carries its own. The channel list is `T1DMSIM/simulator.EVENT_CHANNELS`. A
+carries its own. The channel list is `T1DMSIM/simulator.EVENT_CHANNELS`.
+`config.INPUT_LAYOUT_DEFAULT` is the layout when `--inputs` is omitted. A
 checkpoint is stamped with its layout and accepts only that one; the on-device
 export covers the curve layout only.
 
@@ -228,6 +229,12 @@ context length is re-rolled per sample between 84 and 168 hours, and the masked
 spans are drawn per sample. Day and night are learned by one model without a
 band restriction, because each row starts at a random hour, so the boundaries
 spread over the clock.
+
+`config.BLIND`, or `--blind` on `train.py` and `finetune.py`, selects the blind
+masked-channel policy: a masked patch withholds its carbohydrate and insulin as
+well as its glucose, at each channel's no-dose value. Validation withholds them
+on the same patches and skips the counterfactual probe. The checkpoint records
+`masked_channel_policy`; a resume or fine-tune across policies is refused.
 
 The loss has four terms, all in risk space:
 
@@ -550,6 +557,16 @@ Without `--checkpoint` the learning rates default to `config.py`'s from-scratch
 values; with one they default ten times lower. `--inputs` must match a
 checkpoint's layout. `--no-carbs` blanks the carbohydrate input. `--iobp2-like`
 trains and validates on the closed-loop sources that log no carbohydrate.
+
+`t1dmdroid_converter.py` turns a T1DMDROID `.t1dmbak` backup into a cache of the
+same format, with the trailing `--test-days` held out as the test period. It
+writes curves, point events and both statistics files.
+
+```bash
+python t1dmdroid_converter.py record.t1dmbak        # -> datasets/t1dmdroid/record
+python finetune.py --cache datasets/t1dmdroid/record --inputs events --blind \
+    --out-dir checkpoints_phone
+```
 
 `export_submission.py` renders the leaderboard's `predictions.parquet` from a
 checkpoint and then scores it. A row's forecast zone opens one step after its

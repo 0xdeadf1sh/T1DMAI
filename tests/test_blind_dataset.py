@@ -1,7 +1,7 @@
 """The ``blind`` masked-channel policy, at the dataset boundary.
 
 ``blind=True`` withholds the dose feats on a masked patch too, at ``zero_dose_fill``'s
-``normalize(0)``. ``train_blind.py`` is the only caller; ``blind=False`` is what ships.
+``normalize(0)``. ``train.py`` passes ``config.BLIND``; ``blind=False`` is the default.
 """
 
 import numpy as np

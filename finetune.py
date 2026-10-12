@@ -165,9 +165,9 @@ def parse_args() -> argparse.Namespace:
         "excludes --train-dataset and --test-dataset",
     )
     p.add_argument("--out-dir", default="checkpoints_finetune")
-    p.add_argument("--total-steps", type=int, default=10000)
+    p.add_argument("--total-steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--num-workers", type=int, default=4)
     p.add_argument(
         "--muon-lr",
         type=float,
@@ -180,12 +180,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="default 3e-4 finetuning, config.ADAM_LR from scratch",
     )
-    p.add_argument("--warmup-steps", type=int, default=2000)
+    p.add_argument("--warmup-steps", type=int, default=200)
     p.add_argument("--lr-min-ratio", type=float, default=0.01)
     p.add_argument(
         "--ema-decay", type=float, default=None, help="default: config.EMA_DECAY"
     )
-    p.add_argument("--validation-interval", type=int, default=1000)
+    p.add_argument("--validation-interval", type=int, default=200)
     p.add_argument("--eval-windows", type=int, default=32768)
     p.add_argument("--eval-batch-size", type=int, default=64)
     p.add_argument("--eval-seed", type=int, default=42)
@@ -217,9 +217,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--inputs",
         choices=("curves", "events"),
-        default=None,
+        default="events",
         help="dose inputs: action curves, or per-slot point doses; "
-        "omitted = the checkpoint's layout, curves from scratch",
+        "omitted = the checkpoint's layout, config.INPUT_LAYOUT_DEFAULT from scratch",
+    )
+    p.add_argument(
+        "--blind",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="a masked patch withholds its doses as well as bg; default: config.BLIND",
     )
     p.add_argument("--log-interval", type=int, default=100)
     args = p.parse_args()
@@ -244,7 +250,9 @@ def main() -> None:
         args.inputs = ckpt_layout
         _apply_checkpoint_dims(ckpt)
     else:
-        args.inputs = args.inputs or "curves"
+        import config
+
+        args.inputs = args.inputs or config.INPUT_LAYOUT
         _apply_input_layout(args.inputs)
 
     from torch.utils.data import DataLoader
@@ -254,6 +262,8 @@ def main() -> None:
         ADAM_LR,
         ADAM_WEIGHT_DECAY,
         ARCH_VERSION,
+        BLIND,
+        CURVATURE_LAMBDA,
         EMA_DECAY,
         GRADIENT_CLIP_NORM,
         LOSS_SCHEMA,
@@ -262,7 +272,6 @@ def main() -> None:
         MAX_MASKED_PATCHES,
         METRIC_BAND_TAU_HI,
         METRIC_BAND_TAU_LO,
-        CURVATURE_LAMBDA,
         MSE_ALPHA,
         MUON_LR,
         MUON_MOMENTUM,
@@ -290,16 +299,20 @@ def main() -> None:
     from train import _build_optimizers, _update_lr, _worker_init_fn
     from utils import ModelEMA, kovatchev_f_inv, time_of_day_bin_ce
 
+    if args.blind is None:
+        args.blind = BLIND
     if ckpt is not None:
         if ckpt.get("arch_version") != ARCH_VERSION:
             sys.exit(
                 f"--checkpoint {args.checkpoint}: arch_version "
                 f"{ckpt.get('arch_version')!r} != {ARCH_VERSION!r}"
             )
-        if checkpoint_masked_channel_policy(ckpt) != masked_channel_policy(blind=False):
+        policy = checkpoint_masked_channel_policy(ckpt)
+        if policy != masked_channel_policy(blind=args.blind):
             sys.exit(
-                f"--checkpoint {args.checkpoint}: blind masked-channel policy "
-                "— this pipeline conditions on announced doses"
+                f"--checkpoint {args.checkpoint}: masked_channel_policy {policy!r}; "
+                f"this run trains {masked_channel_policy(blind=args.blind)!r} "
+                "(config.BLIND / --blind)"
             )
         stats = ckpt["normalization_stats"]
         # Same guarantees load_normalization_stats gives a file: a bad channel trains silently.
@@ -396,6 +409,7 @@ def main() -> None:
         gap_budget=args.gap_budget,
         max_interp_steps=args.max_interp_steps,
         no_carbs=args.no_carbs,
+        blind=args.blind,
     )
     train_loader = DataLoader(
         train_ds,
@@ -414,6 +428,7 @@ def main() -> None:
         windows,
         max_interp_steps=args.max_interp_steps,
         no_carbs=args.no_carbs,
+        blind=args.blind,
     )
     # Workerless: eval forks would copy the CUDA-holding parent on a RAM-tight box.
     eval_loader = DataLoader(
@@ -674,6 +689,7 @@ def main() -> None:
                 "training_config": dict(
                     ckpt.get("training_config", {}) if ckpt is not None else {},
                     finetune=vars(args) | {"init_from": init_from},
+                    masked_channel_policy=masked_channel_policy(blind=args.blind),
                     mse_alpha=MSE_ALPHA,
                     curvature_lambda=CURVATURE_LAMBDA,
                 ),
