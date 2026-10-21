@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import importlib
 
-MODULES = ('zoo.classical', 'zoo.kernel', 'zoo.rnn', 'zoo.patch', 'zoo.chronos')
+MODULES = ('zoo.classical', 'zoo.kernel', 'zoo.boost','zoo.rnn', 'zoo.patch', 'zoo.chronos')
 
 
 def models() -> dict:
