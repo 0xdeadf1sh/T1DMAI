@@ -73,9 +73,11 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d))
         self.eps = eps
+        self.register_buffer('avg', torch.full((d, 1), 1.0 / d), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps))
+        ms = (x * x) @ self.avg
+        return self.weight * (x * torch.rsqrt(ms + self.eps))
 
 
 class ResidualBlock(nn.Module):
@@ -139,12 +141,16 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor, kv: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         B, lq, _ = x.shape
         lk = kv.shape[1]
-        q = self.q(x).view(B, lq, self.h, self.dk).transpose(1, 2)
-        k = self.k(kv).view(B, lk, self.h, self.dk).transpose(1, 2)
-        v = self.v(kv).view(B, lk, self.h, self.dk).transpose(1, 2)
-        s = q @ k.transpose(2, 3)
-        w = _drop(torch.softmax(s if bias is None else s + bias, dim=-1), self.p, self.training)
-        return self.o((w @ v).transpose(1, 2).reshape(B, lq, self.h * self.dk))
+        H, dk = self.h, self.dk
+        q = self.q(x).view(B, lq, H, dk).transpose(1, 2).reshape(B * H, lq, dk)
+        k = self.k(kv).view(B, lk, H, dk).transpose(1, 2).reshape(B * H, lk, dk)
+        v = self.v(kv).view(B, lk, H, dk).transpose(1, 2).reshape(B * H, lk, dk)
+        s = torch.bmm(q, k.transpose(1, 2))
+        if bias is not None:
+            s = (s.view(B, H, lq, lk) + bias).view(B * H, lq, lk)
+        w = _drop(torch.softmax(s, dim=-1), self.p, self.training)
+        o = torch.bmm(w, v).view(B, H, lq, dk).transpose(1, 2)
+        return self.o(o.reshape(B, lq, H * dk))
 
 
 class SelfLayer(nn.Module):
@@ -251,6 +257,13 @@ class ChronosBolt(nn.Module):
         self.start_id = cfg['decoder_start_token_id']
         self.nb = cfg['relative_attention_num_buckets']
         self.md = cfg['relative_attention_max_distance']
+        eye = torch.eye(2)
+        self.register_buffer('reg_sel', eye[self.reg_id:self.reg_id + 1], persistent=False)
+        self.register_buffer('start_sel', eye[self.start_id:self.start_id + 1], persistent=False)
+
+    def token(self, sel: torch.Tensor, B: int) -> torch.Tensor:
+        """One-hot row (1, 2) @ ``shared`` -> (B, 1, d); a matmul, so fine-tuning stays live."""
+        return (sel @ self.shared.weight).unsqueeze(0).expand(B, 1, -1)
 
     def tables(self, n_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One-hot buckets: encoder (n, n, nb) bidirectional, decoder (1, 1, nb) causal."""
@@ -262,18 +275,19 @@ class ChronosBolt(nn.Module):
         """Patch features (B, N, 2P) -> scaled quantiles (B, Q, H); REG token appended here."""
         B = inp.shape[0]
         tokens = self.input_patch_embedding(inp)
-        tokens = torch.cat([tokens, self.shared.weight[self.reg_id].expand(B, 1, -1)], dim=1)
+        tokens = torch.cat([tokens, self.token(self.reg_sel, B)], dim=1)
         enc = self.encoder(tokens, enc_b, key_mask)
-        start = self.shared.weight[self.start_id].expand(B, 1, -1)
-        dec = self.decoder(start, dec_b, None, enc, key_mask)
+        dec = self.decoder(self.token(self.start_sel, B), dec_b, None, enc, key_mask)
         return self.output_patch_embedding(dec).view(B, -1, self.prediction_length)
 
     def dense(self, x: torch.Tensor, enc_b: torch.Tensor,
               dec_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gap-free context (B, L), L a multiple of P -> scaled q (B, Q, H), loc, scale (B, 1)."""
         B, L = x.shape
-        loc = x.mean(-1, keepdim=True)
-        sc = ((x - loc) ** 2).mean(-1, keepdim=True).sqrt()
+        avg = x.new_full((L, 1), 1.0 / L)
+        loc = x @ avg
+        d = x - loc
+        sc = ((d * d) @ avg).sqrt()
         sc = torch.where(sc == 0, torch.full_like(sc, 1e-5), sc)
         xp = ((x - loc) / sc).view(B, L // self.patch_size, self.patch_size)
         return self.core(torch.cat([xp, torch.ones_like(xp)], dim=-1), None, enc_b, dec_b), loc, sc
@@ -345,7 +359,7 @@ class MedianGraph(nn.Module):
 
     def forward(self, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
         q, loc, sc = self.scaled(bg)
-        return q[:, self.mi, :ZONE] * sc + loc
+        return q[:, self.mi:self.mi + 1, :ZONE].reshape(-1, ZONE) * sc + loc
 
 
 class ChronosForecaster(Forecaster):
