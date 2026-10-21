@@ -264,7 +264,20 @@ def export_pte(wrapper, w: Window, out_path: str) -> dict:
     from executorch.exir import to_edge_transform_and_lower
     from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 
-    # a venv invocation leaves flatc off PATH, so point FLATC_EXECUTABLE at the bundled binary
+    ensure_flatc()
+    with torch.no_grad():
+        ep = torch.export.export(
+            wrapper, (w.patches, w.struct, w.slot_sel), strict=False,
+        )
+    lowered = to_edge_transform_and_lower(ep, partitioner=[XnnpackPartitioner()])
+    et_prog = lowered.to_executorch()
+    with open(out_path, "wb") as f:
+        f.write(et_prog.buffer)
+    return _census(lowered)
+
+
+def ensure_flatc() -> None:
+    """A venv invocation leaves flatc off PATH; point FLATC_EXECUTABLE at the bundled binary."""
     if not os.environ.get("FLATC_EXECUTABLE"):
         import sys
         import importlib.util
@@ -277,16 +290,9 @@ def export_pte(wrapper, w: Window, out_path: str) -> dict:
                 os.environ["FLATC_EXECUTABLE"] = os.path.abspath(cand)
                 break
 
-    with torch.no_grad():
-        ep = torch.export.export(
-            wrapper, (w.patches, w.struct, w.slot_sel), strict=False,
-        )
-    lowered = to_edge_transform_and_lower(ep, partitioner=[XnnpackPartitioner()])
-    et_prog = lowered.to_executorch()
-    with open(out_path, "wb") as f:
-        f.write(et_prog.buffer)
 
-    # which ops stayed on the portable CPU runtime, undelegated
+def _census(lowered) -> dict:
+    """Which ops stayed on the portable CPU runtime, undelegated."""
     info = {"non_delegated_ops": []}
     try:
         edm = lowered.exported_program().graph_module
