@@ -62,6 +62,14 @@ def test_golden_parity_with_reference_pipeline():
     rel = ((got - want).abs() / scale[:, :, None]).amax().item()
     print(f'DUMP chronos-bolt-tiny golden max |diff|/scale {rel:.2e}')
     assert rel < 1e-4
+    full = torch.isfinite(x).all(dim=1)
+    assert full.sum() >= 2
+    with torch.no_grad():
+        q, loc, sc = net.dense(x[full], *net.tables(x.shape[1] // net.patch_size + 1))
+    dense = (q * sc[:, :, None] + loc[:, :, None])[:, :, :g['horizon']]
+    rel_d = ((dense - want[full]).abs() / scale[full][:, :, None]).amax().item()
+    print(f'DUMP gap-free dense path vs golden max |diff|/scale {rel_d:.2e}')
+    assert rel_d < 1e-4
 
 
 @needs_tiny
@@ -88,6 +96,38 @@ def test_zero_shot_beats_persistence_on_sinusoid():
     e_p = np.sqrt(np.mean((pers - target) ** 2))
     print(f'DUMP sinusoid rmse chronos-bolt-tiny zs {e_zs:.2f}  persistence {e_p:.2f}')
     assert e_zs < 0.5 * e_p
+
+
+def _graph_inputs(n: int) -> tuple[Windows, tuple[torch.Tensor, ...]]:
+    bg, target = _sinusoid(n, 288, seed=2)
+    w = _windows(bg, target)
+    return w, tuple(torch.from_numpy(np.asarray(x, np.float32)) for x in (w.bg, w.insulin, w.carb))
+
+
+@needs_tiny
+def test_graph_matches_predict():
+    w, args = _graph_inputs(8)
+    m = ChronosForecaster('tiny', finetune=False)
+    p = m.predict(w)
+    with torch.no_grad():
+        g = m.graph()(*args).numpy()
+    diff = np.abs(g - p).max()
+    print(f'DUMP chronos graph vs predict max {diff:.2e} mg/dL')
+    assert g.shape == (8, ZONE) and diff < 1e-2
+
+
+@needs_tiny
+def test_graph_exports_without_dropout_or_nan_ops():
+    w, args = _graph_inputs(1)
+    graph = ChronosForecaster('tiny', finetune=False).graph()
+    with torch.no_grad():
+        ep = torch.export.export(graph, args, strict=False)
+        diff = (ep.module()(*args) - graph(*args)).abs().max().item()
+    ops = {str(n.target) for n in ep.graph.nodes if n.op == 'call_function'}
+    print(f'DUMP chronos exported vs eager max {diff:.2e} mg/dL, {len(ops)} ops')
+    assert diff < 1e-3
+    banned = {'dropout', 'isnan', 'nan_to_num', 'embedding', 'log'}
+    assert not [o for o in ops if any(b in o for b in banned)], sorted(ops)
 
 
 @needs_tiny

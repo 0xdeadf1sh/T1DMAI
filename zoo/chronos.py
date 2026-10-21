@@ -64,6 +64,10 @@ def read_safetensors(path: str) -> dict[str, torch.Tensor]:
     return out
 
 
+def _drop(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
+    return nn.functional.dropout(x, p, True) if training and p > 0 else x
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float) -> None:
         super().__init__()
@@ -80,11 +84,11 @@ class ResidualBlock(nn.Module):
         self.hidden_layer = nn.Linear(d_in, d_h)
         self.output_layer = nn.Linear(d_h, d_out)
         self.residual_layer = nn.Linear(d_in, d_out)
-        self.dropout = nn.Dropout(p)
+        self.p = p
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = torch.relu(self.hidden_layer(x))
-        return self.dropout(self.output_layer(h)) + self.residual_layer(x)
+        return _drop(self.output_layer(h), self.p, self.training) + self.residual_layer(x)
 
 
 def relative_bucket(rel: torch.Tensor, bidirectional: bool, num_buckets: int,
@@ -104,6 +108,14 @@ def relative_bucket(rel: torch.Tensor, bidirectional: bool, num_buckets: int,
     return buckets + torch.where(rel < max_exact, rel, large)
 
 
+def bucket_table(lq: int, lk: int, bidirectional: bool, num_buckets: int,
+                 max_distance: int) -> torch.Tensor:
+    """(lq, lk, num_buckets) float one-hot of the bucket of key j against query i."""
+    rel = torch.arange(lk)[None, :] - torch.arange(lq)[:, None]
+    ids = relative_bucket(rel, bidirectional, num_buckets, max_distance)
+    return nn.functional.one_hot(ids, num_buckets).float()
+
+
 class Attention(nn.Module):
     def __init__(self, cfg: dict, rel_bias: bool, bidirectional: bool) -> None:
         super().__init__()
@@ -120,19 +132,18 @@ class Attention(nn.Module):
         if rel_bias:
             self.relative_attention_bias = nn.Embedding(self.nb, self.h)
 
-    def bias(self, lq: int, lk: int, device: torch.device) -> torch.Tensor:
-        rel = torch.arange(lk, device=device)[None, :] - torch.arange(lq, device=device)[:, None]
-        b = self.relative_attention_bias(relative_bucket(rel, self.bidirectional, self.nb, self.md))
-        return b.permute(2, 0, 1).unsqueeze(0)
+    def bias(self, buckets: torch.Tensor) -> torch.Tensor:
+        """One-hot buckets (lq, lk, nb) -> (1, H, lq, lk); a matmul, not a gather, for XNNPACK."""
+        return (buckets @ self.relative_attention_bias.weight).permute(2, 0, 1).unsqueeze(0)
 
-    def forward(self, x: torch.Tensor, kv: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         B, lq, _ = x.shape
         lk = kv.shape[1]
         q = self.q(x).view(B, lq, self.h, self.dk).transpose(1, 2)
         k = self.k(kv).view(B, lk, self.h, self.dk).transpose(1, 2)
         v = self.v(kv).view(B, lk, self.h, self.dk).transpose(1, 2)
-        w = torch.softmax(q @ k.transpose(2, 3) + bias, dim=-1)
-        w = nn.functional.dropout(w, self.p, self.training)
+        s = q @ k.transpose(2, 3)
+        w = _drop(torch.softmax(s if bias is None else s + bias, dim=-1), self.p, self.training)
         return self.o((w @ v).transpose(1, 2).reshape(B, lq, self.h * self.dk))
 
 
@@ -141,11 +152,11 @@ class SelfLayer(nn.Module):
         super().__init__()
         self.SelfAttention = Attention(cfg, rel_bias, bidirectional)
         self.layer_norm = RMSNorm(cfg['d_model'], cfg['layer_norm_epsilon'])
-        self.dropout = nn.Dropout(cfg['dropout_rate'])
+        self.p = cfg['dropout_rate']
 
     def forward(self, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         h = self.layer_norm(x)
-        return x + self.dropout(self.SelfAttention(h, h, bias))
+        return x + _drop(self.SelfAttention(h, h, bias), self.p, self.training)
 
 
 class CrossLayer(nn.Module):
@@ -153,10 +164,11 @@ class CrossLayer(nn.Module):
         super().__init__()
         self.EncDecAttention = Attention(cfg, False, False)
         self.layer_norm = RMSNorm(cfg['d_model'], cfg['layer_norm_epsilon'])
-        self.dropout = nn.Dropout(cfg['dropout_rate'])
+        self.p = cfg['dropout_rate']
 
-    def forward(self, x: torch.Tensor, enc: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        return x + self.dropout(self.EncDecAttention(self.layer_norm(x), enc, bias))
+    def forward(self, x: torch.Tensor, enc: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        a = self.EncDecAttention(self.layer_norm(x), enc, bias)
+        return x + _drop(a, self.p, self.training)
 
 
 class DenseReluDense(nn.Module):
@@ -164,10 +176,10 @@ class DenseReluDense(nn.Module):
         super().__init__()
         self.wi = nn.Linear(cfg['d_model'], cfg['d_ff'], bias=False)
         self.wo = nn.Linear(cfg['d_ff'], cfg['d_model'], bias=False)
-        self.dropout = nn.Dropout(cfg['dropout_rate'])
+        self.p = cfg['dropout_rate']
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.wo(self.dropout(torch.relu(self.wi(x))))
+        return self.wo(_drop(torch.relu(self.wi(x)), self.p, self.training))
 
 
 class FFLayer(nn.Module):
@@ -175,10 +187,10 @@ class FFLayer(nn.Module):
         super().__init__()
         self.DenseReluDense = DenseReluDense(cfg)
         self.layer_norm = RMSNorm(cfg['d_model'], cfg['layer_norm_epsilon'])
-        self.dropout = nn.Dropout(cfg['dropout_rate'])
+        self.p = cfg['dropout_rate']
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.dropout(self.DenseReluDense(self.layer_norm(x)))
+        return x + _drop(self.DenseReluDense(self.layer_norm(x)), self.p, self.training)
 
 
 class Block(nn.Module):
@@ -197,20 +209,21 @@ class Stack(nn.Module):
         self.decoder = decoder
         self.block = nn.ModuleList([Block(cfg, i == 0, decoder) for i in range(n_layers)])
         self.final_layer_norm = RMSNorm(cfg['d_model'], cfg['layer_norm_epsilon'])
-        self.dropout = nn.Dropout(cfg['dropout_rate'])
+        self.p = cfg['dropout_rate']
 
-    def forward(self, x: torch.Tensor, self_mask: torch.Tensor,
+    def forward(self, x: torch.Tensor, buckets: torch.Tensor, self_mask: torch.Tensor | None = None,
                 enc: torch.Tensor | None = None, enc_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """``x`` (B, L, d); masks are additive, broadcastable to (B, H, L, Lk)."""
-        L = x.shape[1]
-        bias = self.block[0].layer[0].SelfAttention.bias(L, L, x.device) + self_mask
-        x = self.dropout(x)
+        """``x`` (B, L, d); ``buckets`` one-hot (L, L, nb); masks additive, (B, 1, 1, Lk)."""
+        bias = self.block[0].layer[0].SelfAttention.bias(buckets)
+        if self_mask is not None:
+            bias = bias + self_mask
+        x = _drop(x, self.p, self.training)
         for blk in self.block:
             x = blk.layer[0](x, bias)
             if self.decoder:
                 x = blk.layer[1](x, enc, enc_mask)
             x = blk.layer[-1](x)
-        return self.dropout(self.final_layer_norm(x))
+        return _drop(self.final_layer_norm(x), self.p, self.training)
 
 
 class ChronosBolt(nn.Module):
@@ -236,6 +249,34 @@ class ChronosBolt(nn.Module):
         self.output_patch_embedding = ResidualBlock(d, cfg['d_ff'], nq * self.prediction_length, p)
         self.reg_id = cfg['reg_token_id']
         self.start_id = cfg['decoder_start_token_id']
+        self.nb = cfg['relative_attention_num_buckets']
+        self.md = cfg['relative_attention_max_distance']
+
+    def tables(self, n_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One-hot buckets: encoder (n, n, nb) bidirectional, decoder (1, 1, nb) causal."""
+        return (bucket_table(n_tokens, n_tokens, True, self.nb, self.md),
+                bucket_table(1, 1, False, self.nb, self.md))
+
+    def core(self, inp: torch.Tensor, key_mask: torch.Tensor | None, enc_b: torch.Tensor,
+             dec_b: torch.Tensor) -> torch.Tensor:
+        """Patch features (B, N, 2P) -> scaled quantiles (B, Q, H); REG token appended here."""
+        B = inp.shape[0]
+        tokens = self.input_patch_embedding(inp)
+        tokens = torch.cat([tokens, self.shared.weight[self.reg_id].expand(B, 1, -1)], dim=1)
+        enc = self.encoder(tokens, enc_b, key_mask)
+        start = self.shared.weight[self.start_id].expand(B, 1, -1)
+        dec = self.decoder(start, dec_b, None, enc, key_mask)
+        return self.output_patch_embedding(dec).view(B, -1, self.prediction_length)
+
+    def dense(self, x: torch.Tensor, enc_b: torch.Tensor,
+              dec_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gap-free context (B, L), L a multiple of P -> scaled q (B, Q, H), loc, scale (B, 1)."""
+        B, L = x.shape
+        loc = x.mean(-1, keepdim=True)
+        sc = ((x - loc) ** 2).mean(-1, keepdim=True).sqrt()
+        sc = torch.where(sc == 0, torch.full_like(sc, 1e-5), sc)
+        xp = ((x - loc) / sc).view(B, L // self.patch_size, self.patch_size)
+        return self.core(torch.cat([xp, torch.ones_like(xp)], dim=-1), None, enc_b, dec_b), loc, sc
 
     @staticmethod
     def scale(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -259,14 +300,10 @@ class ChronosBolt(nn.Module):
             m = torch.cat([m.new_zeros(B, pad), m], dim=1)
         xp = x.view(B, -1, self.patch_size)
         mp = m.view(B, -1, self.patch_size)
-        tokens = self.input_patch_embedding(torch.cat([xp * mp, mp], dim=-1))
-        tokens = torch.cat([tokens, self.shared.weight[self.reg_id].expand(B, 1, -1)], dim=1)
         keep = torch.cat([mp.sum(-1) > 0, torch.ones(B, 1, dtype=torch.bool, device=x.device)], 1)
-        key_mask = torch.where(keep, 0.0, torch.finfo(tokens.dtype).min)[:, None, None, :]
-        enc = self.encoder(tokens, key_mask)
-        start = self.shared.weight[self.start_id].expand(B, 1, -1)
-        dec = self.decoder(start, start.new_zeros(1, 1, 1, 1), enc, key_mask)
-        q = self.output_patch_embedding(dec).view(B, -1, self.prediction_length)
+        key_mask = torch.where(keep, 0.0, torch.finfo(x.dtype).min)[:, None, None, :]
+        enc_b, dec_b = (t.to(x.device) for t in self.tables(keep.shape[1]))
+        q = self.core(torch.cat([xp * mp, mp], dim=-1), key_mask, enc_b, dec_b)
         out = q * sc[:, :, None] + loc[:, :, None]
         return (out, q, loc, sc) if scaled else out
 
@@ -291,6 +328,26 @@ def pinball(q: torch.Tensor, target: torch.Tensor, levels: torch.Tensor) -> torc
     return loss.mean(dim=-2).sum(dim=-1).mean()
 
 
+class MedianGraph(nn.Module):
+    """``(bg, insulin, carb)`` -> (B, ZONE) mg/dL median; bg gap-free (B, ctx), doses unused."""
+
+    def __init__(self, net: ChronosBolt, ctx: int) -> None:
+        super().__init__()
+        assert ctx % net.patch_size == 0 and ctx <= net.context_length
+        self.net = net
+        self.mi = int(torch.argmin((net.quantiles - 0.5).abs()))
+        enc_b, dec_b = net.tables(ctx // net.patch_size + 1)
+        self.register_buffer('enc_b', enc_b.to(net.quantiles.device), persistent=False)
+        self.register_buffer('dec_b', dec_b.to(net.quantiles.device), persistent=False)
+
+    def scaled(self, bg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.net.dense(bg, self.enc_b, self.dec_b)
+
+    def forward(self, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
+        q, loc, sc = self.scaled(bg)
+        return q[:, self.mi, :ZONE] * sc + loc
+
+
 class ChronosForecaster(Forecaster):
     """CGM-only Chronos-Bolt; the point forecast is the 0.5 quantile of the first ZONE steps."""
 
@@ -303,31 +360,33 @@ class ChronosForecaster(Forecaster):
         self.epochs, self.batch, self.lr = epochs, batch, lr
         self.weight_decay, self.val_frac, self.seed = weight_decay, val_frac, seed
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self._net: ChronosBolt | None = None
+        self._graph: MedianGraph | None = None
+
+    @property
+    def g(self) -> MedianGraph:
+        if self._graph is None:
+            self._graph = MedianGraph(load_pretrained(self.size).to(self.device), self.ctx)
+        return self._graph
 
     @property
     def net(self) -> ChronosBolt:
-        if self._net is None:
-            self._net = load_pretrained(self.size).to(self.device)
-        return self._net
+        return self.g.net
 
-    @property
-    def median_idx(self) -> int:
-        return int(torch.argmin((self.net.quantiles - 0.5).abs()))
-
-    def _tensors(self, w: Windows, idx: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        bg = torch.from_numpy(w.bg[idx].astype(np.float32)).to(self.device)
-        return bg, torch.from_numpy(w.target[idx].astype(np.float32)).to(self.device)
+    def _tensors(self, w: Windows, idx: np.ndarray) -> tuple[torch.Tensor, ...]:
+        bg, ins, carb, y = (torch.from_numpy(np.asarray(x[idx], np.float32)).to(self.device)
+                            for x in (w.bg, w.insulin, w.carb, w.target))
+        assert torch.isfinite(bg).all(), 'Windows.bg must be gap-filled'
+        return bg, ins, carb, y
 
     def _val(self, w: Windows, idx: np.ndarray) -> tuple[float, float]:
-        self.net.eval()
+        self.g.eval()
         tot = sq = n = 0.0
         with torch.no_grad():
             for s in range(0, len(idx), self.batch * 4):
-                bg, y = self._tensors(w, idx[s:s + self.batch * 4])
-                out, q, loc, sc = self.net(bg, scaled=True)
+                bg, ins, carb, y = self._tensors(w, idx[s:s + self.batch * 4])
+                q, loc, sc = self.g.scaled(bg)
                 tot += float(pinball(q, (y - loc) / sc, self.net.quantiles)) * len(bg)
-                d = (out[:, self.median_idx, :ZONE] - y)[torch.isfinite(y)]
+                d = (q[:, self.g.mi, :ZONE] * sc + loc - y)[torch.isfinite(y)]
                 sq += float((d ** 2).sum())
                 n += float(d.numel())
         return tot / max(len(idx), 1), (sq / max(n, 1.0)) ** 0.5
@@ -347,12 +406,12 @@ class ChronosForecaster(Forecaster):
         best_state = None
         print(f'  zero-shot val pinball {best:.4f}  median rmse {rmse:.2f} mg/dL', flush=True)
         for ep in range(self.epochs):
-            self.net.train()
+            self.g.train()
             t = time.time()
             tr = rng.permutation(tr)
             for s in range(0, len(tr), self.batch):
-                bg, y = self._tensors(w, tr[s:s + self.batch])
-                _, q, loc, sc = self.net(bg, scaled=True)
+                bg, _, _, y = self._tensors(w, tr[s:s + self.batch])
+                q, loc, sc = self.g.scaled(bg)
                 loss = pinball(q, (y - loc) / sc, self.net.quantiles)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -367,18 +426,22 @@ class ChronosForecaster(Forecaster):
                 best_state = {k: x.detach().clone() for k, x in self.net.state_dict().items()}
         if best_state is not None:
             self.net.load_state_dict(best_state)
-        self.net.eval()
+        self.g.eval()
 
     def predict(self, w: Windows) -> np.ndarray:
-        """(N, ctx) bg -> (N, ZONE) mg/dL median."""
+        """(N, ctx) gap-filled bg -> (N, ZONE) mg/dL median, through ``graph()``'s module."""
         assert w.bg.shape[1] == self.ctx
-        self.net.eval()
+        self.g.eval()
         out = []
         with torch.no_grad():
             for s in range(0, len(w), self.batch * 4):
-                bg, _ = self._tensors(w, np.arange(s, min(s + self.batch * 4, len(w))))
-                out.append(self.net(bg)[:, self.median_idx, :ZONE].cpu().numpy())
+                bg, ins, carb, _ = self._tensors(w, np.arange(s, min(s + self.batch * 4, len(w))))
+                out.append(self.g(bg, ins, carb).cpu().numpy())
         return np.concatenate(out).astype(np.float64) if out else np.empty((0, ZONE))
+
+    def graph(self) -> nn.Module:
+        self.device = torch.device('cpu')
+        return self.g.cpu().eval()
 
     def state(self) -> dict[str, np.ndarray]:
         if not self.finetune:
