@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from config import QUANTILE_LEVELS
+from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
 from zoo.registry import models
 from zoo.windows import MAX_INTERP_STEPS, ZONE, drop_zone_doses, train_windows
 
@@ -102,6 +103,7 @@ def main() -> None:
         'ctx_steps': ctx,
         'zone_steps': ZONE,
         'gap_fill_interp_max_steps': MAX_INTERP_STEPS,
+        'bg_clamp_mgdl': [BG_CLAMP_MIN, BG_CLAMP_MAX],
         'inputs': [{'name': 'bg', 'unit': 'mg/dL', 'shape': [1, ctx]},
                    {'name': 'insulin', 'unit': 'U/step', 'shape': [1, ctx + ZONE]},
                    {'name': 'carb', 'unit': 'g/step', 'shape': [1, ctx + ZONE]}],
