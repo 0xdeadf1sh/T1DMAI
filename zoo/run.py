@@ -15,7 +15,7 @@ import numpy as np
 from zoo.registry import models
 
 MODELS = models()
-from zoo.windows import horizon_columns, template_windows, train_windows
+from zoo.windows import drop_zone_doses, horizon_columns, template_windows, train_windows
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--out', default=os.path.join(ROOT, 'zoo_runs'))
     p.add_argument('--train-windows', type=int, default=500_000)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--causal', action='store_true',
+                   help='zero doses after the origin, in training and prediction')
     p.add_argument('--every', type=int, default=1, metavar='N',
                    help='keep every Nth template row; scoring only, never a file to submit')
     return p.parse_args()
@@ -69,12 +71,13 @@ def main() -> None:
     from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
 
     model = MODELS[args.model]()
-    run_dir = os.path.join(args.out, model.name)
+    prep = drop_zone_doses if args.causal else (lambda w: w)
+    run_dir = os.path.join(args.out, model.name + ('_causal' if args.causal else ''))
     os.makedirs(run_dir, exist_ok=True)
     cache = FinetuneCache(args.cache)
 
     t = time.time()
-    tw = train_windows(cache, args.train_windows, model.ctx, args.seed)
+    tw = prep(train_windows(cache, args.train_windows, model.ctx, args.seed))
     print(f'{model.name}: {len(tw)} train windows, ctx {model.ctx}  ({time.time() - t:.0f} s)',
           flush=True)
     model.fit(tw)
@@ -94,7 +97,7 @@ def main() -> None:
     pred = np.full((len(t_epoch), len(HORIZON_MINUTES)), np.nan)
     anchored = 0
     for s, rows in rows_by_subject.items():
-        w = template_windows(cache, {s: rows}, t_epoch, model.ctx)
+        w = prep(template_windows(cache, {s: rows}, t_epoch, model.ctx))
         if len(w):
             pred[w.row] = horizon_columns(model.predict(w))
             anchored += len(w)
@@ -112,6 +115,7 @@ def main() -> None:
                    'by_source': {s: {str(m): v for m, v in r.items()}
                                  for s, r in by_source.items()},
                    'anchored': anchored, 'rows': n_rows, 'every': args.every,
+                   'causal': args.causal,
                    'train_windows': args.train_windows, 'seed': args.seed}, f, indent=1)
     rebuild_leaderboard(args.out)
 

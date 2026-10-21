@@ -121,6 +121,14 @@ def template_windows(cache: FinetuneCache, rows_by_subject: dict[int, list[int]]
     return _concat(parts, ctx)
 
 
+def drop_zone_doses(w: Windows) -> Windows:
+    """Zero insulin and carbohydrate after the origin: what a live forecast actually knows."""
+    ctx = w.bg.shape[1]
+    w.insulin[:, ctx:] = 0.0
+    w.carb[:, ctx:] = 0.0
+    return w
+
+
 def horizon_columns(zone_pred: np.ndarray) -> np.ndarray:
     """(N, ZONE) zone forecast -> (N, len(HORIZON_MINUTES)) leaderboard columns."""
     return zone_pred[:, list(HORIZON_STEPS)]
