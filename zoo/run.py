@@ -12,7 +12,9 @@ import time
 
 import numpy as np
 
-from zoo.classical import MODELS
+from zoo.registry import models
+
+MODELS = models()
 from zoo.windows import horizon_columns, template_windows, train_windows
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
