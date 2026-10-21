@@ -48,6 +48,7 @@ exported/
 # --- Trained-model + report artifact trees (regenerable; keep the .py tools) ---
 models/
 comparison/
+zoo_runs/
 
 # --- Simulator / dataset caches (regenerable) ---
 *.npz
