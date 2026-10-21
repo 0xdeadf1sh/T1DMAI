@@ -74,3 +74,28 @@ def test_kalman_recovers_linear_ramp():
 
 def test_kalman_beats_persistence_on_sines():
     _beats_persistence(Kalman(), ratio=0.8)
+
+
+def test_graph_matches_predict_and_exports(monkeypatch):
+    import torch
+
+    import zoo.kernel
+    monkeypatch.setattr(zoo.kernel, 'SVR_STEPS', 50)
+    rng = np.random.default_rng(1)
+    for m in (SVR(), GP(), Kalman()):
+        n = 256
+        bg = (130 + np.cumsum(rng.normal(0, 3, (n, m.ctx)), axis=1)).astype(np.float32)
+        doses = rng.exponential(0.5, (n, m.ctx + ZONE)).astype(np.float32)
+        target = bg[:, -1:] + rng.normal(0, 10, (n, ZONE))
+        w = _windows(bg, target, ins=doses, carb=doses * 5)
+        m.fit(w)
+        g = m.graph().eval()
+        args = tuple(torch.from_numpy(x) for x in (w.bg, w.insulin, w.carb))
+        with torch.no_grad():
+            out = g(*args).numpy()
+            ep = torch.export.export(g, tuple(a[:1] for a in args), strict=False)
+            exp = ep.module()(*(a[:1] for a in args)).numpy()
+        err = np.abs(out - m.predict(w)).max()
+        print(f'DUMP {m.name} graph-vs-predict max {err:.2e} mg/dL')
+        assert err < 1e-2
+        assert np.abs(exp - out[:1]).max() < 1e-3

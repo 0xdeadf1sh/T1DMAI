@@ -4,10 +4,14 @@ SVR and GP read the ridge ARX features and forecast the delta from the last read
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
+import torch
+from torch import nn
 
 from finetune_data import HORIZON_MINUTES, HORIZON_STEPS
-from zoo.classical import Forecaster, Ridge
+from zoo.classical import Forecaster, Ridge, _Fn, _t, ridge_features
 from zoo.windows import ZONE, Windows
 
 STEP_30 = HORIZON_STEPS[HORIZON_MINUTES.index(30)]
@@ -47,8 +51,20 @@ def _subsample(w: Windows, n: int, seed: int) -> Windows:
     return w.take(np.sort(np.random.default_rng(seed).choice(len(w), n, replace=False)))
 
 
+def _eval(fn, w: Windows, **buffers: np.ndarray) -> np.ndarray:
+    """Run a graph function in float64 on a ``Windows`` batch; the same code ``graph()`` wraps."""
+    m = SimpleNamespace(**{k: _t(v) for k, v in buffers.items()})
+    with torch.no_grad():
+        return fn(m, _t(w.bg), _t(w.insulin), _t(w.carb)).numpy()
+
+
+def _sqdist_t(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    d = (a * a).sum(1)[:, None] + (b * b).sum(1)[None, :] - 2.0 * a @ b.T
+    return torch.clamp(d, min=0.0)
+
+
 def _sqdist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return np.maximum((a * a).sum(1)[:, None] + (b * b).sum(1)[None, :] - 2.0 * a @ b.T, 0.0)
+    return _sqdist_t(_t(a), _t(b)).numpy()
 
 
 def _median_distance(x: np.ndarray, seed: int) -> float:
@@ -65,8 +81,8 @@ class _ArxDelta(Forecaster):
         self.ctx = self.arx.ctx
         self.mu = self.sd = self.ymu = self.ysd = np.empty(0)
 
-    def _x(self, w: Windows) -> np.ndarray:
-        return (self.arx.features(w) - self.mu) / self.sd
+    def _x(self, m, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
+        return (ridge_features(bg, ins, carb, self.arx.lags, True) - m.mu) / m.sd
 
     def _prepare(self, w: Windows) -> tuple[np.ndarray, np.ndarray]:
         X = self.arx.features(w)
@@ -75,8 +91,24 @@ class _ArxDelta(Forecaster):
         self.ymu, self.ysd = np.nanmean(y, axis=0), np.nanstd(y, axis=0) + 1e-6
         return (X - self.mu) / self.sd, (y - self.ymu) / self.ysd
 
-    def _out(self, w: Windows, z: np.ndarray) -> np.ndarray:
-        return w.bg[:, -1:] + self.ymu + z * self.ysd
+    def _delta(self, m, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _forward(self, m, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
+        return bg[:, -1:] + m.ymu + self._delta(m, self._x(m, bg, ins, carb)) * m.ysd
+
+    def _graph_state(self) -> dict[str, np.ndarray]:
+        return self.state()
+
+    def predict(self, w: Windows) -> np.ndarray:
+        return _eval(self._forward, w, **self._graph_state())
+
+    def graph(self) -> nn.Module:
+        return _Fn(self._forward, **self._graph_state())
+
+
+def _rff(x: torch.Tensor, omega: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+    return (2.0 / omega.shape[1]) ** 0.5 * torch.cos(x @ omega + phase)
 
 
 class SVR(_ArxDelta):
@@ -92,8 +124,12 @@ class SVR(_ArxDelta):
         self.omega = self.phase = self.coef = np.empty(0)
 
     def _z(self, x: np.ndarray) -> np.ndarray:
-        rff = np.sqrt(2.0 / SVR_FEATURES) * np.cos(x @ self.omega + self.phase)
+        rff = _rff(_t(x), _t(self.omega), _t(self.phase)).numpy()
         return np.concatenate([np.ones((len(x), 1)), x, rff], axis=1)
+
+    def _delta(self, m, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[1]
+        return m.coef[0] + x @ m.coef[1:1 + d] + _rff(x, m.omega, m.phase) @ m.coef[1 + d:]
 
     def fit(self, w: Windows) -> None:
         w = _subsample(w, SVR_WINDOWS, self.seed)
@@ -127,9 +163,6 @@ class SVR(_ArxDelta):
             W -= SVR_LR * (m / (1 - 0.9 ** t)) / (np.sqrt(v / (1 - 0.999 ** t)) + 1e-8)
         self.coef = W
 
-    def predict(self, w: Windows) -> np.ndarray:
-        return self._out(w, self._z(self._x(w)) @ self.coef)
-
     def state(self) -> dict[str, np.ndarray]:
         return {'mu': self.mu, 'sd': self.sd, 'ymu': self.ymu, 'ysd': self.ysd,
                 'omega': self.omega, 'phase': self.phase, 'coef': self.coef}
@@ -155,6 +188,10 @@ def _kmeans_pp(x: np.ndarray, m: int, iters: int, rng: np.random.Generator) -> n
     return c
 
 
+def _gp_kernel(a: torch.Tensor, b: torch.Tensor, ell: torch.Tensor, lin: torch.Tensor) -> torch.Tensor:
+    return torch.exp(-_sqdist_t(a, b) / (2 * ell * ell)) + lin * (a @ b.T) / a.shape[1]
+
+
 class GP(_ArxDelta):
     """Subset-of-regressors GP, RBF + linear kernel, inducing points by k-means++.
 
@@ -170,8 +207,10 @@ class GP(_ArxDelta):
         self.ell = self.lin = 0.0
 
     def _k0(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        k = np.exp(-_sqdist(a, b) / (2 * self.ell ** 2))
-        return k + self.lin * (a @ b.T) / a.shape[1] if self.lin else k
+        return _gp_kernel(_t(a), _t(b), _t(self.ell), _t(self.lin)).numpy()
+
+    def _delta(self, m, x: torch.Tensor) -> torch.Tensor:
+        return _gp_kernel(x, m.inducing, m.ell, m.lin) @ m.alpha
 
     def _hyper(self, x: np.ndarray, y: np.ndarray) -> None:
         med = _median_distance(x, self.seed)
@@ -215,20 +254,20 @@ class GP(_ArxDelta):
         self.ainv = np.stack([np.linalg.inv(C + r * kmm + jit) for r in self.ratio])
         self.alpha = np.einsum('kij,jk->ik', self.ainv, b)
 
-    def predict(self, w: Windows) -> np.ndarray:
-        return self._out(w, self._k0(self._x(w), self.inducing) @ self.alpha)
+    def _graph_state(self) -> dict[str, np.ndarray]:
+        return {'mu': self.mu, 'sd': self.sd, 'ymu': self.ymu, 'ysd': self.ysd,
+                'inducing': self.inducing, 'alpha': self.alpha,
+                'ell': np.array(self.ell), 'lin': np.array(self.lin)}
 
     def predict_std(self, w: Windows) -> np.ndarray:
         """(N, ZONE) mg/dL predictive standard deviation, observation noise included."""
-        k = self._k0(self._x(w), self.inducing)
+        x = _eval(self._x, w, mu=self.mu, sd=self.sd)
+        k = self._k0(x, self.inducing)
         q = np.einsum('ni,kij,nj->nk', k, self.ainv, k)
         return np.sqrt(self.noise * (1.0 + q)) * self.ysd
 
     def state(self) -> dict[str, np.ndarray]:
-        return {'mu': self.mu, 'sd': self.sd, 'ymu': self.ymu, 'ysd': self.ysd,
-                'inducing': self.inducing, 'alpha': self.alpha,
-                'ainv': self.ainv.astype(np.float32), 'noise': self.noise,
-                'ell': np.array(self.ell), 'lin': np.array(self.lin)}
+        return {**self._graph_state(), 'ainv': self.ainv.astype(np.float32), 'noise': self.noise}
 
     def load(self, state: dict[str, np.ndarray]) -> None:
         for k, v in state.items():
@@ -239,8 +278,8 @@ class GP(_ArxDelta):
 class Kalman(Forecaster):
     """Damped local-linear-trend Kalman filter over the context, trend propagated over the zone.
 
-    State (level, trend); measurement variance fixed at 1, so only the Q/R ratios and the damping
-    are fitted, by grid search on 30-min RMSE. Gains are window-independent, so computed once.
+    Measurement variance fixed at 1; Q/R ratios and damping by grid search on 30-min RMSE.
+    Gains are window-independent, so the forecast is a (ctx, ZONE) map: the filter on the identity.
     """
     name = 'kalman'
     ctx = KALMAN_CTX
@@ -275,6 +314,16 @@ class Kalman(Forecaster):
     def _reach(phi: float) -> np.ndarray:
         return np.cumsum(phi ** np.arange(1, ZONE + 1))
 
+    def _map(self) -> np.ndarray:
+        """(ctx, ZONE): forecast = bg @ map."""
+        K = self._gains(self.q_level, self.q_trend, self.damping, self.ctx)
+        level, trend = self._filter(np.eye(self.ctx), K, self.damping)
+        return level[:, None] + trend[:, None] * self._reach(self.damping)[None, :]
+
+    @staticmethod
+    def _forward(m, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
+        return bg @ m.map
+
     def fit(self, w: Windows) -> None:
         w = _subsample(w, KALMAN_WINDOWS, 0)
         y = w.target[:, STEP_30].astype(np.float64)
@@ -291,9 +340,10 @@ class Kalman(Forecaster):
                         best, self.q_level, self.q_trend, self.damping = err, ql, qt, phi
 
     def predict(self, w: Windows) -> np.ndarray:
-        K = self._gains(self.q_level, self.q_trend, self.damping, w.bg.shape[1])
-        level, trend = self._filter(w.bg, K, self.damping)
-        return level[:, None] + trend[:, None] * self._reach(self.damping)[None, :]
+        return _eval(self._forward, w, map=self._map())
+
+    def graph(self) -> nn.Module:
+        return _Fn(self._forward, map=self._map())
 
     def state(self) -> dict[str, np.ndarray]:
         return {'q_level': np.array(self.q_level), 'q_trend': np.array(self.q_trend),
