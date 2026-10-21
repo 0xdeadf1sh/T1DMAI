@@ -72,6 +72,14 @@ def test_graph_matches_predict_and_exports():
         assert np.abs(exp - out[:1]).max() < 1e-3
 
 
+def test_window_golden_is_current():
+    import json
+
+    from zoo.golden import DEFAULT_OUT, cases
+    with open(DEFAULT_OUT) as f:
+        assert json.load(f)['cases'] == cases(), 'run python -m zoo.golden'
+
+
 def test_ridge_arx_learns_announced_carbs():
     rng = np.random.default_rng(0)
     n, ctx = 4000, 72
