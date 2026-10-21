@@ -5,6 +5,8 @@ Every model maps a ``Windows`` batch to an (N, ZONE) mg/dL forecast and fits pop
 from __future__ import annotations
 
 import numpy as np
+import torch
+from torch import nn
 
 from zoo.windows import ZONE, Windows
 
@@ -29,12 +31,40 @@ class Forecaster:
     def load(self, state: dict[str, np.ndarray]) -> None:
         pass
 
+    def graph(self) -> nn.Module:
+        """``(bg, insulin, carb)`` raw tensors -> ``(B, ZONE)`` mg/dL, export-traceable."""
+        raise NotImplementedError(f'{self.name} has no exportable graph')
+
+
+class _Fn(nn.Module):
+    def __init__(self, fn, **buffers: np.ndarray) -> None:
+        super().__init__()
+        self.fn = fn
+        for k, v in buffers.items():
+            self.register_buffer(k, torch.as_tensor(np.asarray(v, np.float32)))
+
+    def forward(self, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
+        return self.fn(self, bg, ins, carb)
+
+
+def _t(x: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.asarray(x, np.float64))
+
 
 class Persistence(Forecaster):
     name = 'persistence'
 
     def predict(self, w: Windows) -> np.ndarray:
         return np.repeat(w.bg[:, -1:], ZONE, axis=1)
+
+    def graph(self) -> nn.Module:
+        return _Fn(lambda m, bg, ins, carb: bg[:, -1:].repeat(1, ZONE))
+
+
+def _trend(bg: torch.Tensor, lookback: int) -> torch.Tensor:
+    t = torch.arange(lookback, dtype=bg.dtype) - (lookback - 1) / 2.0
+    slope = (bg[:, -lookback:] @ t) / (t @ t)
+    return bg[:, -1:] + slope[:, None] * torch.arange(1, ZONE + 1, dtype=bg.dtype)[None, :]
 
 
 class LinearExtrapolation(Forecaster):
@@ -45,15 +75,27 @@ class LinearExtrapolation(Forecaster):
         self.ctx = lookback
 
     def predict(self, w: Windows) -> np.ndarray:
-        t = np.arange(self.ctx, dtype=np.float64) - (self.ctx - 1) / 2.0
-        slope = (w.bg[:, -self.ctx:] @ t) / (t @ t)
-        return w.bg[:, -1:] + slope[:, None] * np.arange(1, ZONE + 1)[None, :]
+        return _trend(_t(w.bg), self.ctx).numpy()
+
+    def graph(self) -> nn.Module:
+        return _Fn(lambda m, bg, ins, carb: _trend(bg, self.ctx))
 
 
-def _bin_sums(x: np.ndarray, bins, end: int, reverse: bool) -> np.ndarray:
+def _bin_sums(x: torch.Tensor, bins, end: int, reverse: bool) -> torch.Tensor:
     if reverse:
-        return np.stack([x[:, end - b:end - a].sum(axis=1) for a, b in bins], axis=1)
-    return np.stack([x[:, end + a:end + b].sum(axis=1) for a, b in bins], axis=1)
+        return torch.stack([x[:, end - b:end - a].sum(dim=1) for a, b in bins], dim=1)
+    return torch.stack([x[:, end + a:end + b].sum(dim=1) for a, b in bins], dim=1)
+
+
+def ridge_features(bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor,
+                   lags: int, exogenous: bool) -> torch.Tensor:
+    last = bg[:, -1:]
+    cols = [last, bg[:, -lags:-1] - last]
+    if exogenous:
+        c = bg.shape[1]
+        for x in (ins, carb):
+            cols += [_bin_sums(x, PAST_BINS, c, True), _bin_sums(x, ZONE_BINS, c, False)]
+    return torch.cat(cols, dim=1)
 
 
 class Ridge(Forecaster):
@@ -71,13 +113,13 @@ class Ridge(Forecaster):
         self.mu = self.sd = self.coef = np.empty(0)
 
     def features(self, w: Windows) -> np.ndarray:
-        last = w.bg[:, -1:].astype(np.float64)
-        cols = [last, w.bg[:, -self.lags:-1] - last]
-        if self.exogenous:
-            c = w.bg.shape[1]
-            for x in (w.insulin, w.carb):
-                cols += [_bin_sums(x, PAST_BINS, c, True), _bin_sums(x, ZONE_BINS, c, False)]
-        return np.concatenate(cols, axis=1)
+        return ridge_features(_t(w.bg), _t(w.insulin), _t(w.carb), self.lags, self.exogenous).numpy()
+
+    def graph(self) -> nn.Module:
+        def fn(m, bg, ins, carb):
+            z = (ridge_features(bg, ins, carb, self.lags, self.exogenous) - m.mu) / m.sd
+            return bg[:, -1:] + m.coef[0] + z @ m.coef[1:]
+        return _Fn(fn, mu=self.mu, sd=self.sd, coef=self.coef)
 
     def fit(self, w: Windows) -> None:
         X = self.features(w)

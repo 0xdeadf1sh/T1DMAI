@@ -44,6 +44,34 @@ def test_persistence_and_linear_trend():
     assert np.allclose(LinearExtrapolation().predict(w), truth)
 
 
+def test_graph_matches_predict_and_exports():
+    import torch
+
+    from zoo.registry import models
+    rng = np.random.default_rng(1)
+    reg = models()
+    for name in ('persistence', 'linear_extrapolation', 'ridge_ar', 'ridge_arx', 'glunet', 'nhits'):
+        m = reg[name]()
+        n = 256
+        bg = (130 + np.cumsum(rng.normal(0, 3, (n, m.ctx)), axis=1)).astype(np.float32)
+        doses = rng.exponential(0.5, (n, m.ctx + ZONE)).astype(np.float32)
+        target = bg[:, -1:] + rng.normal(0, 10, (n, ZONE))
+        w = _windows(bg, target, ins=doses, carb=doses * 5)
+        if hasattr(m, 'epochs'):
+            m.epochs = 1
+        m.fit(w)
+        g = m.graph().eval()
+        args = tuple(torch.from_numpy(x) for x in (w.bg, w.insulin, w.carb))
+        with torch.no_grad():
+            out = g(*args).numpy()
+            ep = torch.export.export(g, tuple(a[:1] for a in args), strict=False)
+            exp = ep.module()(*(a[:1] for a in args)).numpy()
+        err = np.abs(out - m.predict(w)).max()
+        print(f'DUMP {name} graph-vs-predict max {err:.2e} mg/dL')
+        assert err < 1e-2
+        assert np.abs(exp - out[:1]).max() < 1e-3
+
+
 def test_ridge_arx_learns_announced_carbs():
     rng = np.random.default_rng(0)
     n, ctx = 4000, 72

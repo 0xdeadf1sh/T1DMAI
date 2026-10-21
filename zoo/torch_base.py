@@ -19,6 +19,21 @@ DELTA_SCALE = 50.0  # mg/dL per unit of model output; zone deltas sit within a f
 BG_SCALE = 50.0
 
 
+def prep(bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor):
+    """Raw mg/dL, U and g per step -> the network's three inputs."""
+    return ((bg - bg[:, -1:]) / BG_SCALE, torch.log1p(ins.clamp(min=0.0)),
+            torch.log1p(carb.clamp(min=0.0) / 10.0))
+
+
+class _Graph(nn.Module):
+    def __init__(self, net: nn.Module) -> None:
+        super().__init__()
+        self.net = net
+
+    def forward(self, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
+        return bg[:, -1:] + self.net(*prep(bg, ins, carb)) * DELTA_SCALE
+
+
 class TorchForecaster(Forecaster):
     def __init__(self, ctx: int, epochs: int = 8, batch: int = 1024, lr: float = 1e-3,
                  weight_decay: float = 1e-4, val_frac: float = 0.05, seed: int = 0) -> None:
@@ -33,11 +48,10 @@ class TorchForecaster(Forecaster):
 
     @staticmethod
     def inputs(w: Windows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        last = w.bg[:, -1:]
-        bg = torch.from_numpy(((w.bg - last) / BG_SCALE).astype(np.float32))
-        ins = torch.from_numpy(np.log1p(np.maximum(w.insulin, 0)).astype(np.float32))
-        carb = torch.from_numpy(np.log1p(np.maximum(w.carb, 0) / 10.0).astype(np.float32))
-        return bg, ins, carb
+        return prep(*(torch.from_numpy(np.asarray(x, np.float32)) for x in (w.bg, w.insulin, w.carb)))
+
+    def graph(self) -> nn.Module:
+        return _Graph(self.net.cpu().eval())
 
     def _batches(self, w: Windows, idx: np.ndarray, shuffle: bool, rng: np.random.Generator):
         if shuffle:
