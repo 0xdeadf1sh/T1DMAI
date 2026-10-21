@@ -61,51 +61,86 @@ def rebuild_leaderboard(out: str) -> None:
     print('\n'.join(lines))
 
 
+def run_name(key: str, causal: bool) -> str:
+    return key + ('_causal' if causal else '')
+
+
+def fit_or_load(key: str, causal: bool, cache, runs: str, n_windows: int, seed: int,
+                refit: bool = False):
+    """The model ``zoo_runs/<run>/params.npz`` holds, fitted and saved there first if absent."""
+    model = MODELS[key]()
+    run_dir = os.path.join(runs, run_name(key, causal))
+    path = os.path.join(run_dir, 'params.npz')
+    if os.path.isfile(path) and not refit:
+        with np.load(path) as z:
+            model.load({k: z[k] for k in z.files})
+        return model
+    os.makedirs(run_dir, exist_ok=True)
+    t = time.time()
+    tw = train_windows(cache, n_windows, model.ctx, seed)
+    if causal:
+        tw = drop_zone_doses(tw)
+    print(f'{run_name(key, causal)}: {len(tw)} train windows, ctx {model.ctx}  '
+          f'({time.time() - t:.0f} s)', flush=True)
+    model.fit(tw)
+    np.savez(path, **model.state())
+    return model
+
+
+class Template:
+    """Leaderboard rows, each resolved to its cache subject."""
+
+    def __init__(self, path: str, every: int, cache) -> None:
+        from export_submission import _read_template
+        from finetune_data import HORIZON_MINUTES
+        self.table, t_src, t_sid, self.t_epoch = _read_template(path, every, HORIZON_MINUTES)
+        self.n_rows = len(self.t_epoch)
+        by_key = {(r['source'], r['sid']): i for i, r in enumerate(cache.subjects)}
+        self.rows_by_subject: dict[int, list[int]] = {}
+        for row in range(self.n_rows):
+            s = by_key.get((str(t_src[row]), str(t_sid[row])))
+            if s is not None:
+                self.rows_by_subject.setdefault(s, []).append(row)
+
+
+def predict_template(model, cache, tpl: Template, causal: bool) -> tuple[np.ndarray, int]:
+    """``(rows, horizons)`` mg/dL, unanchorable rows ladder-filled; plus the anchored count."""
+    from export_submission import _apply_ladder
+    from finetune_data import HORIZON_MINUTES
+    from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
+    pred = np.full((tpl.n_rows, len(HORIZON_MINUTES)), np.nan)
+    anchored = 0
+    for s, rows in tpl.rows_by_subject.items():
+        w = template_windows(cache, {s: rows}, tpl.t_epoch, model.ctx)
+        if causal:
+            w = drop_zone_doses(w)
+        if len(w):
+            pred[w.row] = horizon_columns(model.predict(w))
+            anchored += len(w)
+    _apply_ladder(pred, cache, tpl.rows_by_subject, tpl.t_epoch)
+    np.clip(pred, BG_CLAMP_MIN, BG_CLAMP_MAX, out=pred)
+    return pred, anchored
+
+
 def main() -> None:
     args = parse_args()
     import pyarrow.parquet as pq
 
-    from export_submission import _apply_ladder, _read_template, _write
+    from export_submission import _write
     from finetune_data import HORIZON_MINUTES, FinetuneCache
     from score_submission import score_table
-    from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
 
-    model = MODELS[args.model]()
-    prep = drop_zone_doses if args.causal else (lambda w: w)
-    run_dir = os.path.join(args.out, model.name + ('_causal' if args.causal else ''))
-    os.makedirs(run_dir, exist_ok=True)
     cache = FinetuneCache(args.cache)
-
+    run_dir = os.path.join(args.out, run_name(args.model, args.causal))
+    model = fit_or_load(args.model, args.causal, cache, args.out, args.train_windows, args.seed,
+                        refit=True)
+    tpl = Template(args.template, args.every, cache)
     t = time.time()
-    tw = prep(train_windows(cache, args.train_windows, model.ctx, args.seed))
-    print(f'{model.name}: {len(tw)} train windows, ctx {model.ctx}  ({time.time() - t:.0f} s)',
-          flush=True)
-    model.fit(tw)
-    del tw
-    np.savez(os.path.join(run_dir, 'params.npz'), **model.state())
-
-    table, t_src, t_sid, t_epoch = _read_template(args.template, args.every, HORIZON_MINUTES)
-    n_rows = len(t_epoch)
-    by_key = {(r['source'], r['sid']): i for i, r in enumerate(cache.subjects)}
-    rows_by_subject: dict[int, list[int]] = {}
-    for row in range(n_rows):
-        s = by_key.get((str(t_src[row]), str(t_sid[row])))
-        if s is not None:
-            rows_by_subject.setdefault(s, []).append(row)
-
-    t = time.time()
-    pred = np.full((len(t_epoch), len(HORIZON_MINUTES)), np.nan)
-    anchored = 0
-    for s, rows in rows_by_subject.items():
-        w = prep(template_windows(cache, {s: rows}, t_epoch, model.ctx))
-        if len(w):
-            pred[w.row] = horizon_columns(model.predict(w))
-            anchored += len(w)
+    pred, anchored = predict_template(model, cache, tpl, args.causal)
+    n_rows = tpl.n_rows
     print(f'anchored {anchored}/{n_rows} template rows  ({time.time() - t:.0f} s)', flush=True)
-    _apply_ladder(pred, cache, rows_by_subject, t_epoch)
-    np.clip(pred, BG_CLAMP_MIN, BG_CLAMP_MAX, out=pred)
     out_parquet = os.path.join(run_dir, 'predictions.parquet')
-    if _write(table, pred, n_rows, HORIZON_MINUTES, out_parquet) == 0:
+    if _write(tpl.table, pred, n_rows, HORIZON_MINUTES, out_parquet) == 0:
         sys.exit('no horizon fully populated')
 
     scores = score_table(pq.read_table(out_parquet), args.truth, by_source=True)

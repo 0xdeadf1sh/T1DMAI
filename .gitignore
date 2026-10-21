@@ -50,6 +50,7 @@ models/
 comparison/
 zoo_runs/
 exported_zoo/
+benchmark/
 
 # --- Simulator / dataset caches (regenerable) ---
 *.npz

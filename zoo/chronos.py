@@ -364,6 +364,7 @@ class MedianGraph(nn.Module):
 
 class ChronosForecaster(Forecaster):
     """CGM-only Chronos-Bolt; the point forecast is the 0.5 quantile of the first ZONE steps."""
+    reads_doses = False
 
     def __init__(self, size: str, finetune: bool, epochs: int = 1, batch: int = 256,
                  lr: float = 1e-5, weight_decay: float = 0.0, val_frac: float = 0.05,

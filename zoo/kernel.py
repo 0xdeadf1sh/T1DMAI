@@ -283,6 +283,7 @@ class Kalman(Forecaster):
     """
     name = 'kalman'
     ctx = KALMAN_CTX
+    reads_doses = False
 
     def __init__(self) -> None:
         self.q_level, self.q_trend, self.damping = 1.0, 0.01, 1.0

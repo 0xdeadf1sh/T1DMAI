@@ -18,6 +18,7 @@ ZONE_BINS = ((0, 6), (6, 12), (12, 18), (18, 24))
 class Forecaster:
     name = ''
     ctx = 1
+    reads_doses = True  # False: the blind and given tracks are one forecast
 
     def fit(self, w: Windows) -> None:
         pass
@@ -53,6 +54,7 @@ def _t(x: np.ndarray) -> torch.Tensor:
 
 class Persistence(Forecaster):
     name = 'persistence'
+    reads_doses = False
 
     def predict(self, w: Windows) -> np.ndarray:
         return np.repeat(w.bg[:, -1:], ZONE, axis=1)
@@ -70,6 +72,7 @@ def _trend(bg: torch.Tensor, lookback: int) -> torch.Tensor:
 class LinearExtrapolation(Forecaster):
     """Least-squares slope over the last ``lookback`` readings, carried forward."""
     name = 'linear_extrapolation'
+    reads_doses = False
 
     def __init__(self, lookback: int = 6) -> None:
         self.ctx = lookback
@@ -110,6 +113,7 @@ class Ridge(Forecaster):
         self.alpha = alpha
         self.ctx = max(lags, PAST_BINS[-1][1]) if exogenous else lags
         self.name = 'ridge_arx' if exogenous else 'ridge_ar'
+        self.reads_doses = exogenous
         self.mu = self.sd = self.coef = np.empty(0)
 
     def features(self, w: Windows) -> np.ndarray:
