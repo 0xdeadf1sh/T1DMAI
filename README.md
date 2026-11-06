@@ -496,7 +496,8 @@ truth are the same counterfactual. `cache_simulator.py`'s defaults are that
 geometry, and a pool built to any other is rejected at load.
 
 `--hypo-oversample` weights the pool toward hypoglycemia; it reads the context
-alone, and a tail is never rejected. Each pool directory carries a `DATASET.md`
+alone. `--tail-reject-below` re-draws a row whose tail dips below it in any arm
+(`SPEC/cache.md` §5). Each pool directory carries a `DATASET.md`
 describing what is in it and the `normalization_stats.json` fitted on that pool,
 over the context and all four tails.
 

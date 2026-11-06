@@ -17,7 +17,7 @@ from config import (
     PATCH_DIM, PATCH_SIZE,
     ROPE_BASE, BG_HEAD_HIDDEN, N_SPREADS, BG_HEAD_INIT_SCALE,
     TIME_PROBE_ENABLED, TIME_PROBE_HIDDEN, TIME_PROBE_DETACH, TIME_PROBE_INIT_SCALE,
-    TIME_PROBE_N_BINS,
+    TIME_PROBE_N_BINS, SPREAD_TIE_TO_MEDIAN, SPREAD_TIE_BETA,
 )
 from utils import assemble_quantiles, step_states
 
@@ -229,6 +229,13 @@ class T1DMAI(nn.Module):
             nn.Linear(BG_HEAD_HIDDEN, 1 + 2 * N_SPREADS),
         )
 
+        # The tie travels in the state dict, so a strict load under the other setting fails.
+        self.spread_tie_beta: "torch.Tensor | None"
+        if SPREAD_TIE_TO_MEDIAN:
+            self.register_buffer('spread_tie_beta', torch.tensor(float(SPREAD_TIE_BETA)))
+        else:
+            self.spread_tie_beta = None
+
         # Built under saved/restored RNG state so its draws consume ZERO of the init stream.
         if TIME_PROBE_ENABLED:
             _rng_state = torch.random.get_rng_state()
@@ -338,7 +345,8 @@ class T1DMAI(nn.Module):
             B, M, PATCH_SIZE, 1 + 2 * N_SPREADS
         ), f"head_raw shape {tuple(head_raw.shape)} unexpected"
 
-        q_tau, median = assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx)
+        tie = {} if self.spread_tie_beta is None else {'tie_beta': self.spread_tie_beta}
+        q_tau, median = assemble_quantiles(head_raw, anchor_bg.detach(), mask_idx, **tie)
         if not return_time:
             return q_tau, median
         time_pred = None

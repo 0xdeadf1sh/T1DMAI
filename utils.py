@@ -574,11 +574,12 @@ def assemble_quantiles(
     mask_idx: "torch.Tensor | None" = None,
     valid: "torch.Tensor | None" = None,
     carry_spread: "torch.Tensor | float" = 0.0,
+    tie_beta: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble the BG head's raw output into an ascending risk-space quantile fan.
 
     head_raw cols: 0 median delta, 1..N tau>.5 .75/.9/.95, N+1..2N tau<.5 .25/.1/.05; carry_spread
-    seeds QUADRATURE (hypot), never addition (SPEC/inference.md §8.1); predict_rolling mirrors this.
+    seeds hypot, never addition (§8.1); tie_beta (off-SPEC): spread = span mean·(1 + β·|Δm|).
     """
     from config import N_SPREADS, N_QUANTILES, BG_QUANTILE_SPREAD_MIN
     import torch.nn.functional as F
@@ -626,6 +627,14 @@ def assemble_quantiles(
     m = anchor + delta_med                               # (B,M,S) median (risk)
 
     spread = F.softplus(head_raw[..., 1:]) + BG_QUANTILE_SPREAD_MIN  # (B,M,S,2*N_SPREADS)
+    if tie_beta is not None:
+        start, length = _span_layout(mask_idx, valid, B_, M_, head_raw.device)
+        idx = start.unsqueeze(-1).expand(B_, M_, spread.shape[-1])
+        span_sum = torch.zeros_like(spread[:, :, 0]).scatter_add(1, idx, spread.sum(dim=2))
+        span_mean = span_sum.gather(1, idx) / (length * S_).unsqueeze(-1).to(spread.dtype)
+        # Detached: the median's shape is DILATE's/MSE's; pinball may not bend it through the band.
+        scale = 1.0 + tie_beta.to(spread.dtype) * delta_med.detach().abs()  # (B,M,S)
+        spread = span_mean.unsqueeze(2) * scale.unsqueeze(-1)
     d_up = spread[..., :N_SPREADS]                       # τ>.5: .75/.9/.95
     d_dn = spread[..., N_SPREADS:]                       # τ<.5: .25/.1/.05
     c_up = c_dn = carry_spread

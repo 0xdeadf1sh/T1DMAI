@@ -221,6 +221,11 @@ forecast *protocol*; it is not a region of a training sample.
     `BG_HEAD_INIT_SCALE = 1e-2` with zero bias ⇒ small deltas ⇒ `median ≈ f(anchor_bg)` at init (the
     initial forecast is flat from each slot's own anchor). `QUANTILE_LEVELS = (.05,.1,.25,.5,.75,.9,.95)`,
     `N_QUANTILES = 7`. Output is RISK space; inference owns `f_inv → mg/dL`.
+  - **`SPREAD_TIE_TO_MEDIAN` is an experiment outside `SPEC/inference.md` §8.1.** When on, each
+    spread is its span's mean (`_span_layout`) times `1 + SPREAD_TIE_BETA·|Δm|`, `Δm` detached,
+    so the band edges follow the median's shape and pinball sets only their width. The model
+    carries a `spread_tie_beta` buffer: a strict load under the other setting fails, and
+    `exporters/modified_forward.load_model` refuses the checkpoint, since T1DMDROID decodes §8.1.
   - **`carry_spread` is DEAD at runtime** (risk space, default 0.0) and **PER LEVEL**: six offsets
     in the spread columns' own layout, `[.75 .9 .95 | .25 .1 .05]`, `c_up`/`c_dn` above; a scalar
     widens all six alike. It seeds the cumulative-spread base on both sides of the median, and

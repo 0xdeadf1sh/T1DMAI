@@ -41,7 +41,7 @@ from config import (                                           # noqa: E402
     VALIDATION_N_PATIENTS, VALIDATION_PROBE_N_PATIENTS, NORM_STATS_FILE, PATCH_SIZE,
     N_INPUT_FEATURES, CHANNEL_TO_FEAT, NON_MASKABLE_FEATS, INPUT_LAYOUT, BLIND,
     MASK_SPAN_LENGTHS, MAX_MASKED_PATCHES, MASK_RIGHT_EDGE_QUOTA, MSE_ALPHA,
-    CURVATURE_LAMBDA,
+    CURVATURE_LAMBDA, SPREAD_TIE_TO_MEDIAN, SPREAD_TIE_BETA,
     PATIENT_UNIFORM_SAMPLE_PROB, SIMULATOR_WARMUP_HOURS,
     MAX_BOLUS_ONLY_U,
     EMA_DECAY,
@@ -3560,6 +3560,7 @@ def train(
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
         'curvature_lambda': CURVATURE_LAMBDA,
+        'spread_tie_to_median': SPREAD_TIE_TO_MEDIAN, 'spread_tie_beta': SPREAD_TIE_BETA,
         # The sampler constants the run trained under — the provenance a loader compares against.
         'mask_span_lengths': list(MASK_SPAN_LENGTHS),
         'max_masked_patches': MAX_MASKED_PATCHES,
