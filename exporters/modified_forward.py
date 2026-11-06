@@ -157,10 +157,11 @@ def load_model(ckpt_path: str) -> "tuple[T1DMAI, dict]":
     sd = ck["model_state_dict"]
     ema = ck.get("model_ema_state_dict")
     merged = {k: ema.get(k, v) for k, v in sd.items()} if ema else dict(sd)
-    assert "spread_tie_beta" in merged, (
-        "checkpoint carries no spread_tie_beta: its fan predates SPEC/inference.md §8.1's "
-        "span-tied spreads, which is the only decode a consumer reads; refusing to export"
-    )
+    for key in ("spread_tie_beta", "spread_growth"):
+        assert key in merged, (
+            f"checkpoint carries no {key}: its fan predates SPEC/inference.md §8.1's span-tied, "
+            "√-distance-grown spreads, the only decode a consumer reads; refusing to export"
+        )
 
     # T1DMAI reads dims from config globals; a drift else surfaces as an opaque shape error.
     tc = ck.get("training_config") or {}

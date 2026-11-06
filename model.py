@@ -19,7 +19,7 @@ from config import (
     TIME_PROBE_ENABLED, TIME_PROBE_HIDDEN, TIME_PROBE_DETACH, TIME_PROBE_INIT_SCALE,
     TIME_PROBE_N_BINS, SPREAD_TIE_BETA,
 )
-from utils import assemble_quantiles, step_states
+from utils import assemble_quantiles, span_sides, step_states
 
 
 class RMSNorm(nn.Module):
@@ -231,6 +231,8 @@ class T1DMAI(nn.Module):
 
         # β travels in the state dict: the exporter reads it; a checkpoint without it won't load.
         self.register_buffer('spread_tie_beta', torch.tensor(float(SPREAD_TIE_BETA)))
+        # Marks the √-distance spread growth (§8.1): a checkpoint trained without it won't load.
+        self.register_buffer('spread_growth', torch.tensor(1.0))
 
         # Built under saved/restored RNG state so its draws consume ZERO of the init stream.
         if TIME_PROBE_ENABLED:
@@ -342,7 +344,8 @@ class T1DMAI(nn.Module):
         ), f"head_raw shape {tuple(head_raw.shape)} unexpected"
 
         q_tau, median = assemble_quantiles(
-            head_raw, anchor_bg.detach(), mask_idx, tie_beta=self.spread_tie_beta)
+            head_raw, anchor_bg.detach(), mask_idx, tie_beta=self.spread_tie_beta,
+            sides=span_sides(mask_idx, attn_mask))
         if not return_time:
             return q_tau, median
         time_pred = None

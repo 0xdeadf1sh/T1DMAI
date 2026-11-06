@@ -151,7 +151,7 @@ def test_seam_step_and_slope_change_track_the_interior(scaled_model, spans_batch
 def test_a_per_patch_constant_decode_fails_that_band(scaled_model, spans_batch):
     """The band is not vacuous: hold one state flat across each patch's steps — the
     superseded per-patch decode — and every step change lands on the patch edges."""
-    from utils import assemble_quantiles
+    from utils import assemble_quantiles, span_sides
 
     patches, attn, anchor_bg, mask_idx, _valid = spans_batch
     cap: dict[str, torch.Tensor] = {}
@@ -168,7 +168,8 @@ def test_a_per_patch_constant_decode_fails_that_band(scaled_model, spans_batch):
     with torch.no_grad():
         head_raw = scaled_model.bg_head(node.unsqueeze(2).expand(B, M, S, D_MODEL))
         _q, median = assemble_quantiles(
-            head_raw, anchor_bg, mask_idx, tie_beta=scaled_model.spread_tie_beta)
+            head_raw, anchor_bg, mask_idx, tie_beta=scaled_model.spread_tie_beta,
+            sides=span_sides(mask_idx, attn))
     r_step, r_curv = _seam_ratios(median[:ROWS, :L].reshape(ROWS, L * S))
     print(f"\n[DUMP] per-patch-constant control | step {r_step:.3g} slope change {r_curv:.3g}")
 

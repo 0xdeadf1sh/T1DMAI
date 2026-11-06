@@ -402,6 +402,12 @@ The band's time profile is therefore the median's: when a bolus drives the media
 down, the edges follow it, and pinball, which blurs shape under timing
 uncertainty, sets only the width.
 
+**The band grows away from the evidence.** A span mean alone is one width for every
+step, so the band would be too wide at a forecast's first step and too narrow at
+its last. A fixed profile `g = √d / mean √d`, `d` the steps to the nearest side the
+span can read, restores that growth without parameters: random-walk error, `√n`
+wider at the horizon than at the origin, and pinched at both ends of an infill.
+
 **The median is anchored, not integrated.** A step's median is its slot's
 `f(anchor_bg)` plus the head's offset for that step, so it cannot accumulate
 across patches and it starts at persistence. Continuity along a span comes from

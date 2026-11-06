@@ -502,6 +502,29 @@ def _span_layout(
     return start, length
 
 
+def span_sides(
+    mask_idx: torch.Tensor, attn_mask: torch.Tensor, valid: "torch.Tensor | None" = None,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """(has_left, has_right), each (B, M) bool: whether the slot's span may read a neighbour.
+
+    The §8.2 node rule: inside the window, and readable from the span's first (last) patch.
+    """
+    B, M = mask_idx.shape
+    attn = attn_mask
+    if attn.ndim == 2:
+        attn = attn.unsqueeze(0).expand(B, *attn.shape)
+    elif attn.ndim == 4:
+        attn = attn[:, 0]
+    T = attn.shape[-1]
+    start, length = _span_layout(mask_idx, valid, B, M, mask_idx.device)
+    p_first, p_last = mask_idx.gather(1, start), mask_idx.gather(1, start + length - 1)
+    la_pos, ra_pos = (p_first - 1).clamp(min=0), (p_last + 1).clamp(max=T - 1)
+    rows = torch.arange(B, device=mask_idx.device).unsqueeze(1)
+    has_l = (p_first > 0) & attn[rows, p_first, la_pos]
+    has_r = (p_last + 1 < T) & attn[rows, p_last, ra_pos]
+    return has_l, has_r
+
+
 def step_states(
     x: torch.Tensor, mask_idx: torch.Tensor, attn_mask: torch.Tensor,
     valid: "torch.Tensor | None" = None,
@@ -534,9 +557,7 @@ def step_states(
     end = start + length - 1
     p_first, p_last = mask_idx.gather(1, start), mask_idx.gather(1, end)
     la_pos, ra_pos = (p_first - 1).clamp(min=0), (p_last + 1).clamp(max=T - 1)
-    rows = torch.arange(B, device=dev).unsqueeze(1)
-    has_l = (p_first > 0) & attn[rows, p_first, la_pos]
-    has_r = (p_last + 1 < T) & attn[rows, p_last, ra_pos]
+    has_l, has_r = span_sides(mask_idx, attn, valid)
     xl = x.gather(1, la_pos.unsqueeze(-1).expand(B, M, D))
     xr = x.gather(1, ra_pos.unsqueeze(-1).expand(B, M, D))
     slot = torch.arange(M, device=dev).unsqueeze(0).expand(B, M)
@@ -562,6 +583,25 @@ def step_states(
     return torch.stack(out, 2)                           # (B, M, S, D)
 
 
+def _spread_growth(
+    start: torch.Tensor, length: torch.Tensor, S: int,
+    sides: "tuple[torch.Tensor, torch.Tensor]", dtype: torch.dtype,
+) -> torch.Tensor:
+    """(B, M, S) g = √d / span-mean √d, d the steps to the nearest readable side (§8.1)."""
+    B, M = start.shape
+    has_l, has_r = sides
+    slot = torch.arange(M, device=start.device).unsqueeze(0).expand(B, M)
+    p = ((slot - start) * S).unsqueeze(-1) + torch.arange(S, device=start.device)  # (B, M, S)
+    n = (length * S).unsqueeze(-1)
+    from_l, from_r = p + 1, n - p
+    l, r = has_l.unsqueeze(-1), has_r.unsqueeze(-1)
+    d = torch.where(l & r, torch.minimum(from_l, from_r),
+                    torch.where(l, from_l, torch.where(r, from_r, torch.ones_like(p))))
+    root = d.to(dtype).sqrt()
+    span_sum = torch.zeros(B, M, dtype=dtype, device=start.device).scatter_add(1, start, root.sum(2))
+    return root / (span_sum.gather(1, start) / n.squeeze(-1).to(dtype)).unsqueeze(-1)
+
+
 def _carry_is_zero(carry_spread: "torch.Tensor | float") -> bool:
     """True when ``carry_spread`` widens nothing — the default, and the whole training path."""
     if isinstance(carry_spread, torch.Tensor):
@@ -575,11 +615,12 @@ def assemble_quantiles(
     valid: "torch.Tensor | None" = None,
     carry_spread: "torch.Tensor | float" = 0.0,
     *, tie_beta: "torch.Tensor | float",
+    sides: "tuple[torch.Tensor, torch.Tensor] | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble the BG head's raw output into an ascending risk-space quantile fan.
 
-    head_raw cols: 0 median delta, 1..N tau>.5 .75/.9/.95, N+1..2N tau<.5 .25/.1/.05; carry_spread
-    seeds hypot, never addition; spread = span mean·(1 + tie_beta·|Δm|) (SPEC/inference.md §8.1).
+    Cols: 0 median delta, 1..N tau>.5 .75/.9/.95, N+1..2N tau<.5 .25/.1/.05. spread = span mean·g·
+    (1 + tie_beta·|Δm|), g from span_sides (§8.1); a (B,) anchor is one forecast span.
     """
     from config import N_SPREADS, N_QUANTILES, BG_QUANTILE_SPREAD_MIN
     import torch.nn.functional as F
@@ -596,7 +637,11 @@ def assemble_quantiles(
             f"anchor_bg_mgdl must be (B,)=({B_},), got {tuple(anchor_bg_mgdl.shape)}"
         )
         anchor_bm = anchor_bg_mgdl.unsqueeze(1).expand(B_, M_)
+        if sides is None:
+            ones = torch.ones(B_, M_, dtype=torch.bool, device=head_raw.device)
+            sides = (ones, ~ones)
     else:
+        assert sides is not None, "a (B, M) masked set must come with its span_sides"
         assert anchor_bg_mgdl.shape == (B_, M_), (
             f"anchor_bg_mgdl must be (B, M)=({B_}, {M_}), got "
             f"{tuple(anchor_bg_mgdl.shape)}"
@@ -634,7 +679,8 @@ def assemble_quantiles(
     beta = torch.as_tensor(tie_beta, dtype=spread.dtype, device=spread.device)
     # Detached: the median's shape is DILATE's/MSE's; pinball may not bend it through the band.
     scale = 1.0 + beta * delta_med.detach().abs()        # (B,M,S)
-    spread = span_mean.unsqueeze(2) * scale.unsqueeze(-1)
+    growth = _spread_growth(start, length, S_, sides, spread.dtype)
+    spread = span_mean.unsqueeze(2) * (growth * scale).unsqueeze(-1)
     d_up = spread[..., :N_SPREADS]                       # τ>.5: .75/.9/.95
     d_dn = spread[..., N_SPREADS:]                       # τ<.5: .25/.1/.05
     c_up = c_dn = carry_spread

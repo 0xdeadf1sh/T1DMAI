@@ -211,6 +211,7 @@ def build_descriptor(
             "BG_QUANTILE_SPREAD_MIN": cfg.BG_QUANTILE_SPREAD_MIN,
             # The checkpoint's own buffer, not config's: SPEC/inference.md §8.1.
             "SPREAD_TIE_BETA": float(spread_tie_beta),
+            "SPREAD_GROWTH": "sqrt-side-distance",
             "N_SPREADS": cfg.N_SPREADS,
             "N_QUANTILES": cfg.N_QUANTILES,
             "QUANTILE_LEVELS": list(cfg.QUANTILE_LEVELS),

@@ -17,7 +17,7 @@ import torch
 
 import config as cfg
 from normalization import normalize, CHANNEL_NAMES
-from utils import assemble_quantiles, last_bg_mgdl_from_context
+from utils import assemble_quantiles, last_bg_mgdl_from_context, span_sides
 from inference import _build_patches_tensor, _resolve_mask_spans
 from data import (
     MASKED_CHANNEL_POLICY_BLIND, blind_masked_doses, checkpoint_masked_channel_policy,
@@ -190,7 +190,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
 
     q_tau, median = assemble_quantiles(
         head_raw.double(), anchor_t.double(), mask_idx_t, valid,
-        tie_beta=model.spread_tie_beta.double(),
+        tie_beta=model.spread_tie_beta.double(), sides=span_sides(mask_idx_t, attend, valid),
     )
 
     return {
