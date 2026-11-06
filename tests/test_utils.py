@@ -279,7 +279,7 @@ def test_assemble_quantiles_index_for_index_and_gap():
     head_raw = torch.randn(B, P, S, 1 + 2 * N_SPREADS)
     last_bg = torch.tensor([90.0, 180.0])
 
-    q_tau, median = assemble_quantiles(head_raw, last_bg)
+    q_tau, median = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
     assert q_tau.shape == (B, P, S, N_QUANTILES), f"bad q_tau shape {q_tau.shape}"
     assert median.shape == (B, P, S), f"bad median shape {median.shape}"
 
@@ -308,7 +308,7 @@ def test_assemble_quantiles_init_is_persistence():
     B, P, S = 2, 2, 3
     head_raw = torch.zeros(B, P, S, 7)   # 1 + 2*N_SPREADS with N_SPREADS=3
     last_bg = torch.tensor([95.0, 160.0])
-    _, median = assemble_quantiles(head_raw, last_bg)
+    _, median = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
     anchor = kovatchev_f(last_bg).view(B, 1, 1).expand(B, P, S)
     assert torch.allclose(median, anchor, atol=1e-6), "zero-delta median must == anchor"
     # f_inv of the median recovers last_bg at every horizon step (persistence).
@@ -328,8 +328,8 @@ def test_assemble_quantiles_carry_spread_default_is_identity():
     head_raw = torch.randn(B, P, S, 7)
     last_bg = torch.tensor([85.0, 200.0])
 
-    q_default, m_default = assemble_quantiles(head_raw, last_bg)
-    q_zero, m_zero = assemble_quantiles(head_raw, last_bg, carry_spread=0.0)
+    q_default, m_default = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
+    q_zero, m_zero = assemble_quantiles(head_raw, last_bg, carry_spread=0.0, tie_beta=1.0)
     assert torch.equal(q_default, q_zero), "carry_spread=0.0 must be bit-identical to default"
     assert torch.equal(m_default, m_zero)
     print("\n[DUMP] assemble_quantiles | carry_spread default == 0.0 (bit-identical) ✓")
@@ -348,8 +348,8 @@ def test_assemble_quantiles_carry_spread_widens_band():
     median_idx = QUANTILE_LEVELS.index(0.5)
 
     carry = 0.4
-    q0, m0 = assemble_quantiles(head_raw, last_bg, carry_spread=0.0)
-    qc, mc = assemble_quantiles(head_raw, last_bg, carry_spread=carry)
+    q0, m0 = assemble_quantiles(head_raw, last_bg, carry_spread=0.0, tie_beta=1.0)
+    qc, mc = assemble_quantiles(head_raw, last_bg, carry_spread=carry, tie_beta=1.0)
 
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
@@ -386,8 +386,8 @@ def test_assemble_quantiles_carry_spread_is_per_level():
     median_idx = QUANTILE_LEVELS.index(0.5)
 
     carry = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])   # up .75/.9/.95 | dn .25/.1/.05
-    q0, m0 = assemble_quantiles(head_raw, last_bg, carry_spread=0.0)
-    qc, mc = assemble_quantiles(head_raw, last_bg, carry_spread=carry)
+    q0, m0 = assemble_quantiles(head_raw, last_bg, carry_spread=0.0, tie_beta=1.0)
+    qc, mc = assemble_quantiles(head_raw, last_bg, carry_spread=carry, tie_beta=1.0)
 
     assert torch.allclose(m0, mc, atol=1e-6), "carry must not move the median"
     assert torch.allclose(qc[..., median_idx], q0[..., median_idx], atol=1e-6)
@@ -404,9 +404,9 @@ def test_assemble_quantiles_carry_spread_is_per_level():
         "lower edges must compose with their OWN carry")
 
     # a scalar is the six-slot vector of that scalar
-    q_scalar, _ = assemble_quantiles(head_raw, last_bg, carry_spread=0.37)
+    q_scalar, _ = assemble_quantiles(head_raw, last_bg, carry_spread=0.37, tie_beta=1.0)
     q_vector, _ = assemble_quantiles(
-        head_raw, last_bg, carry_spread=torch.full((2 * N_SPREADS,), 0.37))
+        head_raw, last_bg, carry_spread=torch.full((2 * N_SPREADS,), 0.37), tie_beta=1.0)
     assert torch.allclose(q_scalar, q_vector, atol=1e-6), (
         "a scalar carry must equal the same value in every level slot")
     print("\n[DUMP] assemble_quantiles | per-level carry [.75 .9 .95 | .25 .1 .05] ✓")

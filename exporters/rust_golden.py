@@ -155,9 +155,9 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
         import model as model_module
         orig = model_module.assemble_quantiles
 
-        def _cap(hr, a, mi=None, vl=None, carry_spread=0.0):
+        def _cap(hr, *a, **k):
             captured['hr'] = hr.detach().clone()
-            return orig(hr, a, mi, vl, carry_spread)
+            return orig(hr, *a, **k)
 
         model_module.assemble_quantiles = _cap
         hook = model.final_norm.register_forward_hook(
@@ -190,6 +190,7 @@ def build_case(name: str, model, stats, n_ctx: int, mask_spans, with_forecast: b
 
     q_tau, median = assemble_quantiles(
         head_raw.double(), anchor_t.double(), mask_idx_t, valid,
+        tie_beta=model.spread_tie_beta.double(),
     )
 
     return {

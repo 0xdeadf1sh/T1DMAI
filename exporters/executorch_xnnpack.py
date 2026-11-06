@@ -192,9 +192,9 @@ def stock_head_raw(model, w: Window) -> torch.Tensor:
     captured: dict[str, torch.Tensor] = {}
     orig = model_module.assemble_quantiles
 
-    def _cap(head_raw, anchor_bg_mgdl, mask_idx=None, valid=None, carry_spread=0.0):
+    def _cap(head_raw, *a, **k):
         captured["head_raw"] = head_raw.detach().clone()
-        return orig(head_raw, anchor_bg_mgdl, mask_idx, valid, carry_spread)
+        return orig(head_raw, *a, **k)
 
     model_module.assemble_quantiles = _cap
     try:
@@ -526,6 +526,7 @@ def main() -> None:
         model_id=args.model_id, engine=ENGINE, executorch_version=et_ver,
         artifact_filename=pte_name, normalization_stats=stats, masked_channel_policy=policy,
         precision="fp32", model_card=build_model_card(model, ck), head=head_block, seq_len=T,
+        spread_tie_beta=float(model.spread_tie_beta),
     )
     # named after the artifact: several models share one out-dir; ModelStore globs *.descriptor.json
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.xnnpack.descriptor.json")

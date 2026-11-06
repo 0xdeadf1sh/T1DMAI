@@ -43,6 +43,7 @@ def build_descriptor(
     model_card: dict[str, Any] | None = None,
     head: dict[str, Any] | None = None,
     seq_len: int | None = None,
+    spread_tie_beta: float,
 ) -> dict[str, Any]:
     """Assemble the descriptor dict. Pure data, no I/O.
     seq_len is the graph's fixed T (default cfg.MAX_SEQ_LEN); MAX_CONTEXT_PATCHES = T - P.
@@ -208,6 +209,8 @@ def build_descriptor(
             "RMSNORM_EPS": 1e-6,
             "NORMALIZE_STD_FLOOR": 1e-8,
             "BG_QUANTILE_SPREAD_MIN": cfg.BG_QUANTILE_SPREAD_MIN,
+            # The checkpoint's own buffer, not config's: SPEC/inference.md §8.1.
+            "SPREAD_TIE_BETA": float(spread_tie_beta),
             "N_SPREADS": cfg.N_SPREADS,
             "N_QUANTILES": cfg.N_QUANTILES,
             "QUANTILE_LEVELS": list(cfg.QUANTILE_LEVELS),

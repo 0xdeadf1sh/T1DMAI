@@ -394,12 +394,13 @@ single chokepoint — training, `predict` and `predict_rolling` all pass through
 it, so a config change propagates identically everywhere. The exact algebra is in
 `SPEC/inference.md` §8.1; what matters here is why it has the shape it does.
 
-**Assembly is pointwise.** Every `(slot, step)` is assembled from its own seven
-raw values and its slot's anchor; nothing accumulates or low-passes along the
-horizon. The span grouping `utils._span_layout` performs — contiguous runs of
-`mask_idx`, which the sampler's mandatory separator identifies exactly — belongs
-to the step states one stage earlier, where a padded slot falls out as its own
-singleton.
+**The median is pointwise; the spreads are tied to their span.** Every step's
+median comes from its own delta and its slot's anchor. Each spread level is its
+mean over the span — the contiguous `mask_idx` run `utils._span_layout` finds, a
+padded slot its own singleton — scaled per step by `1 + β·|Δm|`, `Δm` detached.
+The band's time profile is therefore the median's: when a bolus drives the median
+down, the edges follow it, and pinball, which blurs shape under timing
+uncertainty, sets only the width.
 
 **The median is anchored, not integrated.** A step's median is its slot's
 `f(anchor_bg)` plus the head's offset for that step, so it cannot accumulate

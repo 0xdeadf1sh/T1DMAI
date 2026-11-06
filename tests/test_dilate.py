@@ -155,7 +155,7 @@ def _risk_inputs(B: int = 2):
     torch.manual_seed(0)
     head_raw = torch.randn(B, P, S, 1 + 2 * config.N_SPREADS, requires_grad=True)
     last_bg = torch.full((B,), 120.0)
-    q_tau, median = assemble_quantiles(head_raw, last_bg)
+    q_tau, median = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
     true_bg = torch.full((B, P, S), 110.0) + 20.0 * torch.randn(B, P, S)
     true_bg = true_bg.clamp(40.0, 300.0)
     return head_raw, q_tau, median, true_bg
@@ -171,7 +171,7 @@ def test_risk_loss_dilate_centring_drops_median_dc_gradient():
     torch.manual_seed(1)
     head_raw = torch.randn(2, P, S, 1 + 2 * config.N_SPREADS)
     last_bg = torch.full((2,), 120.0)
-    q_tau, median = assemble_quantiles(head_raw, last_bg)
+    q_tau, median = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
     true_bg = torch.full((2, P, S), 130.0)
 
     dc = torch.zeros((), requires_grad=True)

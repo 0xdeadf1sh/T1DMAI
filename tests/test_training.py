@@ -174,7 +174,7 @@ def test_kendall_gal_weighting_combine():
     torch.manual_seed(0)
     head_raw = torch.randn(B, P, S, 1 + 2 * ((N_QUANTILES - 1) // 2))
     last_bg = torch.full((B,), 120.0)
-    q_tau, median = assemble_quantiles(head_raw, last_bg)
+    q_tau, median = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
     true_bg = torch.full((B, P, S), 130.0)
     true_bg[:, : P // 2] = 70.0
 
@@ -217,7 +217,7 @@ def test_mse_alpha_mixes_dilate_and_mse(monkeypatch, alpha):
     B, P, S = 2, config.PREDICTION_PATCHES, config.PATCH_SIZE
     torch.manual_seed(1)
     head_raw = torch.randn(B, P, S, 1 + 2 * ((config.N_QUANTILES - 1) // 2))
-    q_tau, median = assemble_quantiles(head_raw, torch.full((B,), 120.0))
+    q_tau, median = assemble_quantiles(head_raw, torch.full((B,), 120.0), tie_beta=1.0)
     true_bg = 90.0 + 80.0 * torch.rand(B, P, S)
 
     total, comp = risk_total_loss(q_tau, median, true_bg, KendallGalWeighting())
@@ -261,7 +261,7 @@ def test_curvature_lambda_penalises_the_median_second_difference(monkeypatch, al
     B, P, S = 2, config.PREDICTION_PATCHES, config.PATCH_SIZE
     torch.manual_seed(2)
     head_raw = torch.randn(B, P, S, 1 + 2 * ((config.N_QUANTILES - 1) // 2))
-    q_tau, median = assemble_quantiles(head_raw, torch.full((B,), 120.0))
+    q_tau, median = assemble_quantiles(head_raw, torch.full((B,), 120.0), tie_beta=1.0)
     true_bg = 90.0 + 80.0 * torch.rand(B, P, S)
     monkeypatch.setattr(config, 'MSE_ALPHA', alpha)
 
@@ -303,7 +303,7 @@ def test_risk_total_loss_f_applied_once_and_finite():
     # Genuine ascending quantiles off a head_raw + anchor, so q_tau/median are self-consistent.
     head_raw = torch.randn(B, P, S, 1 + 2 * ((N_QUANTILES - 1) // 2), requires_grad=True)
     last_bg = torch.full((B,), 120.0)
-    q_tau, median = assemble_quantiles(head_raw, last_bg)
+    q_tau, median = assemble_quantiles(head_raw, last_bg, tie_beta=1.0)
 
     # mg/dL target inside the physical band, not f'd
     true_bg = torch.full((B, P, S), 130.0)
@@ -350,7 +350,7 @@ def test_risk_total_loss_lower_when_matched():
             for s in range(S):
                 tgt_risk = kovatchev_f(true_bg[:, p, s])
                 head[:, p, s, 0] = delta_sign * (tgt_risk - anchor)
-        q, m = assemble_quantiles(head, last_bg)
+        q, m = assemble_quantiles(head, last_bg, tie_beta=1.0)
         tot, _ = risk_total_loss(q, m, true_bg, weighting)
         return float(tot.detach())
 

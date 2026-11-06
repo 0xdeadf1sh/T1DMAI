@@ -81,9 +81,7 @@ BG_HEAD_INIT_SCALE = (
     1e-2  # small ⇒ median ≈ f(anchor_bg) at init ⇒ starts at persistence
 )
 BG_QUANTILE_SPREAD_MIN = 1e-3  # additive floor per softplus spread; anti σ-collapse
-# Experimental, outside SPEC/inference.md §8.1: offsets = span-mean spread·(1 + β·|Δm|).
-SPREAD_TIE_TO_MEDIAN = False  # True ⇒ the checkpoint carries a spread_tie_beta buffer; unexportable
-SPREAD_TIE_BETA = 1.0  # β, per risk unit of |median − f(anchor)|; read only when tied
+SPREAD_TIE_BETA = 1.0  # SPEC/inference.md §8.1 β, per risk unit of |Δm|; a checkpoint buffer
 
 # Per-slot hour-of-day probe (no mean-pool); its loss never enters risk_total_loss or selection.
 TIME_PROBE_ENABLED = True  # False ⇒ head not built

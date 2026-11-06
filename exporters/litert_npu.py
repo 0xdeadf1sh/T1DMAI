@@ -141,6 +141,7 @@ def main() -> None:
         artifact_filename=os.path.basename(tfl_path), normalization_stats=stats,
         masked_channel_policy=checkpoint_masked_channel_policy(ck),
         precision="fp32", model_card=build_model_card(model, ck),
+        spread_tie_beta=float(model.spread_tie_beta),
     )
     desc_path = os.path.join(args.out_dir, f"{args.model_id}.litert.descriptor.json")
     write_descriptor(desc, desc_path)

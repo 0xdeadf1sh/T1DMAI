@@ -44,6 +44,7 @@ def test_the_inputs_block_names_the_layout_policy_and_every_channel_transform():
     desc = build_descriptor(
         model_id="m", engine="e", executorch_version="1.3.1",
         artifact_filename="m.pte", normalization_stats=stats, masked_channel_policy="blind",
+        spread_tie_beta=1.0,
     )
     inputs = desc["inputs"]
     print(f"[DUMP] inputs={inputs}")
@@ -91,7 +92,7 @@ def test_descriptor_kovatchev_block_tracks_the_live_transform():
     kov = build_descriptor(
         model_id="m", engine="e", executorch_version="1.3.1",
         artifact_filename="m.pte", normalization_stats=_unit_stats(),
-        masked_channel_policy="announced",
+        masked_channel_policy="announced", spread_tie_beta=1.0,
     )["kovatchev"]
     print(f"[DUMP] kovatchev={kov}")
 
@@ -117,7 +118,7 @@ def test_descriptor_drops_the_retired_head_constants_and_names_the_decoder(tmp_p
     desc = build_descriptor(
         model_id="m", engine="e", executorch_version="1.3.1",
         artifact_filename="m.pte", normalization_stats=_unit_stats(),
-        masked_channel_policy="announced", head=block,
+        masked_channel_policy="announced", head=block, spread_tie_beta=1.0,
     )
     stale = sorted(k for k in desc["constants"] if k.startswith("BG_HEAD_"))
     head = desc["head"]

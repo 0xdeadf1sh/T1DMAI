@@ -213,19 +213,19 @@ forecast *protocol*; it is not a region of a training sample.
     has_left, has_right)` is the cached `(L·S, n_nodes)` matrix: no parameters, nothing in the
     checkpoint, no position input, one code path for forecast, backcast and infill.
   - **Assembly.** `head_raw (B, M, S, 1 + 2·N_SPREADS)` goes to
-    `utils.assemble_quantiles`, pointwise per (slot, step): col 0 = median
+    `utils.assemble_quantiles`: col 0 = median
     delta; cols 1..3 = the `τ>.5` spreads (nearest→far .75/.9/.95); cols 4..6 = the `τ<.5` spreads
-    (.25/.1/.05). `anchor = f(anchor_bg).detach()` **per slot**; `spread = softplus(raw) +
-    BG_QUANTILE_SPREAD_MIN` (prevents σ-collapse); `q(τ>.5) = m + hypot(c_up, cumsum(d+))`,
+    (.25/.1/.05). `anchor = f(anchor_bg).detach()` **per slot**; `spread = span_mean(softplus(raw) +
+    BG_QUANTILE_SPREAD_MIN)·(1 + β·|Δm|)`, `Δm` detached, `β` the model's `spread_tie_beta` buffer
+    (from `SPREAD_TIE_BETA`), so the edges follow the median's shape and pinball sets only their
+    width; `q(τ>.5) = m + hypot(c_up, cumsum(d+))`,
     `q(τ<.5) = m − hypot(c_dn, cumsum(d−))`; the fan is ascending by construction.
     `BG_HEAD_INIT_SCALE = 1e-2` with zero bias ⇒ small deltas ⇒ `median ≈ f(anchor_bg)` at init (the
     initial forecast is flat from each slot's own anchor). `QUANTILE_LEVELS = (.05,.1,.25,.5,.75,.9,.95)`,
     `N_QUANTILES = 7`. Output is RISK space; inference owns `f_inv → mg/dL`.
-  - **`SPREAD_TIE_TO_MEDIAN` is an experiment outside `SPEC/inference.md` §8.1.** When on, each
-    spread is its span's mean (`_span_layout`) times `1 + SPREAD_TIE_BETA·|Δm|`, `Δm` detached,
-    so the band edges follow the median's shape and pinball sets only their width. The model
-    carries a `spread_tie_beta` buffer: a strict load under the other setting fails, and
-    `exporters/modified_forward.load_model` refuses the checkpoint, since T1DMDROID decodes §8.1.
+  - **A checkpoint without `spread_tie_beta` is refused.** Its strict load fails, and
+    `exporters/modified_forward.load_model` asserts on it; the descriptor carries the buffer's value
+    as `constants.SPREAD_TIE_BETA`, which T1DMDROID requires.
   - **`carry_spread` is DEAD at runtime** (risk space, default 0.0) and **PER LEVEL**: six offsets
     in the spread columns' own layout, `[.75 .9 .95 | .25 .1 .05]`, `c_up`/`c_dn` above; a scalar
     widens all six alike. It seeds the cumulative-spread base on both sides of the median, and

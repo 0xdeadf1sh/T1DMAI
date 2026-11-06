@@ -1,4 +1,4 @@
-"""config.SPREAD_TIE_TO_MEDIAN: band offsets = span-mean spread × (1 + β·|Δm|), off-SPEC."""
+"""SPEC/inference.md §8.1: band offsets = span-mean spread × (1 + β·|Δm|)."""
 
 import pytest
 import torch
@@ -57,29 +57,23 @@ def test_tied_edges_follow_a_diving_median():
     print(f"\n[DUMP] spread tie | β=0 lower edge parallel to a {float(-dive.min()):.1f}-risk dive ✓")
 
 
-def test_tie_buffer_fails_a_strict_load_across_settings(monkeypatch):
+def test_beta_travels_in_the_state_dict(monkeypatch):
     import model as model_mod
 
-    monkeypatch.setattr(model_mod, "SPREAD_TIE_TO_MEDIAN", False)
-    plain = model_mod.T1DMAI()
-    assert "spread_tie_beta" not in plain.state_dict()
-    monkeypatch.setattr(model_mod, "SPREAD_TIE_TO_MEDIAN", True)
     monkeypatch.setattr(model_mod, "SPREAD_TIE_BETA", 0.5)
     tied = model_mod.T1DMAI()
     assert float(tied.state_dict()["spread_tie_beta"]) == 0.5
-    assert sum(p.numel() for p in tied.parameters()) == sum(p.numel() for p in plain.parameters())
+    old = {k: v for k, v in tied.state_dict().items() if k != "spread_tie_beta"}
     with pytest.raises(RuntimeError, match="spread_tie_beta"):
-        plain.load_state_dict(tied.state_dict(), strict=True)
-    with pytest.raises(RuntimeError, match="spread_tie_beta"):
-        tied.load_state_dict(plain.state_dict(), strict=True)
+        model_mod.T1DMAI().load_state_dict(old, strict=True)
 
 
-def test_exporter_refuses_a_tied_checkpoint(tmp_path, monkeypatch):
+def test_exporter_refuses_a_checkpoint_without_beta(tmp_path):
     import model as model_mod
     from exporters.modified_forward import load_model
 
-    monkeypatch.setattr(model_mod, "SPREAD_TIE_TO_MEDIAN", True)
-    path = tmp_path / "tied.pt"
-    torch.save({"model_state_dict": model_mod.T1DMAI().state_dict()}, path)
-    with pytest.raises(AssertionError, match="SPREAD_TIE_TO_MEDIAN"):
+    sd = {k: v for k, v in model_mod.T1DMAI().state_dict().items() if k != "spread_tie_beta"}
+    path = tmp_path / "untied.pt"
+    torch.save({"model_state_dict": sd}, path)
+    with pytest.raises(AssertionError, match="spread_tie_beta"):
         load_model(str(path))
