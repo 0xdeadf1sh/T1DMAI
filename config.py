@@ -143,7 +143,7 @@ DILATE_GAMMA = 1.0
 DILATE_TDI_FD_EPS = (
     0.05  # FD step for TDI = d/dε sDTW(C+εΩ)|0; median grad exact to O(ε)
 )
-MSE_ALPHA = 1.0  # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
+MSE_ALPHA = 0.0  # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
 # Outside the Kendall fusion, so the trade against L_D is this number and not log_sigma_D's.
 CURVATURE_LAMBDA = (
     10.0  # weight on the median's mean squared second difference, per span
