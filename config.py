@@ -12,8 +12,8 @@ from T1DMSIM.simulator import (
 
 # resize_model.py rewrites these; don't bake values elsewhere. PATCH_SIZE must divide 12.
 D_MODEL = 32
-N_LAYERS = 4
-N_HEADS = 2
+N_LAYERS = 32
+N_HEADS = 1
 HEAD_DIM = D_MODEL // N_HEADS
 FFN_DIM = 1 * D_MODEL
 PATCH_SIZE = 6  # 6 × 5 min = 30 min per patch

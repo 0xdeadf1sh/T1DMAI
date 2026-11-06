@@ -110,8 +110,8 @@ forecast *protocol*; it is not a region of a training sample.
 
 ## Architecture gotchas
 
-- **Capacity.** `D_MODEL = 128`, `N_LAYERS = 8`, `N_HEADS = 8`, `FFN_DIM = 4×D_MODEL`,
-  `BG_HEAD_HIDDEN = 1×D_MODEL` — 2,155,539 parameters and no buffers.
+- **Capacity.** `D_MODEL = 32`, `N_LAYERS = 32`, `N_HEADS = 1`, `FFN_DIM = 1×D_MODEL`,
+  `BG_HEAD_HIDDEN = 1×D_MODEL` — 238,099 parameters and one buffer, `spread_tie_beta`.
   `ARCH_VERSION = 'risk-v5'`. Don't bake those numbers into other code or comments: `resize_model.py`
   rewrites them, preserving `HEAD_DIM = D_MODEL // N_HEADS` and the symbolic `FFN_DIM = k·D_MODEL` /
   `BG_HEAD_HIDDEN = k·D_MODEL` relations.
