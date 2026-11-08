@@ -182,7 +182,9 @@ class _ExportDataset(torch.utils.data.Dataset):
         args: argparse.Namespace,
         patch_size: int,
         prediction_patches: int,
+        blind_fill: dict[int, float] | None = None,
     ) -> None:
+        self.blind_fill = blind_fill
         self.cache = cache
         self.stats = stats
         self.jobs = jobs
@@ -231,6 +233,7 @@ class _ExportDataset(torch.utils.data.Dataset):
             gap_patches,
             seq_len,
             n_ctx,
+            self.blind_fill,
         )
 
 
@@ -361,7 +364,24 @@ def main() -> None:
     model.load_state_dict(ckpt["model_ema_state_dict"], strict=False)
     model.to(device).eval()
 
-    ds = _ExportDataset(cache, stats, jobs, args, PATCH_SIZE, PREDICTION_PATCHES)
+    from data import (
+        MASKED_CHANNEL_POLICY_BLIND,
+        checkpoint_masked_channel_policy,
+        zero_dose_fill,
+    )
+
+    # A blind checkpoint trained with every masked patch, CGM gaps included, withholding doses.
+    policy = checkpoint_masked_channel_policy(ckpt)
+    print(f"  masked_channel_policy: {policy}", flush=True)
+    ds = _ExportDataset(
+        cache,
+        stats,
+        jobs,
+        args,
+        PATCH_SIZE,
+        PREDICTION_PATCHES,
+        zero_dose_fill(stats) if policy == MASKED_CHANNEL_POLICY_BLIND else None,
+    )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,

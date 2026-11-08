@@ -589,6 +589,9 @@ python export_submission.py --checkpoint <ckpt> --template <dir>/test.parquet --
 | `--every N` | keeps every Nth template row; for scoring, not for a file to submit |
 | `--truth PATH` | scores against it; defaults to `test.parquet` beside `--cache`, skipped when absent |
 
+A checkpoint whose `masked_channel_policy` is `blind` withholds doses on every
+masked patch, the forecast zone and context CGM gaps alike, as in its training.
+
 `score_submission.py` scores any predictions file on its own: the median-line DTS
 zone-A share, RMSE and MARD per horizon, over the rows whose truth — the CGM
 reading nearest `date` plus the horizon, within half a step — was measured.
