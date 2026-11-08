@@ -4,6 +4,7 @@ Supervised set = a window's MASKED patches in the head's ``M`` slots; padded slo
 gather patch 0, so every term takes the ``(B, M)`` ``valid`` flag. ``kovatchev_f_target``
 is the sole (b)->(c) target bridge, run once at the top of :func:`risk_total_loss`."""
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -11,7 +12,9 @@ import torch.nn as nn
 
 import config
 from dilate import dilate_loss
-from utils import kovatchev_f_target
+from dts_grid import (DTS_LOW_CLAMP_MGDL, DTS_OVERESTIMATE_COEFF, DTS_UNDERESTIMATE_COEFF,
+                      DTS_ZONE_EDGES)
+from utils import _KOVATCHEV_OFFSET, _KOVATCHEV_POWER, _KOVATCHEV_SCALE, kovatchev_f_target
 
 
 class KendallGalWeighting(nn.Module):
@@ -106,6 +109,44 @@ def mse_loss(
     w = valid.to(sq.dtype)  # (B,M)
     denom = (w.sum() * float(sq.shape[2])).clamp_min(1.0)
     return (sq * w[:, :, None]).sum() / denom
+
+
+def _log_bg(r: torch.Tensor) -> torch.Tensor:
+    """ln(mg/dL) of risk-space ``r``, differentiable; floored at ln 2 so pow's grad stays finite."""
+    base = (r / _KOVATCHEV_SCALE + _KOVATCHEV_OFFSET).clamp(min=math.log(2.0) ** _KOVATCHEV_POWER)
+    return base.pow(1.0 / _KOVATCHEV_POWER)
+
+
+def dts_loss(
+    median: torch.Tensor,
+    y_risk: torch.Tensor,
+    valid: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mean of ``|DTS risk| + Σ_k sigmoid((|DTS risk| - edge_k)/DTS_ZONE_TEMP)``, risk-space in.
+
+    The staircase prices each zone crossing at ~1; |risk| keeps a gradient inside a zone.
+    Same denominator rule as :func:`mse_loss`."""
+    assert median.shape == y_risk.shape, (
+        f"median {tuple(median.shape)} and y_risk {tuple(y_risk.shape)} must match"
+    )
+    assert valid is None or tuple(valid.shape) == tuple(median.shape[:2]), (
+        f"valid {None if valid is None else tuple(valid.shape)} must be "
+        f"(B,M) = {tuple(median.shape[:2])}"
+    )
+    floor = math.log(DTS_LOW_CLAMP_MGDL)
+    lt_raw, lm = _log_bg(y_risk), _log_bg(median)
+    # Grid's 50 mg/dL clamp on the median only when truth is also below it: else no grad upward.
+    lm = torch.where(lt_raw < floor, lm.clamp(min=floor), lm)
+    d = lm - lt_raw.clamp(min=floor)
+    risk = torch.where(d > 0, DTS_OVERESTIMATE_COEFF * d, -DTS_UNDERESTIMATE_COEFF * d)
+    edges = torch.as_tensor(DTS_ZONE_EDGES, dtype=risk.dtype, device=risk.device)
+    stair = torch.sigmoid((risk.unsqueeze(-1) - edges) / float(config.DTS_ZONE_TEMP)).sum(-1)
+    per = risk + stair  # (B,M,S)
+    if valid is None:
+        return per.mean()
+    w = valid.to(per.dtype)
+    denom = (w.sum() * float(per.shape[2])).clamp_min(1.0)
+    return (per * w[:, :, None]).sum() / denom
 
 
 # (p,s,device) keys whose monotonicity sentinel ran; sort+equal force a host sync, cached once.
@@ -211,7 +252,10 @@ def risk_total_loss(
     )
 
     b_size, n_slots, n_steps = median.shape
-    alpha = float(config.MSE_ALPHA)
+    median_loss = config.MEDIAN_LOSS
+    assert median_loss in ("dilate", "dts"), f"MEDIAN_LOSS must be dilate|dts, got {median_loss!r}"
+    # dts: alpha 1 skips DILATE in the bucket walk; the MSE branch below is then swapped out.
+    alpha = 1.0 if median_loss == "dts" else float(config.MSE_ALPHA)
     assert 0.0 <= alpha <= 1.0, f"MSE_ALPHA must be in [0, 1], got {alpha}"
 
     # (b)->(c) target bridge, EXACTLY ONCE, shared by every term.
@@ -273,9 +317,15 @@ def risk_total_loss(
 
     loss_C = (num_curv / float(n_spans_total)) if num_curv is not None else median.new_zeros(())
 
-    loss_M = (mse_loss(median, y_risk, valid=valid) if alpha > 0.0
-              else median.new_zeros(()))
-    loss_DR = (1.0 - alpha) * loss_D + alpha * loss_M
+    if median_loss == "dts":
+        loss_M = median.new_zeros(())
+        loss_DTS = dts_loss(median, y_risk, valid=valid)
+        loss_DR = loss_DTS
+    else:
+        loss_M = (mse_loss(median, y_risk, valid=valid) if alpha > 0.0
+                  else median.new_zeros(()))
+        loss_DTS = median.new_zeros(())
+        loss_DR = (1.0 - alpha) * loss_D + alpha * loss_M
 
     log_sigma_Q, log_sigma_D = weighting.clamped()
     total = (0.5 * torch.exp(-2.0 * log_sigma_Q) * loss_Q + log_sigma_Q
@@ -287,6 +337,7 @@ def risk_total_loss(
         "loss_D": loss_D.detach(),
         "loss_C": loss_C.detach(),
         "loss_M": loss_M.detach(),
+        "loss_DTS": loss_DTS.detach(),
         "loss_D_shape": loss_D_shape.detach(),
         "loss_D_tdi": loss_D_tdi.detach(),
         "log_sigma_Q": log_sigma_Q.detach(),

@@ -2567,7 +2567,7 @@ def _run_validation(
     model.eval()
     blind_fill = zero_dose_fill(norm_stats) if blind else None
     totals: dict[str, float] = {'loss_total': 0.0, 'loss_Q': 0.0, 'loss_D': 0.0, 'loss_M': 0.0,
-                                'loss_C': 0.0, 'pinball': 0.0}
+                                'loss_DTS': 0.0, 'loss_C': 0.0, 'pinball': 0.0}
     n_samples = 0
 
     agg: dict[str, float] = {}
@@ -2637,6 +2637,7 @@ def _run_validation(
             totals['loss_Q'] += float(parts.get('loss_Q', float('nan'))) * B_batch
             totals['loss_D'] += float(parts.get('loss_D', float('nan'))) * B_batch
             totals['loss_M'] += float(parts.get('loss_M', float('nan'))) * B_batch
+            totals['loss_DTS'] += float(parts.get('loss_DTS', float('nan'))) * B_batch
             totals['loss_C'] += float(parts.get('loss_C', float('nan'))) * B_batch
             totals['pinball'] += float(parts.get('pinball', parts.get('loss_Q', float('nan')))) * B_batch
 
@@ -2826,6 +2827,7 @@ def _run_validation(
         'val_loss_Q': totals['loss_Q'] / n,
         'val_loss_D': totals['loss_D'] / n,
         'val_loss_M': totals['loss_M'] / n,
+        'val_loss_DTS': totals['loss_DTS'] / n,
         'val_loss_C': totals['loss_C'] / n,
         'val_pinball': totals['pinball'] / n,
         'log_sigma_Q': float(weighting.log_sigma_Q.detach()),
@@ -3250,7 +3252,7 @@ def _train_log_columns() -> "list[tuple[str, int]]":
     return [
         ('step', 0), ('loss_total', 6), ('loss_ema', 6),
         ('loss_Q', 6), ('loss_D', 6), ('loss_D_shape', 6), ('loss_D_tdi', 6), ('loss_M', 6),
-        ('loss_C', 6),
+        ('loss_DTS', 6), ('loss_C', 6),
         *[(f'loss_D_L{L}', 6) for L in MASK_SPAN_LENGTHS],
         *[(f'n_spans_L{L}', 3) for L in MASK_SPAN_LENGTHS],
         ('n_masked_mean', 3), ('n_spans_mean', 3),
@@ -3279,7 +3281,7 @@ def _val_log_columns() -> "list[tuple[str, int]]":
     return [
         ('step', 0),
         ('val_loss_total', 6), ('val_loss_Q', 6), ('val_loss_D', 6), ('val_loss_M', 6),
-        ('val_loss_C', 6),
+        ('val_loss_DTS', 6), ('val_loss_C', 6),
         ('train_loss_ema', 6), ('overfit_ratio', 6),
         *[(f'coverage90@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
         *[(f'sign_balance@{h}', 4) for h in COVERAGE_HORIZONS_MIN],
@@ -3557,6 +3559,7 @@ def train(
         D_MODEL as _CFG_D_MODEL, N_LAYERS as _CFG_N_LAYERS,
         N_HEADS as _CFG_N_HEADS, FFN_DIM as _CFG_FFN_DIM,
     )
+    import config as _config_mod
     training_config = {
         'arch_version': ARCH_VERSION, 'loss_schema': LOSS_SCHEMA, 'mse_alpha': MSE_ALPHA,
         'curvature_lambda': CURVATURE_LAMBDA,
@@ -3588,6 +3591,7 @@ def train(
         'resumed_from': checkpoint,
         'max_bolus_only_u': max_bolus_only_u,
         'run_dir': run_dir,
+        'median_loss': _config_mod.MEDIAN_LOSS,
     }
     with open(os.path.join(log_dir, 'resolved_config.json'), 'w') as f:
         json.dump(training_config, f, indent=2)
@@ -3836,6 +3840,7 @@ def train(
             loss_d_shape = float(parts.get('loss_D_shape', float('nan')))
             loss_d_tdi = float(parts.get('loss_D_tdi', float('nan')))
             loss_m = float(parts.get('loss_M', float('nan')))
+            loss_dts = float(parts.get('loss_DTS', float('nan')))
             loss_c = float(parts.get('loss_C', float('nan')))
             log_sigma_q = float(parts.get('log_sigma_Q', float('nan')))
             log_sigma_d = float(parts.get('log_sigma_D', float('nan')))
@@ -3860,7 +3865,7 @@ def train(
                 'loss_total': loss_val, 'loss_ema': loss_ema,
                 'loss_Q': loss_q, 'loss_D': loss_d,
                 'loss_D_shape': loss_d_shape, 'loss_D_tdi': loss_d_tdi, 'loss_M': loss_m,
-                'loss_C': loss_c,
+                'loss_DTS': loss_dts, 'loss_C': loss_c,
                 # Per-bucket DILATE + span histogram: Q:D balance moves with mixture, even pinned.
                 **{k: float(v) for k, v in parts.items()
                    if k.startswith('loss_D_L') or k.startswith('n_spans_L')},
@@ -3914,6 +3919,7 @@ def train(
                 'val_loss_Q': round(val_metrics['val_loss_Q'], 6),
                 'val_loss_D': round(val_metrics['val_loss_D'], 6),
                 'val_loss_M': round(val_metrics['val_loss_M'], 6),
+                'val_loss_DTS': round(val_metrics['val_loss_DTS'], 6),
                 'val_loss_C': round(val_metrics['val_loss_C'], 6),
                 'train_loss_ema': round(train_ema, 6),
                 'overfit_ratio': round(overfit_ratio, 4),
@@ -4196,7 +4202,17 @@ if __name__ == '__main__':
     parser.add_argument('--blind', action=argparse.BooleanOptionalAction, default=None,
                         help='A masked patch withholds its doses as well as bg '
                              '(masked_channel_policy "blind"). Default: config.BLIND.')
+    parser.add_argument('--median-loss', choices=('dilate', 'dts'), default=None,
+                        help='Median term in the Kendall D slot. Default: config.MEDIAN_LOSS.')
+    parser.add_argument('--vram-gb', type=float, default=None,
+                        help='Cap this process\'s CUDA caching allocator at this many GB.')
     args = parser.parse_args()
+    import config as _cfg
+    if args.median_loss is not None:
+        _cfg.MEDIAN_LOSS = args.median_loss
+    if args.vram_gb is not None and torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.vram_gb * 2**30 / total))
 
     resolved = {
         'master_seed': MASTER_SEED,
@@ -4265,6 +4281,8 @@ if __name__ == '__main__':
     rows.append(('arch_version', str(ARCH_VERSION), 'config.py'))
     rows.append(('loss_schema', str(LOSS_SCHEMA), 'config.py'))
     rows.append(('mse_alpha', str(MSE_ALPHA), 'config.py'))
+    rows.append(('median_loss', _cfg.MEDIAN_LOSS,
+                 'cli' if args.median_loss is not None else 'config.py'))
     rows.append(('curvature_lambda', str(CURVATURE_LAMBDA), 'config.py'))
     # Read back off config: what the run trains with is what config published + checkpoint records.
     rows.append(('mask_span_lengths', str(MASK_SPAN_LENGTHS), 'config.py'))
