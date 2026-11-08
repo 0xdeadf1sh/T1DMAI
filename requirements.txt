@@ -10,6 +10,9 @@ pandas>=2.0
 # --- Zoo gradient-boosted trees (zoo/boost.py fit only; its export graph is plain torch) ---
 xgboost==3.4.1
 
+# --- Zoo ARIMA / SARIMAX (zoo/arima.py fit only; predict and export are plain matmuls) ---
+statsmodels==0.15.0
+
 # --- Plotting & report figures ---
 matplotlib>=3.7
 

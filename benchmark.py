@@ -30,6 +30,7 @@ LABEL = {
     'ridge_ar': 'AR (ridge)', 'ridge_arx': 'ARX (ridge)', 'kalman': 'Kalman filter',
     'svr': 'SVR', 'gp': 'Sparse GP', 'xgboost': 'XGBoost', 'lstm': 'LSTM',
     'glunet': 'GluNet', 'patchtst': 'PatchTST', 'nhits': 'N-HiTS',
+    'arima': 'ARIMA', 'sarimax': 'SARIMAX',
     'chronos_bolt_tiny_zs': 'Chronos-Bolt tiny (zero-shot)',
     'chronos_bolt_mini_zs': 'Chronos-Bolt mini (zero-shot)',
     'chronos_bolt_tiny_ft': 'Chronos-Bolt tiny (fine-tuned)',
@@ -38,7 +39,7 @@ LABEL = {
 FAMILY = {
     'persistence': 'Baseline', 'linear_extrapolation': 'Baseline', 'ridge_ar': 'Classical',
     'ridge_arx': 'Classical', 'kalman': 'Classical', 'svr': 'Classical', 'gp': 'Classical',
-    'xgboost': 'Classical', 'lstm': 'Deep', 'glunet': 'Deep', 'patchtst': 'Deep',
+    'xgboost': 'Classical', 'arima': 'Classical', 'sarimax': 'Classical', 'lstm': 'Deep', 'glunet': 'Deep', 'patchtst': 'Deep',
     'nhits': 'Deep',
 }
 FAMILY_ORDER = ('Baseline', 'Classical', 'Deep', 'Foundation', 'T1DMAI')
