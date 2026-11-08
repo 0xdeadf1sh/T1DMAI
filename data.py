@@ -285,6 +285,36 @@ def simulate_row(
     return arrays, float(stats['icr'])
 
 
+def augment_trajectory(traj: dict[str, np.ndarray],
+                       rng: np.random.Generator) -> dict[str, np.ndarray]:
+    """Training-only per-window corruption, sized by config.AUG_*; all zero returns ``traj``.
+
+    CGM gain/offset hit context and target alike (a sensor's calibration); carb scale and
+    shift hit only the logged carb channel, never the glucose it produced."""
+    import config as _c
+    gain_sd, off_sd = _c.AUG_BG_GAIN_SD, _c.AUG_BG_OFFSET_SD
+    scale_sd, shift = _c.AUG_CARB_SCALE_SD, _c.AUG_CARB_SHIFT_MAX
+    if not (gain_sd or off_sd or scale_sd or shift):
+        return traj
+    out = dict(traj)
+    if gain_sd or off_sd:
+        g = float(np.exp(rng.normal(0.0, gain_sd))) if gain_sd else 1.0
+        o = float(rng.normal(0.0, off_sd)) if off_sd else 0.0
+        out['bg_observed'] = traj['bg_observed'] * g + o
+    carb = SIM_CHANNEL['carb_intake']
+    if scale_sd or shift:
+        c = traj[carb].astype(np.float32)
+        if scale_sd:
+            c = c * float(np.exp(rng.normal(0.0, scale_sd)))
+        k = int(rng.integers(-shift, shift + 1)) if shift else 0
+        if k > 0:
+            c = np.concatenate([np.zeros(k, c.dtype), c[:-k]])
+        elif k < 0:
+            c = np.concatenate([c[-k:], np.zeros(-k, c.dtype)])
+        out[carb] = c
+    return out
+
+
 def row_trajectory(row: dict[str, Any], arm: int) -> dict[str, np.ndarray]:
     """Context plus one arm's tail per channel, so the boundary is the trajectory's end."""
     return {
@@ -596,9 +626,12 @@ class T1DMDataset(Dataset):
                     patient_seed, self.patient_uniform_sample_prob),
             )
 
+        traj = row_trajectory(row, arm)
+        if self.cache_partition == 'train':
+            traj = augment_trajectory(traj, np.random.default_rng(patient_seed ^ 0xA06_3E7))
         rng = np.random.default_rng(patient_seed ^ 0xDEADBEEF)
         return _build_sample(
-            data=row_trajectory(row, arm),
+            data=traj,
             icr=icr,
             stats=self.stats,
             rng=rng,

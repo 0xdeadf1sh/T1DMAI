@@ -3592,6 +3592,7 @@ def train(
         'max_bolus_only_u': max_bolus_only_u,
         'run_dir': run_dir,
         'median_loss': _config_mod.MEDIAN_LOSS,
+        'aug': {k: getattr(_config_mod, k) for k in dir(_config_mod) if k.startswith('AUG_')},
     }
     with open(os.path.join(log_dir, 'resolved_config.json'), 'w') as f:
         json.dump(training_config, f, indent=2)
@@ -4206,10 +4207,17 @@ if __name__ == '__main__':
                         help='Median term in the Kendall D slot. Default: config.MEDIAN_LOSS.')
     parser.add_argument('--vram-gb', type=float, default=None,
                         help='Cap this process\'s CUDA caching allocator at this many GB.')
+    parser.add_argument('--aug', default=None, metavar='K=V,...',
+                        help='Override config.AUG_* (e.g. BG_GAIN_SD=0.05,CARB_SHIFT_MAX=6).')
     args = parser.parse_args()
     import config as _cfg
     if args.median_loss is not None:
         _cfg.MEDIAN_LOSS = args.median_loss
+    for kv in (args.aug.split(',') if args.aug else ()):
+        k, v = kv.split('=')
+        name = f'AUG_{k.strip().upper()}'
+        assert hasattr(_cfg, name), f'--aug: no config.{name}'
+        setattr(_cfg, name, type(getattr(_cfg, name))(float(v)))
     if args.vram_gb is not None and torch.cuda.is_available():
         total = torch.cuda.get_device_properties(0).total_memory
         torch.cuda.set_per_process_memory_fraction(min(1.0, args.vram_gb * 2**30 / total))

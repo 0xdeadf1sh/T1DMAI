@@ -146,6 +146,12 @@ DILATE_TDI_FD_EPS = (
 MSE_ALPHA = 0.0  # 0 = DILATE only (MSE skipped); 1 = MSE only (soft-DTW skipped)
 MEDIAN_LOSS = "dilate"  # Kendall D slot: "dilate" (DILATE/MSE mix) | "dts" (risk_loss.dts_loss)
 DTS_ZONE_TEMP = 0.1  # |DTS risk| units; sigmoid width of each soft zone edge
+
+# Training-only per-window corruption (data.augment_trajectory); 0 disables each.
+AUG_BG_GAIN_SD = 0.0  # log-space sd of a CGM gain on context and target
+AUG_BG_OFFSET_SD = 0.0  # mg/dL sd of a CGM offset on context and target
+AUG_CARB_SCALE_SD = 0.0  # log-space sd of a logged-carb scale
+AUG_CARB_SHIFT_MAX = 0  # steps; logged carb curve shifted uniformly in [-k, k]
 # Outside the Kendall fusion, so the trade against L_D is this number and not log_sigma_D's.
 CURVATURE_LAMBDA = (
     10.0  # weight on the median's mean squared second difference, per span
