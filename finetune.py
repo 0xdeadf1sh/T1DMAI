@@ -217,7 +217,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--inputs",
         choices=("curves", "events"),
-        default="events",
+        default=None,
         help="dose inputs: action curves, or per-slot point doses; "
         "omitted = the checkpoint's layout, config.INPUT_LAYOUT_DEFAULT from scratch",
     )
