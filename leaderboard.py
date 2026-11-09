@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score forecast files with zoo/paper_metrics.py and render the README's tables and figures.
 
-python leaderboard.py MANIFEST.json [--out results] [--figures results/plots]
+python leaderboard.py MANIFEST.json [--out results] [--figures screenshots]
 MANIFEST: {"tracks": {NAME: {"title", "truth", "time_gain", "entries": [{"key", "label",
 "family", "path"}]}}}; every entry of a track fills the same template rows."""
 from __future__ import annotations
@@ -332,7 +332,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=(__doc__ or '').splitlines()[0])
     p.add_argument('manifest')
     p.add_argument('--out', default='results')
-    p.add_argument('--figures', default=os.path.join('results', 'plots'))
+    p.add_argument('--figures', default='screenshots')
     p.add_argument('--figures-only', action='store_true', help='reuse OUT/<track>.json')
     a = p.parse_args()
     with open(a.manifest) as f:
