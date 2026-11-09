@@ -1,4 +1,4 @@
-# T1DMAI
+# T1DMAI — usage
 
 An encoder-only transformer that forecasts blood glucose for Type 1 Diabetes.
 It reads the three signals a phone can actually observe — CGM, the carbohydrate
@@ -18,12 +18,12 @@ on-device in [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID).
 > decisions, to calculate or adjust insulin doses, or to manage diabetes in any
 > way. For medical guidance consult a qualified healthcare professional. The
 > software is provided "as is", without warranty of any kind (see
-> [LICENSE](LICENSE)).
+> [LICENSE](../LICENSE)).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/forecast-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/forecast.png">
-  <img alt="Backcast, infill and forecast spans with their quantile bands" src="screenshots/forecast.png">
+  <source media="(prefers-color-scheme: dark)" srcset="../screenshots/forecast-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="../screenshots/forecast.png">
+  <img alt="Backcast, infill and forecast spans with their quantile bands" src="../screenshots/forecast.png">
 </picture>
 
 
@@ -55,9 +55,9 @@ on-device in [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID).
 ## Architecture
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/architecture-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/architecture.png">
-  <img alt="Architecture diagram" src="screenshots/architecture.png">
+  <source media="(prefers-color-scheme: dark)" srcset="../screenshots/architecture-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="../screenshots/architecture.png">
+  <img alt="Architecture diagram" src="../screenshots/architecture.png">
 </picture>
 
 Six consecutive 5-minute samples become one 30-minute token. A pre-norm
@@ -131,15 +131,15 @@ and the scoring protocols.
 The contract this implements — the masked set, the attention rule, the anchor,
 the decode — is specified once for the whole suite in
 [T1DMCOMMON/SPEC/inference.md](https://github.com/0xdeadf1sh/T1DMCOMMON/blob/main/SPEC/inference.md);
-[docs/INFERENCE.md](docs/INFERENCE.md) maps it onto this repository.
+[docs/INFERENCE.md](INFERENCE.md) maps it onto this repository.
 
 
 ## Risk space
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/risk-space-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/risk-space.png">
-  <img alt="The Kovatchev risk transform and the loss asymmetry it creates" src="screenshots/risk-space.png">
+  <source media="(prefers-color-scheme: dark)" srcset="../screenshots/risk-space-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="../screenshots/risk-space.png">
+  <img alt="The Kovatchev risk transform and the loss asymmetry it creates" src="../screenshots/risk-space.png">
 </picture>
 
 The model does not forecast mg/dL. It forecasts the Kovatchev risk transform of
@@ -336,7 +336,7 @@ stamp is a record, not a guard.
 
 ## Inference modes
 
-All three go through `inference.py`. [docs/INFERENCE.md](docs/INFERENCE.md) maps
+All three go through `inference.py`. [docs/INFERENCE.md](INFERENCE.md) maps
 where each part of the inference contract is implemented here and points at the
 suite-wide specification in
 [T1DMCOMMON](https://github.com/0xdeadf1sh/T1DMCOMMON), which is what a
@@ -794,11 +794,11 @@ python -m pytest tests/ -v
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — the full model, loss and training
+- [ARCHITECTURE.md](../ARCHITECTURE.md) — the full model, loss and training
   specification, block by block.
-- [docs/INFERENCE.md](docs/INFERENCE.md) — where each inference concern is
+- [docs/INFERENCE.md](INFERENCE.md) — where each inference concern is
   implemented here, and a pointer to the suite-wide specification.
-- [docs/COMPARISON.md](docs/COMPARISON.md) — the per-capacity checkpoint layout
+- [docs/COMPARISON.md](COMPARISON.md) — the per-capacity checkpoint layout
   and the cross-model comparison.
 
 `metrics/rebuild_all.sh` writes its own report alongside the JSON and figures it
@@ -903,4 +903,4 @@ alone.
 
 ## License
 
-Copyright 2026 0xdeadf1sh. MIT License — see [LICENSE](LICENSE).
+Copyright 2026 0xdeadf1sh. MIT License — see [LICENSE](../LICENSE).
