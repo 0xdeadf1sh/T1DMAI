@@ -357,7 +357,8 @@ against.
 Code changes that alter architecture, training, data pipeline, or user-facing interfaces must also update the corresponding markdown in the same change:
 
 - `ARCHITECTURE.md` — model/loss/training specification
-- `README.md` — public summary
+- `README.md` — benchmark results only: built from `results/` and `screenshots/` by `leaderboard.py`
+- `docs/USAGE.md` — public summary: model, training, tools, export
 - `docs/INFERENCE.md` — a **stub**: the model contract is specified once for the whole suite in `T1DMCOMMON/SPEC/inference.md`. Never restore a copy of it here; keep only what is local to this repository.
 
 Markdown drift is a bug. Prefer editing sections over appending. Delete stale paragraphs rather than leaving them. `README.md`, `ARCHITECTURE.md`, `docs/` and `docs/COMPARISON.md` are PUBLIC — no second person, no prescriptive prose, no ranked action items, no speculation about future work.

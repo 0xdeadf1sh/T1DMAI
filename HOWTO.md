@@ -3,7 +3,7 @@
 Running a pretraining job: choosing a capacity, choosing a context window,
 pairing the normalization statistics to the pool, and starting the run.
 
-`README.md` describes what the model is. This file is the operating procedure.
+`docs/USAGE.md` describes what the model is. This file is the operating procedure.
 
 ---
 
