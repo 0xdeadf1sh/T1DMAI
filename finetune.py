@@ -228,7 +228,16 @@ def parse_args() -> argparse.Namespace:
         help="a masked patch withholds its doses as well as bg; default: config.BLIND",
     )
     p.add_argument("--log-interval", type=int, default=100)
+    p.add_argument(
+        "--lora-rank",
+        type=int,
+        default=0,
+        help="train rank-r adapters on every Linear, base frozen; 0 = full finetune",
+    )
+    p.add_argument("--lora-alpha", type=float, default=None, help="default: --lora-rank")
     args = p.parse_args()
+    if args.lora_rank and args.checkpoint is None:
+        p.error("--lora-rank needs --checkpoint")
     if args.iobp2_like:
         if args.train_dataset is not None or args.test_dataset is not None:
             p.error("--iobp2-like excludes --train-dataset and --test-dataset")
@@ -368,6 +377,11 @@ def main() -> None:
         model.load_state_dict(ckpt["model_state_dict"])
         init_from = "model_state_dict"
     model.to(device).train()
+    if args.lora_rank:
+        import lora
+
+        n_lora = lora.attach(model, args.lora_rank, args.lora_alpha or args.lora_rank)
+        print(f"lora: rank {args.lora_rank}, {n_lora} adapter parameters", flush=True)
     weighting = KendallGalWeighting().to(device)
     if ckpt is not None and "weighting_state_dict" in ckpt:
         weighting.load_state_dict(ckpt["weighting_state_dict"])
@@ -672,6 +686,10 @@ def main() -> None:
         with ema.apply_to(model):
             # clone: on CPU .cpu() returns self, and apply_to's exit restores weights IN PLACE.
             sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if args.lora_rank:
+            import lora
+
+            sd = lora.merged(model, sd)
         torch.save(
             {
                 "arch_version": ARCH_VERSION,
