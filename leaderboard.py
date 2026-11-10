@@ -265,7 +265,7 @@ def _day_rmse(d: dict, i: int) -> list[tuple[float, int]]:
     return sorted(out)
 
 
-def day_blocks(spec: dict, d: dict, n_blocks: int = 4, every_h: int = 2) -> dict:
+def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict:
     """Per sim-only model: n_blocks pairs of consecutive test days spread evenly over the test."""
     if len(np.unique(d['keys'])) != 1:
         return {}
@@ -426,15 +426,27 @@ def extra_tables(spec: dict, rows: list[dict], ex: dict, ds: list[dict],
     if cost:
         t = ['| Model | Numbers in the model | Microseconds per forecast | History used |',
              '| --- | ---: | ---: | ---: |']
-        lab = {r['key']: r['label'] for r in rows}
+        by = {r['key']: r for r in rows}
         for k, c in sorted(cost.items(), key=lambda kv: kv[1]['ms_per_forecast']):
-            name = lab.get(k) or lab.get(k.removeprefix('t1dmai_') + '_lora', k)
+            r = _cost_row(by, k)
+            if r is None:
+                continue
+            name = r['label'].split(' (')[0] if r['family'] == 'T1DMAI' else r['label']
             us, minutes = 1e3 * c['ms_per_forecast'], 5 * c['ctx_steps']
-            t.append(f"| {name.replace(' (sim + LoRA)', '')} | {c['numbers']:,} | "
+            t.append(f"| {name} | {c['numbers']:,} | "
                      f"{f'{us:,.0f}' if us >= 100 else f'{us:.2g}'} | "
                      f"{f'{minutes} min' if minutes < 60 else f'{minutes / 60:g} h'} |")
         out['cost'] = '\n'.join(t)
     return out
+
+
+def _cost_row(by: dict, key: str) -> dict | None:
+    """The scored row a cost.json key times; a T1DMAI key maps to its best scored variant."""
+    if key in by:
+        return by[key]
+    arch = key.removeprefix('t1dmai_')
+    cands = [r for k, r in by.items() if k.split('_')[0] == arch]
+    return min(cands, key=lambda r: r['h'][60]['rmse']) if cands else None
 
 
 def _axes(fig, ax, th):
@@ -885,14 +897,16 @@ def fig_cost(rows, cost, title, stem, offsets=None):
     ax.grid(True, axis='both', which='major', color=th['grid'], lw=0.5, ls=':')
     offsets = offsets or {}
     for k, c in cost.items():
-        r = by.get(k) or by.get(k.removeprefix('t1dmai_') + '_lora')
+        r = _cost_row(by, k)
         if r is None:
             continue
         x, y = 1e3 * c['ms_per_forecast'], r['h'][60]['rmse']
         ax.scatter([x], [y], s=26, color=th['fam'][r['family']], edgecolor=th['bg'],
                    linewidth=0.6, zorder=3)
         dx, dy = offsets.get(k, (4, 2))
-        ax.annotate(tex(r['label'].replace('T1DMAI ', '').replace(' (sim + LoRA)', '')),
+        name = r['label'].replace('T1DMAI ', '').split(' (')[0] if r['family'] == 'T1DMAI' \
+            else r['label']
+        ax.annotate(tex(name),
                     (x, y), xytext=(dx, dy), textcoords='offset points', fontsize=6.5,
                     color=th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink2'],
                     ha='right' if dx < 0 else 'left')
