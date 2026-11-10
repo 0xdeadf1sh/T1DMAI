@@ -1,5 +1,8 @@
 # T1DMAI
 
+> [!NOTE]
+> Most of the code in this repo was written by AI. If you don't like that, feel free to leave.
+
 T1DMAI is a small transformer that forecasts my blood glucose up to 2 hours ahead. This page
 compares it with 18 other forecasting methods on my own CGM data and on the public MetaboNet
 dataset.
