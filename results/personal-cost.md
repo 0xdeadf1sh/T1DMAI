@@ -1,4 +1,4 @@
-| Model | Numbers in the model | CPU time per forecast (µs) | History used |
+| Model | Numbers in the model | Microseconds per forecast | History used |
 | --- | ---: | ---: | ---: |
 | Persistence | 0 | 0.0042 | 5 min |
 | Linear extrapolation | 0 | 0.033 | 30 min |

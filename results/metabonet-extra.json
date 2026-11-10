@@ -13882,7 +13882,7 @@
    "models": [
     {
      "key": "d32-rmse_scratch-s43",
-     "label": "T1DMAI D32 MSE \u00b7 from scratch, seed 43",
+     "label": "T1DMAI D32 MSE (from scratch, seed 43)",
      "family": "T1DMAI",
      "pred": [
       114.67074584960938,
@@ -14087,7 +14087,7 @@
    "models": [
     {
      "key": "d32-rmse_scratch-s43",
-     "label": "T1DMAI D32 MSE \u00b7 from scratch, seed 43",
+     "label": "T1DMAI D32 MSE (from scratch, seed 43)",
      "family": "T1DMAI",
      "pred": [
       166.33543395996094,
@@ -14292,7 +14292,7 @@
    "models": [
     {
      "key": "d32-rmse_scratch-s43",
-     "label": "T1DMAI D32 MSE \u00b7 from scratch, seed 43",
+     "label": "T1DMAI D32 MSE (from scratch, seed 43)",
      "family": "T1DMAI",
      "pred": [
       92.37144470214844,
@@ -14365,5 +14365,6 @@
     }
    ]
   }
- ]
+ ],
+ "days": []
 }
