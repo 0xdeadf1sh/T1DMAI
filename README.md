@@ -7,10 +7,21 @@ T1DMAI is a small transformer that forecasts my blood glucose up to 2 hours ahea
 compares it with 18 other forecasting methods on my own CGM data and on the public MetaboNet
 dataset.
 
-Here it is forecasting my glucose on two days it never saw during training. Every 2 hours it
-makes a new 2 hour forecast. The shaded areas are its 50% and 90% bands.
+Below are my three models from `models/` forecasting my glucose on days from the 35 day test
+period, which none of them saw during training. These models get the carbs and insulin I logged
+for the next 2 hours. Blue is the model trained on the simulator only. Orange is the same model
+with a LoRA adapter trained on my first 80 days. Every 2 hours each one makes a new 2 hour
+forecast, and the shaded areas are their 50% bands. For each model the four days are its best,
+median, 75th percentile and worst day by the sim only model's error.
 
-<img alt="T1DMAI forecasting my glucose on two test days" src="screenshots/personal-days.png">
+<img alt="T1DMAI D32 MSE forecasting my glucose on 4 test days" src="screenshots/personal-days-d32-rmse.png">
+
+<img alt="T1DMAI D16 MSE forecasting my glucose on 4 test days" src="screenshots/personal-days-d16-rmse.png">
+
+<img alt="T1DMAI D16 DILATE forecasting my glucose on 4 test days" src="screenshots/personal-days-d16-dilate.png">
+
+A flat forecast line means the model did not have enough clean history at that moment and fell
+back to the last reading.
 
 > [!CAUTION]
 > **Research and educational use only - not a medical device.** T1DMAI is a
