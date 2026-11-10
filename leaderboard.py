@@ -254,10 +254,6 @@ def traces(spec: dict, d: dict, rows: list[dict]) -> list[dict]:
     return out
 
 
-DAY_PICKS = (('Best day', 0.0), ('Median day', 0.5), ('75th percentile day', 0.75),
-             ('Worst day', 1.0))
-
-
 def _day_rmse(d: dict, i: int) -> list[tuple[float, int]]:
     """(RMSE at 60 min, day) for every test day with at least 250 forecasts, sorted."""
     t60, p60 = d['truth'][:, 1], d['pred'][i, :, 1]
@@ -269,37 +265,33 @@ def _day_rmse(d: dict, i: int) -> list[tuple[float, int]]:
     return sorted(out)
 
 
-def day_pairs(spec: dict, d: dict, rows: list[dict], every_h: int = 2) -> list[dict]:
-    """Per architecture: sim-only and LoRA forecasts over the sim-only model's DAY_PICKS days."""
+def day_blocks(spec: dict, d: dict, n_blocks: int = 4, every_h: int = 2) -> dict:
+    """Per sim-only model: n_blocks pairs of consecutive test days spread evenly over the test."""
     if len(np.unique(d['keys'])) != 1:
-        return []
-    by = {r['key']: r for r in rows}
+        return {}
     idx = {e['key']: i for i, e in enumerate(spec['entries'])}
     tts, v = next(iter(d['cgm'].values()))
-    out = []
+    out = {}
     for zs in sorted(k for k in d['bands'] if k.endswith('_zs')):
-        lora = zs.removesuffix('_zs') + '_lora'
-        if lora not in d['bands']:
-            continue
-        ranked = _day_rmse(d, idx[zs])
-        rmse_lora = {day: e for e, day in _day_rmse(d, idx[lora])}
-        days = []
-        for title, q in DAY_PICKS:
-            err, day = ranked[min(int(q * len(ranked)), len(ranked) - 1)]
-            t0 = day * 86400
-            cs = (tts >= t0) & (tts <= t0 + 86400 + 7200)
-            org = np.flatnonzero((d['day'] == day) & (d['ts'] % (every_h * 3600) == 0)
-                                 & np.isfinite(d['origin']))
-            days.append({'title': title, 'rmse': {'zs': err, 'lora': rmse_lora.get(day)},
-                         'cgm_h': ((tts[cs] - t0) / 3600).tolist(), 'cgm': v[cs].tolist(),
-                         'origins': [{'h': float((d['ts'][r] - t0) / 3600),
-                                      'bg': float(d['origin'][r]),
-                                      **{m: {'pred': d['pred'][idx[k], r].tolist(),
-                                             'band': d['bands'][k][r].tolist()}
-                                         for m, k in (('zs', zs), ('lora', lora))}}
-                                     for r in org]})
-        out.append({'arch': zs.removesuffix('_zs'), 'name': by[zs]['label'].split(' (')[0],
-                    'days': days})
+        full = {day: e for e, day in _day_rmse(d, idx[zs])}
+        starts = [day for day in sorted(full) if day + 1 in full]
+        picks = [starts[int(round(p))] for p in np.linspace(0, len(starts) - 1, n_blocks)]
+        blocks = []
+        for b, first in enumerate(picks):
+            days = []
+            for day in (first, first + 1):
+                t0 = day * 86400
+                cs = (tts >= t0) & (tts <= t0 + 86400 + 7200)
+                org = np.flatnonzero((d['day'] == day) & (d['ts'] % (every_h * 3600) == 0)
+                                     & np.isfinite(d['origin']))
+                days.append({'day': int(day - min(full)) + 1, 'rmse': full[day],
+                             'cgm_h': ((tts[cs] - t0) / 3600).tolist(), 'cgm': v[cs].tolist(),
+                             'origins': [{'h': float((d['ts'][r] - t0) / 3600),
+                                          'bg': float(d['origin'][r]),
+                                          'pred': d['pred'][idx[zs], r].tolist(),
+                                          'band': d['bands'][zs][r].tolist()} for r in org]})
+            blocks.append(days)
+        out[zs.removesuffix('_zs')] = blocks
     return out
 
 
@@ -841,17 +833,16 @@ def fig_traces(ex, title, stem):
     plt.close(fig)
 
 
-def fig_days(ex, arch, title, stem):
-    """Whole test days: CGM plus sim-only and LoRA 2-hour forecasts with their 50% bands."""
+def fig_days(ex, arch, block, title, stem):
+    """Two consecutive test days: CGM and the sim-only 2-hour forecasts with 50%/90% bands."""
     import matplotlib.pyplot as plt
     th = THEMES['dark']
-    pair = next((p for p in ex.get('pairs', []) if p['arch'] == arch), None)
-    if pair is None:
+    blocks = ex.get('blocks', {}).get(arch)
+    if not blocks:
         return
-    colors = {'zs': th['cat'][0], 'lora': th['fam']['T1DMAI']}
-    names = {'zs': 'sim only', 'lora': 'sim + LoRA'}
-    days = pair['days']
-    fig, axs = plt.subplots(len(days), 1, figsize=(9.6, 2.5 * len(days)), sharex=True)
+    days = blocks[block]
+    c = th['fam']['T1DMAI']
+    fig, axs = plt.subplots(len(days), 1, figsize=(9.6, 2.6 * len(days)), sharex=True)
     for ax, dd in zip(np.atleast_1d(axs), days):
         _axes(fig, ax, th)
         ax.grid(True, axis='both', color=th['grid'], lw=0.5, ls=':')
@@ -860,27 +851,25 @@ def fig_days(ex, arch, title, stem):
         ax.plot(dd['cgm_h'], dd['cgm'], color=th['ink'], lw=1.0, label='CGM')
         for k, o in enumerate(dd['origins']):
             xs = o['h'] + np.array([0] + list(HORIZONS)) / 60
-            for m in ('zs', 'lora'):
-                b = np.array(o[m]['band'])
-                ax.fill_between(xs, [o['bg']] + list(b[:, 2]), [o['bg']] + list(b[:, 4]),
-                                color=colors[m], alpha=0.22, lw=0)
-                ax.plot(xs, [o['bg']] + o[m]['pred'], color=colors[m], lw=1.1, marker='o',
-                        ms=2.2, label=tex(f'{names[m]} forecast with 50% band') if k == 0
-                        else None)
+            b = np.array(o['band'])
+            ax.fill_between(xs, [o['bg']] + list(b[:, 0]), [o['bg']] + list(b[:, 6]), color=c,
+                            alpha=0.15, lw=0, label=tex('90% band') if k == 0 else None)
+            ax.fill_between(xs, [o['bg']] + list(b[:, 2]), [o['bg']] + list(b[:, 4]), color=c,
+                            alpha=0.30, lw=0, label=tex('50% band') if k == 0 else None)
+            ax.plot(xs, [o['bg']] + o['pred'], color=c, lw=1.2, marker='o', ms=2.5,
+                    label='2 hour forecast' if k == 0 else None)
             ax.scatter([o['h']], [o['bg']], s=10, color=th['ink'], zorder=4)
         ax.set_xlim(0, 26)
         ax.set_ylabel('Glucose (mg/dL)')
-        r = dd['rmse']
-        ax.set_title(tex(f"{dd['title']}. RMSE at 60 min that day: sim only {r['zs']:.0f}, "
-                         f"sim + LoRA {r['lora']:.0f} mg/dL"),
+        ax.set_title(tex(f"Test day {dd['day']}. RMSE at 60 min that day: {dd['rmse']:.0f} mg/dL"),
                      loc='left', fontsize=9, color=th['ink'])
     last = np.atleast_1d(axs)[-1]
     last.set_xticks(range(0, 27, 3))
     last.set_xlabel('Hour of the day')
     h, lab = np.atleast_1d(axs)[0].get_legend_handles_labels()
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    _legend(fig, th, handles=h, labels=lab, loc='upper left', bbox_to_anchor=(0.0, 0.975),
-            ncols=3, handletextpad=0.4)
+    _legend(fig, th, handles=h, labels=lab, loc='upper right', bbox_to_anchor=(0.99, 0.995),
+            ncols=4, handletextpad=0.4)
     fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.995)
     _save(fig, stem, 'dark')
     plt.close(fig)
@@ -951,7 +940,7 @@ def main() -> None:
             rows = score_track(spec, d)
             ex = extras(spec, d) | {'dataset': dataset_stats(spec, d),
                                     'traces': traces(spec, d, rows),
-                                    'pairs': day_pairs(spec, d, rows)}
+                                    'blocks': day_blocks(spec, d)}
             with open(path, 'w') as f:
                 json.dump(rows, f, indent=1)
             with open(xpath, 'w') as f:
