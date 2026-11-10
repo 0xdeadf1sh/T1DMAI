@@ -43,7 +43,7 @@ MARKERS = ('o', 's', '^', 'D', 'v')
 def tex(s: str) -> str:
     """Escape LaTeX specials in a plain label."""
     for a, b in (('\\', r'\textbackslash{}'), ('&', r'\&'), ('%', r'\%'), ('$', r'\$'),
-                 ('#', r'\#'), ('_', r'\_'), ('<', r'$<$'), ('>', r'$>$'), ('·', r'$\cdot$')):
+                 ('#', r'\#'), ('_', r'\_'), ('<', r'$<$'), ('>', r'$>$')):
         s = s.replace(a, b)
     return s
 
@@ -91,7 +91,7 @@ def load_track(spec: dict) -> dict:
 
 
 def _meal_flag(cache_dir, table, ts) -> np.ndarray | None:
-    """True where a carb entry (≥ MEAL_MIN_G) sits in the MEAL_WINDOW_MIN before the origin."""
+    """True where a carb entry (>= MEAL_MIN_G) sits in the MEAL_WINDOW_MIN before the origin."""
     if not cache_dir:
         return None
     from finetune_data import FinetuneCache
@@ -254,6 +254,39 @@ def traces(spec: dict, d: dict, rows: list[dict]) -> list[dict]:
     return out
 
 
+def day_strips(spec: dict, d: dict, rows: list[dict], every_h: int = 2) -> list[dict]:
+    """Best banded T1DMAI model over whole test days: the median day and the 90th-percentile day."""
+    if len(np.unique(d['keys'])) != 1:
+        return []
+    by = {r['key']: r for r in rows}
+    ours = [k for k in d['bands'] if by[k]['family'] == 'T1DMAI']
+    if not ours:
+        return []
+    key = min(ours, key=lambda k: by[k]['h'][60]['rmse'])
+    i = [e['key'] for e in spec['entries']].index(key)
+    t60, p60 = d['truth'][:, 1], d['pred'][i, :, 1]
+    days = []
+    for day in np.unique(d['day']):
+        sel = (d['day'] == day) & np.isfinite(t60) & np.isfinite(p60)
+        if sel.sum() >= 250:
+            days.append((float(np.sqrt(np.mean((p60[sel] - t60[sel]) ** 2))), int(day)))
+    days.sort()
+    tts, v = next(iter(d['cgm'].values()))
+    out = []
+    for title, q in (('A typical day', 0.5), ('A bad day', 0.9)):
+        err, day = days[min(int(q * len(days)), len(days) - 1)]
+        t0 = day * 86400
+        cs = (tts >= t0) & (tts <= t0 + 86400 + 7200)
+        org = np.flatnonzero((d['day'] == day) & (d['ts'] % (every_h * 3600) == 0)
+                             & np.isfinite(d['origin']))
+        out.append({'title': title, 'rmse60': err, 'label': by[key]['label'],
+                    'cgm_h': ((tts[cs] - t0) / 3600).tolist(), 'cgm': v[cs].tolist(),
+                    'origins': [{'h': float((d['ts'][r] - t0) / 3600), 'bg': float(d['origin'][r]),
+                                 'pred': d['pred'][i, r].tolist(),
+                                 'band': d['bands'][key][r].tolist()} for r in org]})
+    return out
+
+
 def _median_case(idx: np.ndarray, size: np.ndarray) -> int:
     """The qualifying origin with the median effect size: typical, not extreme."""
     return int(idx[np.argsort(size)[len(idx) // 2]])
@@ -278,14 +311,14 @@ def _band_scores(t: np.ndarray, q: np.ndarray) -> dict:
 
 
 def _fmt(v, nd=1) -> str:
-    return '—' if v is None else f'{v:.{nd}f}'
+    return '-' if v is None else f'{v:.{nd}f}'
 
 
 def tables(name: str, spec: dict, rows: list[dict]) -> str:
     """Markdown tables: accuracy, clinical, hypo; rows sorted by RMSE at 60 min."""
     rows = sorted(rows, key=lambda r: r['h'][60]['rmse'])
-    star = lambda r, m: ' ◆' if r['h'][m]['vs_best'] in ('best', 'tie') else ''
-    out = [f'#### Accuracy — RMSE / MARD / bias (mg/dL, %)\n',
+    star = lambda r, m: ' *' if r['h'][m]['vs_best'] in ('best', 'tie') else ''
+    out = [f'#### Accuracy: RMSE, MARD, bias (mg/dL, %)\n',
            '| Model | Family | RMSE 30 | RMSE 60 | RMSE 90 | RMSE 120 | gRMSE 60 | MARD 30 | '
            'MARD 60 | MARD 120 | ME 60 | MRE 60 % |' + (' TG 30 | TG 60 |' if spec.get(
                'time_gain') else ''),
@@ -298,7 +331,7 @@ def tables(name: str, spec: dict, rows: list[dict]) -> str:
         if spec.get('time_gain'):
             cells += [_fmt(h[30].get('time_gain'), 0), _fmt(h[60].get('time_gain'), 0)]
         out.append(f"| {r['label']} | {r['family']} | " + ' | '.join(cells) + ' |')
-    out += ['', '#### Clinical — DTS / Clarke / CG-EGA (% of points)\n',
+    out += ['', '#### Clinical: DTS, Clarke, CG-EGA (% of points)\n',
             '| Model | DTS A 30 | DTS A 60 | DTS A 120 | DTS A+B 120 | Clarke A 60 | '
             'Clarke A+B 120 | CG-EGA hypo AP 30 | hypo EP 60 | eu EP 60 | hyper EP 60 |',
             '| --- |' + ' ---: |' * 10]
@@ -319,16 +352,16 @@ def tables(name: str, spec: dict, rows: list[dict]) -> str:
             _fmt(h[30]['hypo_sens'], 2), _fmt(h[60]['hypo_sens'], 2), _fmt(h[60]['hypo_spec'], 3),
             _fmt(h[60]['hypo_ppv'], 2), _fmt(h[30]['hypo_mcc'], 2), _fmt(h[60]['hypo_mcc'], 2),
             _fmt(h[30]['rmse_hypo']), f"{h[30]['me_hypo']:+.1f}" if h[30]['me_hypo'] is not None
-            else '—', f"{h[60]['me_hypo']:+.1f}" if h[60]['me_hypo'] is not None else '—'])
+            else '-', f"{h[60]['me_hypo']:+.1f}" if h[60]['me_hypo'] is not None else '-'])
             + ' |')
     n = rows[0]['h'][60]['n']
-    out.append(f"\nn = {n} forecasts at 60 min; ◆ = best or not significantly worse "
-               f"(Wilcoxon on |error|, Bonferroni α = 0.05/{len(rows) - 1}).")
+    out.append(f"\n{n} forecasts at 60 min. * means lowest RMSE, or not significantly worse than "
+               f"it (Wilcoxon test on absolute errors, alpha 0.05/{len(rows) - 1}).")
     return '\n'.join(out) + '\n'
 
 
 def _ci(lo_hi) -> str:
-    return f'{lo_hi[0]:.1f}–{lo_hi[1]:.1f}'
+    return f'{lo_hi[0]:.1f} to {lo_hi[1]:.1f}'
 
 
 def extra_tables(spec: dict, rows: list[dict], ex: dict, ds: list[dict],
@@ -338,7 +371,7 @@ def extra_tables(spec: dict, rows: list[dict], ex: dict, ds: list[dict],
     m_ = ex['models']
     out = {}
     t = ['| Source | Subjects | Person-days | Forecasts | CGM coverage % | Mean mg/dL | CV % | '
-         '< 54 % | < 70 % | 70–180 % | > 180 % | > 250 % |', '| --- |' + ' ---: |' * 11]
+         '< 54 % | < 70 % | 70-180 % | > 180 % | > 250 % |', '| --- |' + ' ---: |' * 11]
     for s in ds if len(ds) > 2 else ds[:1]:
         t.append(f"| {s['source']} | {s['subjects']} | {s['days']:.0f} | {s['forecasts']} | "
                  f"{s['coverage']:.0f} | {s['mean']:.0f} | {s['cv']:.0f} | {s['tbr54']:.1f} | "
@@ -352,14 +385,14 @@ def extra_tables(spec: dict, rows: list[dict], ex: dict, ds: list[dict],
             f"{r['h'][m]['rmse']:.1f} | {_ci(c[m])}" for m in (30, 60, 120)) + ' |')
     out['ci'] = '\n'.join(t)
     has_meal = 'meal' in m_[rows[0]['key']]['strata'][60]
-    cols = [('hypo', '< 70'), ('eu', '70–180'), ('hyper', '> 180'), ('night', 'night'),
-            ('day', 'day')] + ([('meal', 'meal ≤ 2 h'), ('no_meal', 'no meal')] if has_meal
+    cols = [('hypo', '< 70'), ('eu', '70-180'), ('hyper', '> 180'), ('night', 'night'),
+            ('day', 'day')] + ([('meal', 'meal in last 2 h'), ('no_meal', 'no meal')] if has_meal
                                else [])
     t = ['| Model | ' + ' | '.join(c for _, c in cols) + ' |', '| --- |' + ' ---: |' * len(cols)]
     for r in rows:
         s = m_[r['key']]['strata'][60]
         t.append(f"| {r['label']} | " + ' | '.join(
-            '—' if s[k]['rmse'] is None else f"{s[k]['rmse']:.1f} ({s[k]['me']:+.0f})"
+            '-' if s[k]['rmse'] is None else f"{s[k]['rmse']:.1f} ({s[k]['me']:+.0f})"
             for k, _ in cols) + ' |')
     n = m_[rows[0]['key']]['strata'][60]
     out['strata'] = '\n'.join(t) + '\n\nForecasts per group: ' + ', '.join(
@@ -383,13 +416,13 @@ def extra_tables(spec: dict, rows: list[dict], ex: dict, ds: list[dict],
             t.append(f"| {r['label']} | " + ' | '.join(_fmt(s[k]) for k in srcs) + ' |')
         out['sources'] = '\n'.join(t)
     if cost:
-        t = ['| Model | Numbers in the model | CPU time per forecast (µs) | History used |',
+        t = ['| Model | Numbers in the model | Microseconds per forecast | History used |',
              '| --- | ---: | ---: | ---: |']
         lab = {r['key']: r['label'] for r in rows}
         for k, c in sorted(cost.items(), key=lambda kv: kv[1]['ms_per_forecast']):
             name = lab.get(k) or lab.get(k.removeprefix('t1dmai_') + '_lora', k)
             us, minutes = 1e3 * c['ms_per_forecast'], 5 * c['ctx_steps']
-            t.append(f"| {name.replace(' · sim + LoRA', '')} | {c['numbers']:,} | "
+            t.append(f"| {name.replace(' (sim + LoRA)', '')} | {c['numbers']:,} | "
                      f"{f'{us:,.0f}' if us >= 100 else f'{us:.2g}'} | "
                      f"{f'{minutes} min' if minutes < 60 else f'{minutes / 60:g} h'} |")
         out['cost'] = '\n'.join(t)
@@ -615,7 +648,7 @@ def fig_hist(ds, title, stem):
     for x in (70, 180):
         ax.axvline(x, color=th['ink2'], lw=0.8, ls='--')
     s = ds[-1]
-    ax.text(0.99, 0.95, tex(f"below 70: {s['tbr70']:.1f}%  ·  70–180: {s['tir']:.0f}%  ·  "
+    ax.text(0.99, 0.95, tex(f"below 70: {s['tbr70']:.1f}%,  70-180: {s['tir']:.0f}%,  "
                             f"above 180: {s['tar180']:.0f}%"), transform=ax.transAxes,
             ha='right', va='top', color=th['ink'], fontsize=8)
     ax.set_xlim(40, 400)
@@ -686,11 +719,11 @@ def fig_strata(rows, ex, keys, title, stem):
     th = THEMES['dark']
     sel = _pick(rows, keys)
     s0 = ex['models'][sel[0]['key']]['strata'][60]
-    panels = [('Glucose at the target time', [('hypo', '$<$70'), ('eu', '70--180'),
+    panels = [('Glucose at the target time', [('hypo', 'below 70'), ('eu', '70-180'),
                                                ('hyper', '$>$180')]),
-              ('Time of day', [('night', '00--06 h'), ('day', '06--24 h')])]
+              ('Time of day', [('night', 'midnight-6am'), ('day', '6am-midnight')])]
     if 'meal' in s0:
-        panels.append(('Meals', [('meal', '$\\le$2 h after'), ('no_meal', 'other')]))
+        panels.append(('Meals', [('meal', 'ate in last 2h'), ('no_meal', 'other')]))
     fig, axs = plt.subplots(1, len(panels), figsize=(3.0 * len(panels), 3.0), sharey=True,
                             gridspec_kw={'width_ratios': [len(g) for _, g in panels]})
     for ax, (pt, groups) in zip(np.atleast_1d(axs), panels):
@@ -775,8 +808,7 @@ def fig_traces(ex, title, stem):
                                 alpha=0.30, lw=0)
             ax.plot(xs, [o] + mdl['pred'], color=c, marker=MARKERS[k], ms=3.5,
                     markeredgecolor=th['bg'], markeredgewidth=0.5,
-                    label=tex(mdl['label'].replace(' · sim + LoRA', ' + LoRA')
-                              .replace(' · from scratch', ' (from scratch)')))
+                    label=tex(mdl['label']))
         for y in (70, 180):
             ax.axhline(y, color=th['ink2'], lw=0.5, ls='--')
         ax.set_xlim(-180, 120)
@@ -789,6 +821,47 @@ def fig_traces(ex, title, stem):
     _legend(fig, th, handles=h, labels=lab, loc='upper left', bbox_to_anchor=(0.0, 0.92),
             ncols=3, handletextpad=0.3, columnspacing=1.0)
     fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.99)
+    _save(fig, stem, 'dark')
+    plt.close(fig)
+
+
+def fig_days(ex, title, stem):
+    """Whole test days: CGM, and a 2-hour forecast with its bands every couple of hours."""
+    import matplotlib.pyplot as plt
+    th = THEMES['dark']
+    days = ex.get('days', [])
+    if not days:
+        return
+    c = th['fam']['T1DMAI']
+    fig, axs = plt.subplots(len(days), 1, figsize=(9.6, 2.7 * len(days)), sharex=True)
+    for ax, dd in zip(np.atleast_1d(axs), days):
+        _axes(fig, ax, th)
+        ax.grid(True, axis='both', color=th['grid'], lw=0.5, ls=':')
+        for y in (70, 180):
+            ax.axhline(y, color=th['ink2'], lw=0.5, ls='--')
+        ax.plot(dd['cgm_h'], dd['cgm'], color=th['ink'], lw=1.0, label='CGM')
+        for k, o in enumerate(dd['origins']):
+            xs = o['h'] + np.array([0] + list(HORIZONS)) / 60
+            b = np.array(o['band'])
+            ax.fill_between(xs, [o['bg']] + list(b[:, 0]), [o['bg']] + list(b[:, 6]), color=c,
+                            alpha=0.15, lw=0, label=tex('90% band') if k == 0 else None)
+            ax.fill_between(xs, [o['bg']] + list(b[:, 2]), [o['bg']] + list(b[:, 4]), color=c,
+                            alpha=0.30, lw=0, label=tex('50% band') if k == 0 else None)
+            ax.plot(xs, [o['bg']] + o['pred'], color=c, lw=1.2, marker='o', ms=2.5,
+                    label='2 hour forecast' if k == 0 else None)
+            ax.scatter([o['h']], [o['bg']], s=10, color=th['ink'], zorder=4)
+        ax.set_xlim(0, 26)
+        ax.set_ylabel('Glucose (mg/dL)')
+        ax.set_title(tex(f"{dd['title']} (RMSE at 60 min that day: {dd['rmse60']:.0f} mg/dL)"),
+                     loc='left', fontsize=9, color=th['ink'])
+    last = np.atleast_1d(axs)[-1]
+    last.set_xticks(range(0, 27, 3))
+    last.set_xlabel('Hour of the day')
+    h, lab = np.atleast_1d(axs)[0].get_legend_handles_labels()
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    _legend(fig, th, handles=h, labels=lab, loc='upper right', bbox_to_anchor=(0.99, 0.985),
+            ncols=4, handletextpad=0.4)
+    fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.985)
     _save(fig, stem, 'dark')
     plt.close(fig)
 
@@ -810,7 +883,7 @@ def fig_cost(rows, cost, title, stem, offsets=None):
         ax.scatter([x], [y], s=26, color=th['fam'][r['family']], edgecolor=th['bg'],
                    linewidth=0.6, zorder=3)
         dx, dy = offsets.get(k, (4, 2))
-        ax.annotate(tex(r['label'].replace('T1DMAI ', '').replace(' · sim + LoRA', '')),
+        ax.annotate(tex(r['label'].replace('T1DMAI ', '').replace(' (sim + LoRA)', '')),
                     (x, y), xytext=(dx, dy), textcoords='offset points', fontsize=6.5,
                     color=th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink2'],
                     ha='right' if dx < 0 else 'left')
@@ -820,7 +893,7 @@ def fig_cost(rows, cost, title, stem, offsets=None):
     ax.set_xscale('log')
     lo = min(r['h'][60]['rmse'] for r in rows)
     ax.set_ylim(lo - 3, None)
-    ax.set_xlabel(r'CPU time per forecast, one thread ($\mu$s, log scale); T1DMAI with LoRA')
+    ax.set_xlabel('Microseconds per forecast on one CPU thread (log scale)')
     ax.set_ylabel('RMSE at 60 min (mg/dL)')
     _title(ax, title)
     _save(fig, stem, 'dark')
@@ -857,7 +930,8 @@ def main() -> None:
             d = load_track(spec)
             rows = score_track(spec, d)
             ex = extras(spec, d) | {'dataset': dataset_stats(spec, d),
-                                    'traces': traces(spec, d, rows)}
+                                    'traces': traces(spec, d, rows),
+                                    'days': day_strips(spec, d, rows)}
             with open(path, 'w') as f:
                 json.dump(rows, f, indent=1)
             with open(xpath, 'w') as f:
@@ -888,6 +962,8 @@ def main() -> None:
             fig_hist(extra[track]['dataset'], stem=out, **fig)
         elif kind == 'traces':
             fig_traces(extra[track], stem=out, **fig)
+        elif kind == 'days':
+            fig_days(extra[track], stem=out, **fig)
         elif kind == 'cost':
             fig_cost(scored[track], cost, stem=out, **fig)
         else:
