@@ -189,6 +189,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-windows", type=int, default=32768)
     p.add_argument("--eval-batch-size", type=int, default=64)
     p.add_argument("--eval-seed", type=int, default=42)
+    p.add_argument(
+        "--val-days",
+        type=int,
+        default=0,
+        help="hold out each subject's last N training days and evaluate there, never on test",
+    )
+    p.add_argument(
+        "--select-on",
+        choices=("dts_a", "rmse"),
+        default="dts_a",
+        help="finetune_best.pt: highest mean DTS-A or lowest mean RMSE over the horizons",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--source-alpha",
@@ -412,6 +424,21 @@ def main() -> None:
     test_sources = pick(args.test_dataset, "test")
     cache = view(train_sources)
     eval_cache = view(test_sources)
+    if args.val_days:
+        from T1DMSIM.simulator import DT_MINUTES
+
+        hold = args.val_days * 24 * 60 // DT_MINUTES
+        # Only subjects with at least two held-out spans of training left give one up.
+        for rec in cache.subjects:
+            tl = cache.train_len(rec)
+            if tl >= 3 * hold:
+                rec["test_start"] = tl - hold
+        for rec in eval_cache.subjects:
+            tl = eval_cache.train_len(rec)
+            if tl >= 3 * hold:
+                rec["val_lo"], rec["val_hi"] = tl - hold, tl
+        eval_cache.subjects = [r for r in eval_cache.subjects if "val_hi" in r]
+        assert eval_cache.subjects, f"--val-days {args.val_days}: no subject is long enough"
     train_ds = FinetuneTrainDataset(
         cache,
         stats,
@@ -724,7 +751,14 @@ def main() -> None:
     print(f"baseline eval ({init_from}, {args.checkpoint}):", flush=True)
     with ema.apply_to(model):
         metrics = evaluate()
-    best, best_step = metrics["mean_dts_a"], 0
+    def score(m: dict) -> float:
+        """Higher is better: mean DTS-A, or minus the mean RMSE over the horizons."""
+        if args.select_on == "dts_a":
+            return m["mean_dts_a"]
+        r = [m[h]["rmse"] for h in HORIZON_MINUTES if m[h]["rmse"] is not None]
+        return -float(np.mean(r)) if r else float("-inf")
+
+    best, best_step = score(metrics), 0
     # Legal best: finetune_best.pt always exists at exit, but never clobber a trained run's best.
     best_path = os.path.join(args.out_dir, "finetune_best.pt")
     if not os.path.exists(best_path):
@@ -816,8 +850,8 @@ def main() -> None:
         if step % args.validation_interval == 0 or step == args.total_steps:
             with ema.apply_to(model):
                 metrics = evaluate()
-            if metrics["mean_dts_a"] > best:
-                best, best_step = metrics["mean_dts_a"], step
+            if score(metrics) > best:
+                best, best_step = score(metrics), step
                 save(os.path.join(args.out_dir, "finetune_best.pt"), step, metrics)
             save(os.path.join(args.out_dir, "finetune_last.pt"), step, metrics)
             print_table(metrics, best, best_step)
@@ -825,7 +859,7 @@ def main() -> None:
 
     log_f.close()
     print(
-        f"done. best mean DTS-A {best:.3f} @ step {best_step} "
+        f"done. best {args.select_on} score {best:.3f} @ step {best_step} "
         f"-> {os.path.join(args.out_dir, 'finetune_best.pt')}",
         flush=True,
     )

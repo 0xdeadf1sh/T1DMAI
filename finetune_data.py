@@ -908,7 +908,8 @@ def build_eval_windows(cache: FinetuneCache, n_windows: int,
     min_hist = MIN_CONTEXT_PATCHES * PATCH_SIZE
     max_gaps = EVAL_GAP_BUDGET * MIN_CONTEXT_PATCHES
     for i, rec in enumerate(cache.subjects):
-        if int(rec['test_start']) < 0:
+        held_out = 'val_hi' in rec
+        if int(rec['test_start']) < 0 and not held_out:
             continue
         n = int(rec['n'])
         if n < min_hist + zone:
@@ -916,7 +917,11 @@ def build_eval_windows(cache: FinetuneCache, n_windows: int,
         ch = cache.channels(rec, 0, n)
         finite = np.isfinite(ch['bg'])
         origins = np.arange(min_hist, n - zone + 1)
-        keep = np.asarray(ch['is_test'][origins], dtype=bool)
+        if held_out:
+            # A validation slice: the whole zone stays inside it, so no test step is read.
+            keep = (origins >= rec['val_lo']) & (origins + zone <= rec['val_hi'])
+        else:
+            keep = np.asarray(ch['is_test'][origins], dtype=bool)
         # fin6[p]: steps p..p+5 all measured — one prospective patch.
         c6 = np.concatenate([[0], np.cumsum(finite.astype(np.int64))])
         fin6 = (c6[PATCH_SIZE:] - c6[:-PATCH_SIZE]) == PATCH_SIZE
