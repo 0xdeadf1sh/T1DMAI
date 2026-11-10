@@ -3,12 +3,14 @@
 > [!NOTE]
 > Most of the code in this repo was written by AI. If you don't like that, feel free to leave.
 
-A small transformer that forecasts my blood glucose 2 hours ahead, compared with 18 other
-methods on my own CGM data and on MetaboNet.
+This repo is a zoo. Here I train & test many blood glucose forecasting models (including my own)
+on both my own data and metabonet (public).
 
-Here are the two D16 models from `models/` on my test days. They were trained on simulated
-people only and get the carbs and insulin I logged. Flat lines are fallbacks to the last reading
-when there was too little clean history.
+My model is a small transformer that forecasts blood glucose 2 hours ahead. I've made two variants: D16 DILATE and D16 MSE
+which use DILATE and MSE loss for training, respectively. D16 refers to the width of the model (16). They are both
+trained on synthetic traces, and then a LoRA adapter is added for light fine-tuning, but I also test them without the adapter.
+
+Feast thine eyes on some of their forecasts (these have been trained on synthetic traces and no adapter is used for predictions):
 
 <img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-dilate-1.png">
 
@@ -43,18 +45,17 @@ when there was too little clean history.
 
 ## 1. Background
 
-I have type 1 diabetes. My CGM shows where my glucose is, and I wanted to know where it is
-going. So:
+I have type 1 diabetes and I wanna know if I can train a BG forecasting model
+to help me with my daily management. To this end I've made some auxiliary tools:
 
-- [T1DMSIM](https://github.com/0xdeadf1sh/T1DMSIM) simulates people with T1D.
-- T1DMAI (this repo) is trained on 1 million of them.
-- [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID) runs it on my phone.
+- [T1DMSIM](https://github.com/0xdeadf1sh/T1DMSIM) creates synthetic CGM traces since UVA/Padova was too slow on my laptop.
+- [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID) runs the models on my phone, also has some neat functionality like reading BG from multiple CGMs at once.
 
-The evaluation follows Jacobs et al., IEEE Reviews in Biomedical Engineering, 2024.
+For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biomedical Engineering, 2024. It's a nice paper that you should probably read.
 
 ## 2. Main results
 
-RMSE in mg/dL at 60 min unless noted.
+All models suck. More details below:
 
 1. On my data, D16 DILATE + LoRA comes 2nd of 22 (22.8). Wilcoxon puts it level with XGBoost
    (22.2) at 60 and 90 min, behind it at 30 and 120.
@@ -118,7 +119,8 @@ More in [docs/USAGE.md](docs/USAGE.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 ## 4. Data
 
 **My data.** 115 days from T1DMDROID: days 1 to 80 for training, 81 to 115 for testing.
-Non-blind.
+Note that the model sees future inputs like insulin & carbs. I should probably also
+train the adapters while withholding those inputs.
 
 | Source | Subjects | Person-days | Forecasts | CGM coverage % | Mean mg/dL | CV % | < 54 % | < 70 % | 70-180 % | > 180 % | > 250 % |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -154,8 +156,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | LoRA steps | 2000 | 6000 |
 
 - LoRA checkpoints are picked by mean RMSE on the last 10 days of each subject's training data.
-  The test period is never touched.
-- All models forecast at the same moments. Fallbacks to the last reading still count.
+- All models forecast at the same moments.
 - 95% intervals: bootstrap over people (MetaboNet) or days (my data).
 - Significance: Wilcoxon signed-rank on paired absolute errors against the best model,
   Bonferroni corrected.
@@ -216,7 +217,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 <img alt="Accuracy against CPU time per forecast" src="screenshots/personal-cost.png">
 
-| Model | Numbers in the model | Microseconds per forecast | History used |
+| Model | Parameter count | Microseconds per forecast | History used |
 | --- | ---: | ---: | ---: |
 | Persistence | 0 | 0.0042 | 5 min |
 | Linear extrapolation | 0 | 0.033 | 30 min |
@@ -241,7 +242,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 ## 7. Limitations
 
-- My data is one person over 35 days.
+- My data is N=1 over 35 days.
 - The test sets differ a lot (in range 89% vs 75%, CV 28% vs 40%), so don't compare numbers
   across them.
 - Lows are rare: 292 forecasts on my data, 8347 on MetaboNet.
@@ -263,7 +264,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | Time gain | Horizon minus the lag of peak correlation between forecast and CGM. |
 | Example forecasts | Median case of: falls into a low, rises over 40 mg/dL after a meal, calm nights. |
 | After a meal | At least 5 g of carbs logged in the 2 hours before. |
-| Numbers in the model | Stored weights and constants in the exported model. |
+| Parameter count | Stored weights and constants in the exported model. |
 
 ## 9. Full tables
 
