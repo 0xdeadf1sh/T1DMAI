@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         "skipped when absent",
     )
     p.add_argument("--by-source", action="store_true", help="score per sub-dataset too")
+    p.add_argument(
+        "--quantiles",
+        action="store_true",
+        help="also write q05_30 ... q95_120, the raw quantile band (mg/dL, null where unanchored)",
+    )
     return p.parse_args()
 
 
@@ -310,6 +315,21 @@ def _write(
     return kept
 
 
+def _append_quantiles(path: str, qpred: np.ndarray, horizons: tuple, levels: tuple) -> None:
+    """Add ``q{100τ:02d}_{m}`` columns to the written file; NaN rows become null."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    for h, m in enumerate(horizons):
+        for k, tau in enumerate(levels):
+            v = qpred[: table.num_rows, h, k]
+            table = table.append_column(
+                f"q{round(100 * tau):02d}_{m}", pa.array(v, mask=np.isnan(v), type=pa.float64())
+            )
+    pq.write_table(table, path)
+
+
 def main() -> None:
     args = parse_args()
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -317,7 +337,7 @@ def main() -> None:
 
     from torch.utils.data import DataLoader
 
-    from config import ARCH_VERSION, PATCH_SIZE, PREDICTION_PATCHES
+    from config import ARCH_VERSION, PATCH_SIZE, PREDICTION_PATCHES, QUANTILE_LEVELS
     from finetune_data import (
         HORIZON_MINUTES,
         HORIZON_STEPS,
@@ -392,10 +412,11 @@ def main() -> None:
     )
 
     pred = np.full((len(t_epoch), len(HORIZON_MINUTES)), np.nan, dtype=np.float64)
+    qpred = np.full(pred.shape + (len(QUANTILE_LEVELS),), np.nan) if args.quantiles else None
     pos = 0
     with torch.no_grad():
         for bi, batch in enumerate(loader):
-            _, median = model(
+            q_tau, median = model(
                 batch["patches"].to(device),
                 batch["attn_mask"].to(device),
                 batch["anchor_bg"].to(device),
@@ -412,6 +433,11 @@ def main() -> None:
             pos += B
             for h, hs in enumerate(HORIZON_STEPS):
                 pred[rows, h] = mgdl[:, hs]
+            if qpred is not None:
+                qm = kovatchev_f_inv(q_tau[:, :PREDICTION_PATCHES]).reshape(
+                    B, -1, len(QUANTILE_LEVELS)).cpu().numpy()
+                for h, hs in enumerate(HORIZON_STEPS):
+                    qpred[rows, h] = qm[:, hs]
             if bi % 200 == 0:
                 print(f"  batch {bi}  {pos}/{len(jobs['row'])}", flush=True)
     assert pos == len(jobs["row"]), f"loader covered {pos} of {len(jobs['row'])}"
@@ -420,6 +446,9 @@ def main() -> None:
         _apply_ladder(pred, cache, rows_by_subject, t_epoch)
     np.clip(pred, BG_CLAMP_MIN, BG_CLAMP_MAX, out=pred)
     _write(table, pred, n_rows, HORIZON_MINUTES, args.out)
+    if qpred is not None:
+        _append_quantiles(args.out, np.clip(qpred, BG_CLAMP_MIN, BG_CLAMP_MAX), HORIZON_MINUTES,
+                          QUANTILE_LEVELS)
 
     truth = args.truth or os.path.join(
         os.path.dirname(os.path.abspath(args.cache)), "test.parquet"
