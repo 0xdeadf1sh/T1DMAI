@@ -1,0 +1,107 @@
+{
+ "arima": {
+  "numbers": 4632,
+  "ms_per_forecast": 0.0002729022980929585,
+  "ctx_steps": 48
+ },
+ "chronos_bolt_mini_ft": {
+  "numbers": 21256141,
+  "ms_per_forecast": 3.8887039785322486,
+  "ctx_steps": 288
+ },
+ "chronos_bolt_mini_zs": {
+  "numbers": 21256141,
+  "ms_per_forecast": 3.8708326914047575,
+  "ctx_steps": 288
+ },
+ "chronos_bolt_tiny_ft": {
+  "numbers": 8669901,
+  "ms_per_forecast": 1.34576642187767,
+  "ctx_steps": 288
+ },
+ "chronos_bolt_tiny_zs": {
+  "numbers": 8669901,
+  "ms_per_forecast": 1.3614744043479732,
+  "ctx_steps": 288
+ },
+ "glunet": {
+  "numbers": 65368,
+  "ms_per_forecast": 0.07056853519316064,
+  "ctx_steps": 48
+ },
+ "gp": {
+  "numbers": 66134,
+  "ms_per_forecast": 0.006137816399132134,
+  "ctx_steps": 72
+ },
+ "kalman": {
+  "numbers": 864,
+  "ms_per_forecast": 0.000483699182041164,
+  "ctx_steps": 36
+ },
+ "linear_extrapolation": {
+  "numbers": 0,
+  "ms_per_forecast": 3.3193373383255675e-05,
+  "ctx_steps": 6
+ },
+ "lstm": {
+  "numbers": 103192,
+  "ms_per_forecast": 0.033452878938078356,
+  "ctx_steps": 24
+ },
+ "nhits": {
+  "numbers": 417772,
+  "ms_per_forecast": 0.006524751938741247,
+  "ctx_steps": 72
+ },
+ "patchtst": {
+  "numbers": 182266,
+  "ms_per_forecast": 0.07357222068549163,
+  "ctx_steps": 72
+ },
+ "persistence": {
+  "numbers": 0,
+  "ms_per_forecast": 4.218804861011449e-06,
+  "ctx_steps": 1
+ },
+ "ridge_ar": {
+  "numbers": 648,
+  "ms_per_forecast": 0.00013281055544211995,
+  "ctx_steps": 24
+ },
+ "ridge_arx": {
+  "numbers": 1116,
+  "ms_per_forecast": 0.00036085350529901916,
+  "ctx_steps": 72
+ },
+ "sarimax": {
+  "numbers": 8088,
+  "ms_per_forecast": 0.00020526954358501825,
+  "ctx_steps": 96
+ },
+ "svr": {
+  "numbers": 69772,
+  "ms_per_forecast": 0.004167076099292899,
+  "ctx_steps": 72
+ },
+ "xgboost": {
+  "numbers": 2692860,
+  "ms_per_forecast": 0.5055229825075003,
+  "ctx_steps": 72
+ },
+ "t1dmai_d16-dilate": {
+  "numbers": 31253,
+  "ms_per_forecast": 5.679384631213146,
+  "ctx_steps": 2016
+ },
+ "t1dmai_d16-rmse": {
+  "numbers": 31253,
+  "ms_per_forecast": 7.342397546348818,
+  "ctx_steps": 2016
+ },
+ "t1dmai_d32-rmse": {
+  "numbers": 238101,
+  "ms_per_forecast": 15.526643193269946,
+  "ctx_steps": 2016
+ }
+}
