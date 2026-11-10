@@ -12,24 +12,44 @@ import os
 
 import numpy as np
 
-from metrics import figstyle as fs
-
 HORIZONS = (30, 60, 90, 120)
 FAMILIES = ('Baseline', 'Classical', 'Deep', 'Foundation', 'T1DMAI')
 THEMES = {
-    'light': {'bg': fs.SURFACE, 'ink': fs.INK, 'ink2': fs.INK2, 'grid': fs.GRID,
-              'fam': {'Baseline': fs.MUTED, 'Classical': fs.SERIES[0], 'Deep': fs.SERIES[2],
-                      'Foundation': '#6250d6', 'T1DMAI': fs.SERIES[1]},
-              'cat': fs.SERIES + ('#eda100', '#e87ba4'),
-              'seq': (fs.SEQ[0], fs.SEQ[-1]), 'sig': {'best': '#184f95', 'tie': '#86b6ef',
-                                                      'worse': fs.GRID}},
-    'dark': {'bg': '#1a1a19', 'ink': '#f0efec', 'ink2': '#c3c2b7', 'grid': '#3a3a37',
+    'dark': {'bg': '#141414', 'ink': '#ececec', 'ink2': '#b4b4b4', 'grid': '#333333',
              'fam': {'Baseline': '#8f8e89', 'Classical': '#3987e5', 'Deep': '#199e70',
                      'Foundation': '#9085e9', 'T1DMAI': '#d95926'},
              'cat': ('#3987e5', '#d95926', '#199e70', '#c98500', '#d55181'),
              'seq': ('#184f95', '#cde2fb'), 'sig': {'best': '#86b6ef', 'tie': '#256abf',
-                                                    'worse': '#3a3a37'}},
+                                                    'worse': '#333333'}},
 }
+STYLE = {
+    'text.usetex': True, 'font.family': 'serif', 'font.serif': ['Computer Modern Roman'],
+    'text.latex.preamble': r'\usepackage{amsmath}\usepackage[T1]{fontenc}',
+    'font.size': 9, 'axes.titlesize': 10, 'axes.labelsize': 9, 'legend.fontsize': 8,
+    'xtick.labelsize': 8, 'ytick.labelsize': 8, 'axes.linewidth': 0.6,
+    'xtick.direction': 'in', 'ytick.direction': 'in', 'xtick.top': True, 'ytick.right': True,
+    'xtick.major.size': 3, 'ytick.major.size': 3, 'xtick.major.width': 0.6,
+    'ytick.major.width': 0.6, 'lines.linewidth': 1.2, 'lines.markersize': 4.5,
+    'legend.frameon': False, 'savefig.dpi': 200,
+}
+MARKERS = ('o', 's', '^', 'D', 'v')
+
+
+def tex(s: str) -> str:
+    """Escape LaTeX specials in a plain label."""
+    for a, b in (('\\', r'\textbackslash{}'), ('&', r'\&'), ('%', r'\%'), ('$', r'\$'),
+                 ('#', r'\#'), ('_', r'\_'), ('<', r'$<$'), ('>', r'$>$'), ('·', r'$\cdot$')):
+        s = s.replace(a, b)
+    return s
+
+
+def _model_ticks(ax, rows, th, axis='y'):
+    """Model names as tick labels; T1DMAI rows bold in the family color."""
+    names = [rf"\textbf{{{tex(r['label'])}}}" if r['family'] == 'T1DMAI' else tex(r['label'])
+             for r in rows]
+    (ax.set_yticks if axis == 'y' else ax.set_xticks)(range(len(rows)), names)
+    for t, r in zip(ax.get_yticklabels() if axis == 'y' else ax.get_xticklabels(), rows):
+        t.set_color(th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink'])
 
 
 def load_track(spec: dict) -> dict:
@@ -135,20 +155,29 @@ def tables(name: str, spec: dict, rows: list[dict]) -> str:
 def _axes(fig, ax, th):
     fig.patch.set_facecolor(th['bg'])
     ax.set_facecolor(th['bg'])
-    for s in ('top', 'right'):
-        ax.spines[s].set_visible(False)
-    for s in ('left', 'bottom'):
-        ax.spines[s].set_color(th['grid'])
-    ax.tick_params(colors=th['ink2'], labelsize=9)
-    ax.grid(True, axis='x', color=th['grid'], lw=0.8)
+    for s in ax.spines.values():
+        s.set_color(th['ink2'])
+    ax.tick_params(which='both', colors=th['ink2'], labelcolor=th['ink'])
+    ax.grid(True, axis='x', color=th['grid'], lw=0.5, ls=':')
     ax.set_axisbelow(True)
-    ax.xaxis.label.set_color(th['ink2'])
-    ax.yaxis.label.set_color(th['ink2'])
+    ax.xaxis.label.set_color(th['ink'])
+    ax.yaxis.label.set_color(th['ink'])
+    ax.title.set_color(th['ink'])
+
+
+def _title(ax, s, **kw):
+    ax.set_title(tex(s), loc='left', color=THEMES['dark']['ink'], **kw)
+
+
+def _legend(obj, th, **kw):
+    leg = obj.legend(**kw)
+    for t in leg.get_texts():
+        t.set_color(th['ink'])
+    return leg
 
 
 def _save(fig, path_stem: str, theme: str):
-    fig.savefig(f"{path_stem}{'' if theme == 'light' else '-dark'}.png", dpi=150,
-                bbox_inches='tight', facecolor=fig.get_facecolor())
+    fig.savefig(f'{path_stem}.png', bbox_inches='tight', facecolor=fig.get_facecolor())
 
 
 def fig_leaderboard(rows, title, stem, metric='rmse', xlabel='RMSE (mg/dL)', reverse=False):
@@ -164,27 +193,24 @@ def fig_leaderboard(rows, title, stem, metric='rmse', xlabel='RMSE (mg/dL)', rev
         span = cap_hi - cap_lo
         edge = (cap_lo - 0.06 * span, cap_hi + 0.06 * span)
         shown = np.clip(vals, *edge)
-        for k, (m, mk) in enumerate(zip((30, 60, 120), ('o', 'D', 's'))):
-            ax.scatter(shown[:, k], y, s=34, marker=mk, color=th['cat'][k],
-                       edgecolor=th['bg'], linewidth=1.2, zorder=3, label=f'{m} min')
+        for k, m in enumerate((30, 60, 120)):
+            ax.scatter(shown[:, k], y, s=22, marker=MARKERS[k], color=th['cat'][k],
+                       edgecolor=th['bg'], linewidth=0.6, zorder=3, label=f'{m} min')
         for i in range(len(rows)):
-            ax.plot([shown[i].min(), shown[i].max()], [i, i], color=th['grid'], lw=2, zorder=2)
+            ax.plot([shown[i].min(), shown[i].max()], [i, i], color=th['ink2'], lw=0.6,
+                    zorder=2)
             for k in range(3):
                 if vals[i, k] != shown[i, k]:
-                    ax.annotate(f'{vals[i, k]:.0f}', (shown[i, k], i), xytext=(0, 6),
+                    ax.annotate(f'{vals[i, k]:.0f}', (shown[i, k], i), xytext=(0, 5),
                                 textcoords='offset points', ha='center', fontsize=7,
                                 color=th['ink2'])
         ax.set_xlim(edge[0] - 0.02 * span, edge[1] + 0.02 * span)
-        ax.invert_yaxis()
-        ax.set_yticks(y, [r['label'] for r in rows])
-        for t, r in zip(ax.get_yticklabels(), rows):
-            t.set_color(th['fam'][r['family']] if r['family'] == 'T1DMAI' else th['ink'])
-            t.set_fontweight('bold' if r['family'] == 'T1DMAI' else 'normal')
-        ax.set_xlabel(xlabel)
-        ax.set_title(title, color=th['ink'], fontsize=11, loc='left')
-        ax.legend(loc='lower left', bbox_to_anchor=(0.0, 1.0), frameon=False, fontsize=8,
-                  labelcolor=th['ink2'], ncols=3)
-        ax.set_title(title, color=th['ink'], fontsize=11, loc='left', pad=24)
+        ax.set_ylim(len(rows) - 0.5, -0.5)
+        _model_ticks(ax, rows, th)
+        ax.set_xlabel(tex(xlabel))
+        _legend(ax, th, loc='lower left', bbox_to_anchor=(0.0, 1.0), ncols=3,
+                borderaxespad=0.2, handletextpad=0.2)
+        _title(ax, title, pad=20)
         _save(fig, stem, theme)
         plt.close(fig)
 
@@ -208,18 +234,18 @@ def fig_horizon(rows, keys, metric, ylabel, title, stem, ylim=None):
     for theme, th in THEMES.items():
         fig, ax = plt.subplots(figsize=(6.4, 3.6))
         _axes(fig, ax, th)
-        ax.grid(True, axis='y', color=th['grid'], lw=0.8)
-        for r in sel:
+        ax.grid(True, axis='y', color=th['grid'], lw=0.5, ls=':')
+        for k, r in enumerate(sel):
             v = [r['h'][m][metric] for m in HORIZONS]
-            ax.plot(HORIZONS, v, color=th['fam'][r['family']], lw=2, marker='o', ms=6,
-                    markeredgecolor=th['bg'], label=r['label'])
+            ax.plot(HORIZONS, v, color=th['fam'][r['family']], marker=MARKERS[k],
+                    markeredgecolor=th['bg'], markeredgewidth=0.6, label=tex(r['label']))
         ax.set_xticks(HORIZONS)
-        ax.set_xlabel('horizon (min)')
-        ax.set_ylabel(ylabel)
+        ax.set_xlabel('Horizon (min)')
+        ax.set_ylabel(tex(ylabel[:1].upper() + ylabel[1:]))
         if ylim:
             ax.set_ylim(*ylim)
-        ax.set_title(title, color=th['ink'], fontsize=11, loc='left')
-        ax.legend(frameon=False, fontsize=8, labelcolor=th['ink2'])
+        _title(ax, title)
+        _legend(ax, th, handlelength=2.2)
         _save(fig, stem, theme)
         plt.close(fig)
 
@@ -244,15 +270,13 @@ def fig_heatmap(rows, metric, title, stem, fmt='{:.0f}', higher_better=True):
                 if np.isfinite(v[i, j]):
                     dark_cell = (vv[i, j] - lo) / max(hi - lo, 1e-9) > 0.55
                     ink = ('#ffffff' if theme == 'light' else '#0b0b0b') if dark_cell else th['ink']
-                    ax.text(j, i, fmt.format(v[i, j]), ha='center', va='center', fontsize=8,
+                    s = fmt.format(v[i, j])
+                    ax.text(j, i, s.lstrip('-') if float(s) == 0 else s, ha='center', va='center', fontsize=8,
                             color=ink)
         ax.set_xticks(range(len(HORIZONS)), [f'{m} min' for m in HORIZONS])
-        ax.set_yticks(range(len(rows)), [r['label'] for r in rows])
-        for t, r in zip(ax.get_yticklabels(), rows):
-            t.set_color(th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink'])
-            t.set_fontweight('bold' if r['family'] == 'T1DMAI' else 'normal')
-        ax.xaxis.tick_top()
-        ax.set_title(title, color=th['ink'], fontsize=11, loc='left', pad=22)
+        _model_ticks(ax, rows, th)
+        ax.tick_params(length=0, top=False, right=False, labeltop=True, labelbottom=False)
+        _title(ax, title, pad=18)
         _save(fig, stem, theme)
         plt.close(fig)
 
@@ -277,17 +301,14 @@ def fig_significance(rows, title, stem):
         for j in range(v.shape[1] + 1):
             ax.axvline(j - 0.5, color=th['bg'], lw=2)
         ax.set_xticks(range(len(HORIZONS)), [f'{m} min' for m in HORIZONS])
-        ax.set_yticks(range(len(rows)), [r['label'] for r in rows])
-        for t, r in zip(ax.get_yticklabels(), rows):
-            t.set_color(th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink'])
-            t.set_fontweight('bold' if r['family'] == 'T1DMAI' else 'normal')
-        ax.xaxis.tick_top()
-        ax.legend(handles=[Patch(color=s['best'], label='lowest RMSE'),
-                           Patch(color=s['tie'], label='not significantly worse'),
-                           Patch(color=s['worse'], label='significantly worse')],
-                  loc='upper center', bbox_to_anchor=(0.5, -0.02), ncols=3, frameon=False,
-                  fontsize=8, labelcolor=th['ink2'])
-        ax.set_title(title, color=th['ink'], fontsize=11, loc='left', pad=22)
+        _model_ticks(ax, rows, th)
+        ax.tick_params(length=0, top=False, right=False, labeltop=True, labelbottom=False)
+        _legend(ax, th, handles=[Patch(color=s['best'], label='Lowest RMSE'),
+                                 Patch(color=s['tie'], label='Not significantly worse'),
+                                 Patch(color=s['worse'], label='Significantly worse')],
+                loc='upper center', bbox_to_anchor=(0.5, -0.01), ncols=3,
+                handlelength=1.2, columnspacing=1.0)
+        _title(ax, title, pad=18)
         _save(fig, stem, theme)
         plt.close(fig)
 
@@ -301,29 +322,31 @@ def fig_paths(rows, groups, paths, ref_key, title, stem):
         fig, axs = plt.subplots(1, 3, figsize=(9.6, 3.2), sharey=False)
         for ax, m in zip(axs, (30, 60, 120)):
             _axes(fig, ax, th)
-            ax.grid(True, axis='y', color=th['grid'], lw=0.8)
+            ax.grid(True, axis='y', color=th['grid'], lw=0.5, ls=':')
             ax.grid(False, axis='x')
             w = 0.8 / len(paths)
             for k, (p, plabel) in enumerate(paths):
                 x = np.arange(len(groups)) + (k - (len(paths) - 1) / 2) * w
                 v = [by[f'{g}_{p}']['h'][m]['rmse'] if f'{g}_{p}' in by else np.nan
                      for g, _ in groups]
-                ax.scatter(x, v, s=70, marker='os^'[k], color=th['cat'][k], label=plabel,
-                           edgecolor=th['bg'], linewidth=1.2, zorder=3)
-            ax.axhline(ref['h'][m]['rmse'], color=th['ink2'], lw=1.2, ls='--')
-            ax.text(-0.45, ref['h'][m]['rmse'], ref['label'], fontsize=7,
+                ax.scatter(x, v, s=32, marker=MARKERS[k], color=th['cat'][k], label=tex(plabel),
+                           edgecolor=th['bg'], linewidth=0.6, zorder=3)
+            ax.axhline(ref['h'][m]['rmse'], color=th['ink2'], lw=0.8, ls='--')
+            ax.text(-0.45, ref['h'][m]['rmse'], tex(ref['label']), fontsize=7,
                     color=th['ink2'], ha='left', va='bottom')
-            ax.set_xticks(range(len(groups)), [gl for _, gl in groups], fontsize=8)
-            ax.set_title(f'{m} min', color=th['ink'], fontsize=10)
+            ax.set_xticks(range(len(groups)), [tex(gl) for _, gl in groups])
+            ax.tick_params(axis='x', top=False)
+            ax.set_xlim(-0.5, len(groups) - 0.5)
+            ax.set_title(f'{m} min')
             lo = np.nanmin([by[f'{g}_{p}']['h'][m]['rmse'] for g, _ in groups for p, _ in paths
                             if f'{g}_{p}' in by] + [ref['h'][m]['rmse']])
             ax.set_ylim(lo * 0.85, None)
         axs[0].set_ylabel('RMSE (mg/dL)')
         fig.tight_layout(rect=(0, 0, 1, 0.86))
         h, lab = axs[0].get_legend_handles_labels()
-        fig.legend(h, lab, frameon=False, fontsize=8, labelcolor=th['ink2'], loc='upper right',
-                   bbox_to_anchor=(0.99, 0.97), ncols=len(paths))
-        fig.suptitle(title, color=th['ink'], fontsize=11, x=0.01, ha='left', y=0.97)
+        _legend(fig, th, handles=h, labels=lab, loc='upper right', bbox_to_anchor=(0.99, 0.97),
+                ncols=len(paths), handletextpad=0.2)
+        fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.97)
         _save(fig, stem, theme)
         plt.close(fig)
 
@@ -355,6 +378,9 @@ def main() -> None:
                 f.write(tables(name, spec, rows))
             print(f'{name}: {len(rows)} models scored')
         scored[name] = rows
+    import matplotlib
+    matplotlib.use('Agg')
+    matplotlib.rcParams.update(STYLE)
     kinds = {'leaderboard': fig_leaderboard, 'horizon': fig_horizon, 'heatmap': fig_heatmap,
              'significance': fig_significance, 'paths': fig_paths}
     for fig in man.get('figures', []):

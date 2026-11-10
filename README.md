@@ -39,47 +39,26 @@ Eng.* 2024.
 | 8 | Zero-shot foundation model ≈ ARIMA. Owner, RMSE at 60 min: Chronos-Bolt zero-shot 30.8–30.9, ARIMA 31.4, Kalman 31.3 mg/dL. | [owner](#owner-track--non-blind) |
 
 <a id="metabonet-paths"></a>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-paths-dark.png">
-  <img alt="T1DMAI training paths on MetaboNet" src="screenshots/metabonet-paths.png">
-</picture>
+<img alt="T1DMAI training paths on MetaboNet" src="screenshots/metabonet-paths.png">
 
 <a id="owner-paths"></a>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-paths-dark.png">
-  <img alt="T1DMAI training paths on the owner record" src="screenshots/personal-paths.png">
-</picture>
+<img alt="T1DMAI training paths on the owner record" src="screenshots/personal-paths.png">
 
 <a id="hypo"></a>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-heat-mcc-dark.png">
-  <img alt="Hypo detection MCC by model and horizon, MetaboNet" src="screenshots/metabonet-heat-mcc.png">
-</picture>
+<img alt="Hypo detection MCC by model and horizon, MetaboNet" src="screenshots/metabonet-heat-mcc.png">
 
 <a id="bias"></a>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-horizon-hypo-bias-dark.png">
-  <img alt="Mean error when CGM is below 70 mg/dL, owner" src="screenshots/personal-horizon-hypo-bias.png">
-</picture>
+<img alt="Mean error when CGM is below 70 mg/dL, owner" src="screenshots/personal-horizon-hypo-bias.png">
 
 ## Owner track — non-blind
 
 1 person with T1D · 115 days · train days 1–80 · test days 81–115 · future carbs and insulin as logged.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-rmse-dark.png">
-  <img alt="RMSE per model, owner" src="screenshots/personal-rmse.png">
-</picture>
+<img alt="RMSE per model, owner" src="screenshots/personal-rmse.png">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-significance-dark.png">
-  <img alt="Wilcoxon against the lowest-RMSE model, owner" src="screenshots/personal-significance.png">
-</picture>
+<img alt="Wilcoxon against the lowest-RMSE model, owner" src="screenshots/personal-significance.png">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-horizon-hypo-sens-dark.png">
-  <img alt="Hypo sensitivity by horizon, owner" src="screenshots/personal-horizon-hypo-sens.png">
-</picture>
+<img alt="Hypo sensitivity by horizon, owner" src="screenshots/personal-horizon-hypo-sens.png">
 
 <a id="owner-tables"></a>
 #### Accuracy — RMSE / MARD / bias (mg/dL, %)
@@ -175,20 +154,11 @@ n = 9661 forecasts at 60 min; ◆ = best or not significantly worse (Wilcoxon on
 
 MetaboNet test split · 12 sub-datasets · future carbs and insulin withheld.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-rmse-dark.png">
-  <img alt="RMSE per model, MetaboNet" src="screenshots/metabonet-rmse.png">
-</picture>
+<img alt="RMSE per model, MetaboNet" src="screenshots/metabonet-rmse.png">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-significance-dark.png">
-  <img alt="Wilcoxon against the lowest-RMSE model, MetaboNet" src="screenshots/metabonet-significance.png">
-</picture>
+<img alt="Wilcoxon against the lowest-RMSE model, MetaboNet" src="screenshots/metabonet-significance.png">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-horizon-hypo-bias-dark.png">
-  <img alt="Mean error when CGM is below 70 mg/dL, MetaboNet" src="screenshots/metabonet-horizon-hypo-bias.png">
-</picture>
+<img alt="Mean error when CGM is below 70 mg/dL, MetaboNet" src="screenshots/metabonet-horizon-hypo-bias.png">
 
 #### Accuracy — RMSE / MARD / bias (mg/dL, %)
 
