@@ -20,4 +20,3 @@
 | Chronos-Bolt mini (fine-tuned) | 21,256,141 | 3,889 | 24 h |
 | T1DMAI D16 DILATE | 31,253 | 5,679 | 168 h |
 | T1DMAI D16 MSE | 31,253 | 7,342 | 168 h |
-| T1DMAI D32 MSE | 238,101 | 15,527 | 168 h |
