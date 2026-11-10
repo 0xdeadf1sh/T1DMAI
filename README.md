@@ -55,7 +55,7 @@ For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biom
 
 ## 2. Main results
 
-All models suck. More details below:
+All models suck. XGBoost is the best one but my own model comes close. More details below:
 
 1. On my data, D16 DILATE + LoRA comes 2nd of 22 (22.8). Wilcoxon puts it level with XGBoost
    (22.2) at 60 and 90 min, behind it at 30 and 120.
