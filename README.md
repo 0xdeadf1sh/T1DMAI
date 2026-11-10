@@ -8,20 +8,41 @@ compares it with 18 other forecasting methods on my own CGM data and on the publ
 dataset.
 
 Below are my three models from `models/` forecasting my glucose on days from the 35 day test
-period, which none of them saw during training. These models get the carbs and insulin I logged
-for the next 2 hours. Blue is the model trained on the simulator only. Orange is the same model
-with a LoRA adapter trained on my first 80 days. Every 2 hours each one makes a new 2 hour
-forecast, and the shaded areas are their 50% bands. For each model the four days are its best,
-median, 75th percentile and worst day by the sim only model's error.
+period. They were trained on simulated people only and never saw any of my data. They get the
+carbs and insulin I logged for the next 2 hours. Every 2 hours a model makes a new 2 hour
+forecast. The shaded areas are its 50% and 90% bands. Each graph shows 2 days in a row, and the
+four graphs per model are spread evenly over the test period. A flat forecast line means the
+model did not have enough clean history at that moment and fell back to the last reading.
 
-<img alt="T1DMAI D32 MSE forecasting my glucose on 4 test days" src="screenshots/personal-days-d32-rmse.png">
+### D32 MSE
 
-<img alt="T1DMAI D16 MSE forecasting my glucose on 4 test days" src="screenshots/personal-days-d16-rmse.png">
+<img alt="T1DMAI D32 MSE forecasting my glucose, test days block 1" src="screenshots/personal-days-d32-rmse-1.png">
 
-<img alt="T1DMAI D16 DILATE forecasting my glucose on 4 test days" src="screenshots/personal-days-d16-dilate.png">
+<img alt="T1DMAI D32 MSE forecasting my glucose, test days block 2" src="screenshots/personal-days-d32-rmse-2.png">
 
-A flat forecast line means the model did not have enough clean history at that moment and fell
-back to the last reading.
+<img alt="T1DMAI D32 MSE forecasting my glucose, test days block 3" src="screenshots/personal-days-d32-rmse-3.png">
+
+<img alt="T1DMAI D32 MSE forecasting my glucose, test days block 4" src="screenshots/personal-days-d32-rmse-4.png">
+
+### D16 MSE
+
+<img alt="T1DMAI D16 MSE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-rmse-1.png">
+
+<img alt="T1DMAI D16 MSE forecasting my glucose, test days block 2" src="screenshots/personal-days-d16-rmse-2.png">
+
+<img alt="T1DMAI D16 MSE forecasting my glucose, test days block 3" src="screenshots/personal-days-d16-rmse-3.png">
+
+<img alt="T1DMAI D16 MSE forecasting my glucose, test days block 4" src="screenshots/personal-days-d16-rmse-4.png">
+
+### D16 DILATE
+
+<img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-dilate-1.png">
+
+<img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 2" src="screenshots/personal-days-d16-dilate-2.png">
+
+<img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 3" src="screenshots/personal-days-d16-dilate-3.png">
+
+<img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 4" src="screenshots/personal-days-d16-dilate-4.png">
 
 > [!CAUTION]
 > **Research and educational use only - not a medical device.** T1DMAI is a
