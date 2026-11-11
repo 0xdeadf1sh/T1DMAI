@@ -4,7 +4,7 @@ from __future__ import annotations
 import importlib
 
 MODULES = ('zoo.classical', 'zoo.kernel', 'zoo.boost','zoo.rnn', 'zoo.patch', 'zoo.chronos',
-           'zoo.arima')
+           'zoo.arima', 'zoo.foundation')
 
 
 def models() -> dict:

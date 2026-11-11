@@ -27,7 +27,8 @@ venv/bin/python train.py --cache-path ~/Desktop/T1DMSIM/cache_balanced_cf
 
 Always `venv/bin/python`. A bare `python` has no `blosc2` — it dies only once it
 reaches the cache — and runs a different torch than the one the venv pins. The
-exporters are the one exception: they run under `.venv-export` (§6).
+exporters run under `.venv-export` (§6), and the zoo's Chronos-2 and TimesFM 2.5
+under `.venv-zoo` (`requirements-zoo.txt`).
 
 ---
 

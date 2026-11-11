@@ -69,6 +69,7 @@ def fit_or_load(key: str, causal: bool, cache, runs: str, n_windows: int, seed: 
                 refit: bool = False):
     """The model ``zoo_runs/<run>/params.npz`` holds, fitted and saved there first if absent."""
     model = MODELS[key]()
+    model.causal = causal
     run_dir = os.path.join(runs, run_name(key, causal))
     path = os.path.join(run_dir, 'params.npz')
     if os.path.isfile(path) and not refit:

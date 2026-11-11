@@ -19,6 +19,7 @@ class Forecaster:
     name = ''
     ctx = 1
     reads_doses = True  # False: the blind and given tracks are one forecast
+    causal = False  # set by the runner on the blind track; zone doses are zeros, not announced
 
     def fit(self, w: Windows) -> None:
         pass

@@ -1,0 +1,5 @@
+# .venv-zoo: the training environment plus the zoo's upstream foundation models (zoo/foundation.py).
+# python3.14 -m venv .venv-zoo && .venv-zoo/bin/pip install -r requirements-zoo.txt
+-r requirements.txt
+chronos-forecasting==2.3.2
+timesfm[torch,xreg]==3.0.2

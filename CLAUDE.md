@@ -9,7 +9,7 @@ python train.py                         # train
 python -m pytest tests/ -v -s           # test (-s required: DUMP lines catch silent numerical bugs)
 ```
 
-**Two environments, and `requirements.txt` must never name an export package.** `venv` is the
+**Three environments, and `requirements.txt` must never name an export package.** `venv` is the
 training one — training, inference, evaluation, GUI, tests. `.venv-export` is the export one:
 `executorch==1.3.1` pins `torch>=2.12` and ships wheels for CPython 3.10–3.13 only, which the
 training venv's interpreter and torch do not satisfy. `requirements-export.txt` pins it, restricted
@@ -24,6 +24,11 @@ python3.11 -m venv .venv-export
 .venv-export/bin/pip install -r requirements-export.txt
 .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint <ckpt> --out-dir exported
 ```
+
+`.venv-zoo` (`requirements-zoo.txt`) is `venv` plus `chronos-forecasting` and `timesfm[xreg]`;
+`zoo/foundation.py` registers `chronos2` / `timesfm25` only where those import. On the blind track
+(`Forecaster.causal`, set by `zoo.run.fit_or_load`) Chronos-2 reads past doses only and TimesFM
+glucose only; on the given track zone doses are known-future covariates.
 
 `T1DMSIM` is a symlink to the sibling checkout and `import config` needs it — config reads
 `SIMULATOR_WARMUP_HOURS` and `EVENT_CHANNELS` from `T1DMSIM.simulator` rather than restating

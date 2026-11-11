@@ -666,7 +666,7 @@ post-processing. **An artifact and its descriptor are one unit**: a graph served
 against a descriptor from a different architecture decodes risk space with the
 wrong constants, and nothing downstream can detect it.
 
-There are two environments. `requirements.txt` is the training one — training,
+There are three environments. `requirements.txt` is the training one — training,
 evaluation, the GUI and the tests — at `torch>=2.4` on Python 3.10 or newer.
 `requirements-export.txt` is `.venv-export`, which `exporters/` and
 `deploy_model.sh` run under: it pins `executorch` to the version the consuming
@@ -679,6 +679,16 @@ environment's, so neither file lists the other's packages. The LiteRT path adds
 ```bash
 python3.11 -m venv .venv-export
 .venv-export/bin/pip install -r requirements-export.txt
+```
+
+`requirements-zoo.txt` is `.venv-zoo`: the training requirements plus
+`chronos-forecasting` and `timesfm` (with JAX, for its covariate regression).
+`zoo/foundation.py` registers Chronos-2 and TimesFM 2.5 only where those packages
+import, so under `venv` the zoo lists neither.
+
+```bash
+python3.14 -m venv .venv-zoo
+.venv-zoo/bin/pip install -r requirements-zoo.txt
 ```
 
 
