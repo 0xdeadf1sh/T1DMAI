@@ -1,0 +1,26 @@
+1. Jacobs PG, Herrero P, Facchinetti A, Vehi J, et al. Artificial Intelligence and Machine Learning for Improving Glycemic Control in Diabetes: Best Practices, Pitfalls, and Opportunities. IEEE Reviews in Biomedical Engineering 17:19-41, 2024. <https://doi.org/10.1109/RBME.2023.3331297>
+2. Wolff MK, Calhoun P, Aiello EM, Qin Y, Royston SF. MetaboNet: The Largest Publicly Available Consolidated Dataset for Type 1 Diabetes Management. arXiv:2601.11505, 2026. <https://arxiv.org/abs/2601.11505>
+3. Jeffries N, Wolff M, Royston S, Healey E, Mayer C, Klonoff D, Snyder M, Wang T. MetaboNet-Bench: A Multi-modal Benchmark for Glucose Forecasting in Type 1 Diabetes. arXiv:2606.18640, 2026. <https://arxiv.org/abs/2606.18640>
+4. Lu B, Liang Z, Pontius R, Tang S, Prioleau T. GlucoFM-Bench: Benchmarking Time-Series Foundation Models for Blood Glucose Forecasting. arXiv:2606.06881, 2026. <https://arxiv.org/abs/2606.06881>
+5. Martinsson J, Schliep A, Eliasson B, Mogren O. Blood Glucose Prediction with Variance Estimation Using Recurrent Neural Networks. Journal of Healthcare Informatics Research 4(1):1-18, 2020. <https://doi.org/10.1007/s41666-019-00059-y>
+6. Li K, Liu C, Zhu T, Herrero P, Georgiou P. GluNet: A Deep Learning Framework for Accurate Glucose Forecasting. IEEE Journal of Biomedical and Health Informatics 24(2):414-423, 2020. <https://doi.org/10.1109/JBHI.2019.2931842>
+7. Midroni C, Leimbigler PJ, Baruah G, Kolla M, Whitehead AJ, Fossat Y. Predicting Glycemia in Type 1 Diabetes Patients: Experiments with XGBoost. KHD@IJCAI-ECAI, CEUR-WS 2148:79-84, 2018. <https://ceur-ws.org/Vol-2148/>
+8. McShinsky R, Marshall B. Comparison of Forecasting Algorithms for Type 1 Diabetic Glucose Prediction on 30 and 60-Minute Prediction Horizons. KDH@ECAI, CEUR-WS 2675, 2020. <https://ceur-ws.org/Vol-2675/>
+9. Altin Karagoz M, Breton MD, El Fathi A. A Comparative Study of Transformer-Based Models for Multi-Horizon Blood Glucose Prediction. IFAC EDT, 2025. arXiv:2505.08821. <https://arxiv.org/abs/2505.08821>
+10. Zhang B, Cheng H-W, Yang H, et al. Evaluating Time-Series Foundation Models and Multimodal Dietary Context for CGM Forecasting. arXiv:2609.11872, 2026. <https://arxiv.org/abs/2609.11872>
+11. Potosnak W, Challu C, Olivares KG, Dufendach KA, Dubrawski A. Global Deep Forecasting with Patient-Specific Pharmacokinetics. CHIL, PMLR 287, 2025. arXiv:2309.13135. <https://arxiv.org/abs/2309.13135>
+12. Sergazinov R, Chun E, Rogovchenko V, Fernandes N, Kasman N, Gaynanova I. GlucoBench: Curated List of Continuous Glucose Monitoring Datasets with Prediction Benchmarks. ICLR, 2024. arXiv:2410.05780. <https://arxiv.org/abs/2410.05780>
+13. Nie Y, Nguyen NH, Sinthong P, Kalagnanam J. A Time Series is Worth 64 Words: Long-term Forecasting with Transformers. ICLR, 2023. <https://arxiv.org/abs/2211.14730>
+14. Challu C, Olivares KG, Oreshkin BN, Garza F, Mergenthaler-Canseco M, Dubrawski A. N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting. AAAI 37(6):6989-6997, 2023. <https://doi.org/10.1609/aaai.v37i6.25854>
+15. Ansari AF, Stella L, Turkmen C, et al. Chronos: Learning the Language of Time Series. TMLR, 2024. <https://arxiv.org/abs/2403.07815>
+16. Ansari AF, Shchur O, Kuken J, Auer A, Han B, et al. Chronos-2: From Univariate to Universal Forecasting. arXiv:2510.15821, 2025. <https://arxiv.org/abs/2510.15821>
+17. Das A, Kong W, Sen R, Zhou Y. A Decoder-Only Foundation Model for Time-Series Forecasting. ICML, PMLR 235:10148-10167, 2024. <https://arxiv.org/abs/2310.10688>
+18. Chen T, Guestrin C. XGBoost: A Scalable Tree Boosting System. KDD, 785-794, 2016. <https://doi.org/10.1145/2939672.2939785>
+19. Ke G, Meng Q, Finley T, Wang T, Chen W, Ma W, Ye Q, Liu T-Y. LightGBM: A Highly Efficient Gradient Boosting Decision Tree. NeurIPS 30:3146-3154, 2017. <https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision-tree>
+20. Klonoff DC, Freckmann G, Pleus S, et al. The Diabetes Technology Society Error Grid and Trend Accuracy Matrix for Glucose Monitors. Journal of Diabetes Science and Technology 18(6):1346-1361, 2024. <https://doi.org/10.1177/19322968241275701>
+21. Kovatchev BP, Gonder-Frederick LA, Cox DJ, Clarke WL. Evaluating the Accuracy of Continuous Glucose-Monitoring Sensors: Continuous Glucose-Error Grid Analysis Illustrated by TheraSense Freestyle Navigator Data. Diabetes Care 27(8):1922-1928, 2004. <https://doi.org/10.2337/diacare.27.8.1922>
+22. Clarke WL, Cox D, Gonder-Frederick LA, Carter W, Pohl SL. Evaluating Clinical Accuracy of Systems for Self-Monitoring of Blood Glucose. Diabetes Care 10(5):622-628, 1987. <https://doi.org/10.2337/diacare.10.5.622>
+23. Hu EJ, Shen Y, Wallis P, Allen-Zhu Z, Li Y, Wang S, Wang L, Chen W. LoRA: Low-Rank Adaptation of Large Language Models. ICLR, 2022. <https://arxiv.org/abs/2106.09685>
+24. Cuturi M, Blondel M. Soft-DTW: a Differentiable Loss Function for Time-Series. ICML, PMLR 70:894-903, 2017. <https://arxiv.org/abs/1703.01541>
+25. Le Guen V, Thome N. Shape and Time Distortion Loss for Training Deep Time Series Forecasting Models. NeurIPS, 2019. <https://arxiv.org/abs/1909.09020>
+26. Su J, Ahmed M, Lu Y, Pan S, Bo W, Liu Y. RoFormer: Enhanced Transformer with Rotary Position Embedding. Neurocomputing 568:127063, 2024. <https://doi.org/10.1016/j.neucom.2023.127063>
