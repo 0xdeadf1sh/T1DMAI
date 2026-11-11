@@ -512,11 +512,21 @@ def fig_leaderboard(rows, title, stem, metric='rmse', xlabel='RMSE (mg/dL)', rev
         plt.close(fig)
 
 
+def _published_rows(pub: dict, scored: dict[str, list[dict]]) -> list[dict]:
+    """Paper rows by paper 60-min RMSE, then ``pub['ours']`` keys with no paper score."""
+    labels = {r['key']: r for rows in scored.values() for r in rows}
+    rows = [dict(p, family='') for p in sorted(pub['rows'],
+                                               key=lambda p: p['rmse'].get('60', np.inf))]
+    return rows + [{'key': k, 'label': labels[k]['label'], 'family': labels[k]['family'],
+                    'ref': None, 'dataset': '-', 'inputs': '-', 'rmse': {}}
+                   for k in pub.get('ours', []) if k in labels]
+
+
 def fig_published(pub, scored, shorts, title, stem):
     """Two panels (30, 60 min): paper RMSE and ours per track, one row per published model."""
     import matplotlib.pyplot as plt
     by = {n: {r['key']: r for r in rows} for n, rows in scored.items()}
-    rows = sorted(pub['rows'], key=lambda p: p['rmse'].get('60', np.inf))
+    rows = _published_rows(pub, scored)
     names = ['Paper', *shorts.values()]
     for theme, th in THEMES.items():
         fig, axes = plt.subplots(1, 2, sharey=True, figsize=(7.5, 0.28 * len(rows) + 1.2))
@@ -534,7 +544,7 @@ def fig_published(pub, scored, shorts, title, stem):
                 ax.plot([ok.min(), ok.max()], [i, i], color=th['ink2'], lw=0.6, zorder=2)
             ax.set_xlabel(tex(f'RMSE at {h} min (mg/dL)'))
         axes[0].set_ylim(len(rows) - 0.5, -0.5)
-        _model_ticks(axes[0], [{'label': p['label'], 'family': ''} for p in rows], th)
+        _model_ticks(axes[0], rows, th)
         axes[1].tick_params(labelleft=False)
         _legend(axes[0], th, loc='lower left', bbox_to_anchor=(0.0, 1.0), ncols=3,
                 borderaxespad=0.2, handletextpad=0.2)
@@ -969,9 +979,10 @@ def published_table(pub: dict, scored: dict[str, list[dict]], shorts: dict[str, 
         head += [f'{s} {h}' for h in hs]
     lines = ['| ' + ' | '.join(head) + ' |', '| --- | --- | --- | --- |' + ' ---: |' * (len(head) - 4)]
     by = {n: {r['key']: r for r in rows} for n, rows in scored.items()}
-    for p in pub['rows']:
-        ref = next(r for r in pub['references'] if r['id'] == p['ref'])
-        cells = [p['label'], f"[{num[p['ref']]}]({ref['url']})", p['dataset'], p['inputs'],
+    urls = {r['id']: r['url'] for r in pub['references']}
+    for p in _published_rows(pub, scored):
+        cite = f"[{num[p['ref']]}]({urls[p['ref']]})" if p['ref'] else '-'
+        cells = [p['label'], cite, p['dataset'], p['inputs'],
                  *(_fmt(p['rmse'].get(h)) for h in hs)]
         for n in shorts:
             ours = by[n].get(p['key'])

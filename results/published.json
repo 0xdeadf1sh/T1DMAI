@@ -1,5 +1,6 @@
 {
- "note": "RMSE in mg/dL at the single step 30 or 60 min ahead, as printed in each paper.",
+ "note": "RMSE in mg/dL at the single step 30 or 60 min ahead, as printed in each paper. T1DMAI has no published score.",
+ "ours": ["d16-dilate_lora1", "d16-rmse_lora1", "d16-dilate_zs", "d16-rmse_zs"],
  "excluded": "Chronos-Bolt (Zhang et al. 2026) and N-HiTS (Potosnak et al. 2025; Sergazinov et al. 2024) are published only as RMSE averaged over every step up to the horizon, which is not the same quantity, so they have no row.",
  "rows": [
   {"key": "persistence", "label": "Persistence", "ref": "jeffries2026",
