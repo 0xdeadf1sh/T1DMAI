@@ -20,7 +20,21 @@ N_BOOT = 2000
 MIN_SUBJECT_FORECASTS = 100
 FAMILIES = ('Baseline', 'Classical', 'Deep', 'Foundation', 'T1DMAI')
 THEMES = {
+    'light': {'bg': '#ffffff', 'ink': '#000000', 'ink2': '#7f7f7f', 'grid': '#d3d3d3',
+              'spine': '#000000',
+              'fam': {'Baseline': '#7f7f7f', 'Classical': '#1f77b4', 'Deep': '#2ca02c',
+                      'Foundation': '#9467bd', 'T1DMAI': '#d62728'},
+              'cat': ('#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#9467bd'),
+              'seq': ('#deebf7', '#08519c'), 'sig': {'best': '#08519c', 'tie': '#9ecae1',
+                                                     'worse': '#eeeeee'},
+              'rc': {'text.usetex': False, 'font.family': 'sans-serif',
+                     'font.sans-serif': ['DejaVu Sans'], 'mathtext.default': 'regular',
+                     'axes.linewidth': 0.8, 'xtick.direction': 'out', 'ytick.direction': 'out',
+                     'xtick.top': False, 'ytick.right': False, 'xtick.major.width': 0.8,
+                     'ytick.major.width': 0.8, 'legend.frameon': True,
+                     'legend.edgecolor': '0.8'}},
     'dark': {'bg': '#141414', 'ink': '#ececec', 'ink2': '#b4b4b4', 'grid': '#333333',
+             'spine': '#b4b4b4', 'rc': {},
              'fam': {'Baseline': '#8f8e89', 'Classical': '#3987e5', 'Deep': '#199e70',
                      'Foundation': '#9085e9', 'T1DMAI': '#d95926'},
              'cat': ('#3987e5', '#d95926', '#199e70', '#c98500', '#d55181'),
@@ -38,23 +52,42 @@ STYLE = {
     'legend.frameon': False, 'savefig.dpi': 200,
 }
 MARKERS = ('o', 's', '^', 'D', 'v')
+_THEME = 'dark'
+
+
+def _themes():
+    return [(_THEME, THEMES[_THEME])]
 
 
 def tex(s: str) -> str:
-    """Escape LaTeX specials in a plain label."""
+    """Escape LaTeX specials in a plain label; identity when usetex is off."""
+    import matplotlib
+    if not matplotlib.rcParams['text.usetex']:
+        return s
     for a, b in (('\\', r'\textbackslash{}'), ('&', r'\&'), ('%', r'\%'), ('$', r'\$'),
                  ('#', r'\#'), ('_', r'\_'), ('<', r'$<$'), ('>', r'$>$')):
         s = s.replace(a, b)
     return s
 
 
+def _model_names(rows) -> list[str]:
+    import matplotlib
+    bold = matplotlib.rcParams['text.usetex']
+    return [rf"\textbf{{{tex(r['label'])}}}" if bold and r['family'] == 'T1DMAI'
+            else tex(r['label']) for r in rows]
+
+
+def _color_ticks(labels, rows, th):
+    for t, r in zip(labels, rows):
+        ours = r['family'] == 'T1DMAI'
+        t.set_color(th['fam']['T1DMAI'] if ours else th['ink'])
+        t.set_fontweight('bold' if ours else 'normal')
+
+
 def _model_ticks(ax, rows, th, axis='y'):
     """Model names as tick labels; T1DMAI rows bold in the family color."""
-    names = [rf"\textbf{{{tex(r['label'])}}}" if r['family'] == 'T1DMAI' else tex(r['label'])
-             for r in rows]
-    (ax.set_yticks if axis == 'y' else ax.set_xticks)(range(len(rows)), names)
-    for t, r in zip(ax.get_yticklabels() if axis == 'y' else ax.get_xticklabels(), rows):
-        t.set_color(th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink'])
+    (ax.set_yticks if axis == 'y' else ax.set_xticks)(range(len(rows)), _model_names(rows))
+    _color_ticks(ax.get_yticklabels() if axis == 'y' else ax.get_xticklabels(), rows, th)
 
 
 def load_track(spec: dict) -> dict:
@@ -453,7 +486,7 @@ def _axes(fig, ax, th):
     fig.patch.set_facecolor(th['bg'])
     ax.set_facecolor(th['bg'])
     for s in ax.spines.values():
-        s.set_color(th['ink2'])
+        s.set_color(th['spine'])
     ax.tick_params(which='both', colors=th['ink2'], labelcolor=th['ink'])
     ax.grid(True, axis='x', color=th['grid'], lw=0.5, ls=':')
     ax.set_axisbelow(True)
@@ -463,7 +496,7 @@ def _axes(fig, ax, th):
 
 
 def _title(ax, s, **kw):
-    ax.set_title(tex(s), loc='left', color=THEMES['dark']['ink'], **kw)
+    ax.set_title(tex(s), loc='left', color=THEMES[_THEME]['ink'], **kw)
 
 
 def _legend(obj, th, **kw):
@@ -474,14 +507,14 @@ def _legend(obj, th, **kw):
 
 
 def _save(fig, path_stem: str, theme: str):
-    fig.savefig(f'{path_stem}.png', bbox_inches='tight', facecolor=fig.get_facecolor())
+    fig.savefig(f"{path_stem}{'-dark' if theme == 'dark' else ''}.png", bbox_inches='tight', facecolor=fig.get_facecolor())
 
 
 def fig_leaderboard(rows, title, stem, metric='rmse', xlabel='RMSE (mg/dL)', reverse=False):
     """Dot plot, one row per model, markers at 30/60/120 min, sorted by the 60-min value."""
     import matplotlib.pyplot as plt
     rows = sorted(rows, key=lambda r: r['h'][60][metric], reverse=reverse)
-    for theme, th in THEMES.items():
+    for theme, th in _themes():
         fig, ax = plt.subplots(figsize=(7.5, 0.28 * len(rows) + 1.2))
         _axes(fig, ax, th)
         y = np.arange(len(rows))
@@ -513,13 +546,15 @@ def fig_leaderboard(rows, title, stem, metric='rmse', xlabel='RMSE (mg/dL)', rev
 
 
 def _published_rows(pub: dict, scored: dict[str, list[dict]]) -> list[dict]:
-    """Paper rows by paper 60-min RMSE, then ``pub['ours']`` keys with no paper score."""
+    """Paper rows and ``pub['ours']`` keys, by the first track's 60-min RMSE."""
     labels = {r['key']: r for rows in scored.values() for r in rows}
-    rows = [dict(p, family='') for p in sorted(pub['rows'],
-                                               key=lambda p: p['rmse'].get('60', np.inf))]
-    return rows + [{'key': k, 'label': labels[k]['label'], 'family': labels[k]['family'],
-                    'ref': None, 'dataset': '-', 'inputs': '-', 'rmse': {}}
-                   for k in pub.get('ours', []) if k in labels]
+    first = {r['key']: r['h'][60]['rmse'] for r in next(iter(scored.values()))}
+    rows = [dict(p, family='') for p in pub['rows']]
+    rows += [{'key': k, 'label': labels[k]['label'], 'family': labels[k]['family'],
+              'ref': None, 'dataset': '-', 'inputs': '-', 'rmse': {}}
+             for k in pub.get('ours', []) if k in labels]
+    return sorted(rows, key=lambda p: (first.get(p['key'], np.inf),
+                                       p['rmse'].get('60', np.inf)))
 
 
 def fig_published(pub, scored, shorts, title, stem):
@@ -528,7 +563,7 @@ def fig_published(pub, scored, shorts, title, stem):
     by = {n: {r['key']: r for r in rows} for n, rows in scored.items()}
     rows = _published_rows(pub, scored)
     names = ['Paper', *shorts.values()]
-    for theme, th in THEMES.items():
+    for theme, th in _themes():
         fig, axes = plt.subplots(1, 2, sharey=True, figsize=(7.5, 0.28 * len(rows) + 1.2))
         y = np.arange(len(rows))
         for ax, h in zip(axes, ('30', '60')):
@@ -570,7 +605,7 @@ def fig_horizon(rows, keys, metric, ylabel, title, stem, ylim=None):
     if keys == 'auto':
         keys = auto_keys(rows)
     sel = [next(r for r in rows if r['key'] == k) for k in keys]
-    for theme, th in THEMES.items():
+    for theme, th in _themes():
         fig, ax = plt.subplots(figsize=(6.4, 3.6))
         _axes(fig, ax, th)
         ax.grid(True, axis='y', color=th['grid'], lw=0.5, ls=':')
@@ -596,7 +631,7 @@ def fig_heatmap(rows, metric, title, stem, fmt='{:.0f}', higher_better=True):
     rows = sorted(rows, key=lambda r: r['h'][60][metric] or 0, reverse=higher_better)
     v = np.array([[np.nan if r['h'][m].get(metric) is None else r['h'][m][metric]
                    for m in HORIZONS] for r in rows])
-    for theme, th in THEMES.items():
+    for theme, th in _themes():
         cmap = LinearSegmentedColormap.from_list('seq', th['seq'])
         fig, ax = plt.subplots(figsize=(5.6, 0.26 * len(rows) + 1.1))
         _axes(fig, ax, th)
@@ -628,7 +663,7 @@ def fig_significance(rows, title, stem):
     rows = sorted(rows, key=lambda r: r['h'][60]['rmse'])
     code = {'best': 0, 'tie': 1, 'worse': 2}
     v = np.array([[code[r['h'][m]['vs_best']] for m in HORIZONS] for r in rows])
-    for theme, th in THEMES.items():
+    for theme, th in _themes():
         s = th['sig']
         fig, ax = plt.subplots(figsize=(5.2, 0.26 * len(rows) + 1.4))
         _axes(fig, ax, th)
@@ -657,7 +692,7 @@ def fig_paths(rows, groups, paths, ref_key, title, stem):
     import matplotlib.pyplot as plt
     by = {r['key']: r for r in rows}
     ref = by[ref_key]
-    for theme, th in THEMES.items():
+    for theme, th in _themes():
         fig, axs = plt.subplots(1, 3, figsize=(9.6, 3.2), sharey=False)
         for ax, m in zip(axs, (30, 60, 120)):
             _axes(fig, ax, th)
@@ -698,7 +733,7 @@ def _pick(rows, keys):
 def fig_hist(ds, title, stem):
     """Test-CGM histogram with the 70 and 180 mg/dL lines."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     h = np.array(ds[-1]['hist'], float)
     edges = np.arange(40, 405, 5)
     fig, ax = plt.subplots(figsize=(6.4, 2.8))
@@ -717,14 +752,14 @@ def fig_hist(ds, title, stem):
     ax.set_xlabel('CGM glucose (mg/dL)')
     ax.set_ylabel(tex('Share of readings (%)'))
     _title(ax, title)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_ci(rows, ex, title, stem):
     """RMSE at 60 min with the 95% bootstrap interval, one row per model."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     rows = sorted(rows, key=lambda r: r['h'][60]['rmse'])
     fig, ax = plt.subplots(figsize=(6.4, 0.24 * len(rows) + 1.0))
     _axes(fig, ax, th)
@@ -738,14 +773,14 @@ def fig_ci(rows, ex, title, stem):
     _model_ticks(ax, rows, th)
     ax.set_xlabel(tex('RMSE at 60 min (mg/dL), dot = value, bar = 95% interval'))
     _title(ax, title)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_spread(rows, ex, keys, title, stem):
     """Box plot of 60-min RMSE per subject (or per day) for a few models."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     sel = sorted(_pick(rows, keys), key=lambda r: np.median(ex['models'][r['key']]['spread60']))
     fig, ax = plt.subplots(figsize=(6.4, 0.42 * len(sel) + 1.1))
     _axes(fig, ax, th)
@@ -763,22 +798,19 @@ def fig_spread(rows, ex, keys, title, stem):
     unit = 'subject' if ex['cluster'] == 'subject' else 'test day'
     ax.set_xlabel(tex(f'RMSE at 60 min per {unit} (mg/dL)'))
     _title(ax, title)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def _model_ticks_at(ax, rows, th, start=0):
-    names = [rf"\textbf{{{tex(r['label'])}}}" if r['family'] == 'T1DMAI' else tex(r['label'])
-             for r in rows]
-    ax.set_yticks(range(start, start + len(rows)), names)
-    for t, r in zip(ax.get_yticklabels(), rows):
-        t.set_color(th['fam']['T1DMAI'] if r['family'] == 'T1DMAI' else th['ink'])
+    ax.set_yticks(range(start, start + len(rows)), _model_names(rows))
+    _color_ticks(ax.get_yticklabels(), rows, th)
 
 
 def fig_strata(rows, ex, keys, title, stem):
     """RMSE at 60 min split by glucose range, time of day and meals."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     sel = _pick(rows, keys)
     s0 = ex['models'][sel[0]['key']]['strata'][60]
     panels = [('Glucose at the target time', [('hypo', 'below 70'), ('eu', '70-180'),
@@ -809,14 +841,14 @@ def fig_strata(rows, ex, keys, title, stem):
     _legend(fig, th, handles=h, labels=lab, loc='upper left', bbox_to_anchor=(0.0, 0.92),
             ncols=3, handletextpad=0.2, columnspacing=1.0)
     fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.99)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_calibration(rows, ex, title, stem, horizon=60):
     """Observed share below each forecast quantile against the promised share."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     best: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: r['h'][60]['rmse']):
         if 'bands' in ex['models'][r['key']]:
@@ -838,14 +870,14 @@ def fig_calibration(rows, ex, title, stem, horizon=60):
     ax.set_ylabel(tex('Observed share below (%)'))
     _title(ax, title)
     _legend(ax, th, loc='upper left', fontsize=7, handlelength=1.6)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_traces(ex, title, stem):
     """Example forecasts: CGM, three models at 30/60/90/120 min, T1DMAI 50% and 90% bands."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     tr = ex.get('traces', [])
     if not tr:
         return
@@ -883,14 +915,14 @@ def fig_traces(ex, title, stem):
     _legend(fig, th, handles=h, labels=lab, loc='upper left', bbox_to_anchor=(0.0, 0.92),
             ncols=3, handletextpad=0.3, columnspacing=1.0)
     fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.99)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_days(ex, arch, block, title, stem):
     """Two consecutive test days: CGM and the sim-only 2-hour forecasts with 50%/90% bands."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     blocks = ex.get('blocks', {}).get(arch)
     if not blocks:
         return
@@ -925,14 +957,14 @@ def fig_days(ex, arch, block, title, stem):
     _legend(fig, th, handles=h, labels=lab, loc='upper right', bbox_to_anchor=(0.99, 0.995),
             ncols=4, handletextpad=0.4)
     fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.995)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_cost(rows, cost, title, stem, offsets=None):
     """Accuracy against CPU time per forecast, log scale; offsets: {key: [dx, dy]} in points."""
     import matplotlib.pyplot as plt
-    th = THEMES['dark']
+    th = THEMES[_THEME]
     by = {r['key']: r for r in rows}
     fig, ax = plt.subplots(figsize=(6.4, 3.8))
     _axes(fig, ax, th)
@@ -961,7 +993,7 @@ def fig_cost(rows, cost, title, stem, offsets=None):
     ax.set_xlabel('Microseconds per forecast on one CPU thread (log scale)')
     ax.set_ylabel('RMSE at 60 min (mg/dL)')
     _title(ax, title)
-    _save(fig, stem, 'dark')
+    _save(fig, stem, _THEME)
     plt.close(fig)
 
 
@@ -1046,7 +1078,13 @@ def main() -> None:
                 f.write(md + '\n')
     import matplotlib
     matplotlib.use('Agg')
-    matplotlib.rcParams.update(STYLE)
+    global _THEME
+    for _THEME in THEMES:
+        with matplotlib.rc_context(STYLE | THEMES[_THEME]['rc']):
+            _figures(man, a.figures, scored, extra, pub, shorts, cost)
+
+
+def _figures(man, figdir, scored, extra, pub, shorts, cost) -> None:
     kinds = {'leaderboard': fig_leaderboard, 'horizon': fig_horizon, 'heatmap': fig_heatmap,
              'significance': fig_significance, 'paths': fig_paths}
     with_ex = {'ci': fig_ci, 'spread': fig_spread, 'strata': fig_strata,
@@ -1054,7 +1092,7 @@ def main() -> None:
     for fig in man.get('figures', []):
         fig = dict(fig)
         kind, track, stem = fig.pop('kind'), fig.pop('track', None), fig.pop('stem')
-        out = os.path.join(a.figures, stem)
+        out = os.path.join(figdir, stem)
         if kind == 'published':
             fig_published(pub, scored, shorts, stem=out, **fig)
         elif kind in with_ex:

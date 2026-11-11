@@ -12,13 +12,25 @@ trained on synthetic traces, and then a LoRA adapter is added for light fine-tun
 
 Feast thine eyes on some of their forecasts (these have been trained on synthetic traces and no adapter is used for predictions):
 
-<img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-dilate-1.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-d16-dilate-1-dark.png">
+  <img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-dilate-1.png">
+</picture>
 
-<img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 2" src="screenshots/personal-days-d16-dilate-2.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-d16-dilate-2-dark.png">
+  <img alt="T1DMAI D16 DILATE forecasting my glucose, test days block 2" src="screenshots/personal-days-d16-dilate-2.png">
+</picture>
 
-<img alt="T1DMAI D16 MSE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-rmse-1.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-d16-rmse-1-dark.png">
+  <img alt="T1DMAI D16 MSE forecasting my glucose, test days block 1" src="screenshots/personal-days-d16-rmse-1.png">
+</picture>
 
-<img alt="T1DMAI D16 MSE forecasting my glucose, test days block 2" src="screenshots/personal-days-d16-rmse-2.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-d16-rmse-2-dark.png">
+  <img alt="T1DMAI D16 MSE forecasting my glucose, test days block 2" src="screenshots/personal-days-d16-rmse-2.png">
+</picture>
 
 > [!CAUTION]
 > **Research and educational use only - not a medical device.** T1DMAI is a
@@ -136,7 +148,10 @@ train the adapters while withholding those inputs.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | t1dmdroid | 1 | 35 | 9764 | 97 | 130 | 28 | 0.4 | 3.0 | 89 | 8 | 0 |
 
-<img alt="Distribution of my CGM readings in the 35 test days" src="screenshots/personal-glucose.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-glucose-dark.png">
+  <img alt="Distribution of my CGM readings in the 35 test days" src="screenshots/personal-glucose.png">
+</picture>
 
 **MetaboNet** [[2]](#12-references). Official split, 279 test people from 9 studies. Blind, because most of them use
 closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
@@ -154,7 +169,10 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | ShanghaiT1DM | 2 | 19 | 28 | 33 | 159 | 39 | 1.0 | 3.8 | 63 | 33 | 7 |
 | All | 279 | 64146 | 264899 | 90 | 143 | 40 | 0.7 | 3.7 | 75 | 22 | 6 |
 
-<img alt="Distribution of MetaboNet CGM readings in the test split" src="screenshots/metabonet-glucose.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-glucose-dark.png">
+  <img alt="Distribution of MetaboNet CGM readings in the test split" src="screenshots/metabonet-glucose.png">
+</picture>
 
 ## 5. Method
 
@@ -174,59 +192,140 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 ## 6. Results
 
-<img alt="RMSE per model on my data" src="screenshots/personal-rmse.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-rmse-dark.png">
+  <img alt="RMSE per model on my data" src="screenshots/personal-rmse.png">
+</picture>
 
-<img alt="RMSE per model on MetaboNet" src="screenshots/metabonet-rmse.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-rmse-dark.png">
+  <img alt="RMSE per model on MetaboNet" src="screenshots/metabonet-rmse.png">
+</picture>
 
-<img alt="RMSE by horizon, my data" src="screenshots/personal-horizon-rmse.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-horizon-rmse-dark.png">
+  <img alt="RMSE by horizon, my data" src="screenshots/personal-horizon-rmse.png">
+</picture>
 
-<img alt="RMSE by horizon, MetaboNet" src="screenshots/metabonet-horizon-rmse.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-horizon-rmse-dark.png">
+  <img alt="RMSE by horizon, MetaboNet" src="screenshots/metabonet-horizon-rmse.png">
+</picture>
 
-<img alt="RMSE at 60 min with 95% intervals, my data" src="screenshots/personal-ci.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-ci-dark.png">
+  <img alt="RMSE at 60 min with 95% intervals, my data" src="screenshots/personal-ci.png">
+</picture>
 
-<img alt="RMSE at 60 min with 95% intervals, MetaboNet" src="screenshots/metabonet-ci.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-ci-dark.png">
+  <img alt="RMSE at 60 min with 95% intervals, MetaboNet" src="screenshots/metabonet-ci.png">
+</picture>
 
-<img alt="Wilcoxon test against the lowest-RMSE model, my data" src="screenshots/personal-significance.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-significance-dark.png">
+  <img alt="Wilcoxon test against the lowest-RMSE model, my data" src="screenshots/personal-significance.png">
+</picture>
 
-<img alt="Wilcoxon test against the lowest-RMSE model, MetaboNet" src="screenshots/metabonet-significance.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-significance-dark.png">
+  <img alt="Wilcoxon test against the lowest-RMSE model, MetaboNet" src="screenshots/metabonet-significance.png">
+</picture>
 
-<img alt="RMSE at 60 min per test day, my data" src="screenshots/personal-spread.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-spread-dark.png">
+  <img alt="RMSE at 60 min per test day, my data" src="screenshots/personal-spread.png">
+</picture>
 
-<img alt="RMSE at 60 min per person, MetaboNet" src="screenshots/metabonet-spread.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-spread-dark.png">
+  <img alt="RMSE at 60 min per person, MetaboNet" src="screenshots/metabonet-spread.png">
+</picture>
 
-<img alt="RMSE at 60 min by situation, my data" src="screenshots/personal-strata.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-strata-dark.png">
+  <img alt="RMSE at 60 min by situation, my data" src="screenshots/personal-strata.png">
+</picture>
 
-<img alt="RMSE at 60 min by situation, MetaboNet" src="screenshots/metabonet-strata.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-strata-dark.png">
+  <img alt="RMSE at 60 min by situation, MetaboNet" src="screenshots/metabonet-strata.png">
+</picture>
 
-<img alt="Share of lows caught by horizon, my data" src="screenshots/personal-horizon-hypo-sens.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-horizon-hypo-sens-dark.png">
+  <img alt="Share of lows caught by horizon, my data" src="screenshots/personal-horizon-hypo-sens.png">
+</picture>
 
-<img alt="Share of lows caught by horizon, MetaboNet" src="screenshots/metabonet-horizon-hypo-sens.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-horizon-hypo-sens-dark.png">
+  <img alt="Share of lows caught by horizon, MetaboNet" src="screenshots/metabonet-horizon-hypo-sens.png">
+</picture>
 
-<img alt="Low detection MCC by model and horizon, my data" src="screenshots/personal-heat-mcc.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-heat-mcc-dark.png">
+  <img alt="Low detection MCC by model and horizon, my data" src="screenshots/personal-heat-mcc.png">
+</picture>
 
-<img alt="Low detection MCC by model and horizon, MetaboNet" src="screenshots/metabonet-heat-mcc.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-heat-mcc-dark.png">
+  <img alt="Low detection MCC by model and horizon, MetaboNet" src="screenshots/metabonet-heat-mcc.png">
+</picture>
 
-<img alt="Mean error when the real value is below 70 mg/dL, my data" src="screenshots/personal-horizon-hypo-bias.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-horizon-hypo-bias-dark.png">
+  <img alt="Mean error when the real value is below 70 mg/dL, my data" src="screenshots/personal-horizon-hypo-bias.png">
+</picture>
 
-<img alt="Mean error when the real value is below 70 mg/dL, MetaboNet" src="screenshots/metabonet-horizon-hypo-bias.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-horizon-hypo-bias-dark.png">
+  <img alt="Mean error when the real value is below 70 mg/dL, MetaboNet" src="screenshots/metabonet-horizon-hypo-bias.png">
+</picture>
 
-<img alt="DTS error grid zone A by model and horizon, my data" src="screenshots/personal-heat-dts.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-heat-dts-dark.png">
+  <img alt="DTS error grid zone A by model and horizon, my data" src="screenshots/personal-heat-dts.png">
+</picture>
 
-<img alt="DTS error grid zone A by model and horizon, MetaboNet" src="screenshots/metabonet-heat-dts.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-heat-dts-dark.png">
+  <img alt="DTS error grid zone A by model and horizon, MetaboNet" src="screenshots/metabonet-heat-dts.png">
+</picture>
 
-<img alt="Calibration of the T1DMAI bands at 60 min, my data" src="screenshots/personal-calibration.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-calibration-dark.png">
+  <img alt="Calibration of the T1DMAI bands at 60 min, my data" src="screenshots/personal-calibration.png">
+</picture>
 
-<img alt="Calibration of the T1DMAI bands at 60 min, MetaboNet" src="screenshots/metabonet-calibration.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-calibration-dark.png">
+  <img alt="Calibration of the T1DMAI bands at 60 min, MetaboNet" src="screenshots/metabonet-calibration.png">
+</picture>
 
-<img alt="Example forecasts on my data" src="screenshots/personal-traces.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-traces-dark.png">
+  <img alt="Example forecasts on my data" src="screenshots/personal-traces.png">
+</picture>
 
-<img alt="Example forecasts on MetaboNet" src="screenshots/metabonet-traces.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-traces-dark.png">
+  <img alt="Example forecasts on MetaboNet" src="screenshots/metabonet-traces.png">
+</picture>
 
-<img alt="T1DMAI with LoRA on and off, my data" src="screenshots/personal-paths.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-paths-dark.png">
+  <img alt="T1DMAI with LoRA on and off, my data" src="screenshots/personal-paths.png">
+</picture>
 
-<img alt="T1DMAI with LoRA on and off, MetaboNet" src="screenshots/metabonet-paths.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-paths-dark.png">
+  <img alt="T1DMAI with LoRA on and off, MetaboNet" src="screenshots/metabonet-paths.png">
+</picture>
 
-<img alt="Accuracy against CPU time per forecast" src="screenshots/personal-cost.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-cost-dark.png">
+  <img alt="Accuracy against CPU time per forecast" src="screenshots/personal-cost.png">
+</picture>
 
 | Model | Parameter count | Microseconds per forecast | History used |
 | --- | ---: | ---: | ---: |
@@ -503,26 +602,29 @@ RMSE (mg/dL) that each model's paper reports, beside the same model on my data a
 MetaboNet. The papers use other people, splits, inputs and history lengths, so a gap between the
 two sides is not a like-for-like comparison. My data is non-blind, MetaboNet blind (§8).
 
-<img alt="Published RMSE at 30 and 60 min against the same models on my data and MetaboNet" src="screenshots/published-rmse.png">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/published-rmse-dark.png">
+  <img alt="Published RMSE at 30 and 60 min against the same models on my data and MetaboNet" src="screenshots/published-rmse.png">
+</picture>
 
 | Model | Paper | Paper data | Paper inputs | Paper 30 | Paper 60 | My data 30 | My data 60 | MetaboNet 30 | MetaboNet 60 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| PatchTST | [9](https://arxiv.org/abs/2505.08821) | DCLP3 train, OhioT1DM test (12) | CGM, carbs, insulin | 16.7 | 24.6 | 15.1 | 23.3 | 20.3 | 34.4 |
-| LSTM | [5](https://doi.org/10.1007/s41666-019-00059-y) | OhioT1DM 2018 (6) | CGM | 18.9 | 31.4 | 15.4 | 24.3 | 21.1 | 35.9 |
-| TimesFM 2.5 (zero-shot) | [4](https://arxiv.org/abs/2606.06881) | 12 datasets, mixed | CGM | 18.8 | 31.8 | 18.4 | 29.1 | 20.7 | 35.0 |
-| GluNet | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 19.3 | 31.8 | 15.4 | 23.6 | 20.6 | 34.8 |
-| Chronos-2 (zero-shot) | [4](https://arxiv.org/abs/2606.06881) | 12 datasets, mixed | CGM | 19.2 | 32.0 | 17.8 | 29.4 | 21.0 | 35.3 |
-| LSTM (15 h) | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin | 20.1 | 33.4 | 15.2 | 23.2 | 20.3 | 33.6 |
-| SVR | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.8 | 34.3 | 15.1 | 23.0 | 20.4 | 33.9 |
-| LightGBM | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin, time | 20.8 | 34.5 | 14.7 | 22.4 | 19.8 | 33.2 |
-| ARIMA | [8](https://ceur-ws.org/Vol-2675/) | OhioT1DM 2020 (6) | CGM, doses, meals, exercise | 23.7 | 36.4 | 18.6 | 31.4 | 23.4 | 41.9 |
-| ARX | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.5 | 39.5 | 15.7 | 24.1 | 21.3 | 35.4 |
-| Persistence | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM | 26.3 | 41.5 | 20.0 | 32.1 | 25.2 | 40.0 |
 | XGBoost | [7](https://ceur-ws.org/Vol-2148/) | OhioT1DM 2018 (6) | CGM, doses, meals, activity | 20.4 | - | 14.7 | 22.2 | 19.8 | 33.2 |
+| LightGBM | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin, time | 20.8 | 34.5 | 14.7 | 22.4 | 19.8 | 33.2 |
 | T1DMAI D16 DILATE (sim + LoRA) | - | - | - | - | - | 15.2 | 22.8 | 21.5 | 34.6 |
+| SVR | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.8 | 34.3 | 15.1 | 23.0 | 20.4 | 33.9 |
+| LSTM (15 h) | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin | 20.1 | 33.4 | 15.2 | 23.2 | 20.3 | 33.6 |
+| PatchTST | [9](https://arxiv.org/abs/2505.08821) | DCLP3 train, OhioT1DM test (12) | CGM, carbs, insulin | 16.7 | 24.6 | 15.1 | 23.3 | 20.3 | 34.4 |
 | T1DMAI D16 MSE (sim + LoRA) | - | - | - | - | - | 15.1 | 23.5 | 21.8 | 35.1 |
+| GluNet | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 19.3 | 31.8 | 15.4 | 23.6 | 20.6 | 34.8 |
+| ARX | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.5 | 39.5 | 15.7 | 24.1 | 21.3 | 35.4 |
+| LSTM | [5](https://doi.org/10.1007/s41666-019-00059-y) | OhioT1DM 2018 (6) | CGM | 18.9 | 31.4 | 15.4 | 24.3 | 21.1 | 35.9 |
 | T1DMAI D16 DILATE (sim only) | - | - | - | - | - | 16.2 | 26.1 | 23.4 | 36.6 |
 | T1DMAI D16 MSE (sim only) | - | - | - | - | - | 16.8 | 27.1 | 23.4 | 36.7 |
+| TimesFM 2.5 (zero-shot) | [4](https://arxiv.org/abs/2606.06881) | 12 datasets, mixed | CGM | 18.8 | 31.8 | 18.4 | 29.1 | 20.7 | 35.0 |
+| Chronos-2 (zero-shot) | [4](https://arxiv.org/abs/2606.06881) | 12 datasets, mixed | CGM | 19.2 | 32.0 | 17.8 | 29.4 | 21.0 | 35.3 |
+| ARIMA | [8](https://ceur-ws.org/Vol-2675/) | OhioT1DM 2020 (6) | CGM, doses, meals, exercise | 23.7 | 36.4 | 18.6 | 31.4 | 23.4 | 41.9 |
+| Persistence | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM | 26.3 | 41.5 | 20.0 | 32.1 | 25.2 | 40.0 |
 
 RMSE in mg/dL at the single step 30 or 60 min ahead, as printed in each paper. T1DMAI has no published score.
 
