@@ -35,12 +35,15 @@ LABEL = {
     'chronos_bolt_mini_zs': 'Chronos-Bolt mini (zero-shot)',
     'chronos_bolt_tiny_ft': 'Chronos-Bolt tiny (fine-tuned)',
     'chronos_bolt_mini_ft': 'Chronos-Bolt mini (fine-tuned)',
+    'lightgbm': 'LightGBM', 'lstm_15h': 'LSTM (15 h)', 'chronos2': 'Chronos-2 (zero-shot)',
+    'timesfm25': 'TimesFM 2.5 (zero-shot)',
 }
 FAMILY = {
     'persistence': 'Baseline', 'linear_extrapolation': 'Baseline', 'ridge_ar': 'Classical',
     'ridge_arx': 'Classical', 'kalman': 'Classical', 'svr': 'Classical', 'gp': 'Classical',
     'xgboost': 'Classical', 'arima': 'Classical', 'sarimax': 'Classical', 'lstm': 'Deep', 'glunet': 'Deep', 'patchtst': 'Deep',
-    'nhits': 'Deep',
+    'nhits': 'Deep', 'lightgbm': 'Classical', 'lstm_15h': 'Deep', 'chronos2': 'Foundation',
+    'timesfm25': 'Foundation',
 }
 FAMILY_ORDER = ('Baseline', 'Classical', 'Deep', 'Foundation', 'T1DMAI')
 

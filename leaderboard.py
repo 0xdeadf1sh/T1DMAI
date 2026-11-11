@@ -923,6 +923,31 @@ def fig_cost(rows, cost, title, stem, offsets=None):
     plt.close(fig)
 
 
+def references(pub: dict) -> str:
+    """Numbered list in ``pub['references']`` order; the number is the citation."""
+    return '\n'.join(f"{i}. {r['text']} <{r['url']}>" for i, r in enumerate(pub['references'], 1))
+
+
+def published_table(pub: dict, scored: dict[str, list[dict]], shorts: dict[str, str]) -> str:
+    """Paper RMSE at 30 and 60 min beside ours on every track, matched by zoo key."""
+    num = {r['id']: i for i, r in enumerate(pub['references'], 1)}
+    hs = ('30', '60')
+    head = ['Model', 'Paper', 'Paper data', 'Paper inputs', *(f'Paper {h}' for h in hs)]
+    for s in shorts.values():
+        head += [f'{s} {h}' for h in hs]
+    lines = ['| ' + ' | '.join(head) + ' |', '| --- | --- | --- | --- |' + ' ---: |' * (len(head) - 4)]
+    by = {n: {r['key']: r for r in rows} for n, rows in scored.items()}
+    for p in pub['rows']:
+        ref = next(r for r in pub['references'] if r['id'] == p['ref'])
+        cells = [p['label'], f"[{num[p['ref']]}]({ref['url']})", p['dataset'], p['inputs'],
+                 *(_fmt(p['rmse'].get(h)) for h in hs)]
+        for n in shorts:
+            ours = by[n].get(p['key'])
+            cells += [_fmt(ours['h'][int(h)]['rmse']) if ours else '-' for h in hs]
+        lines.append('| ' + ' | '.join(cells) + ' |')
+    return '\n'.join(lines + ['', pub['note'], '', pub['excluded']])
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=(__doc__ or '').splitlines()[0])
     p.add_argument('manifest')
@@ -968,6 +993,14 @@ def main() -> None:
             with open(os.path.join(a.out, f'{name}-{snip}.md'), 'w') as f:
                 f.write(md + '\n')
         scored[name], extra[name] = rows, ex
+    if man.get('published'):
+        with open(man['published']) as f:
+            pub = json.load(f)
+        shorts = {n: s.get('short', n) for n, s in man['tracks'].items()}
+        for stem, md in (('published', published_table(pub, scored, shorts)),
+                         ('references', references(pub))):
+            with open(os.path.join(a.out, f'{stem}.md'), 'w') as f:
+                f.write(md + '\n')
     import matplotlib
     matplotlib.use('Agg')
     matplotlib.rcParams.update(STYLE)
