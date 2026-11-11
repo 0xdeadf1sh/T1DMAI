@@ -24,10 +24,10 @@ class _ZoneDoses(nn.Module):
 
 
 class _LSTMNet(nn.Module):
-    def __init__(self, ctx: int, hidden: int, zone_hidden: int) -> None:
+    def __init__(self, ctx: int, hidden: int, zone_hidden: int, layers: int) -> None:
         super().__init__()
         self.ctx = ctx
-        self.lstm = nn.LSTM(3, hidden, batch_first=True)
+        self.lstm = nn.LSTM(3, hidden, num_layers=layers, batch_first=True)
         self.zone = _ZoneDoses(zone_hidden)
         self.head = nn.Sequential(nn.Linear(hidden + zone_hidden, hidden), nn.GELU(),
                                   nn.Linear(hidden, ZONE))
@@ -45,12 +45,21 @@ class LSTM(TorchForecaster):
     """Martinsson et al. 2019: one LSTM layer over 2 h of bg and past doses."""
     name = 'lstm'
 
-    def __init__(self, ctx: int = 24, hidden: int = 128, zone_hidden: int = 64, **kw) -> None:
-        self.hidden, self.zone_hidden = hidden, zone_hidden
+    def __init__(self, ctx: int = 24, hidden: int = 128, zone_hidden: int = 64, layers: int = 1,
+                 **kw) -> None:
+        self.hidden, self.zone_hidden, self.layers = hidden, zone_hidden, layers
         super().__init__(ctx, **kw)
 
     def build(self) -> nn.Module:
-        return _LSTMNet(self.ctx, self.hidden, self.zone_hidden)
+        return _LSTMNet(self.ctx, self.hidden, self.zone_hidden, self.layers)
+
+
+class LSTM15h(LSTM):
+    """MetaboNet-Bench (arXiv 2606.18640) LSTM: two layers of 128 over 15 h."""
+    name = 'lstm_15h'
+
+    def __init__(self, **kw) -> None:
+        super().__init__(ctx=180, layers=2, **kw)
 
 
 class _GatedBlock(nn.Module):
@@ -111,5 +120,6 @@ class GluNet(TorchForecaster):
 
 MODELS = {
     'lstm': LSTM,
+    'lstm_15h': LSTM15h,
     'glunet': GluNet,
 }
