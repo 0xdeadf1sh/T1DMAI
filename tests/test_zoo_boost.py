@@ -1,8 +1,11 @@
 import numpy as np
+import pytest
 import torch
 
 import zoo.boost
-from zoo.boost import XGBoost
+from zoo.boost import LightGBM, XGBoost, _lgb_table
+
+BOOSTERS = pytest.mark.parametrize('cls', [XGBoost, LightGBM], ids=['xgboost', 'lightgbm'])
 from zoo.classical import Persistence
 from zoo.windows import ZONE, Windows
 
@@ -36,21 +39,37 @@ def _graph_out(m: XGBoost, w: Windows) -> np.ndarray:
         return m.graph()(*(torch.from_numpy(x) for x in (w.bg, w.insulin, w.carb))).numpy()
 
 
-def test_xgboost_float32_graph_survives_pump_increment_drift(monkeypatch):
+@BOOSTERS
+def test_trees_float32_graph_survives_pump_increment_drift(monkeypatch, cls):
     monkeypatch.setattr(zoo.boost, 'XGB_ROUNDS', 60)
-    m = XGBoost()
+    m = cls()
     m.fit(_random(3000, m.ctx, 0, pump=True))
     w = _random(1000, m.ctx, 1, pump=True)
     pred = m.predict(w)
     drift = np.abs(_graph_out(m, w) - pred).max()
     off = (np.abs(pred - m.predict_native(w)).max(axis=1) > 1e-2).mean()
-    print(f'DUMP xgboost pump doses: float32 graph vs predict {drift:.2e}  native off {off:.1%}')
+    print(f'DUMP {m.name} pump doses: float32 graph vs predict {drift:.2e}  native off {off:.1%}')
     assert drift < 1e-2
 
 
-def test_xgboost_torch_walk_matches_native_predict_and_export(monkeypatch):
+def test_lgb_table_keeps_less_equal_at_the_float32_threshold():
+    t = 0.1
+    t32 = np.float32(t)
+    below = t32 if t32 <= t else np.nextafter(t32, np.float32(-1))
+    root = {'split_feature': 0, 'threshold': t, 'decision_type': '<=', 'default_left': True,
+            'missing_type': 'None', 'left_child': {'leaf_value': -1.0},
+            'right_child': {'leaf_value': 1.0}}
+    tab = _lgb_table(root)
+    cut = tab['threshold'][0]
+    assert below < cut and np.nextafter(below, np.float32(1)) >= cut
+    assert tab['left'].tolist() == [1, -1, -1] and tab['value'].tolist() == [0.0, -1.0, 1.0]
+    assert not tab['default_left'][0]
+
+
+@BOOSTERS
+def test_trees_torch_walk_matches_native_predict_and_export(monkeypatch, cls):
     monkeypatch.setattr(zoo.boost, 'XGB_ROUNDS', 60)
-    m = XGBoost()
+    m = cls()
     m.fit(_random(3000, m.ctx, 0, pump=False))
     w = _random(1000, m.ctx, 1, pump=False)
     truth = w.target
@@ -67,10 +86,10 @@ def test_xgboost_torch_walk_matches_native_predict_and_export(monkeypatch):
     ok = np.isfinite(truth)
     err = np.sqrt(np.mean((pred - truth)[ok] ** 2))
     base = np.sqrt(np.mean((Persistence().predict(w) - truth)[ok] ** 2))
-    print(f'DUMP xgboost vs native max {native:.2e} windows off {off:.1%}  graph vs predict {np.abs(out - pred).max():.2e}'
+    print(f'DUMP {m.name} vs native max {native:.2e} windows off {off:.1%}  graph vs predict {np.abs(out - pred).max():.2e}'
           f'  export {np.abs(exp - one).max():.1e}  depth {m.depth}  rmse {err:.2f}'
           f'  persistence {base:.2f}')
-    assert off < 0.05 and native < 1.0
+    assert off < 0.01 and (cls is not XGBoost or native < 1.0)
     assert np.abs(out - pred).max() < 1e-2
     assert np.array_equal(exp, one)
     assert err < 0.5 * base
