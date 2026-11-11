@@ -512,6 +512,38 @@ def fig_leaderboard(rows, title, stem, metric='rmse', xlabel='RMSE (mg/dL)', rev
         plt.close(fig)
 
 
+def fig_published(pub, scored, shorts, title, stem):
+    """Two panels (30, 60 min): paper RMSE and ours per track, one row per published model."""
+    import matplotlib.pyplot as plt
+    by = {n: {r['key']: r for r in rows} for n, rows in scored.items()}
+    rows = sorted(pub['rows'], key=lambda p: p['rmse'].get('60', np.inf))
+    names = ['Paper', *shorts.values()]
+    for theme, th in THEMES.items():
+        fig, axes = plt.subplots(1, 2, sharey=True, figsize=(7.5, 0.28 * len(rows) + 1.2))
+        y = np.arange(len(rows))
+        for ax, h in zip(axes, ('30', '60')):
+            _axes(fig, ax, th)
+            vals = np.array([[p['rmse'].get(h, np.nan)]
+                             + [by[n][p['key']]['h'][int(h)]['rmse'] if p['key'] in by[n]
+                                else np.nan for n in shorts] for p in rows], float)
+            for k, name in enumerate(names):
+                ax.scatter(vals[:, k], y, s=22, marker=MARKERS[k], color=th['cat'][k],
+                           edgecolor=th['bg'], linewidth=0.6, zorder=3, label=name)
+            for i in range(len(rows)):
+                ok = vals[i][np.isfinite(vals[i])]
+                ax.plot([ok.min(), ok.max()], [i, i], color=th['ink2'], lw=0.6, zorder=2)
+            ax.set_xlabel(tex(f'RMSE at {h} min (mg/dL)'))
+        axes[0].set_ylim(len(rows) - 0.5, -0.5)
+        _model_ticks(axes[0], [{'label': p['label'], 'family': ''} for p in rows], th)
+        axes[1].tick_params(labelleft=False)
+        _legend(axes[0], th, loc='lower left', bbox_to_anchor=(0.0, 1.0), ncols=3,
+                borderaxespad=0.2, handletextpad=0.2)
+        _title(axes[0], title, pad=20)
+        fig.tight_layout()
+        _save(fig, stem, theme)
+        plt.close(fig)
+
+
 def auto_keys(rows: list[dict]) -> list[str]:
     """Best of each of Classical, Deep, Foundation, T1DMAI by 60-min RMSE, then persistence."""
     out = []
@@ -993,10 +1025,10 @@ def main() -> None:
             with open(os.path.join(a.out, f'{name}-{snip}.md'), 'w') as f:
                 f.write(md + '\n')
         scored[name], extra[name] = rows, ex
+    pub, shorts = None, {n: s.get('short', n) for n, s in man['tracks'].items()}
     if man.get('published'):
         with open(man['published']) as f:
             pub = json.load(f)
-        shorts = {n: s.get('short', n) for n, s in man['tracks'].items()}
         for stem, md in (('published', published_table(pub, scored, shorts)),
                          ('references', references(pub))):
             with open(os.path.join(a.out, f'{stem}.md'), 'w') as f:
@@ -1010,9 +1042,11 @@ def main() -> None:
                'calibration': fig_calibration}
     for fig in man.get('figures', []):
         fig = dict(fig)
-        kind, track, stem = fig.pop('kind'), fig.pop('track'), fig.pop('stem')
+        kind, track, stem = fig.pop('kind'), fig.pop('track', None), fig.pop('stem')
         out = os.path.join(a.figures, stem)
-        if kind in with_ex:
+        if kind == 'published':
+            fig_published(pub, scored, shorts, stem=out, **fig)
+        elif kind in with_ex:
             with_ex[kind](scored[track], extra[track], stem=out, **fig)
         elif kind == 'hist':
             fig_hist(extra[track]['dataset'], stem=out, **fig)

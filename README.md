@@ -503,6 +503,8 @@ RMSE (mg/dL) that each model's paper reports, beside the same model on my data a
 MetaboNet. The papers use other people, splits, inputs and history lengths, so a gap between the
 two sides is not a like-for-like comparison. My data is non-blind, MetaboNet blind (§8).
 
+<img alt="Published RMSE at 30 and 60 min against the same models on my data and MetaboNet" src="screenshots/published-rmse.png">
+
 | Model | Paper | Paper data | Paper inputs | Paper 30 | Paper 60 | My data 30 | My data 60 | MetaboNet 30 | MetaboNet 60 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Persistence | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM | 26.3 | 41.5 | 20.0 | 32.1 | 25.2 | 40.0 |
