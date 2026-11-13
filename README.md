@@ -313,6 +313,16 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 </picture>
 
 <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-clarke-dark.png">
+  <img alt="Clarke error grid by horizon, my data" src="screenshots/personal-clarke.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-clarke-dark.png">
+  <img alt="Clarke error grid by horizon, MetaboNet" src="screenshots/metabonet-clarke.png">
+</picture>
+
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-paths-dark.png">
   <img alt="T1DMAI with LoRA on and off, my data" src="screenshots/personal-paths.png">
 </picture>

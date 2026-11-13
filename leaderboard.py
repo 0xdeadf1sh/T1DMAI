@@ -3,7 +3,7 @@
 
 python leaderboard.py MANIFEST.json [--out results] [--figures screenshots]
 MANIFEST: {"cost"?, "figures", "tracks": {NAME: {"title", "truth", "time_gain", "cache"?,
-"entries": [{"key", "label", "family", "path", "bands"? (a --quantiles export)}]}}}."""
+"entries": [{"key", "label", "family", "path", "bands"? (--quantiles), "dense"? (--dense)}]}}}."""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,7 @@ import os
 import numpy as np
 
 HORIZONS = (30, 60, 90, 120)
+DENSE_MIN = tuple(range(5, 125, 5))
 QUANTILES = (0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95)
 MEAL_MIN_G, MEAL_WINDOW_MIN = 5.0, 120
 NIGHT_HOURS = range(0, 6)
@@ -113,9 +114,22 @@ def load_track(spec: dict) -> dict:
             bands[e['key']] = np.stack([np.stack(
                 [b.column(f'q{round(100 * q):02d}_{m}').to_numpy(zero_copy_only=False)
                  .astype(np.float64) for q in QUANTILES], axis=1) for m in HORIZONS], axis=1)
+    dense = {}
+    for e in spec['entries']:
+        if e.get('dense'):
+            b = pq.read_table(e['dense'])
+            if not np.array_equal(_epoch_s(b.column('date')), ts):
+                raise SystemExit(f"{e['dense']}: rows differ from {e['path']}")
+
+            def col(c):
+                return b.column(c).to_numpy(zero_copy_only=False).astype(np.float64)
+            dense[e['key']] = (np.stack([col(f'pred_{m}') for m in DENSE_MIN], axis=1),
+                               np.stack([np.stack([col(f'q{round(100 * q):02d}_{m}')
+                                                   for q in QUANTILES], axis=1)
+                                         for m in DENSE_MIN], axis=1))
     src = first.column('source_file').to_numpy(zero_copy_only=False).astype(str)
     return {'pred': np.stack(preds), 'truth': truth, 'origin': origin, 'ts': ts, 'keys': keys,
-            'cgm': cgm, 'src': src, 'bands': bands, 'hour': (ts // 3600) % 24,
+            'cgm': cgm, 'src': src, 'bands': bands, 'dense': dense, 'hour': (ts // 3600) % 24,
             'day': ts // 86400, 'meal': _meal_flag(spec.get('cache'), first, ts)}
 
 
@@ -247,40 +261,85 @@ def extras(spec: dict, d: dict) -> dict:
     return out
 
 
-def traces(spec: dict, d: dict, rows: list[dict]) -> list[dict]:
-    """Three example origins: a fall into a low, a rise after a meal, a quiet night."""
+def _best_ours(d: dict, rows: list[dict]) -> str:
     by = {r['key']: r for r in rows}
-    ours = [k for k in d['bands'] if by[k]['family'] == 'T1DMAI']
-    best = min(ours, key=lambda k: by[k]['h'][60]['rmse'])
-    show = [best] + [k for k in ('xgboost', 'persistence') if k in by]
-    idx = {e['key']: i for i, e in enumerate(spec['entries'])}
-    t, o = d['truth'], d['origin']
-    full = np.isfinite(t).all(axis=1) & np.isfinite(o)
-    night = np.isin(d['hour'], list(NIGHT_HOURS))
-    meal = d['meal'] if d['meal'] is not None else np.zeros(len(o), bool)
-    picks = {}
-    sane = full & (t < 390).all(axis=1) & (t > 45).all(axis=1) & (o < 390)
-    low = np.flatnonzero(sane & (t[:, 1] < 70) & (o >= 110))
-    if len(low):
-        picks['A fall into a low'] = _median_case(low, o[low] - t[low, 1])
-    rise = np.flatnonzero(sane & meal & (o < 180) & (t[:, 1] - o > 40))
-    if len(rise):
-        picks['A rise after a meal'] = _median_case(rise, t[rise, 1] - o[rise])
-    calm = np.flatnonzero(full & night & (np.abs(t - o[:, None]).max(axis=1) < 15))
-    if len(calm):
-        picks['Quiet night'] = calm[len(calm) // 2]
-    out = []
-    for title, r in picks.items():
-        tts, v = d['cgm'][d['keys'][r]]
-        sel = (tts >= d['ts'][r] - 3 * 3600) & (tts <= d['ts'][r] + 2 * 3600)
-        out.append({'title': title, 'source': str(d['src'][r]),
-                    'cgm_min': ((tts[sel] - d['ts'][r]) / 60).tolist(),
-                    'cgm': np.where(np.isfinite(v[sel]), v[sel], np.nan).tolist(),
-                    'models': [{'key': k, 'label': by[k]['label'], 'family': by[k]['family'],
-                                'pred': d['pred'][idx[k], r].tolist(),
-                                'band': d['bands'][k][r].tolist() if k in d['bands'] else None}
-                               for k in show]})
+    return min((k for k in d['bands'] if by[k]['family'] == 'T1DMAI'),
+               key=lambda k: by[k]['h'][60]['rmse'])
+
+
+def _curve(d: dict, i: int, key: str, r: int) -> dict:
+    """Forecast at row ``r``: the scored points, their band, and the 5-min path when exported."""
+    out = {'pred': d['pred'][i, r].tolist(),
+           'band': d['bands'][key][r].tolist() if key in d['bands'] else None}
+    if key in d['dense']:
+        p, q = d['dense'][key]
+        out |= {'dense': p[r].tolist(), 'dense_band': q[r].tolist()}
     return out
+
+
+def traces(spec: dict, d: dict, rows: list[dict], n: int = 9) -> dict:
+    """``n`` origins of the best T1DMAI run spread over the 2-hour swing, largest first."""
+    key = _best_ours(d, rows)
+    i = [e['key'] for e in spec['entries']].index(key)
+    t, o = d['truth'], d['origin']
+    ok = np.isfinite(t).all(axis=1) & np.isfinite(o) & np.isfinite(d['pred'][i]).all(axis=1)
+    if key in d['dense']:
+        ok &= np.isfinite(d['dense'][key][0]).all(axis=1)
+    pts =np.column_stack([o, t])
+    swing = np.where(ok, pts.max(axis=1) - pts.min(axis=1), -1.0)
+    cand = np.flatnonzero(ok)
+    cand = cand[np.argsort(-swing[cand], kind='stable')]
+    single = len(np.unique(d['keys'])) == 1
+    unit = d['day'] if single else d['keys']
+    used, picks = set(), []
+    for frac in np.linspace(0.005, 0.9, n):
+        at = int(frac * (len(cand) - 1))
+        for off in range(len(cand)):
+            hit = [c for c in (at + off, at - off) if 0 <= c < len(cand)
+                   and unit[cand[c]] not in used]
+            if hit:
+                picks.append(int(cand[hit[0]]))
+                used.add(unit[cand[hit[0]]])
+                break
+    out = []
+    for r in picks:
+        tts, v = d['cgm'][d['keys'][r]]
+        sel = (tts >= d['ts'][r] - 3600) & (tts <= d['ts'][r] + 7200)
+        fut = v[sel & (tts >= d['ts'][r])]
+        sec = int(d['ts'][r]) % 86400
+        name = (f"Day {int(d['day'][r] - d['day'].min()) + 1}" if single
+                else f"{d['src'][r]} {d['keys'][r].split(chr(31))[-1]}")
+        out.append({'name': name, 'hhmm': f'{sec // 3600:02d}:{sec % 3600 // 60:02d}',
+                    'swing': float(np.nanmax(fut) - np.nanmin(fut)), 'bg': float(o[r]),
+                    'cgm_min': ((tts[sel] - d['ts'][r]) / 60).tolist(), 'cgm': v[sel].tolist(),
+                    **_curve(d, i, key, r)})
+    return {'key': key, 'label': spec['entries'][i]['label'], 'windows': out}
+
+
+def clarke(spec: dict, d: dict, rows: list[dict], n: int = 1000) -> dict:
+    """``n`` sampled (truth, forecast) pairs per horizon of the best T1DMAI run."""
+    key = _best_ours(d, rows)
+    i = [e['key'] for e in spec['entries']].index(key)
+    h = next(r['h'] for r in rows if r['key'] == key)
+    rng = np.random.default_rng(0)
+    out = {}
+    for j, m in enumerate(HORIZONS):
+        ok = np.flatnonzero(np.isfinite(d['truth'][:, j]) & np.isfinite(d['pred'][i, :, j]))
+        s = np.sort(rng.choice(ok, min(n, len(ok)), replace=False))
+        out[m] = {'t': d['truth'][s, j].tolist(), 'p': d['pred'][i, s, j].tolist(),
+                  'a': h[m]['clarke_a'], 'ab': h[m]['clarke_ab']}
+    return {'key': key, 'label': spec['entries'][i]['label'], 'h': out}
+
+
+def _subject_events(cache_dir: str, key: str) -> tuple:
+    """(t0 epoch s, carb g, bolus U, basal U), each dose per 5-min slot, for one subject."""
+    from finetune_data import FinetuneCache
+    cache = FinetuneCache(cache_dir)
+    src, sid = key.split('\x1f')
+    rec = next(r for r in cache.subjects if (r['source'], str(r['sid'])) == (src, sid))
+    ch = cache.channels(rec, 0, int(rec['n']))
+    return (int(rec['t0']),) + tuple(np.nan_to_num(np.asarray(ch[c], np.float64))
+                                     for c in ('carb_g', 'bolus_u', 'basal_u'))
 
 
 def _day_rmse(d: dict, i: int) -> list[tuple[float, int]]:
@@ -295,38 +354,44 @@ def _day_rmse(d: dict, i: int) -> list[tuple[float, int]]:
 
 
 def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict:
-    """Per sim-only model: n_blocks pairs of consecutive test days spread evenly over the test."""
+    """Per sim-only model: n_blocks 48-hour spans of consecutive test days, spread evenly."""
     if len(np.unique(d['keys'])) != 1:
         return {}
     idx = {e['key']: i for i, e in enumerate(spec['entries'])}
-    tts, v = next(iter(d['cgm'].values()))
+    subject = str(d['keys'][0])
+    tts, v = d['cgm'][subject]
+    ev = _subject_events(spec['cache'], subject) if spec.get('cache') else None
     out = {}
     for zs in sorted(k for k in d['bands'] if k.endswith('_zs')):
         full = {day: e for e, day in _day_rmse(d, idx[zs])}
         starts = [day for day in sorted(full) if day + 1 in full]
         picks = [starts[int(round(p))] for p in np.linspace(0, len(starts) - 1, n_blocks)]
         blocks = []
-        for b, first in enumerate(picks):
-            days = []
-            for day in (first, first + 1):
-                t0 = day * 86400
-                cs = (tts >= t0) & (tts <= t0 + 86400 + 7200)
-                org = np.flatnonzero((d['day'] == day) & (d['ts'] % (every_h * 3600) == 0)
-                                     & np.isfinite(d['origin']))
-                days.append({'day': int(day - min(full)) + 1, 'rmse': full[day],
-                             'cgm_h': ((tts[cs] - t0) / 3600).tolist(), 'cgm': v[cs].tolist(),
-                             'origins': [{'h': float((d['ts'][r] - t0) / 3600),
-                                          'bg': float(d['origin'][r]),
-                                          'pred': d['pred'][idx[zs], r].tolist(),
-                                          'band': d['bands'][zs][r].tolist()} for r in org]})
-            blocks.append(days)
+        for first in picks:
+            t0 = first * 86400
+            cs = (tts >= t0) & (tts <= t0 + 2 * 86400 + 7200)
+            org = np.flatnonzero(((d['day'] == first) | (d['day'] == first + 1))
+                                 & (d['ts'] % (every_h * 3600) == 0) & np.isfinite(d['origin']))
+            blk = {'days': [int(first - min(full)) + 1, int(first - min(full)) + 2],
+                   'rmse': [full[first], full[first + 1]], 'every_h': every_h,
+                   'cgm_h': ((tts[cs] - t0) / 3600).tolist(), 'cgm': v[cs].tolist(),
+                   'origins': [{'h': float((d['ts'][r] - t0) / 3600), 'bg': float(d['origin'][r]),
+                                **_curve(d, idx[zs], zs, r)} for r in org]}
+            if ev is not None:
+                e0, carb, bolus, basal = ev
+                k0 = int(round((t0 - e0) / 300))
+                ks = np.arange(max(k0, 0), min(k0 + 576, len(carb)))
+                h = (ks - k0) / 12
+                blk['carbs'] = [[float(h[j]), float(carb[k])] for j, k in enumerate(ks)
+                                if carb[k] > 0]
+                blk['boluses'] = [[float(h[j]), float(bolus[k])] for j, k in enumerate(ks)
+                                  if bolus[k] > 0]
+                blk['basal'] = [[w, float(basal[ks[(h >= w) & (h < w + every_h)]].sum())]
+                                for w in range(0, 48, every_h)]
+                blk['basal_total'] = float(basal[ks].sum())
+            blocks.append(blk)
         out[zs.removesuffix('_zs')] = blocks
     return out
-
-
-def _median_case(idx: np.ndarray, size: np.ndarray) -> int:
-    """The qualifying origin with the median effect size: typical, not extreme."""
-    return int(idx[np.argsort(size)[len(idx) // 2]])
 
 
 def _band_scores(t: np.ndarray, q: np.ndarray) -> dict:
@@ -870,89 +935,180 @@ def fig_calibration(rows, ex, title, stem, horizon=60):
     plt.close(fig)
 
 
+def _box(fig, ax, th):
+    _axes(fig, ax, th)
+    ax.grid(False)
+
+
+def _path(o: dict) -> tuple:
+    """(minutes, median, (steps, quantiles) band or None) from the origin; 5-min when exported."""
+    if 'dense' in o:
+        return (np.array((0,) + DENSE_MIN), np.r_[o['bg'], o['dense']],
+                np.vstack([np.full(len(QUANTILES), o['bg']), o['dense_band']]))
+    band = None if o['band'] is None else np.vstack([np.full(len(QUANTILES), o['bg']),
+                                                     o['band']])
+    return np.array((0,) + HORIZONS), np.r_[o['bg'], o['pred']], band
+
+
 def fig_traces(ex, title, stem):
-    """Example forecasts: CGM, three models at 30/60/90/120 min, T1DMAI 50% and 90% bands."""
+    """Example windows: CGM before and after, the forecast path, its scored 30-120 min points."""
     import matplotlib.pyplot as plt
     th = THEMES[_THEME]
-    tr = ex.get('traces', [])
-    if not tr:
+    tr = ex.get('traces') or {}
+    ws = tr.get('windows', []) if isinstance(tr, dict) else []
+    if not ws:
         return
-    fig, axs = plt.subplots(1, len(tr), figsize=(3.3 * len(tr), 3.0))
-    for ax, t in zip(np.atleast_1d(axs), tr):
-        _axes(fig, ax, th)
-        ax.grid(True, axis='y', color=th['grid'], lw=0.5, ls=':')
-        x, v = np.array(t['cgm_min']), np.array(t['cgm'], float)
-        past = x <= 0
-        ax.plot(x[past], v[past], color=th['ink'], lw=1.0, label='CGM before the forecast')
-        ax.plot(x[~past], v[~past], color=th['ink2'], lw=1.0, ls=':', label='CGM afterwards')
-        ax.axvspan(0, 120, color=th['grid'], alpha=0.35, lw=0)
-        for k, mdl in enumerate(t['models']):
-            xs = [0] + list(HORIZONS)
-            o = v[past][-1]
-            c = th['fam'][mdl['family']] if mdl['key'] != 'persistence' else th['fam']['Baseline']
-            if mdl['band']:
-                b = np.array(mdl['band'])
-                ax.fill_between(xs, [o] + list(b[:, 0]), [o] + list(b[:, 6]), color=c,
-                                alpha=0.18, lw=0)
-                ax.fill_between(xs, [o] + list(b[:, 2]), [o] + list(b[:, 4]), color=c,
-                                alpha=0.30, lw=0)
-            ax.plot(xs, [o] + mdl['pred'], color=c, marker=MARKERS[k], ms=3.5,
-                    markeredgecolor=th['bg'], markeredgewidth=0.5,
-                    label=tex(mdl['label']))
+    nr = -(-len(ws) // 3)
+    fig, axs = plt.subplots(nr, 3, figsize=(12, 2.7 * nr), squeeze=False)
+    blue, red = th['cat'][0], th['fam']['T1DMAI']
+    for ax, w in zip(axs.flat, ws):
+        _box(fig, ax, th)
         for y in (70, 180):
-            ax.axhline(y, color=th['ink2'], lw=0.5, ls='--')
-        ax.set_xlim(-180, 120)
-        ax.set_xticks([-180, -120, -60, 0, 60, 120])
-        ax.set_xlabel('Minutes from the forecast')
-        ax.set_title(tex(t['title']), fontsize=9)
-    np.atleast_1d(axs)[0].set_ylabel('Glucose (mg/dL)')
-    fig.tight_layout(rect=(0, 0, 1, 0.80))
-    h, lab = np.atleast_1d(axs)[0].get_legend_handles_labels()
-    _legend(fig, th, handles=h, labels=lab, loc='upper left', bbox_to_anchor=(0.0, 0.92),
-            ncols=3, handletextpad=0.3, columnspacing=1.0)
-    fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.99)
+            ax.axhline(y, color=th['grid'], lw=0.7, zorder=0)
+        ax.axvline(0, color=th['grid'], lw=0.9, zorder=0)
+        x, v = np.array(w['cgm_min']), np.array(w['cgm'], float)
+        ax.plot(x[x <= 0], v[x <= 0], color=th['ink2'], lw=1.0)
+        ax.plot(x[x >= 0], v[x >= 0], color=blue, lw=1.5, label='true CGM')
+        xs, med, _ = _path(w)
+        ax.plot(xs, med, color=red, lw=1.5, ls='--', label='predicted')
+        ax.plot(HORIZONS, w['pred'], ls='none', marker='o', ms=3.6, color=red,
+                markeredgecolor=th['bg'], markeredgewidth=0.6, label='scored 30-120 min')
+        ax.set_xlim(-65, 125)
+        ax.set_xticks(range(-60, 121, 30))
+        ax.tick_params(labelsize=7)
+        ax.set_title(tex(f"{w['name']} · swing {w['swing']:.0f} mg/dL · {w['hhmm']}"),
+                     fontsize=8.5, color=th['ink'])
+    for ax in axs.flat[len(ws):]:
+        ax.set_visible(False)
+    _legend(axs.flat[0], th, loc='best', fontsize=7)
+    fig.supxlabel('minutes from prediction start', color=th['ink'], fontsize=9)
+    fig.supylabel('BG (mg/dL)', color=th['ink'], fontsize=9)
+    fig.suptitle(tex(f"{title} · {tr['label']}"), color=th['ink'], fontsize=11)
+    fig.tight_layout()
+    _save(fig, stem, _THEME)
+    plt.close(fig)
+
+
+_CLARKE_LINES = (((0, 175 / 3), (70, 70)), ((175 / 3, 400 / 1.2), (70, 400)),
+                 ((70, 70), (84, 400)), ((0, 70), (180, 180)), ((70, 290), (180, 400)),
+                 ((70, 70), (0, 56)), ((70, 400), (56, 320)), ((180, 180), (0, 70)),
+                 ((180, 400), (70, 70)), ((240, 240), (70, 180)), ((240, 400), (180, 180)),
+                 ((130, 180), (0, 70)))
+_CLARKE_LETTERS = (('A', 30, 20), ('B', 380, 260), ('B', 290, 370), ('C', 165, 370),
+                   ('C', 165, 20), ('D', 30, 145), ('D', 380, 125), ('E', 30, 370),
+                   ('E', 380, 20))
+
+
+def fig_clarke(ex, title, stem):
+    """Clarke error grid per horizon, sampled forecasts of the best T1DMAI run."""
+    import matplotlib.pyplot as plt
+    th = THEMES[_THEME]
+    cl = ex.get('clarke')
+    if not cl:
+        return
+    hs = sorted(cl['h'])
+    fig, axs = plt.subplots(1, len(hs), figsize=(3.7 * len(hs), 4.1))
+    for ax, m in zip(np.atleast_1d(axs), hs):
+        c = cl['h'][m]
+        _box(fig, ax, th)
+        for xs, ys in _CLARKE_LINES:
+            ax.plot(xs, ys, color=th['ink'], lw=0.7)
+        ax.plot((0, 400), (0, 400), color=th['ink'], lw=0.7, ls=':')
+        for s, x, y in _CLARKE_LETTERS:
+            ax.text(x, y, s, ha='center', va='center', fontsize=10, fontweight='bold',
+                    color=th['ink2'])
+        ax.scatter(c['t'], c['p'], s=7, color=th['cat'][0], alpha=0.45, lw=0)
+        ax.set_xlim(0, 400)
+        ax.set_ylim(0, 400)
+        ax.set_aspect('equal')
+        ax.set_xticks(range(0, 401, 50))
+        ax.set_yticks(range(0, 401, 50))
+        ax.tick_params(labelsize=7)
+        lab = f'{m // 60} h' if m % 60 == 0 else f'{m} min'
+        ax.set_title(tex(f"{lab}  (A {c['a']:.0f}%, A+B {c['ab']:.0f}%)"), fontsize=9,
+                     color=th['ink'])
+        ax.set_xlabel('reference CGM (mg/dL)', fontsize=8)
+    np.atleast_1d(axs)[0].set_ylabel('predicted BG (mg/dL)', fontsize=8)
+    fig.suptitle(tex(f"{title} · {cl['label']}"), color=th['ink'], fontsize=11)
+    fig.tight_layout()
     _save(fig, stem, _THEME)
     plt.close(fig)
 
 
 def fig_days(ex, arch, block, title, stem):
-    """Two consecutive test days: CGM and the sim-only 2-hour forecasts with 50%/90% bands."""
+    """48 hours: CGM, the sim-only 2-hour forecasts with 50%/90% bands, logged doses."""
     import matplotlib.pyplot as plt
     th = THEMES[_THEME]
     blocks = ex.get('blocks', {}).get(arch)
     if not blocks:
         return
-    days = blocks[block]
-    c = th['fam']['T1DMAI']
-    fig, axs = plt.subplots(len(days), 1, figsize=(9.6, 2.6 * len(days)), sharex=True)
-    for ax, dd in zip(np.atleast_1d(axs), days):
-        _axes(fig, ax, th)
-        ax.grid(True, axis='both', color=th['grid'], lw=0.5, ls=':')
-        for y in (70, 180):
-            ax.axhline(y, color=th['ink2'], lw=0.5, ls='--')
-        ax.plot(dd['cgm_h'], dd['cgm'], color=th['ink'], lw=1.0, label='CGM')
-        for k, o in enumerate(dd['origins']):
-            xs = o['h'] + np.array([0] + list(HORIZONS)) / 60
-            b = np.array(o['band'])
-            ax.fill_between(xs, [o['bg']] + list(b[:, 0]), [o['bg']] + list(b[:, 6]), color=c,
-                            alpha=0.15, lw=0, label=tex('90% band') if k == 0 else None)
-            ax.fill_between(xs, [o['bg']] + list(b[:, 2]), [o['bg']] + list(b[:, 4]), color=c,
-                            alpha=0.30, lw=0, label=tex('50% band') if k == 0 else None)
-            ax.plot(xs, [o['bg']] + o['pred'], color=c, lw=1.2, marker='o', ms=2.5,
-                    label='2 hour forecast' if k == 0 else None)
-            ax.scatter([o['h']], [o['bg']], s=10, color=th['ink'], zorder=4)
-        ax.set_xlim(0, 26)
-        ax.set_ylabel('Glucose (mg/dL)')
-        ax.set_title(tex(f"Test day {dd['day']}. RMSE at 60 min that day: {dd['rmse']:.0f} mg/dL"),
+    b = blocks[block]
+    red, green, purple = th['fam']['T1DMAI'], th['cat'][2], th['fam']['Foundation']
+    every = b['every_h']
+    fig, ax = plt.subplots(figsize=(16, 4.8))
+    _box(fig, ax, th)
+    cg = np.array(b['cgm'], float)
+    top = max(250.0, 50 * np.ceil((np.nanmax(cg) + 20) / 50))
+    ax.axhspan(70, 180, color=green, alpha=0.10, lw=0, zorder=0)
+    for y in (70, 180):
+        ax.axhline(y, color=red, lw=0.7, ls=':', alpha=0.8, zorder=0)
+    for w in range(0, 49, every):
+        night = w % 24 == 0
+        ax.axvline(w, color=th['ink2'] if night else th['grid'], lw=1.0 if night else 0.6,
+                   zorder=0)
+    shown = [o for o in b['origins'] if 'dense' not in o or np.isfinite(o['dense']).all()]
+    for k, o in enumerate(shown):
+        xs, med, band = _path(o)
+        xs = o['h'] + xs / 60
+        if band is not None:
+            ax.fill_between(xs, band[:, 0], band[:, 6], color=red, alpha=0.13, lw=0,
+                            label=tex('90% band') if k == 0 else None)
+            ax.fill_between(xs, band[:, 2], band[:, 4], color=red, alpha=0.28, lw=0,
+                            label=tex('50% band') if k == 0 else None)
+        ax.plot(xs, med, color=red, lw=1.2, label='forecast' if k == 0 else None)
+        ax.plot(o['h'] + np.array(HORIZONS) / 60, o['pred'], ls='none', marker='o', ms=2.4,
+                color=red, label='scored 30-120 min' if k == 0 else None)
+    ax.plot(b['cgm_h'], cg, color=th['ink'], lw=1.8, label='true CGM', zorder=3)
+    ax.set_xlim(-0.3, 50.3)
+    ax.set_ylim(40, top)
+    ax.set_ylabel('BG (mg/dL)')
+    ax.set_xticks(range(0, 51))
+    ax.set_xticklabels([f'{h % 24:02d}:00' for h in range(0, 51)], rotation=90, fontsize=5.5)
+    ax.set_xlabel('time of day (HH:MM)  ·  grey lines = midnight')
+    for w, uph in b.get('basal', []):
+        ax.text(w + every / 2, 43, f'{uph:.1f}', ha='center', va='bottom', fontsize=6,
+                color=th['ink2'])
+    _legend(ax, th, loc='upper right', ncols=3, fontsize=7)
+    sub = (f"Test days {b['days'][0]}-{b['days'][1]} · RMSE at 60 min {b['rmse'][0]:.0f} / "
+           f"{b['rmse'][1]:.0f} mg/dL · a 2 h forecast every {every} h from real context · "
+           f"bands = 50% and 90% quantiles")
+    if 'carbs' in b:
+        ax2 = ax.twinx()
+        ax2.set_ylim(-30, 140)
+        for s in ax2.spines.values():
+            s.set_color(th['spine'])
+        ax2.tick_params(colors=th['ink2'], labelcolor=th['ink'], labelsize=7)
+        ax2.set_ylabel('carb g / bolus U', color=th['ink'], fontsize=8)
+        for h, g in b['carbs']:
+            ax2.plot((h, h), (0, g), color=green, lw=1.0)
+            ax2.text(h, g + 3, f'{g:.0f}g', ha='center', va='bottom', fontsize=6, color=green)
+        for h, u in b['boluses']:
+            ax2.text(h, u - 4, f'{u:.1f}U', ha='center', va='top', fontsize=6, color=purple)
+        if b['carbs']:
+            ax2.scatter(*zip(*b['carbs']), marker='^', s=22, color=green, label='carb (g)',
+                        zorder=4)
+        if b['boluses']:
+            ax2.scatter(*zip(*b['boluses']), marker='v', s=22, color=purple, label='bolus (U)',
+                        zorder=4)
+        if b['carbs'] or b['boluses']:
+            _legend(ax2, th, loc='upper left', fontsize=7)
+        ax.set_title('2 h prediction windows (BG)  ·  grey nums = basal U per window',
                      loc='left', fontsize=9, color=th['ink'])
-    last = np.atleast_1d(axs)[-1]
-    last.set_xticks(range(0, 27, 3))
-    last.set_xlabel('Hour of the day')
-    h, lab = np.atleast_1d(axs)[0].get_legend_handles_labels()
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    _legend(fig, th, handles=h, labels=lab, loc='upper right', bbox_to_anchor=(0.99, 0.995),
-            ncols=4, handletextpad=0.4)
-    fig.suptitle(tex(title), color=th['ink'], fontsize=10, x=0.01, ha='left', y=0.995)
+        sub += (f" · logged 48 h: {sum(g for _, g in b['carbs']):.0f} g carb · "
+                f"{sum(u for _, u in b['boluses']):.1f} U bolus · {b['basal_total']:.1f} U basal")
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.suptitle(tex(f'{title} · 48 h'), color=th['ink'], fontsize=13, fontweight='bold', y=0.985)
+    fig.text(0.5, 0.925, tex(sub), ha='center', fontsize=8, color=th['ink'])
     _save(fig, stem, _THEME)
     plt.close(fig)
 
@@ -1050,7 +1206,8 @@ def main() -> None:
             rows = score_track(spec, d)
             ex = extras(spec, d) | {'dataset': dataset_stats(spec, d),
                                     'traces': traces(spec, d, rows),
-                                    'blocks': day_blocks(spec, d)}
+                                    'blocks': day_blocks(spec, d),
+                                    'clarke': clarke(spec, d, rows)}
             with open(path, 'w') as f:
                 json.dump(rows, f, indent=1)
             with open(xpath, 'w') as f:
@@ -1099,6 +1256,8 @@ def _figures(man, figdir, scored, extra, pub, shorts, cost) -> None:
             fig_traces(extra[track], stem=out, **fig)
         elif kind == 'days':
             fig_days(extra[track], stem=out, **fig)
+        elif kind == 'clarke':
+            fig_clarke(extra[track], stem=out, **fig)
         elif kind == 'cost':
             fig_cost(scored[track], cost, stem=out, **fig)
         else:
@@ -1114,6 +1273,8 @@ def _int_keys(rows: list[dict], ex: dict) -> None:
         for f in ('ci', 'strata', 'bands'):
             if f in r:
                 r[f] = {int(k): v for k, v in r[f].items()}
+    if 'clarke' in ex:
+        ex['clarke']['h'] = {int(k): v for k, v in ex['clarke']['h'].items()}
 
 
 if __name__ == '__main__':
