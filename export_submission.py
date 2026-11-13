@@ -76,6 +76,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="also write q05_30 ... q95_120, the raw quantile band (mg/dL, null where unanchored)",
     )
+    p.add_argument(
+        "--dense",
+        default=None,
+        metavar="OUT",
+        help="also write every 5-min step, pred_5 ... pred_120 and q05_5 ... q95_120, "
+        "to this parquet (mg/dL, null where unanchored, never ladder-filled)",
+    )
     return p.parse_args()
 
 
@@ -330,6 +337,25 @@ def _append_quantiles(path: str, qpred: np.ndarray, horizons: tuple, levels: tup
     pq.write_table(table, path)
 
 
+def _write_dense(table: object, dense: np.ndarray, qdense: np.ndarray, levels: tuple,
+                 out_path: str) -> None:
+    """Key columns plus ``pred_{m}`` and ``q{100τ:02d}_{m}`` for every 5-min step ``m``."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = table.select(["id", "source_file", "date"])
+    for s in range(dense.shape[1]):
+        m = 5 * (s + 1)
+        v = dense[:, s]
+        out = out.append_column(f"pred_{m}", pa.array(v, mask=np.isnan(v), type=pa.float64()))
+        for k, tau in enumerate(levels):
+            v = qdense[:, s, k]
+            out = out.append_column(f"q{round(100 * tau):02d}_{m}",
+                                    pa.array(v, mask=np.isnan(v), type=pa.float64()))
+    pq.write_table(out, out_path)
+    print(f"wrote {out_path}  {out.num_rows} rows, {dense.shape[1]} steps", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -413,6 +439,9 @@ def main() -> None:
 
     pred = np.full((len(t_epoch), len(HORIZON_MINUTES)), np.nan, dtype=np.float64)
     qpred = np.full(pred.shape + (len(QUANTILE_LEVELS),), np.nan) if args.quantiles else None
+    n_steps = PREDICTION_PATCHES * PATCH_SIZE
+    dense = np.full((len(t_epoch), n_steps), np.nan) if args.dense else None
+    qdense = np.full((len(t_epoch), n_steps, len(QUANTILE_LEVELS)), np.nan) if args.dense else None
     pos = 0
     with torch.no_grad():
         for bi, batch in enumerate(loader):
@@ -433,11 +462,15 @@ def main() -> None:
             pos += B
             for h, hs in enumerate(HORIZON_STEPS):
                 pred[rows, h] = mgdl[:, hs]
-            if qpred is not None:
+            if qpred is not None or dense is not None:
                 qm = kovatchev_f_inv(q_tau[:, :PREDICTION_PATCHES]).reshape(
                     B, -1, len(QUANTILE_LEVELS)).cpu().numpy()
+            if qpred is not None:
                 for h, hs in enumerate(HORIZON_STEPS):
                     qpred[rows, h] = qm[:, hs]
+            if dense is not None:
+                dense[rows] = mgdl
+                qdense[rows] = qm
             if bi % 200 == 0:
                 print(f"  batch {bi}  {pos}/{len(jobs['row'])}", flush=True)
     assert pos == len(jobs["row"]), f"loader covered {pos} of {len(jobs['row'])}"
@@ -449,6 +482,9 @@ def main() -> None:
     if qpred is not None:
         _append_quantiles(args.out, np.clip(qpred, BG_CLAMP_MIN, BG_CLAMP_MAX), HORIZON_MINUTES,
                           QUANTILE_LEVELS)
+    if dense is not None:
+        _write_dense(table, np.clip(dense, BG_CLAMP_MIN, BG_CLAMP_MAX),
+                     np.clip(qdense, BG_CLAMP_MIN, BG_CLAMP_MAX), QUANTILE_LEVELS, args.dense)
 
     truth = args.truth or os.path.join(
         os.path.dirname(os.path.abspath(args.cache)), "test.parquet"
