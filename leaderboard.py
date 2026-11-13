@@ -7,6 +7,7 @@ MANIFEST: {"cost"?, "figures", "tracks": {NAME: {"title", "truth", "time_gain", 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 
@@ -47,6 +48,7 @@ STYLE = {
     'ytick.right': False, 'xtick.major.size': 3.5, 'ytick.major.size': 3.5,
     'xtick.major.width': 0.8, 'ytick.major.width': 0.8, 'lines.linewidth': 1.2,
     'lines.markersize': 4.5, 'legend.frameon': True, 'savefig.dpi': 200,
+    'axes.unicode_minus': False,
 }
 MARKERS = ('o', 's', '^', 'D', 'v')
 _THEME = 'dark'
@@ -302,7 +304,10 @@ def traces(spec: dict, d: dict, rows: list[dict], n: int = 9) -> dict:
                 used.add(unit[cand[hit[0]]])
                 break
     out = []
+    seen = spec.get('future_doses') != 'zero'
     for r in picks:
+        ev = _subject_events(spec['cache'], str(d['keys'][r])) if spec.get('cache') else None
+        doses = {'future_seen': seen, **_window_doses(ev, int(d['ts'][r]))} if ev else {}
         tts, v = d['cgm'][d['keys'][r]]
         sel = (tts >= d['ts'][r] - 3600) & (tts <= d['ts'][r] + 7200)
         fut = v[sel & (tts >= d['ts'][r])]
@@ -312,7 +317,7 @@ def traces(spec: dict, d: dict, rows: list[dict], n: int = 9) -> dict:
         out.append({'name': name, 'hhmm': f'{sec // 3600:02d}:{sec % 3600 // 60:02d}',
                     'swing': float(np.nanmax(fut) - np.nanmin(fut)), 'bg': float(o[r]),
                     'cgm_min': ((tts[sel] - d['ts'][r]) / 60).tolist(), 'cgm': v[sel].tolist(),
-                    **_curve(d, i, key, r)})
+                    **_curve(d, i, key, r), **doses})
     return {'key': key, 'label': spec['entries'][i]['label'], 'windows': out}
 
 
@@ -331,12 +336,19 @@ def clarke(spec: dict, d: dict, rows: list[dict], n: int = 1000) -> dict:
     return {'key': key, 'label': spec['entries'][i]['label'], 'h': out}
 
 
-def _subject_events(cache_dir: str, key: str) -> tuple:
-    """(t0 epoch s, carb g, bolus U, basal U), each dose per 5-min slot, for one subject."""
+@functools.lru_cache(maxsize=None)
+def _finetune_cache(cache_dir: str):
     from finetune_data import FinetuneCache
-    cache = FinetuneCache(cache_dir)
+    return FinetuneCache(cache_dir)
+
+
+def _subject_events(cache_dir: str, key: str) -> tuple | None:
+    """(t0 epoch s, carb g, bolus U, basal U), each dose per 5-min slot; None if absent."""
+    cache = _finetune_cache(cache_dir)
     src, sid = key.split('\x1f')
-    rec = next(r for r in cache.subjects if (r['source'], str(r['sid'])) == (src, sid))
+    rec = next((r for r in cache.subjects if (r['source'], str(r['sid'])) == (src, sid)), None)
+    if rec is None:
+        return None
     ch = cache.channels(rec, 0, int(rec['n']))
     return (int(rec['t0']),) + tuple(np.nan_to_num(np.asarray(ch[c], np.float64))
                                      for c in ('carb_g', 'bolus_u', 'basal_u'))
@@ -351,6 +363,18 @@ def _day_rmse(d: dict, i: int) -> list[tuple[float, int]]:
         if sel.sum() >= 250:
             out.append((float(np.sqrt(np.mean((p60[sel] - t60[sel]) ** 2))), int(day)))
     return sorted(out)
+
+
+def _window_doses(ev: tuple, ts: int, lo: int = -60, hi: int = 120) -> dict:
+    """Logged doses in [ts+lo, ts+hi] min as [[minute, dose]]; basal only if injected (MDI)."""
+    e0, carb, bolus, basal = ev
+    k0 = int(round((ts - e0) / 300))
+    ks = np.arange(max(k0 + lo // 5, 0), min(k0 + hi // 5 + 1, len(carb)))
+    chans = [('carbs', carb), ('boluses', bolus)]
+    if np.count_nonzero(basal) <= 4 * len(basal) / 288:
+        chans.append(('basal_inj', basal))
+    return {name: [[float(5 * (k - k0)), float(ch[k])] for k in ks if ch[k] > 0]
+            for name, ch in chans}
 
 
 def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict:
@@ -950,6 +974,41 @@ def _path(o: dict) -> tuple:
     return np.array((0,) + HORIZONS), np.r_[o['bg'], o['pred']], band
 
 
+def _dose_marks(th):
+    """(key, color, marker, label format, legend) per dose kind."""
+    return (('carbs', th['cat'][2], '^', '{:.0f}g', 'carb (g)'),
+            ('boluses', th['fam']['Foundation'], 'v', '{:.1f}U', 'bolus (U)'),
+            ('basal_inj', th['ink2'], 'v', 'B {:.0f}U', 'basal (U)'))
+
+
+def _dose_axis(ax, th, b, fs=6, unseen_after=None):
+    """Right axis with carb stems and bolus/basal marks; hollow past ``unseen_after``."""
+    ax2 = ax.twinx()
+    ax2.set_ylim(-30, 140)
+    for s in ax2.spines.values():
+        s.set_color(th['spine'])
+    ax2.tick_params(colors=th['ink2'], labelcolor=th['ink'], labelsize=7)
+    for key, color, marker, fmt, lab in _dose_marks(th):
+        pts = b.get(key) or []
+        for x, y in pts:
+            if key == 'carbs':
+                ax2.plot((x, x), (0, y), color=color, lw=1.0)
+                ax2.text(x, y + 3, fmt.format(y), ha='center', va='bottom', fontsize=fs,
+                         color=color)
+            else:
+                up = key == 'basal_inj'
+                ax2.text(x, y + 4 if up else y - 4, fmt.format(y), ha='center',
+                         va='bottom' if up else 'top', fontsize=fs, color=color)
+        seen = [p for p in pts if unseen_after is None or p[0] <= unseen_after]
+        unseen = [p for p in pts if p not in seen]
+        if seen:
+            ax2.scatter(*zip(*seen), marker=marker, s=22, color=color, label=lab, zorder=4)
+        if unseen:
+            ax2.scatter(*zip(*unseen), marker=marker, s=22, facecolors='none',
+                        edgecolors=color, linewidths=1.0, zorder=4)
+    return ax2
+
+
 def fig_traces(ex, title, stem):
     """Example windows: CGM before and after, the forecast path, its scored 30-120 min points."""
     import matplotlib.pyplot as plt
@@ -961,8 +1020,16 @@ def fig_traces(ex, title, stem):
     nr = -(-len(ws) // 3)
     fig, axs = plt.subplots(nr, 3, figsize=(12, 2.7 * nr), squeeze=False)
     blue, red = th['cat'][0], th['fam']['T1DMAI']
-    for ax, w in zip(axs.flat, ws):
+    for k, (ax, w) in enumerate(zip(axs.flat, ws)):
         _box(fig, ax, th)
+        if 'carbs' in w:
+            ax2 = _dose_axis(ax, th, w, fs=5.5, unseen_after=None if w['future_seen'] else 0)
+            ax2.tick_params(labelsize=6, labelright=k % 3 == 2)
+            if k % 3 == 2:
+                ax2.set_ylabel('g / U', color=th['ink'], fontsize=7)
+            ax2.set_facecolor(ax.get_facecolor())
+            ax.set_zorder(ax2.get_zorder() + 1)
+            ax.patch.set_visible(False)
         for y in (70, 180):
             ax.axhline(y, color=th['grid'], lw=0.7, zorder=0)
         ax.axvline(0, color=th['grid'], lw=0.9, zorder=0)
@@ -976,15 +1043,29 @@ def fig_traces(ex, title, stem):
         ax.set_xlim(-65, 125)
         ax.set_xticks(range(-60, 121, 30))
         ax.tick_params(labelsize=7)
-        ax.set_title(tex(f"{w['name']} · swing {w['swing']:.0f} mg/dL · {w['hhmm']}"),
+        ax.set_title(tex(f"{w['name']} | swing {w['swing']:.0f} mg/dL | {w['hhmm']}"),
                      fontsize=8.5, color=th['ink'])
     for ax in axs.flat[len(ws):]:
         ax.set_visible(False)
-    _legend(axs.flat[0], th, loc='best', fontsize=7)
+    from matplotlib.lines import Line2D
+    hs, ls = axs.flat[0].get_legend_handles_labels()
+    for key, color, marker, _, lab in _dose_marks(th):
+        if any(w.get(key) for w in ws):
+            hs.append(Line2D([], [], ls='none', marker=marker, color=color))
+            ls.append(lab)
+    if any(not w.get('future_seen', True) and any(p[0] > 0 for k in ('carbs', 'boluses')
+                                                   for p in w.get(k, [])) for w in ws):
+        hs.append(Line2D([], [], ls='none', marker='v', markerfacecolor='none',
+                         color=th['ink2']))
+        ls.append('dose after 0 (not given to model)')
+    leg = fig.legend(hs, ls, loc='upper center', bbox_to_anchor=(0.5, 0.965), ncols=len(hs),
+                     fontsize=7, frameon=False)
+    for t in leg.get_texts():
+        t.set_color(th['ink'])
     fig.supxlabel('minutes from prediction start', color=th['ink'], fontsize=9)
     fig.supylabel('BG (mg/dL)', color=th['ink'], fontsize=9)
-    fig.suptitle(tex(f"{title} · {tr['label']}"), color=th['ink'], fontsize=11)
-    fig.tight_layout()
+    fig.suptitle(tex(f"{title} | {tr['label']}"), color=th['ink'], fontsize=11, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     _save(fig, stem, _THEME)
     plt.close(fig)
 
@@ -1029,7 +1110,7 @@ def fig_clarke(ex, title, stem):
                      color=th['ink'])
         ax.set_xlabel('reference CGM (mg/dL)', fontsize=8)
     np.atleast_1d(axs)[0].set_ylabel('predicted BG (mg/dL)', fontsize=8)
-    fig.suptitle(tex(f"{title} · {cl['label']}"), color=th['ink'], fontsize=11)
+    fig.suptitle(tex(f"{title} | {cl['label']}"), color=th['ink'], fontsize=11)
     fig.tight_layout()
     _save(fig, stem, _THEME)
     plt.close(fig)
@@ -1043,7 +1124,7 @@ def fig_days(ex, arch, block, title, stem):
     if not blocks:
         return
     b = blocks[block]
-    red, green, purple = th['fam']['T1DMAI'], th['cat'][2], th['fam']['Foundation']
+    red, green = th['fam']['T1DMAI'], th['cat'][2]
     every = b['every_h']
     fig, ax = plt.subplots(figsize=(16, 4.8))
     _box(fig, ax, th)
@@ -1074,40 +1155,25 @@ def fig_days(ex, arch, block, title, stem):
     ax.set_ylabel('BG (mg/dL)')
     ax.set_xticks(range(0, 51))
     ax.set_xticklabels([f'{h % 24:02d}:00' for h in range(0, 51)], rotation=90, fontsize=5.5)
-    ax.set_xlabel('time of day (HH:MM)  ·  grey lines = midnight')
+    ax.set_xlabel('time of day (HH:MM)  |  grey lines = midnight')
     for w, uph in b.get('basal', []):
         ax.text(w + every / 2, 43, f'{uph:.1f}', ha='center', va='bottom', fontsize=6,
                 color=th['ink2'])
     _legend(ax, th, loc='upper right', ncols=3, fontsize=7)
-    sub = (f"Test days {b['days'][0]}-{b['days'][1]} · RMSE at 60 min {b['rmse'][0]:.0f} / "
-           f"{b['rmse'][1]:.0f} mg/dL · a 2 h forecast every {every} h from real context · "
+    sub = (f"Test days {b['days'][0]}-{b['days'][1]} | RMSE at 60 min {b['rmse'][0]:.0f} / "
+           f"{b['rmse'][1]:.0f} mg/dL | a 2 h forecast every {every} h from real context | "
            f"bands = 50% and 90% quantiles")
     if 'carbs' in b:
-        ax2 = ax.twinx()
-        ax2.set_ylim(-30, 140)
-        for s in ax2.spines.values():
-            s.set_color(th['spine'])
-        ax2.tick_params(colors=th['ink2'], labelcolor=th['ink'], labelsize=7)
+        ax2 = _dose_axis(ax, th, b)
         ax2.set_ylabel('carb g / bolus U', color=th['ink'], fontsize=8)
-        for h, g in b['carbs']:
-            ax2.plot((h, h), (0, g), color=green, lw=1.0)
-            ax2.text(h, g + 3, f'{g:.0f}g', ha='center', va='bottom', fontsize=6, color=green)
-        for h, u in b['boluses']:
-            ax2.text(h, u - 4, f'{u:.1f}U', ha='center', va='top', fontsize=6, color=purple)
-        if b['carbs']:
-            ax2.scatter(*zip(*b['carbs']), marker='^', s=22, color=green, label='carb (g)',
-                        zorder=4)
-        if b['boluses']:
-            ax2.scatter(*zip(*b['boluses']), marker='v', s=22, color=purple, label='bolus (U)',
-                        zorder=4)
         if b['carbs'] or b['boluses']:
             _legend(ax2, th, loc='upper left', fontsize=7)
-        ax.set_title('2 h prediction windows (BG)  ·  grey nums = basal U per window',
+        ax.set_title('2 h prediction windows (BG)  |  grey nums = basal U per window',
                      loc='left', fontsize=9, color=th['ink'])
-        sub += (f" · logged 48 h: {sum(g for _, g in b['carbs']):.0f} g carb · "
-                f"{sum(u for _, u in b['boluses']):.1f} U bolus · {b['basal_total']:.1f} U basal")
+        sub += (f" | logged 48 h: {sum(g for _, g in b['carbs']):.0f} g carb, "
+                f"{sum(u for _, u in b['boluses']):.1f} U bolus, {b['basal_total']:.1f} U basal")
     fig.tight_layout(rect=(0, 0, 1, 0.9))
-    fig.suptitle(tex(f'{title} · 48 h'), color=th['ink'], fontsize=13, fontweight='bold', y=0.985)
+    fig.suptitle(tex(f'{title} | 48 h'), color=th['ink'], fontsize=13, fontweight='bold', y=0.985)
     fig.text(0.5, 0.925, tex(sub), ha='center', fontsize=8, color=th['ink'])
     _save(fig, stem, _THEME)
     plt.close(fig)
