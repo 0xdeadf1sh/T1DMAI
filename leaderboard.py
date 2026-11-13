@@ -378,7 +378,7 @@ def _window_doses(ev: tuple, ts: int, lo: int = -60, hi: int = 120) -> dict:
 
 
 def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict:
-    """Per sim-only model: n_blocks 48-hour spans of consecutive test days, spread evenly."""
+    """Per LoRA model: n_blocks 48-hour spans of consecutive test days, spread evenly."""
     if len(np.unique(d['keys'])) != 1:
         return {}
     idx = {e['key']: i for i, e in enumerate(spec['entries'])}
@@ -386,8 +386,8 @@ def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict
     tts, v = d['cgm'][subject]
     ev = _subject_events(spec['cache'], subject) if spec.get('cache') else None
     out = {}
-    for zs in sorted(k for k in d['bands'] if k.endswith('_zs')):
-        full = {day: e for e, day in _day_rmse(d, idx[zs])}
+    for key in sorted(k for k in d['bands'] if k.endswith('_lora1')):
+        full = {day: e for e, day in _day_rmse(d, idx[key])}
         starts = [day for day in sorted(full) if day + 1 in full]
         picks = [starts[int(round(p))] for p in np.linspace(0, len(starts) - 1, n_blocks)]
         blocks = []
@@ -400,7 +400,7 @@ def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict
                    'rmse': [full[first], full[first + 1]], 'every_h': every_h,
                    'cgm_h': ((tts[cs] - t0) / 3600).tolist(), 'cgm': v[cs].tolist(),
                    'origins': [{'h': float((d['ts'][r] - t0) / 3600), 'bg': float(d['origin'][r]),
-                                **_curve(d, idx[zs], zs, r)} for r in org]}
+                                **_curve(d, idx[key], key, r)} for r in org]}
             if ev is not None:
                 e0, carb, bolus, basal = ev
                 k0 = int(round((t0 - e0) / 300))
@@ -414,7 +414,7 @@ def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict
                                 for w in range(0, 48, every_h)]
                 blk['basal_total'] = float(basal[ks].sum())
             blocks.append(blk)
-        out[zs.removesuffix('_zs')] = blocks
+        out[key.removesuffix('_lora1')] = blocks
     return out
 
 
@@ -1117,7 +1117,7 @@ def fig_clarke(ex, title, stem):
 
 
 def fig_days(ex, arch, block, title, stem):
-    """48 hours: CGM, the sim-only 2-hour forecasts with 50%/90% bands, logged doses."""
+    """48 hours: CGM, the LoRA 2-hour forecasts with 50%/90% bands, logged doses."""
     import matplotlib.pyplot as plt
     th = THEMES[_THEME]
     blocks = ex.get('blocks', {}).get(arch)
