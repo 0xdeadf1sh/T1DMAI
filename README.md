@@ -71,8 +71,8 @@ For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biom
 
 All models suck. XGBoost is the best one but my own model comes close. More details below:
 
-1. On my data, D16 DILATE + LoRA comes 3rd of 26 (22.8), behind XGBoost (22.2) and LightGBM
-   (22.4). Wilcoxon puts it level with both at 60 and 90 min, behind them at 30 and 120.
+1. On my data, D16 DILATE + LoRA comes 3rd of 26 (22.8), behind XGBoost and LightGBM
+   (both 22.4). Wilcoxon over test days cannot tell it from the best model at any horizon.
 2. On MetaboNet, D16 DILATE + LoRA comes 9th (34.6) but has the lowest RMSE of all models at
    90 min. XGBoost leads at 30, 60 and 120.
 3. At 60 min a 3771 parameter LoRA adapter helps both models on both datasets: 26.1 to 22.8 and
@@ -82,11 +82,11 @@ All models suck. XGBoost is the best one but my own model comes close. More deta
    60 min with sim only and 81-85% with LoRA. On my data both are 83-85%.
 5. T1DMAI + LoRA reacts earliest on my data: 40-50 min time gain at 60 min, against 30 for
    XGBoost.
-6. It also catches the most lows on my data: 40-47% at 60 min, against 29% for XGBoost. On
+6. It also catches the most lows on my data: 40-47% at 60 min, against 28% for XGBoost. On
    MetaboNet every low-RMSE model misses nearly all lows (XGBoost 0%, T1DMAI 6-8%), while
    linear extrapolation catches 58%.
 7. LightGBM matches XGBoost within 0.2 mg/dL everywhere. An LSTM with 15 hours of history comes
-   3rd on MetaboNet (33.6 at 60 min), against 35.9 for the 2 hour one.
+   4th on MetaboNet (33.9 at 60 min), against 35.9 for the 2 hour one.
 8. Zero-shot Chronos-2 and TimesFM 2.5 beat zero-shot Chronos-Bolt by 1.4-2.7 mg/dL at 60 min
    on both datasets, but trail fine-tuned Chronos-Bolt.
 
@@ -180,14 +180,16 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | --- | --- | --- |
 | Forecasts | every 5 min of the test days | every 10th row of the leaderboard template |
 | Horizons | 30, 60, 90, 120 min | 30, 60, 90, 120 min |
-| Training windows, other models | 60000 | 351000 (200000 for fine-tuned Chronos) |
+| Training windows, other models | 50000 | 338000 (135000 for fine-tuned Chronos) |
 | LoRA steps | 2000 | 6000 |
 
 - LoRA checkpoints are picked by mean RMSE on the last 10 days of each subject's training data.
+- The other models never train on those 10 days. The neural ones pick their epoch on the first 5.
+- A training window ends on a measured reading and is scored on measured readings only.
 - All models forecast at the same moments.
 - 95% intervals: bootstrap over people (MetaboNet) or days (my data).
-- Significance: Wilcoxon signed-rank on paired absolute errors against the best model,
-  Bonferroni corrected.
+- Significance: Wilcoxon signed-rank against the best model on the mean paired absolute-error
+  difference per person (MetaboNet) or per day (my data), Bonferroni corrected.
 - Clinical error grids: DTS [20], Clarke [22], CG-EGA [21].
 
 ## 6. Results
@@ -224,12 +226,12 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-significance-dark.png">
-  <img alt="Wilcoxon test against the lowest-RMSE model, my data" src="screenshots/personal-significance.png">
+  <img alt="Wilcoxon test over days against the lowest-RMSE model, my data" src="screenshots/personal-significance.png">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/metabonet-significance-dark.png">
-  <img alt="Wilcoxon test against the lowest-RMSE model, MetaboNet" src="screenshots/metabonet-significance.png">
+  <img alt="Wilcoxon test over people against the lowest-RMSE model, MetaboNet" src="screenshots/metabonet-significance.png">
 </picture>
 
 <picture>
@@ -398,30 +400,30 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | Family | RMSE 30 | RMSE 60 | RMSE 90 | RMSE 120 | gRMSE 60 | MARD 30 | MARD 60 | MARD 120 | ME 60 | MRE 60 % | TG 30 | TG 60 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | Classical | 14.7 * | 22.2 * | 26.9 * | 31.1 * | 24.2 | 8.5 | 13.4 | 19.8 | +0.8 | +3.1 | 15 | 30 |
-| LightGBM | Classical | 14.7 * | 22.4 * | 27.0 * | 31.0 * | 24.4 | 8.5 | 13.4 | 19.8 | +0.9 | +3.2 | 15 | 30 |
-| T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 15.2 | 22.8 * | 27.4 * | 31.7 | 24.7 | 8.8 | 13.5 | 20.3 | -1.6 | +1.2 | 15 | 40 |
-| SVR | Classical | 15.1 * | 23.0 | 27.8 | 31.6 | 24.9 | 8.5 | 13.6 | 20.0 | -0.7 | +1.8 | 10 | 25 |
-| LSTM (15 h) | Deep | 15.2 | 23.2 | 28.3 | 32.5 | 24.9 | 8.9 | 14.3 | 21.5 | +2.0 | +4.0 | 10 | 25 |
-| PatchTST | Deep | 15.1 | 23.3 | 28.9 | 33.1 | 25.0 | 8.9 | 14.3 | 21.8 | +1.3 | +3.3 | 10 | 25 |
-| Sparse GP | Classical | 15.4 | 23.5 | 28.3 | 32.1 | 25.6 | 9.1 | 14.4 | 21.0 | +0.8 | +3.4 | 10 | 25 |
-| T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 15.1 | 23.5 | 28.4 | 32.4 | 25.4 | 8.7 | 13.9 | 20.3 | -0.2 | +2.0 | 20 | 50 |
-| GluNet | Deep | 15.4 | 23.6 | 29.6 | 34.4 | 25.3 | 8.9 | 14.3 | 22.3 | +1.0 | +2.8 | 10 | 25 |
-| ARX (ridge) | Classical | 15.7 | 24.1 | 28.6 | 31.6 | 26.3 | 9.4 | 15.1 | 21.2 | +1.0 | +4.0 | 10 | 15 |
-| LSTM | Deep | 15.4 | 24.3 | 30.6 | 35.8 | 25.7 | 8.9 | 14.6 | 22.9 | +0.2 | +1.9 | 10 | 20 |
-| N-HiTS | Deep | 15.8 | 25.0 | 31.4 | 36.0 | 26.6 | 9.5 | 15.5 | 23.3 | +2.0 | +3.5 | 15 | 30 |
+| XGBoost | Classical | 14.6 * | 22.4 * | 27.5 * | 31.6 * | 24.3 | 8.5 | 13.4 | 20.1 | +1.1 | +3.3 | 15 | 30 |
+| LightGBM | Classical | 14.6 * | 22.4 * | 27.6 * | 31.5 * | 24.4 | 8.5 | 13.4 | 20.2 | +1.1 | +3.3 | 15 | 30 |
+| T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 15.2 * | 22.8 * | 27.4 * | 31.7 * | 24.7 | 8.8 | 13.5 | 20.3 | -1.6 | +1.2 | 15 | 40 |
+| LSTM (15 h) | Deep | 15.1 | 23.2 | 28.6 * | 32.9 | 24.9 | 8.9 | 14.4 | 21.9 | +2.5 | +4.4 | 10 | 20 |
+| PatchTST | Deep | 15.1 | 23.3 | 28.8 * | 33.0 | 25.0 | 8.9 | 14.3 | 21.8 | +1.5 | +3.4 | 10 | 20 |
+| SVR | Classical | 15.2 * | 23.4 * | 28.4 * | 31.8 * | 25.3 | 8.6 | 13.7 | 20.0 | -0.9 | +1.6 | 10 | 20 |
+| T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 15.1 * | 23.5 * | 28.4 * | 32.4 * | 25.4 | 8.7 | 13.9 | 20.3 | -0.2 | +2.0 | 20 | 50 |
+| Sparse GP | Classical | 15.4 | 23.7 | 28.9 * | 32.8 * | 25.8 | 9.0 | 14.4 | 21.2 | +0.7 | +3.1 | 10 | 20 |
+| GluNet | Deep | 15.4 | 24.0 | 29.8 | 34.5 | 25.6 | 8.9 | 14.4 | 22.3 | +1.0 | +2.8 | 10 | 20 |
+| LSTM | Deep | 15.3 | 24.2 | 30.6 | 35.7 | 25.7 | 8.8 | 14.5 | 22.8 | +0.4 | +2.0 | 10 | 20 |
+| ARX (ridge) | Classical | 15.8 | 24.3 | 28.9 * | 31.8 * | 26.5 | 9.4 | 15.2 | 21.3 | +0.9 | +3.9 | 5 | 15 |
+| N-HiTS | Deep | 15.5 | 24.7 | 30.6 | 34.6 | 26.2 | 9.1 | 15.0 | 22.1 | +2.7 | +3.9 | 10 | 20 |
 | T1DMAI D16 DILATE (sim only) | T1DMAI | 16.2 | 26.1 | 33.2 | 39.9 | 28.6 | 9.6 | 16.0 | 25.2 | +0.6 | +3.9 | 10 | 15 |
 | T1DMAI D16 MSE (sim only) | T1DMAI | 16.8 | 27.1 | 33.9 | 37.5 | 29.8 | 9.9 | 16.8 | 24.4 | +1.2 | +4.8 | 10 | 15 |
-| AR (ridge) | Classical | 17.2 | 27.3 | 32.3 | 34.5 | 30.3 | 10.3 | 17.2 | 23.0 | -0.1 | +4.1 | 5 | 5 |
-| Chronos-Bolt tiny (fine-tuned) | Foundation | 17.3 | 27.3 | 33.0 | 36.0 | 30.0 | 9.8 | 16.4 | 23.4 | -2.2 | +1.7 | 5 | 10 |
-| Chronos-Bolt mini (fine-tuned) | Foundation | 17.3 | 27.3 | 32.9 | 36.0 | 29.9 | 9.8 | 16.5 | 23.6 | -1.5 | +2.2 | 5 | 10 |
+| AR (ridge) | Classical | 17.2 | 27.5 | 32.5 | 34.7 | 30.3 | 10.3 | 17.2 | 23.1 | -0.0 | +4.1 | 5 | 5 |
+| Chronos-Bolt tiny (fine-tuned) | Foundation | 17.5 | 27.5 | 33.1 | 36.1 | 30.1 | 9.8 | 16.4 | 23.5 | -2.2 | +1.6 | 5 | 10 |
+| Chronos-Bolt mini (fine-tuned) | Foundation | 17.5 | 27.6 | 33.1 | 36.1 | 30.1 | 9.8 | 16.5 | 23.7 | -1.8 | +1.9 | 5 | 10 |
 | TimesFM 2.5 (zero-shot) | Foundation | 18.4 | 29.1 | 35.8 | 39.4 | 31.5 | 10.5 | 17.4 | 25.1 | -1.5 | +2.0 | 5 | 5 |
 | Chronos-2 (zero-shot) | Foundation | 17.8 | 29.4 | 36.4 | 40.0 | 31.8 | 10.2 | 17.7 | 25.5 | -1.0 | +2.5 | 5 | 10 |
-| SARIMAX | Classical | 17.7 | 29.8 | 38.6 | 45.4 | 31.6 | 10.2 | 17.9 | 28.8 | -3.5 | -0.6 | 5 | 5 |
+| SARIMAX | Classical | 17.7 | 29.8 | 38.7 | 45.5 | 31.6 | 10.2 | 17.9 | 28.8 | -3.8 | -0.9 | 5 | 5 |
 | Chronos-Bolt tiny (zero-shot) | Foundation | 18.7 | 30.8 | 38.3 | 42.0 | 32.9 | 10.8 | 18.5 | 27.1 | +0.8 | +3.5 | 5 | 5 |
 | Chronos-Bolt mini (zero-shot) | Foundation | 18.7 | 30.9 | 38.3 | 42.4 | 32.9 | 10.7 | 18.5 | 27.2 | +1.0 | +3.6 | 5 | 10 |
 | Kalman filter | Classical | 18.5 | 31.3 | 39.6 | 45.0 | 33.2 | 10.6 | 18.7 | 28.6 | +0.2 | +2.7 | 0 | 5 |
-| ARIMA | Classical | 18.6 | 31.4 | 39.7 | 45.1 | 33.3 | 10.7 | 18.8 | 28.7 | +0.2 | +2.7 | 0 | 5 |
+| ARIMA | Classical | 18.7 | 31.5 | 39.8 | 45.1 | 33.3 | 10.7 | 18.8 | 28.7 | +0.2 | +2.7 | 0 | 5 |
 | Persistence | Baseline | 20.0 | 32.1 | 39.7 | 44.7 | 34.2 | 11.7 | 19.4 | 28.5 | +0.2 | +3.3 | 0 | 0 |
 | Linear extrapolation | Baseline | 24.3 | 48.9 | 71.0 | 89.2 | 50.1 | 13.3 | 27.9 | 56.4 | +0.1 | -0.3 | 10 | 15 |
 
@@ -429,30 +431,30 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | DTS A 30 | DTS A 60 | DTS A 120 | DTS A+B 120 | Clarke A 60 | Clarke A+B 120 | CG-EGA hypo AP 30 | hypo EP 60 | eu EP 60 | hyper EP 60 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | 91.5 | 78.3 | 62.8 | 96.9 | 78.6 | 96.6 | 77.7 | 51.9 | 0.0 | 0.1 |
-| LightGBM | 91.4 | 78.0 | 62.7 | 96.9 | 78.4 | 96.6 | 77.7 | 50.3 | 0.0 | 0.3 |
+| XGBoost | 91.3 | 77.9 | 62.7 | 96.9 | 78.3 | 96.6 | 78.4 | 51.3 | 0.0 | 0.1 |
+| LightGBM | 91.4 | 78.0 | 62.1 | 96.8 | 78.3 | 96.6 | 77.7 | 57.7 | 0.0 | 0.1 |
 | T1DMAI D16 DILATE (sim + LoRA) | 90.7 | 78.0 | 60.7 | 96.8 | 78.3 | 97.0 | 83.2 | 38.4 | 0.0 | 0.1 |
-| SVR | 91.3 | 77.5 | 61.3 | 97.3 | 77.8 | 97.1 | 83.5 | 47.4 | 0.0 | 0.8 |
-| LSTM (15 h) | 91.0 | 76.0 | 58.3 | 97.2 | 76.3 | 96.7 | 82.6 | 48.7 | 0.0 | 0.1 |
-| PatchTST | 90.9 | 75.0 | 57.6 | 96.5 | 75.3 | 96.9 | 82.3 | 48.1 | 0.0 | 0.4 |
-| Sparse GP | 89.9 | 75.7 | 59.2 | 97.1 | 76.1 | 96.8 | 71.9 | 58.7 | 0.0 | 0.8 |
+| LSTM (15 h) | 90.9 | 75.0 | 58.1 | 96.6 | 75.3 | 96.7 | 81.9 | 49.4 | 0.0 | 0.1 |
+| PatchTST | 90.8 | 75.8 | 57.8 | 96.7 | 76.1 | 96.8 | 82.9 | 46.8 | 0.0 | 0.7 |
+| SVR | 91.2 | 77.4 | 61.2 | 97.1 | 77.8 | 97.0 | 81.6 | 45.8 | 0.0 | 0.5 |
 | T1DMAI D16 MSE (sim + LoRA) | 91.2 | 76.4 | 60.0 | 96.7 | 76.7 | 97.0 | 88.1 | 35.5 | 0.0 | 0.3 |
-| GluNet | 90.7 | 75.8 | 56.3 | 96.0 | 76.1 | 96.8 | 86.8 | 42.3 | 0.0 | 0.1 |
-| ARX (ridge) | 90.0 | 73.7 | 59.5 | 96.7 | 74.0 | 96.7 | 69.7 | 72.3 | 0.0 | 0.1 |
-| LSTM | 90.8 | 75.6 | 55.3 | 95.5 | 75.9 | 97.1 | 89.4 | 31.6 | 0.0 | 0.1 |
-| N-HiTS | 89.8 | 72.4 | 54.5 | 95.4 | 72.8 | 97.1 | 84.2 | 33.9 | 0.0 | 0.1 |
+| Sparse GP | 90.2 | 75.2 | 58.4 | 96.8 | 75.6 | 96.8 | 76.8 | 57.4 | 0.0 | 0.3 |
+| GluNet | 90.5 | 75.4 | 55.2 | 96.3 | 75.6 | 96.8 | 85.8 | 41.3 | 0.0 | 0.3 |
+| LSTM | 91.1 | 75.4 | 55.4 | 95.4 | 75.8 | 97.1 | 89.7 | 31.9 | 0.0 | 0.1 |
+| ARX (ridge) | 89.9 | 73.8 | 59.1 | 96.7 | 74.1 | 96.7 | 72.9 | 69.7 | 0.0 | 0.1 |
+| N-HiTS | 90.7 | 73.4 | 56.6 | 96.4 | 73.8 | 97.0 | 85.2 | 35.8 | 0.0 | 0.1 |
 | T1DMAI D16 DILATE (sim only) | 89.0 | 72.1 | 50.8 | 93.0 | 72.4 | 95.8 | 73.5 | 62.6 | 0.1 | 0.4 |
 | T1DMAI D16 MSE (sim only) | 88.2 | 69.7 | 54.0 | 93.9 | 70.1 | 96.2 | 69.4 | 71.9 | 0.1 | 0.5 |
-| AR (ridge) | 87.1 | 67.7 | 55.7 | 95.9 | 67.9 | 96.5 | 53.2 | 97.7 | 0.0 | 0.3 |
-| Chronos-Bolt tiny (fine-tuned) | 88.3 | 69.8 | 54.1 | 95.8 | 70.0 | 96.4 | 71.6 | 76.5 | 0.0 | 0.3 |
-| Chronos-Bolt mini (fine-tuned) | 88.2 | 69.5 | 54.0 | 95.6 | 69.7 | 96.4 | 73.9 | 80.6 | 0.0 | 0.4 |
+| AR (ridge) | 87.1 | 67.6 | 55.4 | 95.9 | 67.7 | 96.5 | 55.5 | 96.8 | 0.0 | 0.3 |
+| Chronos-Bolt tiny (fine-tuned) | 88.2 | 69.6 | 54.0 | 95.7 | 69.9 | 96.4 | 75.5 | 69.4 | 0.0 | 0.3 |
+| Chronos-Bolt mini (fine-tuned) | 88.1 | 69.4 | 54.1 | 95.4 | 69.7 | 96.4 | 81.3 | 71.0 | 0.0 | 0.4 |
 | TimesFM 2.5 (zero-shot) | 86.1 | 67.3 | 51.8 | 93.9 | 67.6 | 96.5 | 78.4 | 61.0 | 0.0 | 0.3 |
 | Chronos-2 (zero-shot) | 87.1 | 66.6 | 51.6 | 93.8 | 66.9 | 95.8 | 82.9 | 63.5 | 0.0 | 0.4 |
-| SARIMAX | 87.6 | 64.7 | 43.5 | 89.8 | 65.2 | 97.4 | 90.6 | 27.4 | 0.0 | 0.3 |
+| SARIMAX | 87.5 | 64.8 | 43.5 | 89.6 | 65.3 | 97.4 | 91.3 | 26.5 | 0.0 | 0.3 |
 | Chronos-Bolt tiny (zero-shot) | 86.0 | 64.4 | 49.5 | 92.4 | 64.7 | 95.8 | 79.4 | 53.9 | 0.0 | 0.3 |
 | Chronos-Bolt mini (zero-shot) | 86.2 | 64.6 | 49.9 | 92.3 | 64.9 | 95.6 | 82.6 | 54.5 | 0.0 | 0.3 |
 | Kalman filter | 86.1 | 64.0 | 47.1 | 90.8 | 64.3 | 96.1 | 85.2 | 46.8 | 0.1 | 0.3 |
-| ARIMA | 86.0 | 64.0 | 46.9 | 90.8 | 64.3 | 96.0 | 85.2 | 46.8 | 0.1 | 0.3 |
+| ARIMA | 85.9 | 63.9 | 47.0 | 90.8 | 64.3 | 96.0 | 84.5 | 46.5 | 0.1 | 0.3 |
 | Persistence | 82.9 | 62.5 | 47.5 | 91.0 | 63.1 | 96.1 | 79.7 | 51.3 | 0.0 | 0.3 |
 | Linear extrapolation | 78.7 | 50.5 | 25.9 | 65.9 | 51.3 | 83.2 | 91.9 | 23.2 | 2.0 | 2.6 |
 
@@ -460,34 +462,34 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | Sens 30 | Sens 60 | Spec 60 | PPV 60 | MCC 30 | MCC 60 | RMSE<70 30 | ME<70 30 | ME<70 60 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | 0.49 | 0.29 | 0.997 | 0.73 | 0.62 | 0.45 | 13.1 | +9.1 | +17.6 |
-| LightGBM | 0.48 | 0.31 | 0.996 | 0.70 | 0.62 | 0.45 | 12.8 | +9.0 | +17.1 |
+| XGBoost | 0.49 | 0.28 | 0.996 | 0.71 | 0.63 | 0.43 | 12.2 | +8.3 | +17.1 |
+| LightGBM | 0.52 | 0.24 | 0.996 | 0.64 | 0.64 | 0.38 | 12.3 | +8.7 | +17.8 |
 | T1DMAI D16 DILATE (sim + LoRA) | 0.63 | 0.40 | 0.993 | 0.65 | 0.69 | 0.50 | 11.3 | +6.2 | +13.0 |
-| SVR | 0.62 | 0.34 | 0.992 | 0.58 | 0.66 | 0.43 | 10.7 | +6.2 | +14.4 |
-| LSTM (15 h) | 0.59 | 0.36 | 0.993 | 0.62 | 0.66 | 0.46 | 11.2 | +5.7 | +13.8 |
-| PatchTST | 0.57 | 0.39 | 0.989 | 0.52 | 0.63 | 0.43 | 11.7 | +4.9 | +11.7 |
-| Sparse GP | 0.51 | 0.23 | 0.995 | 0.57 | 0.60 | 0.35 | 13.7 | +9.5 | +19.0 |
+| LSTM (15 h) | 0.56 | 0.35 | 0.992 | 0.58 | 0.63 | 0.44 | 10.9 | +6.2 | +13.9 |
+| PatchTST | 0.59 | 0.40 | 0.990 | 0.54 | 0.64 | 0.45 | 11.2 | +4.7 | +11.5 |
+| SVR | 0.59 | 0.34 | 0.992 | 0.55 | 0.64 | 0.42 | 11.3 | +6.6 | +14.1 |
 | T1DMAI D16 MSE (sim + LoRA) | 0.66 | 0.47 | 0.992 | 0.64 | 0.70 | 0.54 | 10.3 | +4.7 | +10.9 |
-| GluNet | 0.66 | 0.49 | 0.987 | 0.55 | 0.66 | 0.50 | 11.1 | +3.3 | +8.5 |
-| ARX (ridge) | 0.38 | 0.18 | 0.995 | 0.54 | 0.49 | 0.30 | 13.4 | +10.1 | +21.5 |
-| LSTM | 0.70 | 0.53 | 0.983 | 0.50 | 0.65 | 0.50 | 10.3 | +1.5 | +5.2 |
-| N-HiTS | 0.65 | 0.53 | 0.984 | 0.50 | 0.66 | 0.50 | 12.4 | +3.0 | +7.8 |
+| Sparse GP | 0.53 | 0.24 | 0.995 | 0.61 | 0.61 | 0.37 | 12.6 | +8.8 | +17.9 |
+| GluNet | 0.66 | 0.50 | 0.987 | 0.55 | 0.67 | 0.51 | 11.0 | +3.6 | +9.0 |
+| LSTM | 0.70 | 0.53 | 0.983 | 0.49 | 0.66 | 0.49 | 10.1 | +1.4 | +5.0 |
+| ARX (ridge) | 0.41 | 0.20 | 0.995 | 0.53 | 0.51 | 0.31 | 12.9 | +9.5 | +20.7 |
+| N-HiTS | 0.65 | 0.51 | 0.987 | 0.54 | 0.66 | 0.51 | 11.6 | +3.3 | +8.6 |
 | T1DMAI D16 DILATE (sim only) | 0.51 | 0.21 | 0.997 | 0.69 | 0.64 | 0.37 | 13.2 | +9.2 | +20.2 |
 | T1DMAI D16 MSE (sim only) | 0.42 | 0.14 | 0.997 | 0.62 | 0.58 | 0.28 | 14.1 | +10.5 | +22.3 |
-| AR (ridge) | 0.22 | 0.00 | 0.999 | 0.00 | 0.33 | -0.00 | 16.1 | +14.3 | +31.4 |
-| Chronos-Bolt tiny (fine-tuned) | 0.43 | 0.07 | 0.993 | 0.24 | 0.48 | 0.11 | 13.4 | +10.1 | +23.4 |
-| Chronos-Bolt mini (fine-tuned) | 0.46 | 0.06 | 0.994 | 0.23 | 0.51 | 0.11 | 12.9 | +9.5 | +24.4 |
+| AR (ridge) | 0.23 | 0.00 | 0.999 | 0.00 | 0.33 | -0.01 | 15.8 | +13.9 | +30.3 |
+| Chronos-Bolt tiny (fine-tuned) | 0.49 | 0.12 | 0.991 | 0.30 | 0.51 | 0.18 | 12.5 | +8.6 | +21.8 |
+| Chronos-Bolt mini (fine-tuned) | 0.53 | 0.10 | 0.991 | 0.25 | 0.54 | 0.14 | 11.9 | +7.9 | +22.1 |
 | TimesFM 2.5 (zero-shot) | 0.54 | 0.27 | 0.987 | 0.39 | 0.55 | 0.31 | 13.3 | +7.0 | +19.1 |
 | Chronos-2 (zero-shot) | 0.59 | 0.24 | 0.983 | 0.31 | 0.53 | 0.25 | 11.7 | +5.7 | +21.5 |
-| SARIMAX | 0.71 | 0.55 | 0.964 | 0.32 | 0.60 | 0.40 | 9.2 | +2.3 | +7.6 |
+| SARIMAX | 0.72 | 0.58 | 0.963 | 0.33 | 0.60 | 0.41 | 9.1 | +2.0 | +6.7 |
 | Chronos-Bolt tiny (zero-shot) | 0.55 | 0.34 | 0.980 | 0.34 | 0.51 | 0.32 | 12.3 | +6.4 | +17.8 |
 | Chronos-Bolt mini (zero-shot) | 0.60 | 0.29 | 0.982 | 0.34 | 0.54 | 0.30 | 11.9 | +5.8 | +18.5 |
 | Kalman filter | 0.63 | 0.40 | 0.974 | 0.33 | 0.56 | 0.34 | 10.7 | +5.6 | +15.0 |
-| ARIMA | 0.63 | 0.40 | 0.974 | 0.33 | 0.56 | 0.34 | 10.7 | +5.7 | +14.9 |
+| ARIMA | 0.62 | 0.40 | 0.974 | 0.32 | 0.56 | 0.34 | 10.8 | +5.8 | +14.9 |
 | Persistence | 0.55 | 0.36 | 0.981 | 0.36 | 0.54 | 0.34 | 12.8 | +8.1 | +18.1 |
 | Linear extrapolation | 0.79 | 0.72 | 0.872 | 0.15 | 0.47 | 0.29 | 11.1 | -1.8 | -3.5 |
 
-9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon test on absolute errors, alpha 0.05/25).
+9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/25).
 
 </details>
 
@@ -498,96 +500,96 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | Family | RMSE 30 | RMSE 60 | RMSE 90 | RMSE 120 | gRMSE 60 | MARD 30 | MARD 60 | MARD 120 | ME 60 | MRE 60 % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | Classical | 19.8 * | 33.2 * | 41.3 | 46.0 * | 40.3 | 10.6 | 18.6 | 27.2 | +0.5 | +6.3 |
-| LightGBM | Classical | 19.8 | 33.2 | 41.3 | 46.0 * | 40.3 | 10.6 | 18.7 | 27.2 | +0.5 | +6.3 |
-| LSTM (15 h) | Deep | 20.3 | 33.6 | 41.5 | 46.1 * | 40.3 | 10.8 | 18.6 | 26.9 | -0.0 | +5.4 |
-| SVR | Classical | 20.4 | 33.9 * | 41.9 | 46.6 * | 40.9 | 10.5 | 18.1 | 25.5 | -2.5 | +3.5 |
-| Sparse GP | Classical | 20.8 | 34.3 | 42.1 | 46.6 | 41.6 | 11.1 | 19.1 | 27.5 | +0.3 | +6.3 |
-| N-HiTS | Deep | 20.6 | 34.4 | 42.7 | 47.8 | 40.8 | 11.0 | 19.0 | 27.4 | +0.5 | +5.4 |
-| PatchTST | Deep | 20.3 | 34.4 | 42.9 | 48.0 | 40.7 | 10.7 | 19.0 | 27.7 | +0.7 | +5.5 |
-| Chronos-Bolt mini (fine-tuned) | Foundation | 21.1 | 34.5 | 42.0 | 46.2 * | 40.9 | 10.8 | 18.1 | 25.0 | -2.6 | +2.6 |
+| XGBoost | Classical | 19.8 * | 33.2 * | 41.3 | 46.0 * | 40.3 | 10.6 | 18.6 | 27.1 | +0.5 | +6.3 |
+| LightGBM | Classical | 19.8 * | 33.2 | 41.3 | 46.0 * | 40.3 | 10.6 | 18.7 | 27.1 | +0.6 | +6.4 |
+| Sparse GP | Classical | 20.4 | 33.7 | 41.6 | 46.2 | 40.8 | 10.9 | 18.9 | 27.2 | +0.4 | +6.2 |
+| LSTM (15 h) | Deep | 20.6 | 33.9 | 41.8 | 46.5 | 40.7 | 10.9 | 18.7 | 27.0 | -0.1 | +5.3 |
+| SVR | Classical | 20.4 | 34.0 | 42.0 | 46.8 * | 41.0 | 10.6 | 18.0 | 25.2 | -3.3 | +2.8 |
+| N-HiTS | Deep | 20.6 | 34.3 | 42.7 | 47.8 | 40.8 | 11.0 | 18.9 | 27.5 | +0.5 | +5.4 |
+| PatchTST | Deep | 20.4 | 34.5 | 42.9 | 48.0 | 40.7 | 10.7 | 19.0 | 27.7 | +0.8 | +5.6 |
+| Chronos-Bolt mini (fine-tuned) | Foundation | 21.0 | 34.5 | 42.0 | 46.2 * | 40.8 | 10.8 | 18.1 | 25.0 | -2.1 | +3.0 |
 | T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 21.5 | 34.6 | 41.0 * | 50.4 | 41.2 | 10.9 | 18.0 | 25.2 | -3.5 | +2.0 |
-| Chronos-Bolt tiny (fine-tuned) | Foundation | 21.2 | 34.6 | 42.2 | 46.3 * | 41.0 | 10.9 | 18.2 | 25.0 | -2.4 | +2.8 |
-| GluNet | Deep | 20.6 | 34.8 | 43.6 | 49.0 | 41.1 | 10.8 | 19.0 | 27.7 | +0.2 | +4.9 |
-| TimesFM 2.5 (zero-shot) | Foundation | 20.7 | 35.0 | 43.3 | 47.9 * | 41.4 | 10.7 | 18.6 | 26.1 | -1.7 | +3.2 |
+| Chronos-Bolt tiny (fine-tuned) | Foundation | 21.1 | 34.6 | 42.1 | 46.2 * | 41.0 | 10.9 | 18.2 | 25.0 | -2.3 | +2.9 |
+| GluNet | Deep | 20.5 | 34.8 | 43.6 | 49.0 | 41.1 | 10.8 | 18.9 | 27.8 | +0.4 | +5.0 |
+| TimesFM 2.5 (zero-shot) | Foundation | 20.7 | 35.0 | 43.3 | 47.9 | 41.4 | 10.7 | 18.6 | 26.1 | -1.7 | +3.2 |
 | T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 21.8 | 35.1 | 41.0 * | 46.8 * | 41.3 | 11.2 | 18.1 | 25.1 | -3.8 | +1.3 |
 | Chronos-2 (zero-shot) | Foundation | 21.0 | 35.3 | 43.4 | 48.0 | 41.6 | 10.8 | 18.7 | 26.2 | -1.3 | +3.6 |
-| ARX (ridge) | Classical | 21.3 | 35.4 | 43.5 | 47.9 | 42.3 | 11.7 | 20.5 | 29.5 | +2.6 | +8.1 |
-| AR (ridge) | Classical | 21.4 | 35.6 | 43.6 | 48.1 | 42.4 | 11.7 | 20.7 | 29.9 | +3.3 | +8.5 |
-| LSTM | Deep | 21.1 | 35.9 | 45.1 | 51.0 | 41.9 | 11.1 | 19.5 | 28.5 | +0.6 | +4.8 |
+| ARX (ridge) | Classical | 21.3 | 35.4 | 43.4 | 47.9 | 42.3 | 11.6 | 20.4 | 29.4 | +2.5 | +8.0 |
+| AR (ridge) | Classical | 21.3 | 35.5 | 43.6 | 48.0 | 42.4 | 11.7 | 20.6 | 29.9 | +3.1 | +8.4 |
+| LSTM | Deep | 21.2 | 35.9 | 45.2 | 51.0 | 41.9 | 11.1 | 19.4 | 28.6 | +0.5 | +4.7 |
 | T1DMAI D16 DILATE (sim only) | T1DMAI | 23.4 | 36.6 | 44.0 | 48.0 | 44.0 | 12.2 | 20.4 | 28.8 | +0.0 | +6.0 |
 | T1DMAI D16 MSE (sim only) | T1DMAI | 23.4 | 36.7 | 44.1 | 48.2 | 43.8 | 13.1 | 21.7 | 29.7 | +4.4 | +9.7 |
+| SARIMAX | Classical | 21.8 | 36.9 | 46.4 | 52.3 | 42.9 | 11.5 | 20.4 | 30.3 | +1.5 | +5.7 |
 | Chronos-Bolt tiny (zero-shot) | Foundation | 22.8 | 37.7 | 46.4 | 51.3 | 43.3 | 11.9 | 20.1 | 28.3 | +0.7 | +4.4 |
 | Chronos-Bolt mini (zero-shot) | Foundation | 22.9 | 37.7 | 46.3 | 51.4 | 43.4 | 11.8 | 19.9 | 28.2 | +0.1 | +3.8 |
 | Kalman filter | Classical | 22.2 | 38.4 | 48.9 | 55.6 | 43.9 | 11.4 | 20.3 | 30.3 | +0.2 | +3.5 |
-| SARIMAX | Classical | 22.3 | 39.2 | 51.0 | 59.4 | 44.3 | 11.6 | 21.2 | 33.7 | +2.2 | +4.8 |
+| ARIMA | Classical | 22.5 | 39.3 | 50.2 | 57.4 | 44.7 | 11.6 | 20.9 | 31.5 | +0.2 | +3.4 |
 | Persistence | Baseline | 25.2 | 40.0 | 49.4 | 55.5 | 46.2 | 13.1 | 21.3 | 30.3 | +0.3 | +4.4 |
-| ARIMA | Classical | 23.4 | 41.9 | 55.1 | 64.6 | 47.1 | 12.1 | 22.2 | 35.5 | +0.1 | +2.6 |
 | Linear extrapolation | Baseline | 30.7 | 59.2 | 81.8 | 98.8 | 64.0 | 15.6 | 31.4 | 56.8 | +0.1 | +0.7 |
 
 #### Clinical: DTS, Clarke, CG-EGA (% of points)
 
 | Model | DTS A 30 | DTS A 60 | DTS A 120 | DTS A+B 120 | Clarke A 60 | Clarke A+B 120 | CG-EGA hypo AP 30 | hypo EP 60 | eu EP 60 | hyper EP 60 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | 86.0 | 66.9 | 49.6 | 93.0 | 67.0 | 93.1 | 33.5 | 99.4 | 0.1 | 3.1 |
-| LightGBM | 85.9 | 66.8 | 49.5 | 93.0 | 67.0 | 93.1 | 32.6 | 99.4 | 0.1 | 3.1 |
-| LSTM (15 h) | 85.5 | 67.0 | 50.2 | 93.1 | 67.2 | 93.4 | 53.6 | 87.5 | 0.1 | 2.9 |
-| SVR | 86.0 | 67.6 | 51.6 | 93.6 | 67.8 | 92.9 | 61.7 | 91.3 | 0.1 | 3.4 |
-| Sparse GP | 84.8 | 66.0 | 49.3 | 92.7 | 66.2 | 93.1 | 45.8 | 97.1 | 0.1 | 3.0 |
-| N-HiTS | 85.0 | 66.1 | 49.1 | 92.4 | 66.3 | 93.3 | 57.5 | 80.0 | 0.1 | 2.9 |
-| PatchTST | 85.7 | 66.0 | 48.8 | 92.3 | 66.2 | 93.3 | 63.9 | 79.7 | 0.1 | 2.7 |
-| Chronos-Bolt mini (fine-tuned) | 85.4 | 67.7 | 53.1 | 93.7 | 67.9 | 93.3 | 65.6 | 77.4 | 0.1 | 3.1 |
+| XGBoost | 85.9 | 67.0 | 49.8 | 93.0 | 67.1 | 93.1 | 33.1 | 99.6 | 0.1 | 3.1 |
+| LightGBM | 85.9 | 66.9 | 49.8 | 93.0 | 67.0 | 93.1 | 33.2 | 99.5 | 0.1 | 3.1 |
+| Sparse GP | 85.3 | 66.4 | 49.8 | 92.9 | 66.5 | 93.1 | 43.3 | 98.1 | 0.1 | 3.1 |
+| LSTM (15 h) | 85.2 | 66.6 | 49.8 | 93.0 | 66.8 | 93.3 | 53.9 | 86.0 | 0.1 | 2.9 |
+| SVR | 86.0 | 68.0 | 52.1 | 93.6 | 68.2 | 92.9 | 62.4 | 89.4 | 0.1 | 3.3 |
+| N-HiTS | 85.1 | 66.3 | 49.3 | 92.4 | 66.5 | 93.3 | 57.4 | 80.0 | 0.1 | 2.9 |
+| PatchTST | 85.7 | 65.9 | 48.8 | 92.3 | 66.1 | 93.3 | 63.0 | 80.8 | 0.1 | 2.6 |
+| Chronos-Bolt mini (fine-tuned) | 85.3 | 67.7 | 53.1 | 93.7 | 67.9 | 93.3 | 64.1 | 78.7 | 0.1 | 3.0 |
 | T1DMAI D16 DILATE (sim + LoRA) | 84.9 | 67.8 | 49.5 | 93.1 | 68.0 | 91.8 | 71.7 | 79.8 | 0.1 | 3.2 |
-| Chronos-Bolt tiny (fine-tuned) | 85.2 | 67.5 | 53.0 | 93.7 | 67.7 | 93.3 | 62.2 | 77.8 | 0.1 | 3.1 |
-| GluNet | 85.4 | 66.0 | 48.7 | 91.9 | 66.2 | 93.1 | 64.2 | 75.9 | 0.1 | 2.8 |
+| Chronos-Bolt tiny (fine-tuned) | 85.1 | 67.5 | 53.0 | 93.7 | 67.7 | 93.3 | 59.8 | 78.6 | 0.1 | 3.1 |
+| GluNet | 85.5 | 66.2 | 48.5 | 92.0 | 66.4 | 93.1 | 65.0 | 76.2 | 0.1 | 2.8 |
 | TimesFM 2.5 (zero-shot) | 85.6 | 66.6 | 51.3 | 92.7 | 66.8 | 93.3 | 67.6 | 73.8 | 0.1 | 3.1 |
 | T1DMAI D16 MSE (sim + LoRA) | 84.4 | 67.7 | 51.5 | 94.0 | 67.9 | 92.4 | 68.5 | 74.8 | 0.1 | 2.9 |
 | Chronos-2 (zero-shot) | 85.3 | 66.3 | 51.0 | 92.7 | 66.6 | 93.2 | 68.9 | 74.6 | 0.1 | 3.3 |
-| ARX (ridge) | 83.8 | 62.0 | 45.3 | 91.9 | 62.2 | 93.2 | 51.1 | 93.4 | 0.1 | 2.8 |
-| AR (ridge) | 83.7 | 61.8 | 45.1 | 91.7 | 61.9 | 93.2 | 52.1 | 93.5 | 0.1 | 2.8 |
-| LSTM | 84.9 | 64.9 | 47.7 | 91.1 | 65.1 | 92.8 | 67.5 | 72.4 | 0.1 | 2.8 |
+| ARX (ridge) | 83.9 | 62.2 | 45.5 | 92.0 | 62.4 | 93.2 | 52.0 | 93.3 | 0.1 | 2.9 |
+| AR (ridge) | 83.7 | 61.8 | 45.1 | 91.7 | 62.0 | 93.2 | 51.7 | 93.6 | 0.1 | 2.8 |
+| LSTM | 84.8 | 65.0 | 47.7 | 91.1 | 65.3 | 92.8 | 67.5 | 71.3 | 0.2 | 2.8 |
 | T1DMAI D16 DILATE (sim only) | 82.3 | 62.4 | 45.3 | 92.4 | 62.6 | 92.7 | 56.0 | 86.3 | 0.1 | 3.3 |
 | T1DMAI D16 MSE (sim only) | 80.1 | 59.2 | 45.0 | 91.8 | 59.3 | 93.3 | 34.6 | 93.9 | 0.1 | 3.1 |
+| SARIMAX | 83.9 | 63.6 | 46.9 | 89.9 | 63.8 | 92.7 | 62.7 | 75.6 | 0.2 | 2.6 |
 | Chronos-Bolt tiny (zero-shot) | 82.8 | 63.9 | 49.2 | 90.9 | 64.1 | 92.8 | 66.9 | 67.9 | 0.3 | 3.0 |
 | Chronos-Bolt mini (zero-shot) | 83.1 | 64.2 | 49.4 | 91.0 | 64.4 | 92.7 | 70.7 | 66.9 | 0.3 | 3.1 |
 | Kalman filter | 83.9 | 63.3 | 46.3 | 88.5 | 63.6 | 92.2 | 74.7 | 61.0 | 0.3 | 2.9 |
-| SARIMAX | 83.6 | 61.5 | 42.0 | 86.5 | 61.8 | 91.1 | 74.2 | 61.2 | 0.4 | 2.7 |
+| ARIMA | 83.5 | 61.8 | 44.4 | 87.6 | 62.1 | 91.8 | 75.2 | 59.9 | 0.3 | 3.0 |
 | Persistence | 79.6 | 61.0 | 46.1 | 88.7 | 61.5 | 92.1 | 57.3 | 68.3 | 0.2 | 3.4 |
-| ARIMA | 82.4 | 59.3 | 40.1 | 83.6 | 59.7 | 89.8 | 78.0 | 51.9 | 0.5 | 3.3 |
 | Linear extrapolation | 74.9 | 48.6 | 26.8 | 67.0 | 49.4 | 78.0 | 83.5 | 34.3 | 3.6 | 7.8 |
 
 #### Hypoglycaemia (< 70 mg/dL at the horizon)
 
 | Model | Sens 30 | Sens 60 | Spec 60 | PPV 60 | MCC 30 | MCC 60 | RMSE<70 30 | ME<70 30 | ME<70 60 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | 0.06 | 0.00 | 1.000 | 0.74 | 0.20 | 0.03 | 26.5 | +22.3 | +45.6 |
-| LightGBM | 0.06 | 0.00 | 1.000 | 0.68 | 0.19 | 0.04 | 26.6 | +22.5 | +45.8 |
-| LSTM (15 h) | 0.30 | 0.05 | 0.997 | 0.37 | 0.37 | 0.12 | 24.6 | +17.8 | +39.3 |
-| SVR | 0.34 | 0.02 | 0.999 | 0.33 | 0.38 | 0.08 | 22.6 | +15.8 | +38.4 |
-| Sparse GP | 0.22 | 0.01 | 0.999 | 0.27 | 0.31 | 0.04 | 25.9 | +19.9 | +44.5 |
-| N-HiTS | 0.34 | 0.10 | 0.992 | 0.29 | 0.39 | 0.16 | 24.3 | +16.3 | +37.0 |
-| PatchTST | 0.40 | 0.10 | 0.992 | 0.28 | 0.42 | 0.15 | 22.8 | +14.4 | +36.0 |
-| Chronos-Bolt mini (fine-tuned) | 0.40 | 0.10 | 0.993 | 0.32 | 0.41 | 0.16 | 21.9 | +14.1 | +33.5 |
+| XGBoost | 0.06 | 0.00 | 1.000 | 0.71 | 0.20 | 0.03 | 26.4 | +22.3 | +45.7 |
+| LightGBM | 0.07 | 0.00 | 1.000 | 0.65 | 0.21 | 0.03 | 26.5 | +22.4 | +45.8 |
+| Sparse GP | 0.18 | 0.00 | 1.000 | 0.30 | 0.29 | 0.03 | 25.8 | +20.4 | +44.4 |
+| LSTM (15 h) | 0.31 | 0.05 | 0.997 | 0.32 | 0.37 | 0.12 | 24.9 | +17.7 | +39.0 |
+| SVR | 0.34 | 0.03 | 0.998 | 0.34 | 0.39 | 0.09 | 22.6 | +15.6 | +37.6 |
+| N-HiTS | 0.34 | 0.10 | 0.992 | 0.28 | 0.39 | 0.15 | 24.4 | +16.3 | +37.0 |
+| PatchTST | 0.38 | 0.09 | 0.992 | 0.27 | 0.41 | 0.14 | 23.0 | +14.7 | +36.3 |
+| Chronos-Bolt mini (fine-tuned) | 0.38 | 0.09 | 0.994 | 0.34 | 0.40 | 0.16 | 22.2 | +14.6 | +34.1 |
 | T1DMAI D16 DILATE (sim + LoRA) | 0.42 | 0.06 | 0.997 | 0.38 | 0.41 | 0.15 | 20.6 | +13.3 | +33.4 |
-| Chronos-Bolt tiny (fine-tuned) | 0.37 | 0.10 | 0.993 | 0.30 | 0.40 | 0.16 | 22.5 | +15.0 | +33.7 |
-| GluNet | 0.41 | 0.13 | 0.988 | 0.26 | 0.42 | 0.17 | 22.9 | +14.1 | +34.8 |
+| Chronos-Bolt tiny (fine-tuned) | 0.35 | 0.09 | 0.993 | 0.31 | 0.39 | 0.15 | 22.8 | +15.7 | +34.1 |
+| GluNet | 0.41 | 0.13 | 0.988 | 0.26 | 0.42 | 0.16 | 22.8 | +13.9 | +34.9 |
 | TimesFM 2.5 (zero-shot) | 0.44 | 0.14 | 0.987 | 0.26 | 0.43 | 0.17 | 21.4 | +12.8 | +32.6 |
 | T1DMAI D16 MSE (sim + LoRA) | 0.40 | 0.08 | 0.996 | 0.37 | 0.40 | 0.16 | 21.7 | +14.2 | +32.1 |
 | Chronos-2 (zero-shot) | 0.46 | 0.14 | 0.986 | 0.26 | 0.43 | 0.17 | 21.6 | +12.0 | +33.0 |
-| ARX (ridge) | 0.27 | 0.03 | 0.996 | 0.20 | 0.33 | 0.07 | 24.5 | +17.7 | +42.7 |
-| AR (ridge) | 0.28 | 0.03 | 0.995 | 0.19 | 0.33 | 0.07 | 24.0 | +17.3 | +42.9 |
-| LSTM | 0.44 | 0.16 | 0.982 | 0.23 | 0.42 | 0.17 | 22.7 | +13.0 | +33.2 |
+| ARX (ridge) | 0.28 | 0.03 | 0.996 | 0.19 | 0.33 | 0.07 | 24.3 | +17.4 | +42.6 |
+| AR (ridge) | 0.28 | 0.03 | 0.996 | 0.19 | 0.33 | 0.06 | 24.0 | +17.4 | +42.9 |
+| LSTM | 0.45 | 0.17 | 0.981 | 0.22 | 0.42 | 0.17 | 22.8 | +13.1 | +33.0 |
 | T1DMAI D16 DILATE (sim only) | 0.32 | 0.07 | 0.991 | 0.20 | 0.34 | 0.10 | 24.9 | +16.9 | +39.3 |
 | T1DMAI D16 MSE (sim only) | 0.18 | 0.03 | 0.997 | 0.22 | 0.27 | 0.07 | 28.6 | +22.5 | +45.1 |
+| SARIMAX | 0.40 | 0.14 | 0.984 | 0.22 | 0.39 | 0.15 | 23.3 | +14.3 | +36.5 |
 | Chronos-Bolt tiny (zero-shot) | 0.46 | 0.20 | 0.976 | 0.21 | 0.41 | 0.18 | 23.2 | +12.7 | +31.9 |
 | Chronos-Bolt mini (zero-shot) | 0.49 | 0.20 | 0.976 | 0.21 | 0.41 | 0.18 | 22.4 | +11.5 | +31.0 |
 | Kalman filter | 0.52 | 0.26 | 0.963 | 0.19 | 0.43 | 0.19 | 20.7 | +9.8 | +28.3 |
-| SARIMAX | 0.53 | 0.27 | 0.961 | 0.18 | 0.43 | 0.19 | 21.2 | +9.8 | +28.8 |
+| ARIMA | 0.54 | 0.28 | 0.959 | 0.18 | 0.43 | 0.20 | 20.7 | +9.3 | +28.0 |
 | Persistence | 0.37 | 0.19 | 0.975 | 0.19 | 0.35 | 0.16 | 26.1 | +16.3 | +33.6 |
-| ARIMA | 0.59 | 0.37 | 0.938 | 0.16 | 0.43 | 0.21 | 20.7 | +7.3 | +23.8 |
 | Linear extrapolation | 0.72 | 0.58 | 0.861 | 0.12 | 0.41 | 0.21 | 27.2 | -1.4 | +12.3 |
 
-264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon test on absolute errors, alpha 0.05/25).
+264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/25).
 
 </details>
 
@@ -619,21 +621,21 @@ two sides is not a like-for-like comparison. My data is non-blind, MetaboNet bli
 
 | Model | Paper | Paper data | Paper inputs | Paper 30 | Paper 60 | My data 30 | My data 60 | MetaboNet 30 | MetaboNet 60 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | [7](https://ceur-ws.org/Vol-2148/) | OhioT1DM 2018 (6) | CGM, doses, meals, activity | 20.4 | - | 14.7 | 22.2 | 19.8 | 33.2 |
-| LightGBM | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin, time | 20.8 | 34.5 | 14.7 | 22.4 | 19.8 | 33.2 |
+| XGBoost | [7](https://ceur-ws.org/Vol-2148/) | OhioT1DM 2018 (6) | CGM, doses, meals, activity | 20.4 | - | 14.6 | 22.4 | 19.8 | 33.2 |
+| LightGBM | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin, time | 20.8 | 34.5 | 14.6 | 22.4 | 19.8 | 33.2 |
 | T1DMAI D16 DILATE (sim + LoRA) | - | - | - | - | - | 15.2 | 22.8 | 21.5 | 34.6 |
-| SVR | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.8 | 34.3 | 15.1 | 23.0 | 20.4 | 33.9 |
-| LSTM (15 h) | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin | 20.1 | 33.4 | 15.2 | 23.2 | 20.3 | 33.6 |
-| PatchTST | [9](https://arxiv.org/abs/2505.08821) | DCLP3 train, OhioT1DM test (12) | CGM, carbs, insulin | 16.7 | 24.6 | 15.1 | 23.3 | 20.3 | 34.4 |
+| LSTM (15 h) | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM, carbs, insulin | 20.1 | 33.4 | 15.1 | 23.2 | 20.6 | 33.9 |
+| PatchTST | [9](https://arxiv.org/abs/2505.08821) | DCLP3 train, OhioT1DM test (12) | CGM, carbs, insulin | 16.7 | 24.6 | 15.1 | 23.3 | 20.4 | 34.5 |
+| SVR | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.8 | 34.3 | 15.2 | 23.4 | 20.4 | 34.0 |
 | T1DMAI D16 MSE (sim + LoRA) | - | - | - | - | - | 15.1 | 23.5 | 21.8 | 35.1 |
-| GluNet | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 19.3 | 31.8 | 15.4 | 23.6 | 20.6 | 34.8 |
-| ARX | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.5 | 39.5 | 15.7 | 24.1 | 21.3 | 35.4 |
-| LSTM | [5](https://doi.org/10.1007/s41666-019-00059-y) | OhioT1DM 2018 (6) | CGM | 18.9 | 31.4 | 15.4 | 24.3 | 21.1 | 35.9 |
+| GluNet | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 19.3 | 31.8 | 15.4 | 24.0 | 20.5 | 34.8 |
+| LSTM | [5](https://doi.org/10.1007/s41666-019-00059-y) | OhioT1DM 2018 (6) | CGM | 18.9 | 31.4 | 15.3 | 24.2 | 21.2 | 35.9 |
+| ARX | [6](https://doi.org/10.1109/JBHI.2019.2931842) | OhioT1DM 2018 (6) | CGM, carbs, insulin | 21.5 | 39.5 | 15.8 | 24.3 | 21.3 | 35.4 |
 | T1DMAI D16 DILATE (sim only) | - | - | - | - | - | 16.2 | 26.1 | 23.4 | 36.6 |
 | T1DMAI D16 MSE (sim only) | - | - | - | - | - | 16.8 | 27.1 | 23.4 | 36.7 |
 | TimesFM 2.5 (zero-shot) | [4](https://arxiv.org/abs/2606.06881) | 12 datasets, mixed | CGM | 18.8 | 31.8 | 18.4 | 29.1 | 20.7 | 35.0 |
 | Chronos-2 (zero-shot) | [4](https://arxiv.org/abs/2606.06881) | 12 datasets, mixed | CGM | 19.2 | 32.0 | 17.8 | 29.4 | 21.0 | 35.3 |
-| ARIMA | [8](https://ceur-ws.org/Vol-2675/) | OhioT1DM 2020 (6) | CGM, doses, meals, exercise | 23.7 | 36.4 | 18.6 | 31.4 | 23.4 | 41.9 |
+| ARIMA | [8](https://ceur-ws.org/Vol-2675/) | OhioT1DM 2020 (6) | CGM, doses, meals, exercise | 23.7 | 36.4 | 18.7 | 31.5 | 22.5 | 39.3 |
 | Persistence | [3](https://arxiv.org/abs/2606.18640) | MetaboNet | CGM | 26.3 | 41.5 | 20.0 | 32.1 | 25.2 | 40.0 |
 
 RMSE in mg/dL at the single step 30 or 60 min ahead, as printed in each paper. T1DMAI has no published score.
