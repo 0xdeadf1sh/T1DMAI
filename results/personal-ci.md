@@ -17,6 +17,10 @@
 | AR (ridge) | 17.2 | 16.1 to 18.4 | 27.5 | 25.7 to 29.2 | 34.7 | 32.3 to 37.1 |
 | Chronos-Bolt tiny (fine-tuned) | 17.5 | 16.3 to 18.6 | 27.5 | 25.6 to 29.3 | 36.1 | 33.4 to 38.8 |
 | Chronos-Bolt mini (fine-tuned) | 17.5 | 16.3 to 18.6 | 27.6 | 25.7 to 29.3 | 36.1 | 33.4 to 38.9 |
+| Timestral 123M (zero-shot) | 16.9 | 15.9 to 17.9 | 27.8 | 26.0 to 29.6 | 38.2 | 35.0 to 41.6 |
+| Timestral 5M (zero-shot) | 17.1 | 16.0 to 18.2 | 28.0 | 26.2 to 29.8 | 37.7 | 34.5 to 40.9 |
+| Timestral 209M (zero-shot) | 17.1 | 16.0 to 18.1 | 28.4 | 26.6 to 30.1 | 39.2 | 35.8 to 42.7 |
+| Timestral 28M (zero-shot) | 17.2 | 16.2 to 18.2 | 28.4 | 26.6 to 30.2 | 39.2 | 36.0 to 42.6 |
 | TimesFM 2.5 (zero-shot) | 18.4 | 17.1 to 19.6 | 29.1 | 27.0 to 31.2 | 39.4 | 35.9 to 43.0 |
 | Chronos-2 (zero-shot) | 17.8 | 16.6 to 19.0 | 29.4 | 27.1 to 31.8 | 40.0 | 35.5 to 44.7 |
 | SARIMAX | 17.7 | 16.5 to 18.9 | 29.8 | 27.9 to 31.7 | 45.5 | 42.3 to 48.6 |

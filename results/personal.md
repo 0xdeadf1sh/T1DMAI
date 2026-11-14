@@ -19,6 +19,10 @@
 | AR (ridge) | Classical | 17.2 | 27.5 | 32.5 | 34.7 | 30.3 | 10.3 | 17.2 | 23.1 | -0.0 | +4.1 | 5 | 5 |
 | Chronos-Bolt tiny (fine-tuned) | Foundation | 17.5 | 27.5 | 33.1 | 36.1 | 30.1 | 9.8 | 16.4 | 23.5 | -2.2 | +1.6 | 5 | 10 |
 | Chronos-Bolt mini (fine-tuned) | Foundation | 17.5 | 27.6 | 33.1 | 36.1 | 30.1 | 9.8 | 16.5 | 23.7 | -1.8 | +1.9 | 5 | 10 |
+| Timestral 123M (zero-shot) | Foundation | 16.9 | 27.8 | 34.4 | 38.2 | 30.1 | 9.6 | 16.5 | 24.1 | -2.8 | +0.7 | 5 | 10 |
+| Timestral 5M (zero-shot) | Foundation | 17.1 | 28.0 | 34.4 | 37.7 | 30.4 | 9.8 | 16.7 | 24.1 | -2.7 | +1.0 | 5 | 10 |
+| Timestral 209M (zero-shot) | Foundation | 17.1 | 28.4 | 35.2 | 39.2 | 30.5 | 9.6 | 16.7 | 24.6 | -2.4 | +0.9 | 5 | 10 |
+| Timestral 28M (zero-shot) | Foundation | 17.2 | 28.4 | 35.3 | 39.2 | 30.6 | 9.8 | 16.8 | 24.8 | -2.8 | +0.7 | 5 | 10 |
 | TimesFM 2.5 (zero-shot) | Foundation | 18.4 | 29.1 | 35.8 | 39.4 | 31.5 | 10.5 | 17.4 | 25.1 | -1.5 | +2.0 | 5 | 5 |
 | Chronos-2 (zero-shot) | Foundation | 17.8 | 29.4 | 36.4 | 40.0 | 31.8 | 10.2 | 17.7 | 25.5 | -1.0 | +2.5 | 5 | 10 |
 | SARIMAX | Classical | 17.7 | 29.8 | 38.7 | 45.5 | 31.6 | 10.2 | 17.9 | 28.8 | -3.8 | -0.9 | 5 | 5 |
@@ -50,6 +54,10 @@
 | AR (ridge) | 87.1 | 67.6 | 55.4 | 95.9 | 67.7 | 96.5 | 55.5 | 96.8 | 0.0 | 0.3 |
 | Chronos-Bolt tiny (fine-tuned) | 88.2 | 69.6 | 54.0 | 95.7 | 69.9 | 96.4 | 75.5 | 69.4 | 0.0 | 0.3 |
 | Chronos-Bolt mini (fine-tuned) | 88.1 | 69.4 | 54.1 | 95.4 | 69.7 | 96.4 | 81.3 | 71.0 | 0.0 | 0.4 |
+| Timestral 123M (zero-shot) | 88.9 | 69.2 | 52.9 | 94.9 | 69.6 | 96.3 | 82.9 | 55.5 | 0.0 | 0.1 |
+| Timestral 5M (zero-shot) | 88.5 | 69.0 | 52.4 | 94.9 | 69.3 | 96.4 | 78.4 | 60.0 | 0.0 | 0.4 |
+| Timestral 209M (zero-shot) | 88.7 | 68.8 | 52.1 | 94.5 | 69.2 | 96.3 | 85.8 | 51.6 | 0.0 | 0.1 |
+| Timestral 28M (zero-shot) | 88.4 | 68.1 | 52.0 | 94.6 | 68.5 | 96.4 | 81.3 | 55.2 | 0.0 | 0.4 |
 | TimesFM 2.5 (zero-shot) | 86.1 | 67.3 | 51.8 | 93.9 | 67.6 | 96.5 | 78.4 | 61.0 | 0.0 | 0.3 |
 | Chronos-2 (zero-shot) | 87.1 | 66.6 | 51.6 | 93.8 | 66.9 | 95.8 | 82.9 | 63.5 | 0.0 | 0.4 |
 | SARIMAX | 87.5 | 64.8 | 43.5 | 89.6 | 65.3 | 97.4 | 91.3 | 26.5 | 0.0 | 0.3 |
@@ -81,6 +89,10 @@
 | AR (ridge) | 0.23 | 0.00 | 0.999 | 0.00 | 0.33 | -0.01 | 15.8 | +13.9 | +30.3 |
 | Chronos-Bolt tiny (fine-tuned) | 0.49 | 0.12 | 0.991 | 0.30 | 0.51 | 0.18 | 12.5 | +8.6 | +21.8 |
 | Chronos-Bolt mini (fine-tuned) | 0.53 | 0.10 | 0.991 | 0.25 | 0.54 | 0.14 | 11.9 | +7.9 | +22.1 |
+| Timestral 123M (zero-shot) | 0.58 | 0.31 | 0.983 | 0.36 | 0.55 | 0.31 | 11.6 | +6.0 | +17.4 |
+| Timestral 5M (zero-shot) | 0.53 | 0.27 | 0.987 | 0.39 | 0.54 | 0.31 | 12.4 | +7.6 | +18.9 |
+| Timestral 209M (zero-shot) | 0.61 | 0.37 | 0.980 | 0.37 | 0.56 | 0.35 | 11.1 | +5.3 | +15.9 |
+| Timestral 28M (zero-shot) | 0.59 | 0.33 | 0.982 | 0.36 | 0.54 | 0.33 | 11.6 | +6.2 | +17.1 |
 | TimesFM 2.5 (zero-shot) | 0.54 | 0.27 | 0.987 | 0.39 | 0.55 | 0.31 | 13.3 | +7.0 | +19.1 |
 | Chronos-2 (zero-shot) | 0.59 | 0.24 | 0.983 | 0.31 | 0.53 | 0.25 | 11.7 | +5.7 | +21.5 |
 | SARIMAX | 0.72 | 0.58 | 0.963 | 0.33 | 0.60 | 0.41 | 9.1 | +2.0 | +6.7 |
@@ -91,4 +103,4 @@
 | Persistence | 0.55 | 0.36 | 0.981 | 0.36 | 0.54 | 0.34 | 12.8 | +8.1 | +18.1 |
 | Linear extrapolation | 0.79 | 0.72 | 0.872 | 0.15 | 0.47 | 0.29 | 11.1 | -1.8 | -3.5 |
 
-9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/25).
+9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/29).

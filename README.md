@@ -71,7 +71,7 @@ For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biom
 
 All models suck. XGBoost is the best one but my own model comes close. More details below:
 
-1. On my data, D16 DILATE + LoRA comes 3rd of 26 (22.8), behind XGBoost and LightGBM
+1. On my data, D16 DILATE + LoRA comes 3rd of 30 (22.8), behind XGBoost and LightGBM
    (both 22.4). Wilcoxon over test days cannot tell it from the best model at any horizon.
 2. On MetaboNet, D16 DILATE + LoRA comes 9th (34.6) but has the lowest RMSE of all models at
    90 min. XGBoost leads at 30, 60 and 120.
@@ -89,6 +89,9 @@ All models suck. XGBoost is the best one but my own model comes close. More deta
    4th on MetaboNet (33.9 at 60 min), against 35.9 for the 2 hour one.
 8. Zero-shot Chronos-2 and TimesFM 2.5 beat zero-shot Chronos-Bolt by 1.4-2.7 mg/dL at 60 min
    on both datasets, but trail fine-tuned Chronos-Bolt.
+9. Zero-shot Timestral beats Chronos-2 and TimesFM 2.5 on my data (27.8-28.4 against 29.1-29.4
+   at 60 min) and ties them on MetaboNet (35.0-35.2 against 35.0-35.3). Size barely matters:
+   5M is within 0.4 mg/dL of 209M at 60 min on both datasets.
 
 ## 3. Models
 
@@ -113,6 +116,7 @@ All models suck. XGBoost is the best one but my own model comes close. More deta
 | Chronos-Bolt tiny and mini | Foundation | 9M and 21M parameters, glucose only, zero-shot and fine-tuned [15]. |
 | Chronos-2 | Foundation | 120M parameters, zero-shot. Past insulin and carbs; on my data also the future ones [16]. |
 | TimesFM 2.5 | Foundation | 200M parameters, zero-shot. Glucose only on MetaboNet; on my data future insulin and carbs through in-context regression [17]. |
+| Timestral 5M, 28M, 123M and 209M | Foundation | Zero-shot. Past insulin and carbs; on my data also the future ones [27]. |
 | T1DMAI D16 DILATE and D16 MSE | T1DMAI | 31k parameters. Glucose, carbs and insulin. |
 
 Numbers in brackets point to [References](#12-references). Everything except the baselines and
@@ -376,7 +380,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 - Time gain is only computed for my data.
 - Unlogged meals count as "no meal".
 - CPU timings are single runs on one laptop core and varied by up to 45% between runs.
-- LightGBM, LSTM (15 h), Chronos-2 and TimesFM 2.5 have no CPU timing yet.
+- LightGBM, LSTM (15 h), Chronos-2, TimesFM 2.5 and Timestral have no CPU timing yet.
 
 ## 8. Terms
 
@@ -417,6 +421,10 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | AR (ridge) | Classical | 17.2 | 27.5 | 32.5 | 34.7 | 30.3 | 10.3 | 17.2 | 23.1 | -0.0 | +4.1 | 5 | 5 |
 | Chronos-Bolt tiny (fine-tuned) | Foundation | 17.5 | 27.5 | 33.1 | 36.1 | 30.1 | 9.8 | 16.4 | 23.5 | -2.2 | +1.6 | 5 | 10 |
 | Chronos-Bolt mini (fine-tuned) | Foundation | 17.5 | 27.6 | 33.1 | 36.1 | 30.1 | 9.8 | 16.5 | 23.7 | -1.8 | +1.9 | 5 | 10 |
+| Timestral 123M (zero-shot) | Foundation | 16.9 | 27.8 | 34.4 | 38.2 | 30.1 | 9.6 | 16.5 | 24.1 | -2.8 | +0.7 | 5 | 10 |
+| Timestral 5M (zero-shot) | Foundation | 17.1 | 28.0 | 34.4 | 37.7 | 30.4 | 9.8 | 16.7 | 24.1 | -2.7 | +1.0 | 5 | 10 |
+| Timestral 209M (zero-shot) | Foundation | 17.1 | 28.4 | 35.2 | 39.2 | 30.5 | 9.6 | 16.7 | 24.6 | -2.4 | +0.9 | 5 | 10 |
+| Timestral 28M (zero-shot) | Foundation | 17.2 | 28.4 | 35.3 | 39.2 | 30.6 | 9.8 | 16.8 | 24.8 | -2.8 | +0.7 | 5 | 10 |
 | TimesFM 2.5 (zero-shot) | Foundation | 18.4 | 29.1 | 35.8 | 39.4 | 31.5 | 10.5 | 17.4 | 25.1 | -1.5 | +2.0 | 5 | 5 |
 | Chronos-2 (zero-shot) | Foundation | 17.8 | 29.4 | 36.4 | 40.0 | 31.8 | 10.2 | 17.7 | 25.5 | -1.0 | +2.5 | 5 | 10 |
 | SARIMAX | Classical | 17.7 | 29.8 | 38.7 | 45.5 | 31.6 | 10.2 | 17.9 | 28.8 | -3.8 | -0.9 | 5 | 5 |
@@ -448,6 +456,10 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | AR (ridge) | 87.1 | 67.6 | 55.4 | 95.9 | 67.7 | 96.5 | 55.5 | 96.8 | 0.0 | 0.3 |
 | Chronos-Bolt tiny (fine-tuned) | 88.2 | 69.6 | 54.0 | 95.7 | 69.9 | 96.4 | 75.5 | 69.4 | 0.0 | 0.3 |
 | Chronos-Bolt mini (fine-tuned) | 88.1 | 69.4 | 54.1 | 95.4 | 69.7 | 96.4 | 81.3 | 71.0 | 0.0 | 0.4 |
+| Timestral 123M (zero-shot) | 88.9 | 69.2 | 52.9 | 94.9 | 69.6 | 96.3 | 82.9 | 55.5 | 0.0 | 0.1 |
+| Timestral 5M (zero-shot) | 88.5 | 69.0 | 52.4 | 94.9 | 69.3 | 96.4 | 78.4 | 60.0 | 0.0 | 0.4 |
+| Timestral 209M (zero-shot) | 88.7 | 68.8 | 52.1 | 94.5 | 69.2 | 96.3 | 85.8 | 51.6 | 0.0 | 0.1 |
+| Timestral 28M (zero-shot) | 88.4 | 68.1 | 52.0 | 94.6 | 68.5 | 96.4 | 81.3 | 55.2 | 0.0 | 0.4 |
 | TimesFM 2.5 (zero-shot) | 86.1 | 67.3 | 51.8 | 93.9 | 67.6 | 96.5 | 78.4 | 61.0 | 0.0 | 0.3 |
 | Chronos-2 (zero-shot) | 87.1 | 66.6 | 51.6 | 93.8 | 66.9 | 95.8 | 82.9 | 63.5 | 0.0 | 0.4 |
 | SARIMAX | 87.5 | 64.8 | 43.5 | 89.6 | 65.3 | 97.4 | 91.3 | 26.5 | 0.0 | 0.3 |
@@ -479,6 +491,10 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | AR (ridge) | 0.23 | 0.00 | 0.999 | 0.00 | 0.33 | -0.01 | 15.8 | +13.9 | +30.3 |
 | Chronos-Bolt tiny (fine-tuned) | 0.49 | 0.12 | 0.991 | 0.30 | 0.51 | 0.18 | 12.5 | +8.6 | +21.8 |
 | Chronos-Bolt mini (fine-tuned) | 0.53 | 0.10 | 0.991 | 0.25 | 0.54 | 0.14 | 11.9 | +7.9 | +22.1 |
+| Timestral 123M (zero-shot) | 0.58 | 0.31 | 0.983 | 0.36 | 0.55 | 0.31 | 11.6 | +6.0 | +17.4 |
+| Timestral 5M (zero-shot) | 0.53 | 0.27 | 0.987 | 0.39 | 0.54 | 0.31 | 12.4 | +7.6 | +18.9 |
+| Timestral 209M (zero-shot) | 0.61 | 0.37 | 0.980 | 0.37 | 0.56 | 0.35 | 11.1 | +5.3 | +15.9 |
+| Timestral 28M (zero-shot) | 0.59 | 0.33 | 0.982 | 0.36 | 0.54 | 0.33 | 11.6 | +6.2 | +17.1 |
 | TimesFM 2.5 (zero-shot) | 0.54 | 0.27 | 0.987 | 0.39 | 0.55 | 0.31 | 13.3 | +7.0 | +19.1 |
 | Chronos-2 (zero-shot) | 0.59 | 0.24 | 0.983 | 0.31 | 0.53 | 0.25 | 11.7 | +5.7 | +21.5 |
 | SARIMAX | 0.72 | 0.58 | 0.963 | 0.33 | 0.60 | 0.41 | 9.1 | +2.0 | +6.7 |
@@ -489,7 +505,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Persistence | 0.55 | 0.36 | 0.981 | 0.36 | 0.54 | 0.34 | 12.8 | +8.1 | +18.1 |
 | Linear extrapolation | 0.79 | 0.72 | 0.872 | 0.15 | 0.47 | 0.29 | 11.1 | -1.8 | -3.5 |
 
-9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/25).
+9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/29).
 
 </details>
 
@@ -501,7 +517,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Model | Family | RMSE 30 | RMSE 60 | RMSE 90 | RMSE 120 | gRMSE 60 | MARD 30 | MARD 60 | MARD 120 | ME 60 | MRE 60 % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | XGBoost | Classical | 19.8 * | 33.2 * | 41.3 | 46.0 * | 40.3 | 10.6 | 18.6 | 27.1 | +0.5 | +6.3 |
-| LightGBM | Classical | 19.8 * | 33.2 | 41.3 | 46.0 * | 40.3 | 10.6 | 18.7 | 27.1 | +0.6 | +6.4 |
+| LightGBM | Classical | 19.8 * | 33.2 * | 41.3 | 46.0 * | 40.3 | 10.6 | 18.7 | 27.1 | +0.6 | +6.4 |
 | Sparse GP | Classical | 20.4 | 33.7 | 41.6 | 46.2 | 40.8 | 10.9 | 18.9 | 27.2 | +0.4 | +6.2 |
 | LSTM (15 h) | Deep | 20.6 | 33.9 | 41.8 | 46.5 | 40.7 | 10.9 | 18.7 | 27.0 | -0.1 | +5.3 |
 | SVR | Classical | 20.4 | 34.0 | 42.0 | 46.8 * | 41.0 | 10.6 | 18.0 | 25.2 | -3.3 | +2.8 |
@@ -511,8 +527,12 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 21.5 | 34.6 | 41.0 * | 50.4 | 41.2 | 10.9 | 18.0 | 25.2 | -3.5 | +2.0 |
 | Chronos-Bolt tiny (fine-tuned) | Foundation | 21.1 | 34.6 | 42.1 | 46.2 * | 41.0 | 10.9 | 18.2 | 25.0 | -2.3 | +2.9 |
 | GluNet | Deep | 20.5 | 34.8 | 43.6 | 49.0 | 41.1 | 10.8 | 18.9 | 27.8 | +0.4 | +5.0 |
+| Timestral 5M (zero-shot) | Foundation | 20.5 | 35.0 | 43.5 | 48.5 | 41.4 | 10.5 | 18.2 | 25.8 | -2.8 | +2.2 |
 | TimesFM 2.5 (zero-shot) | Foundation | 20.7 | 35.0 | 43.3 | 47.9 | 41.4 | 10.7 | 18.6 | 26.1 | -1.7 | +3.2 |
 | T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 21.8 | 35.1 | 41.0 * | 46.8 * | 41.3 | 11.2 | 18.1 | 25.1 | -3.8 | +1.3 |
+| Timestral 123M (zero-shot) | Foundation | 20.5 | 35.1 | 43.6 | 48.5 | 41.4 | 10.5 | 18.2 | 25.7 | -3.2 | +1.8 |
+| Timestral 209M (zero-shot) | Foundation | 20.4 | 35.1 | 43.7 | 48.7 | 41.2 | 10.5 | 18.3 | 26.1 | -2.3 | +2.4 |
+| Timestral 28M (zero-shot) | Foundation | 20.5 | 35.2 | 43.8 | 48.9 | 41.4 | 10.5 | 18.2 | 25.9 | -2.9 | +1.9 |
 | Chronos-2 (zero-shot) | Foundation | 21.0 | 35.3 | 43.4 | 48.0 | 41.6 | 10.8 | 18.7 | 26.2 | -1.3 | +3.6 |
 | ARX (ridge) | Classical | 21.3 | 35.4 | 43.4 | 47.9 | 42.3 | 11.6 | 20.4 | 29.4 | +2.5 | +8.0 |
 | AR (ridge) | Classical | 21.3 | 35.5 | 43.6 | 48.0 | 42.4 | 11.7 | 20.6 | 29.9 | +3.1 | +8.4 |
@@ -542,8 +562,12 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 DILATE (sim + LoRA) | 84.9 | 67.8 | 49.5 | 93.1 | 68.0 | 91.8 | 71.7 | 79.8 | 0.1 | 3.2 |
 | Chronos-Bolt tiny (fine-tuned) | 85.1 | 67.5 | 53.0 | 93.7 | 67.7 | 93.3 | 59.8 | 78.6 | 0.1 | 3.1 |
 | GluNet | 85.5 | 66.2 | 48.5 | 92.0 | 66.4 | 93.1 | 65.0 | 76.2 | 0.1 | 2.8 |
+| Timestral 5M (zero-shot) | 86.0 | 67.1 | 51.5 | 92.6 | 67.4 | 93.3 | 69.0 | 71.6 | 0.1 | 3.4 |
 | TimesFM 2.5 (zero-shot) | 85.6 | 66.6 | 51.3 | 92.7 | 66.8 | 93.3 | 67.6 | 73.8 | 0.1 | 3.1 |
 | T1DMAI D16 MSE (sim + LoRA) | 84.4 | 67.7 | 51.5 | 94.0 | 67.9 | 92.4 | 68.5 | 74.8 | 0.1 | 2.9 |
+| Timestral 123M (zero-shot) | 86.1 | 67.2 | 51.6 | 92.7 | 67.4 | 93.2 | 71.4 | 69.1 | 0.1 | 3.4 |
+| Timestral 209M (zero-shot) | 86.1 | 67.1 | 51.2 | 92.4 | 67.3 | 93.2 | 71.2 | 69.2 | 0.1 | 3.2 |
+| Timestral 28M (zero-shot) | 86.0 | 67.1 | 51.3 | 92.5 | 67.3 | 93.2 | 71.4 | 68.6 | 0.1 | 3.3 |
 | Chronos-2 (zero-shot) | 85.3 | 66.3 | 51.0 | 92.7 | 66.6 | 93.2 | 68.9 | 74.6 | 0.1 | 3.3 |
 | ARX (ridge) | 83.9 | 62.2 | 45.5 | 92.0 | 62.4 | 93.2 | 52.0 | 93.3 | 0.1 | 2.9 |
 | AR (ridge) | 83.7 | 61.8 | 45.1 | 91.7 | 62.0 | 93.2 | 51.7 | 93.6 | 0.1 | 2.8 |
@@ -573,8 +597,12 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 DILATE (sim + LoRA) | 0.42 | 0.06 | 0.997 | 0.38 | 0.41 | 0.15 | 20.6 | +13.3 | +33.4 |
 | Chronos-Bolt tiny (fine-tuned) | 0.35 | 0.09 | 0.993 | 0.31 | 0.39 | 0.15 | 22.8 | +15.7 | +34.1 |
 | GluNet | 0.41 | 0.13 | 0.988 | 0.26 | 0.42 | 0.16 | 22.8 | +13.9 | +34.9 |
+| Timestral 5M (zero-shot) | 0.44 | 0.16 | 0.985 | 0.26 | 0.43 | 0.18 | 20.8 | +12.4 | +30.7 |
 | TimesFM 2.5 (zero-shot) | 0.44 | 0.14 | 0.987 | 0.26 | 0.43 | 0.17 | 21.4 | +12.8 | +32.6 |
 | T1DMAI D16 MSE (sim + LoRA) | 0.40 | 0.08 | 0.996 | 0.37 | 0.40 | 0.16 | 21.7 | +14.2 | +32.1 |
+| Timestral 123M (zero-shot) | 0.47 | 0.18 | 0.983 | 0.25 | 0.44 | 0.19 | 20.4 | +11.4 | +29.7 |
+| Timestral 209M (zero-shot) | 0.47 | 0.18 | 0.983 | 0.25 | 0.44 | 0.19 | 20.5 | +11.5 | +30.0 |
+| Timestral 28M (zero-shot) | 0.47 | 0.18 | 0.982 | 0.25 | 0.44 | 0.19 | 20.3 | +11.3 | +29.5 |
 | Chronos-2 (zero-shot) | 0.46 | 0.14 | 0.986 | 0.26 | 0.43 | 0.17 | 21.6 | +12.0 | +33.0 |
 | ARX (ridge) | 0.28 | 0.03 | 0.996 | 0.19 | 0.33 | 0.07 | 24.3 | +17.4 | +42.6 |
 | AR (ridge) | 0.28 | 0.03 | 0.996 | 0.19 | 0.33 | 0.06 | 24.0 | +17.4 | +42.9 |
@@ -589,7 +617,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Persistence | 0.37 | 0.19 | 0.975 | 0.19 | 0.35 | 0.16 | 26.1 | +16.3 | +33.6 |
 | Linear extrapolation | 0.72 | 0.58 | 0.861 | 0.12 | 0.41 | 0.21 | 27.2 | -1.4 | +12.3 |
 
-264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/25).
+264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/29).
 
 </details>
 
@@ -606,7 +634,7 @@ python export_submission.py --checkpoint CKPT --template template.parquet --cach
 python leaderboard.py MANIFEST.json --out results
 ```
 
-Chronos-2 and TimesFM 2.5 run under `.venv-zoo` (`requirements-zoo.txt`).
+Chronos-2, TimesFM 2.5 and Timestral run under `.venv-zoo` (`requirements-zoo.txt`).
 
 ## 11. Published scores
 
@@ -670,6 +698,7 @@ Chronos-Bolt (Zhang et al. 2026) and N-HiTS (Potosnak et al. 2025; Sergazinov et
 24. Cuturi M, Blondel M. Soft-DTW: a Differentiable Loss Function for Time-Series. ICML, PMLR 70:894-903, 2017. <https://arxiv.org/abs/1703.01541>
 25. Le Guen V, Thome N. Shape and Time Distortion Loss for Training Deep Time Series Forecasting Models. NeurIPS, 2019. <https://arxiv.org/abs/1909.09020>
 26. Su J, Ahmed M, Lu Y, Pan S, Bo W, Liu Y. RoFormer: Enhanced Transformer with Rotary Position Embedding. Neurocomputing 568:127063, 2024. <https://doi.org/10.1016/j.neucom.2023.127063>
+27. Mistral AI. Timestral. 2026. <https://mistral.ai/news/timestral/>
 
 ## License
 

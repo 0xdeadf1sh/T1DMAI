@@ -24,3 +24,4 @@
 24. Cuturi M, Blondel M. Soft-DTW: a Differentiable Loss Function for Time-Series. ICML, PMLR 70:894-903, 2017. <https://arxiv.org/abs/1703.01541>
 25. Le Guen V, Thome N. Shape and Time Distortion Loss for Training Deep Time Series Forecasting Models. NeurIPS, 2019. <https://arxiv.org/abs/1909.09020>
 26. Su J, Ahmed M, Lu Y, Pan S, Bo W, Liu Y. RoFormer: Enhanced Transformer with Rotary Position Embedding. Neurocomputing 568:127063, 2024. <https://doi.org/10.1016/j.neucom.2023.127063>
+27. Mistral AI. Timestral. 2026. <https://mistral.ai/news/timestral/>
