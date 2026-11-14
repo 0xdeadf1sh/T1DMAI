@@ -18,6 +18,7 @@ MODELS = models()
 from zoo.windows import drop_zone_doses, horizon_columns, template_windows, train_windows
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VAL_SHARE = 0.05
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,12 +79,13 @@ def fit_or_load(key: str, causal: bool, cache, runs: str, n_windows: int, seed: 
         return model
     os.makedirs(run_dir, exist_ok=True)
     t = time.time()
-    tw = train_windows(cache, n_windows, model.ctx, seed)
+    tw = train_windows(cache, n_windows, model.ctx, seed, block='fit')
+    vw = train_windows(cache, max(round(n_windows * VAL_SHARE), 1), model.ctx, seed, block='val')
     if causal:
-        tw = drop_zone_doses(tw)
-    print(f'{run_name(key, causal)}: {len(tw)} train windows, ctx {model.ctx}  '
-          f'({time.time() - t:.0f} s)', flush=True)
-    model.fit(tw)
+        tw, vw = drop_zone_doses(tw), drop_zone_doses(vw)
+    print(f'{run_name(key, causal)}: {len(tw)} train windows, {len(vw)} validation, '
+          f'ctx {model.ctx}  ({time.time() - t:.0f} s)', flush=True)
+    model.fit(tw, vw)
     np.savez(path, **model.state())
     return model
 

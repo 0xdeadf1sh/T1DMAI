@@ -131,7 +131,7 @@ class SVR(_ArxDelta):
         d = x.shape[1]
         return m.coef[0] + x @ m.coef[1:1 + d] + _rff(x, m.omega, m.phase) @ m.coef[1 + d:]
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
         w = _subsample(w, SVR_WINDOWS, self.seed)
         x, y = self._prepare(w)
         rng = np.random.default_rng(self.seed)
@@ -234,7 +234,7 @@ class GP(_ArxDelta):
         self.ratio = noise / sig
         self.noise = noise
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
         w = _subsample(w, GP_WINDOWS, self.seed)
         w = w.take(np.flatnonzero(np.isfinite(w.target).all(axis=1)))
         x, y = self._prepare(w)
@@ -325,7 +325,7 @@ class Kalman(Forecaster):
     def _forward(m, bg: torch.Tensor, ins: torch.Tensor, carb: torch.Tensor) -> torch.Tensor:
         return bg @ m.map
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
         w = _subsample(w, KALMAN_WINDOWS, 0)
         y = w.target[:, STEP_30].astype(np.float64)
         ok = np.isfinite(y)

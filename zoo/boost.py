@@ -105,7 +105,7 @@ class _Trees(Forecaster):
     def _train(self, X: np.ndarray, y: np.ndarray) -> None:
         raise NotImplementedError
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
         if len(w) > XGB_WINDOWS:
             w = w.take(np.sort(np.random.default_rng(0).choice(len(w), XGB_WINDOWS, replace=False)))
         X = self._x(w)

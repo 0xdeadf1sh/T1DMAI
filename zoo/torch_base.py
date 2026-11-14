@@ -36,10 +36,10 @@ class _Graph(nn.Module):
 
 class TorchForecaster(Forecaster):
     def __init__(self, ctx: int, epochs: int = 8, batch: int = 1024, lr: float = 1e-3,
-                 weight_decay: float = 1e-4, val_frac: float = 0.05, seed: int = 0) -> None:
+                 weight_decay: float = 1e-4, seed: int = 0) -> None:
         self.ctx = ctx
         self.epochs, self.batch, self.lr = epochs, batch, lr
-        self.weight_decay, self.val_frac, self.seed = weight_decay, val_frac, seed
+        self.weight_decay, self.seed = weight_decay, seed
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net: nn.Module = self.build()
 
@@ -73,12 +73,11 @@ class TorchForecaster(Forecaster):
                 n += float(ok.sum())
         return tot / max(n, 1.0)
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
+        """Train on ``w``; keep the epoch with the lowest ``val`` loss, or the last without one."""
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
-        order = rng.permutation(len(w))
-        n_val = max(int(len(w) * self.val_frac), 1)
-        val, tr = order[:n_val], order[n_val:]
+        tr = np.arange(len(w))
         self.net.to(self.device)
         opt = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         steps = self.epochs * ((len(tr) + self.batch - 1) // self.batch)
@@ -89,6 +88,8 @@ class TorchForecaster(Forecaster):
             t = time.time()
             for bg, ins, carb, y in self._batches(w, tr, True, rng):
                 ok = torch.isfinite(y)
+                if not ok.any():
+                    continue
                 d = (self.net(bg, ins, carb) - torch.nan_to_num(y))[ok]
                 loss = (d ** 2).mean()
                 opt.zero_grad(set_to_none=True)
@@ -96,7 +97,10 @@ class TorchForecaster(Forecaster):
                 nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
                 sched.step()
-            v = self._loss(w, val, rng)
+            if val is None or not len(val):
+                print(f'  epoch {ep + 1}/{self.epochs}  ({time.time() - t:.0f} s)', flush=True)
+                continue
+            v = self._loss(val, np.arange(len(val)), rng)
             rmse = DELTA_SCALE * v ** 0.5
             print(f'  epoch {ep + 1}/{self.epochs}  val rmse {rmse:.2f} mg/dL  '
                   f'({time.time() - t:.0f} s)', flush=True)

@@ -172,6 +172,9 @@ def score_track(spec: dict, d: dict) -> list[dict]:
                 r['h'][m]['time_gain'] = tg[0] if len(tg) == 1 else None
         rows.append(r)
     alpha = 0.05 / max(len(rows) - 1, 1)
+    cl, unit = _clusters(d), _cluster_unit(d)
+    for r in rows:
+        r['test_unit'] = unit
     for j, m in enumerate(HORIZONS):
         best = min(range(len(rows)), key=lambda i: rows[i]['h'][m].get('rmse', np.inf))
         for i, r in enumerate(rows):
@@ -179,7 +182,7 @@ def score_track(spec: dict, d: dict) -> list[dict]:
                 r['h'][m] |= {'vs_best': 'best', 'p_vs_best': None, 'dmae_vs_best': 0.0}
                 continue
             dm, p = pm.wilcoxon_abs_error(d['truth'][:, j], d['pred'][i, :, j],
-                                          d['pred'][best, :, j])
+                                          d['pred'][best, :, j], cl)
             r['h'][m] |= {'vs_best': 'tie' if p >= alpha or dm <= 0 else 'worse',
                           'p_vs_best': p, 'dmae_vs_best': dm}
     return rows
@@ -208,9 +211,13 @@ def dataset_stats(spec: dict, d: dict) -> list[dict]:
     return rows
 
 
+def _cluster_unit(d: dict) -> str:
+    return 'subject' if len(np.unique(d['keys'])) > 1 else 'day'
+
+
 def _clusters(d: dict) -> np.ndarray:
-    """Resampling unit for the bootstrap: the subject, or the day when there is one subject."""
-    by = d['keys'] if len(np.unique(d['keys'])) > 1 else d['day']
+    """Unit of the bootstrap and the paired test: the subject, or the day for one subject."""
+    by = d['keys'] if _cluster_unit(d) == 'subject' else d['day']
     return np.unique(by, return_inverse=True)[1]
 
 
@@ -235,7 +242,7 @@ def extras(spec: dict, d: dict) -> dict:
     subj_n = dict(zip(*np.unique(d['keys'], return_counts=True)))
     big = np.array([subj_n[k] >= MIN_SUBJECT_FORECASTS for k in d['keys']])
     unit = d['keys'] if per_subject else d['day']
-    out = {'cluster': 'subject' if per_subject else 'day', 'clusters': int(n_cl), 'models': {}}
+    out = {'cluster': _cluster_unit(d), 'clusters': int(n_cl), 'models': {}}
     for i, e in enumerate(spec['entries']):
         r = {'ci': {}, 'strata': {}}
         for j, m in enumerate(HORIZONS):
@@ -482,7 +489,8 @@ def tables(name: str, spec: dict, rows: list[dict]) -> str:
             + ' |')
     n = rows[0]['h'][60]['n']
     out.append(f"\n{n} forecasts at 60 min. * means lowest RMSE, or not significantly worse than "
-               f"it (Wilcoxon test on absolute errors, alpha 0.05/{len(rows) - 1}).")
+               f"it (Wilcoxon signed-rank test on the mean absolute-error difference per "
+               f"{rows[0]['test_unit']}, alpha 0.05/{len(rows) - 1}).")
     return '\n'.join(out) + '\n'
 
 

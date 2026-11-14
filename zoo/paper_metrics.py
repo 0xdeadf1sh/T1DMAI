@@ -97,11 +97,19 @@ def time_gain(ts: np.ndarray, pred: np.ndarray, truth_ts: np.ndarray, truth: np.
     return None if best_k is None else float(horizon_min - 5 * best_k)
 
 
-def wilcoxon_abs_error(true: np.ndarray, a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-    """Two-sided Wilcoxon signed-rank on paired |error|: (mean |a| - |b| mg/dL, p)."""
+def wilcoxon_abs_error(true: np.ndarray, a: np.ndarray, b: np.ndarray,
+                       cluster: np.ndarray | None = None) -> tuple[float, float]:
+    """Two-sided Wilcoxon signed-rank on paired |error|: (mean |a| - |b| mg/dL, p).
+
+    With ``cluster`` (N,) the test runs on each cluster's mean difference, one value per cluster,
+    and the returned mean is over clusters; without it every row is its own unit.
+    """
     from scipy.stats import wilcoxon
     ok = np.isfinite(true) & np.isfinite(a) & np.isfinite(b)
     d = np.abs(a[ok] - true[ok]) - np.abs(b[ok] - true[ok])
+    if cluster is not None and len(d):
+        inv = np.unique(cluster[ok], return_inverse=True)[1]
+        d = np.bincount(inv, d) / np.bincount(inv)
     if not np.any(d):
         return 0.0, 1.0
     return float(np.mean(d)), float(wilcoxon(d, zero_method='wilcox').pvalue)

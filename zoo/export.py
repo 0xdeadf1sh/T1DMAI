@@ -19,7 +19,6 @@ from zoo.windows import MAX_INTERP_STEPS, ZONE, drop_zone_doses, train_windows
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FORMAT = 't1dm-zoo-1'
-CAL_SEED = 1  # the fit draws seed 0; calibration windows come from a disjoint stream
 MEDIAN_INDEX = QUANTILE_LEVELS.index(0.5)
 
 
@@ -66,7 +65,9 @@ def main() -> None:
     with np.load(os.path.join(run_dir, 'params.npz')) as z:
         model.load({k: z[k] for k in z.files})
 
-    cal = train_windows(FinetuneCache(args.cache), args.cal_windows, model.ctx, CAL_SEED)
+    cal = train_windows(FinetuneCache(args.cache), args.cal_windows, model.ctx, block='cal')
+    if not len(cal):
+        raise SystemExit('no calibration window in the last days of any train period')
     if causal:
         cal = drop_zone_doses(cal)
     offsets = band_offsets(cal.target - model.predict(cal))

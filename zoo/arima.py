@@ -59,7 +59,7 @@ class StateSpace(Forecaster):
         return SARIMAX(endog, exog=exog, order=self.order, trend='n',
                        enforce_stationarity=False, enforce_invertibility=False)
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
         rng = np.random.default_rng(0)
         if len(w) > self.fit_windows:
             w = w.take(np.sort(rng.choice(len(w), self.fit_windows, replace=False)))

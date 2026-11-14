@@ -367,13 +367,12 @@ class ChronosForecaster(Forecaster):
     reads_doses = False
 
     def __init__(self, size: str, finetune: bool, epochs: int = 1, batch: int = 256,
-                 lr: float = 1e-5, weight_decay: float = 0.0, val_frac: float = 0.05,
-                 seed: int = 0) -> None:
+                 lr: float = 1e-5, weight_decay: float = 0.0, seed: int = 0) -> None:
         self.size, self.finetune = size, finetune
         self.name = f"chronos_bolt_{size}_{'ft' if finetune else 'zs'}"
         self.ctx = CTX
         self.epochs, self.batch, self.lr = epochs, batch, lr
-        self.weight_decay, self.val_frac, self.seed = weight_decay, val_frac, seed
+        self.weight_decay, self.seed = weight_decay, seed
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._graph: MedianGraph | None = None
 
@@ -406,20 +405,21 @@ class ChronosForecaster(Forecaster):
                 n += float(d.numel())
         return tot / max(len(idx), 1), (sq / max(n, 1.0)) ** 0.5
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
+        """Fine-tune on ``w``; restore the best epoch on ``val`` if it beats zero-shot."""
         if not self.finetune:
             return
         torch.manual_seed(self.seed)
         rng = np.random.default_rng(self.seed)
-        order = rng.permutation(len(w))
-        n_val = max(int(len(w) * self.val_frac), 1)
-        val, tr = order[:n_val], order[n_val:]
+        tr = np.arange(len(w))
+        has_val = val is not None and len(val) > 0
         opt = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         steps = max(self.epochs * ((len(tr) + self.batch - 1) // self.batch), 1)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: max(1.0 - i / steps, 0.0))
-        best, rmse = self._val(w, val)
-        best_state = None
-        print(f'  zero-shot val pinball {best:.4f}  median rmse {rmse:.2f} mg/dL', flush=True)
+        best, best_state = float('inf'), None
+        if has_val:
+            best, rmse = self._val(val, np.arange(len(val)))
+            print(f'  zero-shot val pinball {best:.4f}  median rmse {rmse:.2f} mg/dL', flush=True)
         for ep in range(self.epochs):
             self.g.train()
             t = time.time()
@@ -433,7 +433,10 @@ class ChronosForecaster(Forecaster):
                 nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
                 sched.step()
-            v, rmse = self._val(w, val)
+            if not has_val:
+                print(f'  epoch {ep + 1}/{self.epochs}  ({time.time() - t:.0f} s)', flush=True)
+                continue
+            v, rmse = self._val(val, np.arange(len(val)))
             print(f'  epoch {ep + 1}/{self.epochs}  val pinball {v:.4f}  median rmse '
                   f'{rmse:.2f} mg/dL  ({time.time() - t:.0f} s)', flush=True)
             if v < best:

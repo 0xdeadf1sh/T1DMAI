@@ -34,3 +34,38 @@ def test_wilcoxon_detects_a_strictly_better_model():
     good, bad = t + rng.normal(0, 5, 500), t + rng.normal(0, 30, 500)
     d, p = pm.wilcoxon_abs_error(t, bad, good)
     assert d > 0 and p < 1e-6
+
+
+def _clustered_case():
+    """10 days of 288 rows: |a| - |b| is +1 on 6 days and -0.9 on 4, with small row noise."""
+    rng = np.random.default_rng(0)
+    day = np.repeat(np.arange(10), 288)
+    shift = np.where(np.isin(day, [0, 2, 3, 5, 7, 8]), 1.0, -0.9)
+    t = np.full(len(day), 150.0)
+    b = t + 10.0
+    a = t + 10.0 + shift + rng.normal(0, 0.1, len(day))
+    return t, a, b, day
+
+
+def test_clustered_wilcoxon_counts_days_not_rows():
+    t, a, b, day = _clustered_case()
+    _, p_rows = pm.wilcoxon_abs_error(t, a, b)
+    d, p_days = pm.wilcoxon_abs_error(t, a, b, day)
+    print(f'DUMP row-level p {p_rows:.2e}, per-day p {p_days:.3f}, per-day mean {d:+.3f}')
+    assert p_rows < 1e-6 and p_days > 0.05
+    assert np.isclose(d, (6 * 1.0 - 4 * 0.9) / 10, atol=0.01)
+
+
+def test_leaderboard_verdict_uses_the_clustered_test():
+    import leaderboard as lb
+    t, a, b, day = _clustered_case()
+    h = len(lb.HORIZONS)
+    d = {'truth': np.repeat(t[:, None], h, 1), 'pred': np.stack([np.repeat(x[:, None], h, 1)
+                                                                  for x in (b, a)]),
+         'origin': t.copy(), 'keys': np.full(len(t), 'p1'), 'day': day,
+         'ts': day * 86400 + np.arange(len(t)) % 288 * 300, 'cgm': {}}
+    spec = {'entries': [{'key': k, 'label': k, 'family': 'Baseline'} for k in ('b', 'a')]}
+    rows = lb.score_track(spec, d)
+    assert rows[0]['h'][60]['vs_best'] == 'best'
+    assert rows[1]['h'][60]['vs_best'] == 'tie' and rows[1]['test_unit'] == 'day'
+    assert 'per day' in lb.tables('t', spec, rows)

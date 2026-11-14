@@ -15,7 +15,7 @@ def _windows(bg: np.ndarray, target: np.ndarray, ins=None, carb=None) -> Windows
 def test_cut_zone_opens_one_step_after_the_reading():
     bg = np.arange(100, dtype=np.float32)
     ins = np.zeros(100, np.float32)
-    b, _, _, t = _cut(bg, ins, ins.copy(), np.array([40]), 12, True)
+    b, _, _, t = _cut(bg, ins, ins.copy(), np.array([40]), 12, bg)
     assert b[0, -1] == 39.0
     assert t[0, 0] == 40.0
     pred_30 = horizon_columns(t)[0, 0]
@@ -26,7 +26,7 @@ def test_cut_zone_opens_one_step_after_the_reading():
 def test_cut_past_the_end_is_nan_and_dose_free():
     bg = np.arange(50, dtype=np.float32)
     ins = np.ones(50, np.float32)
-    _, i, _, t = _cut(bg, ins, ins.copy(), np.array([45]), 6, True)
+    _, i, _, t = _cut(bg, ins, ins.copy(), np.array([45]), 6, bg)
     assert np.isnan(t[0, 5:]).all() and np.isfinite(t[0, :5]).all()
     assert (i[0, 6 + 5:] == 0).all() and (i[0, :6 + 5] == 1).all()
 
@@ -95,3 +95,59 @@ def test_ridge_arx_learns_announced_carbs():
     err_arx = np.sqrt(np.mean((arx.predict(w) - target) ** 2))
     print(f'DUMP ridge AR rmse {err_ar:.2f}  ARX rmse {err_arx:.2f}')
     assert err_arx < 0.2 * err_ar
+
+
+DAY = 288
+T0 = 1_700_000_100
+
+
+class _FakeCache:
+    """Records whose measured bg is the calendar step since its person's epoch; 3-step gaps."""
+
+    def __init__(self) -> None:
+        def rec(pool, src, sid, day0, days, test_day=-1):
+            return {'key': f'{pool}:{src}:{sid}', 'pool': pool, 'source': src, 'sid': sid,
+                    'n': days * DAY, 't0': T0 + day0 * DAY * 300,
+                    'test_start': test_day * DAY if test_day >= 0 else -1}
+        self.subjects = [rec('phone', 'x', 'owner', 0, 40, 30),
+                         rec('phone', 'x', 'owner-s1', 1, 14),
+                         rec('phone', 'x', 'owner-s2', 18, 12),
+                         rec('metabonet', 'B', '1', 0, 20),
+                         rec('metabonet', 'C', '1', 0, 8)]
+
+    def train_len(self, rec: dict) -> int:
+        ts = int(rec['test_start'])
+        return int(rec['n']) if ts < 0 else min(int(rec['n']), ts)
+
+    def channels(self, rec: dict, lo: int, hi: int) -> dict:
+        cal = (int(rec['t0']) - T0) // 300 + np.arange(lo, hi)
+        bg = np.where(np.isin(cal % 50, (10, 11, 12)), np.nan, cal).astype(np.float32)
+        z = np.zeros(hi - lo, np.float32)
+        return {'bg': bg, 'bolus_u': z, 'basal_u': z, 'carb_g': z}
+
+
+def test_holdout_blocks_are_per_person_calendar_days_and_measured():
+    from zoo.windows import BLOCKS, block_spans, train_windows
+    cache = _FakeCache()
+    spans = block_spans(cache)
+    assert (spans[1, 1:, 0] == spans[1, 1:, 1]).all(), 'a sibling ending early holds no val/cal'
+    assert spans[4, 0, 0] == spans[4, 0, 1], 'a train period under 10 days fits nothing'
+    ends = {'x': 30 * DAY, 'B': 20 * DAY, 'C': 8 * DAY}
+    for k, block in enumerate(BLOCKS):
+        w = train_windows(cache, 4000, 12, seed=k, block=block)
+        last = w.bg[:, -1]
+        for src, end in ends.items():
+            sel = w.source == src
+            lo, hi = {'fit': (-np.inf, end - 10 * DAY), 'val': (end - 10 * DAY, end - 5 * DAY),
+                      'cal': (end - 5 * DAY, end)}[block]
+            if sel.any():
+                assert last[sel].min() >= lo and (last[sel] + ZONE).max() < hi, (block, src)
+            print(f'DUMP {block} {src}: {int(sel.sum())} windows')
+        assert ('C' in set(w.source)) == (block != 'fit')
+        assert (w.source == 'x').any()
+        assert np.isfinite(w.bg).all()
+        assert not np.isin(last % 50, (10, 11, 12)).any(), 'last context reading measured'
+        cal = last[:, None] + 1 + np.arange(ZONE)[None, :]
+        gap = np.isin(cal % 50, (10, 11, 12))
+        assert np.isnan(w.target[gap]).all(), 'targets never interpolated'
+        assert np.array_equal(w.target[~gap], cal[~gap].astype(np.float32))

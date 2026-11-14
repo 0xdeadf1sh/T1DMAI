@@ -21,8 +21,8 @@ class Forecaster:
     reads_doses = True  # False: the blind and given tracks are one forecast
     causal = False  # set by the runner on the blind track; zone doses are zeros, not announced
 
-    def fit(self, w: Windows) -> None:
-        pass
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
+        """Fit on ``w``; ``val`` is a held-out block for epoch selection, unused by most models."""
 
     def predict(self, w: Windows) -> np.ndarray:
         raise NotImplementedError
@@ -126,7 +126,7 @@ class Ridge(Forecaster):
             return bg[:, -1:] + m.coef[0] + z @ m.coef[1:]
         return _Fn(fn, mu=self.mu, sd=self.sd, coef=self.coef)
 
-    def fit(self, w: Windows) -> None:
+    def fit(self, w: Windows, val: Windows | None = None) -> None:
         X = self.features(w)
         self.mu, self.sd = X.mean(axis=0), X.std(axis=0) + 1e-6
         Z = np.concatenate([np.ones((len(X), 1)), (X - self.mu) / self.sd], axis=1)
