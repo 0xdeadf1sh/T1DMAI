@@ -3,3 +3,4 @@
 -r requirements.txt
 chronos-forecasting==2.3.2
 timesfm[torch,xreg]==3.0.2
+timestral @ git+https://github.com/mistralai/timestral.git@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff

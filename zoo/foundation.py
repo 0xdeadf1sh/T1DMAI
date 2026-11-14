@@ -1,7 +1,7 @@
-"""Chronos-2 and TimesFM 2.5 through their upstream packages, zero-shot, no export graph.
+"""Chronos-2, TimesFM 2.5 and Timestral through upstream packages, zero-shot, no export graph.
 
-Each registers only where its package imports (``.venv-zoo``). Blind: Chronos-2 reads past
-doses only, TimesFM glucose only. Given: zone doses are known-future covariates.
+Each registers only where its package imports (``.venv-zoo``). Blind: Chronos-2 and Timestral
+read past doses only, TimesFM glucose only. Given: zone doses are known-future covariates.
 """
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ TIMESFM_REPO = 'google/timesfm-2.5-200m-pytorch'
 CHRONOS2_BATCH = 256
 TIMESFM_BATCH = 256
 XREG_CHUNK = 256  # XReg fits one ridge per call, so a call never spans more than one chunk
+TIMESTRAL_REVISIONS = {
+    '5M': 'bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f',
+    '28M': '49b26409ac87b5935539a5d8ffe7f397b720db47',
+    '123M': '5a147287addda85f6acd8da3fb8858fe9af7e8f7',
+    '209M': '9874d252ab0aae16f7f7c999f98f98d6ad7d8365',
+}
+TIMESTRAL_BATCH = 256
 
 
 class Chronos2(Forecaster):
@@ -91,6 +98,45 @@ class TimesFM25(Forecaster):
         return np.stack(out)
 
 
+class Timestral(Forecaster):
+    """Mistral AI 2026; median of the 21-quantile head, upstream two-pass symmetric average."""
+    ctx = CTX
+    size = ''
+
+    def __init__(self) -> None:
+        self._fc = None
+
+    def _forecaster(self):
+        if self._fc is None:
+            from timestral import TimestralForecaster
+            dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self._fc = TimestralForecaster.from_pretrained(
+                f'mistralai/Timestral-{self.size}', device=dev,
+                revision=TIMESTRAL_REVISIONS[self.size])
+        return self._fc
+
+    def predict(self, w: Windows) -> np.ndarray:
+        if not len(w):
+            return np.empty((0, ZONE))
+        fc, c = self._forecaster(), self.ctx
+        out = []
+        for s in range(0, len(w), TIMESTRAL_BATCH):
+            sl = slice(s, s + TIMESTRAL_BATCH)
+            doses = np.stack([w.insulin[sl], w.carb[sl]], axis=1)
+            cov = ({'past_covariates': doses[..., :c]} if self.causal
+                   else {'known_covariates': doses})
+            f = fc.forecast(w.bg[sl], prediction_length=ZONE, symmetric_averaging=True, **cov)
+            out.append(f.median[:, 0].float().cpu().numpy())
+        return np.concatenate(out).astype(np.float64)
+
+
+def _timestral(size: str) -> type[Timestral]:
+    return type(f'Timestral{size}', (Timestral,),
+                {'name': f'timestral_{size.lower()}', 'size': size})
+
+
 MODELS = {k: v for k, v, pkg in (('chronos2', Chronos2, 'chronos'),
-                                  ('timesfm25', TimesFM25, 'timesfm'))
+                                  ('timesfm25', TimesFM25, 'timesfm'),
+                                  *((f'timestral_{z.lower()}', _timestral(z), 'timestral')
+                                    for z in TIMESTRAL_REVISIONS))
           if importlib.util.find_spec(pkg) is not None}

@@ -25,10 +25,11 @@ python3.11 -m venv .venv-export
 .venv-export/bin/python -m exporters.executorch_xnnpack --checkpoint <ckpt> --out-dir exported
 ```
 
-`.venv-zoo` (`requirements-zoo.txt`) is `venv` plus `chronos-forecasting` and `timesfm[xreg]`;
-`zoo/foundation.py` registers `chronos2` / `timesfm25` only where those import. On the blind track
-(`Forecaster.causal`, set by `zoo.run.fit_or_load`) Chronos-2 reads past doses only and TimesFM
-glucose only; on the given track zone doses are known-future covariates.
+`.venv-zoo` (`requirements-zoo.txt`) is `venv` plus `chronos-forecasting`, `timesfm[xreg]` and
+`timestral` (git-pinned); `zoo/foundation.py` registers `chronos2` / `timesfm25` /
+`timestral_{5m,28m,123m,209m}` only where those import. On the blind track (`Forecaster.causal`,
+set by `zoo.run.fit_or_load`) Chronos-2 and Timestral read past doses only and TimesFM glucose
+only; on the given track zone doses are known-future covariates.
 
 `T1DMSIM` is a symlink to the sibling checkout and `import config` needs it — config reads
 `SIMULATOR_WARMUP_HOURS` and `EVENT_CHANNELS` from `T1DMSIM.simulator` rather than restating

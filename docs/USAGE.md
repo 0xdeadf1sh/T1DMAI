@@ -682,9 +682,10 @@ python3.11 -m venv .venv-export
 ```
 
 `requirements-zoo.txt` is `.venv-zoo`: the training requirements plus
-`chronos-forecasting` and `timesfm` (with JAX, for its covariate regression).
-`zoo/foundation.py` registers Chronos-2 and TimesFM 2.5 only where those packages
-import, so under `venv` the zoo lists neither.
+`chronos-forecasting`, `timesfm` (with JAX, for its covariate regression) and
+`timestral` (from GitHub, pinned to a commit). `zoo/foundation.py` registers
+Chronos-2, TimesFM 2.5 and the four Timestral sizes only where those packages
+import, so under `venv` the zoo lists none of them.
 
 ```bash
 python3.14 -m venv .venv-zoo
