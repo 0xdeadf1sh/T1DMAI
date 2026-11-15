@@ -15,7 +15,7 @@ import numpy as np
 from zoo.registry import models
 
 MODELS = models()
-from zoo.windows import drop_zone_doses, horizon_columns, template_windows, train_windows
+from zoo.windows import ZONE, drop_zone_doses, horizon_columns, template_windows, train_windows
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VAL_SHARE = 0.05
@@ -106,23 +106,47 @@ class Template:
                 self.rows_by_subject.setdefault(s, []).append(row)
 
 
-def predict_template(model, cache, tpl: Template, causal: bool) -> tuple[np.ndarray, int]:
-    """``(rows, horizons)`` mg/dL, unanchorable rows ladder-filled; plus the anchored count."""
+def predict_template(model, cache, tpl: Template, causal: bool) -> tuple:
+    """``(rows, horizons)`` mg/dL, unanchorable rows ladder-filled; the anchored count; and,
+    from a model with ``predict_quantiles``, the ``(rows, ZONE, levels)`` band, NaN unanchored."""
+    from config import QUANTILE_LEVELS
     from export_submission import _apply_ladder
     from finetune_data import HORIZON_MINUTES
     from T1DMSIM.simulator import BG_CLAMP_MAX, BG_CLAMP_MIN
     pred = np.full((tpl.n_rows, len(HORIZON_MINUTES)), np.nan)
+    quantiles = getattr(model, 'predict_quantiles', None)
+    band = np.full((tpl.n_rows, ZONE, len(QUANTILE_LEVELS)), np.nan) if quantiles else None
     anchored = 0
     for s, rows in tpl.rows_by_subject.items():
         w = template_windows(cache, {s: rows}, tpl.t_epoch, model.ctx)
         if causal:
             w = drop_zone_doses(w)
         if len(w):
-            pred[w.row] = horizon_columns(model.predict(w))
+            if quantiles:
+                band[w.row] = quantiles(w)
+                zone = band[w.row][..., QUANTILE_LEVELS.index(0.5)]
+            else:
+                zone = model.predict(w)
+            pred[w.row] = horizon_columns(zone)
             anchored += len(w)
     _apply_ladder(pred, cache, tpl.rows_by_subject, tpl.t_epoch)
     np.clip(pred, BG_CLAMP_MIN, BG_CLAMP_MAX, out=pred)
-    return pred, anchored
+    if band is not None:
+        np.clip(band, BG_CLAMP_MIN, BG_CLAMP_MAX, out=band)
+    return pred, anchored, band
+
+
+def write_band(table, pred: np.ndarray, band: np.ndarray, run_dir: str) -> None:
+    """``predictions_q.parquet``: ``pred`` plus the band at the horizons; ``predictions_dense``:
+    the median and band at every zone step. The leaderboard reads both as ``bands``/``dense``."""
+    from config import QUANTILE_LEVELS
+    from export_submission import _append_quantiles, _write, _write_dense
+    from finetune_data import HORIZON_MINUTES, HORIZON_STEPS
+    q_path = os.path.join(run_dir, 'predictions_q.parquet')
+    _write(table, pred, len(pred), HORIZON_MINUTES, q_path)
+    _append_quantiles(q_path, band[:, list(HORIZON_STEPS)], HORIZON_MINUTES, QUANTILE_LEVELS)
+    _write_dense(table, band[..., QUANTILE_LEVELS.index(0.5)], band, QUANTILE_LEVELS,
+                 os.path.join(run_dir, 'predictions_dense.parquet'))
 
 
 def main() -> None:
@@ -139,12 +163,14 @@ def main() -> None:
                         refit=True)
     tpl = Template(args.template, args.every, cache)
     t = time.time()
-    pred, anchored = predict_template(model, cache, tpl, args.causal)
+    pred, anchored, band = predict_template(model, cache, tpl, args.causal)
     n_rows = tpl.n_rows
     print(f'anchored {anchored}/{n_rows} template rows  ({time.time() - t:.0f} s)', flush=True)
     out_parquet = os.path.join(run_dir, 'predictions.parquet')
     if _write(tpl.table, pred, n_rows, HORIZON_MINUTES, out_parquet) == 0:
         sys.exit('no horizon fully populated')
+    if band is not None:
+        write_band(tpl.table, pred, band, run_dir)
 
     scores = score_table(pq.read_table(out_parquet), args.truth, by_source=True)
     by_source = scores.pop('by_source')

@@ -39,6 +39,9 @@ LABEL = {
     'timesfm25': 'TimesFM 2.5 (zero-shot)',
     'timestral_5m': 'Timestral 5M (zero-shot)', 'timestral_28m': 'Timestral 28M (zero-shot)',
     'timestral_123m': 'Timestral 123M (zero-shot)', 'timestral_209m': 'Timestral 209M (zero-shot)',
+    'timestral_5m_ft': 'Timestral 5M (fine-tuned)', 'timestral_28m_ft': 'Timestral 28M (fine-tuned)',
+    'timestral_123m_ft': 'Timestral 123M (fine-tuned)',
+    'timestral_209m_ft': 'Timestral 209M (fine-tuned)',
 }
 FAMILY = {
     'persistence': 'Baseline', 'linear_extrapolation': 'Baseline', 'ridge_ar': 'Classical',
@@ -47,6 +50,8 @@ FAMILY = {
     'nhits': 'Deep', 'lightgbm': 'Classical', 'lstm_15h': 'Deep', 'chronos2': 'Foundation',
     'timesfm25': 'Foundation', 'timestral_5m': 'Foundation', 'timestral_28m': 'Foundation',
     'timestral_123m': 'Foundation', 'timestral_209m': 'Foundation',
+    'timestral_5m_ft': 'Foundation', 'timestral_28m_ft': 'Foundation',
+    'timestral_123m_ft': 'Foundation', 'timestral_209m_ft': 'Foundation',
 }
 FAMILY_ORDER = ('Baseline', 'Classical', 'Deep', 'Foundation', 'T1DMAI')
 
@@ -151,7 +156,7 @@ def zoo_predictions(entry, tracks, args, cache, tpl, pred_dir) -> dict:
                                          args.train_windows, args.seed, refit=args.refit)
         model = fitted[causal]
         t = time.time()
-        pred, anchored = predict_template(model, cache, tpl, causal)
+        pred, anchored, _ = predict_template(model, cache, tpl, causal)
         _write(tpl.table, pred, tpl.n_rows, HORIZON_MINUTES, path)
         print(f"  {entry['name']} {track}: {anchored}/{tpl.n_rows} anchored "
               f"({time.time() - t:.0f} s)", flush=True)

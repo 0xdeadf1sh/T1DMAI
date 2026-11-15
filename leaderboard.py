@@ -385,15 +385,17 @@ def _window_doses(ev: tuple, ts: int, lo: int = -60, hi: int = 120) -> dict:
 
 
 def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict:
-    """Per LoRA model: n_blocks 48-hour spans of consecutive test days, spread evenly."""
+    """Per LoRA model and track ``day_blocks`` key: n_blocks 48-hour spans of test days."""
     if len(np.unique(d['keys'])) != 1:
         return {}
     idx = {e['key']: i for i, e in enumerate(spec['entries'])}
     subject = str(d['keys'][0])
     tts, v = d['cgm'][subject]
     ev = _subject_events(spec['cache'], subject) if spec.get('cache') else None
+    names = {k: k.removesuffix('_lora1') for k in d['bands'] if k.endswith('_lora1')}
+    names |= {k: k for k in spec.get('day_blocks', [])}
     out = {}
-    for key in sorted(k for k in d['bands'] if k.endswith('_lora1')):
+    for key, name in sorted(names.items()):
         full = {day: e for e, day in _day_rmse(d, idx[key])}
         starts = [day for day in sorted(full) if day + 1 in full]
         picks = [starts[int(round(p))] for p in np.linspace(0, len(starts) - 1, n_blocks)]
@@ -421,7 +423,7 @@ def day_blocks(spec: dict, d: dict, n_blocks: int = 2, every_h: int = 2) -> dict
                                 for w in range(0, 48, every_h)]
                 blk['basal_total'] = float(basal[ks].sum())
             blocks.append(blk)
-        out[key.removesuffix('_lora1')] = blocks
+        out[name] = blocks
     return out
 
 
@@ -944,7 +946,7 @@ def fig_calibration(rows, ex, title, stem, horizon=60):
     th = THEMES[_THEME]
     best: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: r['h'][60]['rmse']):
-        if 'bands' in ex['models'][r['key']]:
+        if r['family'] == 'T1DMAI' and 'bands' in ex['models'][r['key']]:
             best.setdefault(r['key'].split('_')[-1].split('-')[0], r)
     sel = list(best.values())
     fig, ax = plt.subplots(figsize=(3.6, 3.6))
@@ -1125,7 +1127,7 @@ def fig_clarke(ex, title, stem):
 
 
 def fig_days(ex, arch, block, title, stem):
-    """48 hours: CGM, the LoRA 2-hour forecasts with 50%/90% bands, logged doses."""
+    """48 hours: CGM, one model's 2-hour forecasts with 50%/90% bands, logged doses."""
     import matplotlib.pyplot as plt
     th = THEMES[_THEME]
     blocks = ex.get('blocks', {}).get(arch)

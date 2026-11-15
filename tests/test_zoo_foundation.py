@@ -72,8 +72,13 @@ def test_foundation_dose_reads_per_track(key, pkg, reads_past):
     assert persist < 5.0
 
 
+KNOTS = (0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75,
+         0.8, 0.85, 0.9, 0.95, 0.99)
+
+
 class _Recorder:
-    """Stands in for ``TimestralForecaster``: logs each call, median = last reading + step."""
+    """Stands in for ``TimestralForecaster``: logs each call; quantile p = last + step + 100 p."""
+    quantile_levels = KNOTS
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -82,8 +87,8 @@ class _Recorder:
         import torch
         self.calls.append({'context': np.array(context), 'h': prediction_length, **kw})
         last = torch.as_tensor(np.asarray(context)[:, -1:], dtype=torch.float32)
-        median = (last + torch.arange(prediction_length))[:, None]
-        return type('F', (), {'median': median})()
+        q = (last + torch.arange(prediction_length))[:, None, :, None] + 100 * torch.tensor(KNOTS)
+        return type('F', (), {'quantiles': q})()
 
 
 @pytest.mark.parametrize('causal', [True, False])
@@ -104,7 +109,94 @@ def test_timestral_hands_each_chunk_its_own_rows(monkeypatch, causal):
         np.testing.assert_array_equal(call['context'], w.bg[sl])
         for k, v in want.items():
             np.testing.assert_array_equal(call[k], v[sl])
-    np.testing.assert_allclose(p, w.bg[:, -1:] + np.arange(ZONE), rtol=0, atol=1e-4)
+    np.testing.assert_allclose(p, w.bg[:, -1:] + np.arange(ZONE) + 50, rtol=0, atol=1e-4)
+
+
+def test_timestral_band_is_the_leaderboard_levels():
+    import zoo.foundation as fnd
+    from config import QUANTILE_LEVELS
+    m = fnd._timestral('5M')()
+    m.causal, m._fc = True, _Recorder()
+    w = _windows(5, m.ctx, 2)
+    q = m.predict_quantiles(w)
+    want = (w.bg[:, -1:] + np.arange(ZONE))[..., None] + 100 * np.array(QUANTILE_LEVELS)
+    assert q.shape == (5, ZONE, len(QUANTILE_LEVELS))
+    np.testing.assert_allclose(q, want, rtol=0, atol=1e-3)
+    np.testing.assert_array_equal(m.predict(w), q[..., QUANTILE_LEVELS.index(0.5)])
+
+
+@pytest.mark.parametrize('size', list(TIMESTRAL_REVISIONS))
+@pytest.mark.parametrize('causal', [True, False])
+def test_timestral_training_forward_is_the_forecast(size, causal):
+    pytest.importorskip('timestral')
+    import torch
+
+    import zoo.foundation as fnd
+    m = fnd._timestral(size, finetune=True)()
+    m.causal = causal
+    w = _windows(24, m.ctx, 3)
+    cov = m._covariates(w, slice(None))
+    fc = m._forecaster()
+    want = fc.forecast(w.bg, prediction_length=ZONE, symmetric_averaging=True,
+                       clip_nonnegative=False, **cov).quantiles[:, 0]
+    with torch.no_grad():
+        got = m._quantiles(w.bg, cov)
+    print(f'DUMP {size} causal={causal}: max |train forward - forecast| '
+          f'{(got - want).abs().max():.2e} mg/dL')
+    assert got.shape == want.shape == (24, ZONE, len(fc.quantile_levels))
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-3)
+
+
+def _with_targets(w: Windows, truth: np.ndarray) -> Windows:
+    w = w.take(np.arange(len(w)))
+    w.target = truth.astype(np.float32)
+    w.target[::3, ::4] = np.nan
+    return w
+
+
+def test_timestral_finetune_learns_restores_and_round_trips():
+    pytest.importorskip('timestral')
+    import torch
+
+    import zoo.foundation as fnd
+    zs = fnd._timestral('5M')()
+    zs.causal = True
+    w, truth = _sines(64, zs.ctx)
+    w = _with_targets(w, truth + 15)  # a level shift zero-shot cannot know
+    before = zs.predict(w)
+    zs.fit(w, w)
+    assert zs.state() == {}
+    np.testing.assert_array_equal(zs.predict(w), before)
+
+    ft = fnd._timestral('5M', finetune=True)(epochs=3, batch=16, lr=1e-4)
+    ft.causal = True
+    loss0 = ft._val(w)[0]
+    ft.fit(w, w)
+    after = ft.predict(w)
+    loss1 = ft._val(w)[0]
+    print(f'DUMP fine-tune val pinball {loss0:.3f} -> {loss1:.3f}  mean shift '
+          f'{np.abs(after - before).mean():.2f} mg/dL')
+    assert loss1 < loss0 and not np.allclose(after, before)
+    ft2 = fnd._timestral('5M', finetune=True)()
+    ft2.causal = True
+    ft2.load(ft.state())
+    np.testing.assert_allclose(ft2.predict(w), after, rtol=0, atol=1e-4)
+
+    bad = fnd._timestral('5M', finetune=True)(epochs=1, batch=16, lr=1.0)
+    bad.causal = True
+    ref = {k: v.clone() for k, v in bad._forecaster().model.state_dict().items()}
+    bad.fit(w, w)
+    for k, v in bad._forecaster().model.state_dict().items():
+        torch.testing.assert_close(v, ref[k], rtol=0, atol=0)
+
+
+def test_timestral_finetuned_keys_are_registered():
+    pytest.importorskip('timestral')
+    from zoo.foundation import MODELS
+    for z in TIMESTRAL_REVISIONS:
+        zs, ft = MODELS[f'timestral_{z.lower()}'](), MODELS[f'timestral_{z.lower()}_ft']()
+        assert (zs.finetune, ft.finetune) == (False, True)
+        assert ft.name == f'timestral_{z.lower()}_ft' and ft.size == zs.size == z
 
 
 @pytest.mark.parametrize('size', list(TIMESTRAL_REVISIONS))
