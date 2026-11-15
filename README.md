@@ -758,7 +758,7 @@ Chronos-2, TimesFM 2.5 and Timestral run under `.venv-zoo` (`requirements-zoo.tx
 
 RMSE (mg/dL) that each model's paper reports, beside the same model on my data and on
 MetaboNet. The papers use other people, splits, inputs and history lengths, so a gap between the
-two sides is not a like-for-like comparison. My data is non-blind, MetaboNet blind (§8).
+two sides is not a like-for-like comparison. My data is non-blind, MetaboNet blind ([Terms](#9-terms)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/published-rmse-dark.png">
