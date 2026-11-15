@@ -23,10 +23,12 @@ MEDIAN_INDEX = QUANTILE_LEVELS.index(0.5)
 
 
 def band_offsets(residual: np.ndarray) -> np.ndarray:
-    """(levels, ZONE) mg/dL added to the median; the median's own row is zero."""
+    """(levels, ZONE) mg/dL added to the median; the median's own row is zero, rows ascend."""
     off = np.stack([np.nanquantile(residual, q, axis=0) for q in QUANTILE_LEVELS])
+    off[:MEDIAN_INDEX] = np.minimum(off[:MEDIAN_INDEX], 0.0)
     off[MEDIAN_INDEX] = 0.0
-    return np.maximum.accumulate(off, axis=0)
+    off[MEDIAN_INDEX + 1:] = np.maximum(off[MEDIAN_INDEX + 1:], 0.0)
+    return off
 
 
 def lower(graph: torch.nn.Module, args: tuple, out_path: str) -> None:
