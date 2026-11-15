@@ -51,12 +51,13 @@ Feast thine eyes on some of their forecasts (these have been trained on syntheti
 5. [Method](#5-method)
 6. [Results](#6-results)
 7. [Mistral models](#7-mistral-models)
-8. [Limitations](#8-limitations)
-9. [Terms](#9-terms)
-10. [Full tables](#10-full-tables)
-11. [Reproduce](#11-reproduce)
-12. [Published scores](#12-published-scores)
-13. [References](#13-references)
+8. [MiniRocket](#8-minirocket)
+9. [Limitations](#9-limitations)
+10. [Terms](#10-terms)
+11. [Full tables](#11-full-tables)
+12. [Reproduce](#12-reproduce)
+13. [Published scores](#13-published-scores)
+14. [References](#14-references)
 
 ## 1. Background
 
@@ -66,16 +67,16 @@ to help me with my daily management. To this end I've made some auxiliary tools:
 - [T1DMSIM](https://github.com/0xdeadf1sh/T1DMSIM) creates synthetic CGM traces since UVA/Padova was too slow on my laptop.
 - [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID) runs the models on my phone, also has some neat functionality like reading BG from multiple CGMs at once.
 
-For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biomedical Engineering, 2024 [[1]](#13-references). It's a nice paper that you should probably read.
+For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biomedical Engineering, 2024 [[1]](#14-references). It's a nice paper that you should probably read.
 
 ## 2. Main results
 
 All models suck. On my data XGBoost is the best one but my own model comes close. On MetaboNet
 fine-tuned Timestral wins. More details below:
 
-1. On my data, D16 DILATE + LoRA comes 3rd of 34 (22.8), behind XGBoost and LightGBM
+1. On my data, D16 DILATE + LoRA comes 3rd of 35 (22.8), behind XGBoost and LightGBM
    (both 22.4). Wilcoxon over test days cannot tell it from the best model at any horizon.
-2. On MetaboNet, D16 DILATE + LoRA comes 13th (34.6). Fine-tuned Timestral 209M has the lowest
+2. On MetaboNet, D16 DILATE + LoRA comes 14th (34.6). Fine-tuned Timestral 209M has the lowest
    RMSE at every horizon (32.6 at 60 min), and Wilcoxon ties no other model to it.
 3. At 60 min a 3771 parameter LoRA adapter helps both models on both datasets: 26.1 to 22.8 and
    27.1 to 23.5 on my data, 36.6 to 34.6 and 36.7 to 35.1 on MetaboNet. At 120 min on
@@ -97,6 +98,9 @@ fine-tuned Timestral wins. More details below:
 10. One epoch of full fine-tuning helps every Timestral size on both datasets: 27.8-28.4 to
     24.2-25.4 on my data and 35.0-35.2 to 32.6-33.8 on MetaboNet at 60 min. On MetaboNet size
     now matters: 209M leads 5M by 1.2 mg/dL. On my data 28M and 123M do best (24.2).
+11. MiniRocket comes 10th on my data (24.0 at 60 min) and 13th on MetaboNet (34.6). At 90 and
+    120 min on my data Wilcoxon cannot tell it from the best model. On MetaboNet it catches 1% of lows
+    at 60 min.
 
 ## 3. Models
 
@@ -113,6 +117,7 @@ fine-tuned Timestral wins. More details below:
 | Sparse GP | Classical | 1000 inducing points. |
 | XGBoost | Classical | Glucose, insulin and carbs [18]. |
 | LightGBM | Classical | Same features, depth, rate and rounds as XGBoost [19]. |
+| MiniRocket | Classical | 9996 random-kernel features over 6 hours of glucose, insulin and carbs, plus the last reading and binned doses, into ridge regression per step [28]. |
 | LSTM | Deep | 2 hours of history [5]. |
 | LSTM (15 h) | Deep | Two layers of 128 over 15 hours, as in MetaboNet-Bench [3]. |
 | GluNet | Deep | Dilated causal convolutions over 4 hours [6]. |
@@ -124,7 +129,7 @@ fine-tuned Timestral wins. More details below:
 | Timestral 5M, 28M, 123M and 209M | Foundation | Zero-shot and fine-tuned. Past insulin and carbs; on my data also the future ones [27]. |
 | T1DMAI D16 DILATE and D16 MSE | T1DMAI | 31k parameters. Glucose, carbs and insulin. |
 
-Numbers in brackets point to [References](#13-references). Everything except the baselines and
+Numbers in brackets point to [References](#14-references). Everything except the baselines and
 the foundation models was trained from scratch on each dataset's training split. T1DMAI comes in two versions: **sim only** is the checkpoint in `models/`, and
 **sim + LoRA** adds a frozen-base rank 1 adapter [23] (3771 parameters) trained on the real training
 split.
@@ -162,7 +167,7 @@ train the adapters while withholding those inputs.
   <img alt="Distribution of my CGM readings in the 35 test days" src="screenshots/personal-glucose.png">
 </picture>
 
-**MetaboNet** [[2]](#13-references). Official split, 279 test people from 9 studies. Blind, because most of them use
+**MetaboNet** [[2]](#14-references). Official split, 279 test people from 9 studies. Blind, because most of them use
 closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 | Source | Subjects | Person-days | Forecasts | CGM coverage % | Mean mg/dL | CV % | < 54 % | < 70 % | 70-180 % | > 180 % | > 250 % |
@@ -373,7 +378,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 ## 7. Mistral models
 
-Timestral [[27]](#13-references) on two 48 h spans of my test days, zero-shot and fine-tuned on my
+Timestral [[27]](#14-references) on two 48 h spans of my test days, zero-shot and fine-tuned on my
 training split. Bands are the raw 50% and 90% quantiles of the model.
 
 ### Timestral, zero-shot
@@ -460,7 +465,22 @@ training split. Bands are the raw 50% and 90% quantiles of the model.
   <img alt="Timestral 209M (fine-tuned) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-209m-ft-2.png">
 </picture>
 
-## 8. Limitations
+## 8. MiniRocket
+
+MiniRocket [[28]](#14-references) on the same two 48 h spans, trained on my training split. Bands
+are residual quantiles on the last 5 days of the training split.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-minirocket-1-dark.png">
+  <img alt="MiniRocket forecasting my glucose, test days block 1" src="screenshots/personal-days-minirocket-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-minirocket-2-dark.png">
+  <img alt="MiniRocket forecasting my glucose, test days block 2" src="screenshots/personal-days-minirocket-2.png">
+</picture>
+
+## 9. Limitations
 
 - My data is N=1 over 35 days.
 - The test sets differ a lot (in range 89% vs 75%, CV 28% vs 40%), so don't compare numbers
@@ -468,15 +488,16 @@ training split. Bands are the raw 50% and 90% quantiles of the model.
 - Lows are rare: 292 forecasts on my data, 8347 on MetaboNet.
 - T1DMAI fell back to the last reading on 0.7% of my forecasts and 0.4% on MetaboNet, including
   all 28 ShanghaiT1DM ones. The other models never fall back.
-- The bands are raw quantiles, no conformal correction.
+- The bands are raw quantiles, no conformal correction. MiniRocket's are residual quantiles on the
+  last 5 days of the training split.
 - The sparse GP's own uncertainty isn't shown. Its noise fit hit the bottom of its grid, giving
   a band about 1 mg/dL wide.
 - Time gain is only computed for my data.
 - Unlogged meals count as "no meal".
 - CPU timings are single runs on one laptop core and varied by up to 45% between runs.
-- LightGBM, LSTM (15 h), Chronos-2, TimesFM 2.5 and Timestral have no CPU timing yet.
+- LightGBM, LSTM (15 h), Chronos-2, TimesFM 2.5, Timestral and MiniRocket have no CPU timing yet.
 
-## 9. Terms
+## 10. Terms
 
 | Term | Meaning |
 | --- | --- |
@@ -487,7 +508,7 @@ training split. Bands are the raw 50% and 90% quantiles of the model.
 | After a meal | At least 5 g of carbs logged in the 2 hours before. |
 | Parameter count | Stored weights and constants in the exported model. |
 
-## 10. Full tables
+## 11. Full tables
 
 A * marks the lowest RMSE and the models not significantly worse than it.
 
@@ -507,6 +528,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 15.1 * | 23.5 * | 28.4 * | 32.4 * | 25.4 | 8.7 | 13.9 | 20.3 | -0.2 | +2.0 | 20 | 50 |
 | Sparse GP | Classical | 15.4 | 23.7 | 28.9 * | 32.8 * | 25.8 | 9.0 | 14.4 | 21.2 | +0.7 | +3.1 | 10 | 20 |
 | GluNet | Deep | 15.4 | 24.0 | 29.8 | 34.5 | 25.6 | 8.9 | 14.4 | 22.3 | +1.0 | +2.8 | 10 | 20 |
+| MiniRocket | Classical | 15.7 | 24.0 | 28.7 * | 31.9 * | 26.3 | 9.3 | 14.9 | 21.5 | +0.4 | +3.8 | 10 | 20 |
 | Timestral 28M (fine-tuned) | Foundation | 15.4 * | 24.2 * | 29.8 * | 33.6 * | 26.5 | 8.7 | 14.1 | 21.0 | -1.6 | +1.2 | 10 | 25 |
 | Timestral 123M (fine-tuned) | Foundation | 15.3 * | 24.2 | 30.5 | 34.7 | 26.3 | 8.7 | 14.3 | 21.8 | -0.6 | +1.8 | 15 | 30 |
 | LSTM | Deep | 15.3 | 24.2 | 30.6 | 35.7 | 25.7 | 8.8 | 14.5 | 22.8 | +0.4 | +2.0 | 10 | 20 |
@@ -546,6 +568,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 MSE (sim + LoRA) | 91.2 | 76.4 | 60.0 | 96.7 | 76.7 | 97.0 | 88.1 | 35.5 | 0.0 | 0.3 |
 | Sparse GP | 90.2 | 75.2 | 58.4 | 96.8 | 75.6 | 96.8 | 76.8 | 57.4 | 0.0 | 0.3 |
 | GluNet | 90.5 | 75.4 | 55.2 | 96.3 | 75.6 | 96.8 | 85.8 | 41.3 | 0.0 | 0.3 |
+| MiniRocket | 89.6 | 73.5 | 59.9 | 96.5 | 73.7 | 96.6 | 68.4 | 78.1 | 0.0 | 0.8 |
 | Timestral 28M (fine-tuned) | 90.9 | 76.1 | 59.0 | 96.6 | 76.3 | 96.8 | 81.6 | 43.5 | 0.0 | 0.7 |
 | Timestral 123M (fine-tuned) | 91.1 | 76.0 | 57.7 | 96.1 | 76.4 | 96.8 | 83.2 | 37.4 | 0.0 | 0.4 |
 | LSTM | 91.1 | 75.4 | 55.4 | 95.4 | 75.8 | 97.1 | 89.7 | 31.9 | 0.0 | 0.1 |
@@ -585,6 +608,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 MSE (sim + LoRA) | 0.66 | 0.47 | 0.992 | 0.64 | 0.70 | 0.54 | 10.3 | +4.7 | +10.9 |
 | Sparse GP | 0.53 | 0.24 | 0.995 | 0.61 | 0.61 | 0.37 | 12.6 | +8.8 | +17.9 |
 | GluNet | 0.66 | 0.50 | 0.987 | 0.55 | 0.67 | 0.51 | 11.0 | +3.6 | +9.0 |
+| MiniRocket | 0.38 | 0.16 | 0.997 | 0.61 | 0.51 | 0.30 | 14.3 | +11.0 | +23.7 |
 | Timestral 28M (fine-tuned) | 0.63 | 0.42 | 0.990 | 0.58 | 0.65 | 0.48 | 10.9 | +5.7 | +13.4 |
 | Timestral 123M (fine-tuned) | 0.65 | 0.50 | 0.991 | 0.62 | 0.68 | 0.54 | 11.4 | +5.6 | +13.4 |
 | LSTM | 0.70 | 0.53 | 0.983 | 0.49 | 0.66 | 0.49 | 10.1 | +1.4 | +5.0 |
@@ -611,7 +635,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Persistence | 0.55 | 0.36 | 0.981 | 0.36 | 0.54 | 0.34 | 12.8 | +8.1 | +18.1 |
 | Linear extrapolation | 0.79 | 0.72 | 0.872 | 0.15 | 0.47 | 0.29 | 11.1 | -1.8 | -3.5 |
 
-9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/33).
+9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/34).
 
 </details>
 
@@ -634,6 +658,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | N-HiTS | Deep | 20.6 | 34.3 | 42.7 | 47.8 | 40.8 | 11.0 | 18.9 | 27.5 | +0.5 | +5.4 |
 | PatchTST | Deep | 20.4 | 34.5 | 42.9 | 48.0 | 40.7 | 10.7 | 19.0 | 27.7 | +0.8 | +5.6 |
 | Chronos-Bolt mini (fine-tuned) | Foundation | 21.0 | 34.5 | 42.0 | 46.2 | 40.8 | 10.8 | 18.1 | 25.0 | -2.1 | +3.0 |
+| MiniRocket | Classical | 21.5 | 34.6 | 42.1 | 46.4 | 41.8 | 11.6 | 19.4 | 27.2 | +0.3 | +6.3 |
 | T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 21.5 | 34.6 | 41.0 | 50.4 | 41.2 | 10.9 | 18.0 | 25.2 | -3.5 | +2.0 |
 | Chronos-Bolt tiny (fine-tuned) | Foundation | 21.1 | 34.6 | 42.1 | 46.2 | 41.0 | 10.9 | 18.2 | 25.0 | -2.3 | +2.9 |
 | GluNet | Deep | 20.5 | 34.8 | 43.6 | 49.0 | 41.1 | 10.8 | 18.9 | 27.8 | +0.4 | +5.0 |
@@ -673,6 +698,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | N-HiTS | 85.1 | 66.3 | 49.3 | 92.4 | 66.5 | 93.3 | 57.4 | 80.0 | 0.1 | 2.9 |
 | PatchTST | 85.7 | 65.9 | 48.8 | 92.3 | 66.1 | 93.3 | 63.0 | 80.8 | 0.1 | 2.6 |
 | Chronos-Bolt mini (fine-tuned) | 85.3 | 67.7 | 53.1 | 93.7 | 67.9 | 93.3 | 64.1 | 78.7 | 0.1 | 3.0 |
+| MiniRocket | 83.6 | 65.0 | 49.6 | 92.9 | 65.1 | 93.2 | 36.2 | 96.2 | 0.1 | 3.3 |
 | T1DMAI D16 DILATE (sim + LoRA) | 84.9 | 67.8 | 49.5 | 93.1 | 68.0 | 91.8 | 71.7 | 79.8 | 0.1 | 3.2 |
 | Chronos-Bolt tiny (fine-tuned) | 85.1 | 67.5 | 53.0 | 93.7 | 67.7 | 93.3 | 59.8 | 78.6 | 0.1 | 3.1 |
 | GluNet | 85.5 | 66.2 | 48.5 | 92.0 | 66.4 | 93.1 | 65.0 | 76.2 | 0.1 | 2.8 |
@@ -712,6 +738,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | N-HiTS | 0.34 | 0.10 | 0.992 | 0.28 | 0.39 | 0.15 | 24.4 | +16.3 | +37.0 |
 | PatchTST | 0.38 | 0.09 | 0.992 | 0.27 | 0.41 | 0.14 | 23.0 | +14.7 | +36.3 |
 | Chronos-Bolt mini (fine-tuned) | 0.38 | 0.09 | 0.994 | 0.34 | 0.40 | 0.16 | 22.2 | +14.6 | +34.1 |
+| MiniRocket | 0.16 | 0.01 | 0.999 | 0.28 | 0.25 | 0.05 | 27.5 | +22.0 | +44.7 |
 | T1DMAI D16 DILATE (sim + LoRA) | 0.42 | 0.06 | 0.997 | 0.38 | 0.41 | 0.15 | 20.6 | +13.3 | +33.4 |
 | Chronos-Bolt tiny (fine-tuned) | 0.35 | 0.09 | 0.993 | 0.31 | 0.39 | 0.15 | 22.8 | +15.7 | +34.1 |
 | GluNet | 0.41 | 0.13 | 0.988 | 0.26 | 0.42 | 0.16 | 22.8 | +13.9 | +34.9 |
@@ -735,13 +762,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Persistence | 0.37 | 0.19 | 0.975 | 0.19 | 0.35 | 0.16 | 26.1 | +16.3 | +33.6 |
 | Linear extrapolation | 0.72 | 0.58 | 0.861 | 0.12 | 0.41 | 0.21 | 27.2 | -1.4 | +12.3 |
 
-264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/33).
+264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/34).
 
 </details>
 
 Raw numbers are in [results/](results/).
 
-## 11. Reproduce
+## 12. Reproduce
 
 ```bash
 python -m zoo.run MODEL --cache CACHE --template template.parquet --truth truth.parquet [--causal]
@@ -754,11 +781,11 @@ python leaderboard.py MANIFEST.json --out results
 
 Chronos-2, TimesFM 2.5 and Timestral run under `.venv-zoo` (`requirements-zoo.txt`).
 
-## 12. Published scores
+## 13. Published scores
 
 RMSE (mg/dL) that each model's paper reports, beside the same model on my data and on
 MetaboNet. The papers use other people, splits, inputs and history lengths, so a gap between the
-two sides is not a like-for-like comparison. My data is non-blind, MetaboNet blind ([Terms](#9-terms)).
+two sides is not a like-for-like comparison. My data is non-blind, MetaboNet blind ([Terms](#10-terms)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/published-rmse-dark.png">
@@ -788,7 +815,7 @@ RMSE in mg/dL at the single step 30 or 60 min ahead, as printed in each paper. T
 
 Chronos-Bolt (Zhang et al. 2026) and N-HiTS (Potosnak et al. 2025; Sergazinov et al. 2024) are published only as RMSE averaged over every step up to the horizon, which is not the same quantity, so they have no row.
 
-## 13. References
+## 14. References
 
 1. Jacobs PG, Herrero P, Facchinetti A, Vehi J, et al. Artificial Intelligence and Machine Learning for Improving Glycemic Control in Diabetes: Best Practices, Pitfalls, and Opportunities. IEEE Reviews in Biomedical Engineering 17:19-41, 2024. <https://doi.org/10.1109/RBME.2023.3331297>
 2. Wolff MK, Calhoun P, Aiello EM, Qin Y, Royston SF. MetaboNet: The Largest Publicly Available Consolidated Dataset for Type 1 Diabetes Management. arXiv:2601.11505, 2026. <https://arxiv.org/abs/2601.11505>
@@ -817,6 +844,7 @@ Chronos-Bolt (Zhang et al. 2026) and N-HiTS (Potosnak et al. 2025; Sergazinov et
 25. Le Guen V, Thome N. Shape and Time Distortion Loss for Training Deep Time Series Forecasting Models. NeurIPS, 2019. <https://arxiv.org/abs/1909.09020>
 26. Su J, Ahmed M, Lu Y, Pan S, Bo W, Liu Y. RoFormer: Enhanced Transformer with Rotary Position Embedding. Neurocomputing 568:127063, 2024. <https://doi.org/10.1016/j.neucom.2023.127063>
 27. Mistral AI. Timestral. 2026. <https://mistral.ai/news/timestral/>
+28. Dempster A, Schmidt DF, Webb GI. MiniRocket: A Very Fast (Almost) Deterministic Transform for Time Series Classification. KDD 2021. <https://arxiv.org/abs/2012.08791>
 
 ## License
 

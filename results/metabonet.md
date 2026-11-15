@@ -14,6 +14,7 @@
 | N-HiTS | Deep | 20.6 | 34.3 | 42.7 | 47.8 | 40.8 | 11.0 | 18.9 | 27.5 | +0.5 | +5.4 |
 | PatchTST | Deep | 20.4 | 34.5 | 42.9 | 48.0 | 40.7 | 10.7 | 19.0 | 27.7 | +0.8 | +5.6 |
 | Chronos-Bolt mini (fine-tuned) | Foundation | 21.0 | 34.5 | 42.0 | 46.2 | 40.8 | 10.8 | 18.1 | 25.0 | -2.1 | +3.0 |
+| MiniRocket | Classical | 21.5 | 34.6 | 42.1 | 46.4 | 41.8 | 11.6 | 19.4 | 27.2 | +0.3 | +6.3 |
 | T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 21.5 | 34.6 | 41.0 | 50.4 | 41.2 | 10.9 | 18.0 | 25.2 | -3.5 | +2.0 |
 | Chronos-Bolt tiny (fine-tuned) | Foundation | 21.1 | 34.6 | 42.1 | 46.2 | 41.0 | 10.9 | 18.2 | 25.0 | -2.3 | +2.9 |
 | GluNet | Deep | 20.5 | 34.8 | 43.6 | 49.0 | 41.1 | 10.8 | 18.9 | 27.8 | +0.4 | +5.0 |
@@ -53,6 +54,7 @@
 | N-HiTS | 85.1 | 66.3 | 49.3 | 92.4 | 66.5 | 93.3 | 57.4 | 80.0 | 0.1 | 2.9 |
 | PatchTST | 85.7 | 65.9 | 48.8 | 92.3 | 66.1 | 93.3 | 63.0 | 80.8 | 0.1 | 2.6 |
 | Chronos-Bolt mini (fine-tuned) | 85.3 | 67.7 | 53.1 | 93.7 | 67.9 | 93.3 | 64.1 | 78.7 | 0.1 | 3.0 |
+| MiniRocket | 83.6 | 65.0 | 49.6 | 92.9 | 65.1 | 93.2 | 36.2 | 96.2 | 0.1 | 3.3 |
 | T1DMAI D16 DILATE (sim + LoRA) | 84.9 | 67.8 | 49.5 | 93.1 | 68.0 | 91.8 | 71.7 | 79.8 | 0.1 | 3.2 |
 | Chronos-Bolt tiny (fine-tuned) | 85.1 | 67.5 | 53.0 | 93.7 | 67.7 | 93.3 | 59.8 | 78.6 | 0.1 | 3.1 |
 | GluNet | 85.5 | 66.2 | 48.5 | 92.0 | 66.4 | 93.1 | 65.0 | 76.2 | 0.1 | 2.8 |
@@ -92,6 +94,7 @@
 | N-HiTS | 0.34 | 0.10 | 0.992 | 0.28 | 0.39 | 0.15 | 24.4 | +16.3 | +37.0 |
 | PatchTST | 0.38 | 0.09 | 0.992 | 0.27 | 0.41 | 0.14 | 23.0 | +14.7 | +36.3 |
 | Chronos-Bolt mini (fine-tuned) | 0.38 | 0.09 | 0.994 | 0.34 | 0.40 | 0.16 | 22.2 | +14.6 | +34.1 |
+| MiniRocket | 0.16 | 0.01 | 0.999 | 0.28 | 0.25 | 0.05 | 27.5 | +22.0 | +44.7 |
 | T1DMAI D16 DILATE (sim + LoRA) | 0.42 | 0.06 | 0.997 | 0.38 | 0.41 | 0.15 | 20.6 | +13.3 | +33.4 |
 | Chronos-Bolt tiny (fine-tuned) | 0.35 | 0.09 | 0.993 | 0.31 | 0.39 | 0.15 | 22.8 | +15.7 | +34.1 |
 | GluNet | 0.41 | 0.13 | 0.988 | 0.26 | 0.42 | 0.16 | 22.8 | +13.9 | +34.9 |
@@ -115,4 +118,4 @@
 | Persistence | 0.37 | 0.19 | 0.975 | 0.19 | 0.35 | 0.16 | 26.1 | +16.3 | +33.6 |
 | Linear extrapolation | 0.72 | 0.58 | 0.861 | 0.12 | 0.41 | 0.21 | 27.2 | -1.4 | +12.3 |
 
-264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/33).
+264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/34).
