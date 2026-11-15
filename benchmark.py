@@ -41,7 +41,7 @@ LABEL = {
     'timestral_123m': 'Timestral 123M (zero-shot)', 'timestral_209m': 'Timestral 209M (zero-shot)',
     'timestral_5m_ft': 'Timestral 5M (fine-tuned)', 'timestral_28m_ft': 'Timestral 28M (fine-tuned)',
     'timestral_123m_ft': 'Timestral 123M (fine-tuned)',
-    'timestral_209m_ft': 'Timestral 209M (fine-tuned)',
+    'timestral_209m_ft': 'Timestral 209M (fine-tuned)', 'minirocket': 'MiniRocket',
 }
 FAMILY = {
     'persistence': 'Baseline', 'linear_extrapolation': 'Baseline', 'ridge_ar': 'Classical',
@@ -51,7 +51,7 @@ FAMILY = {
     'timesfm25': 'Foundation', 'timestral_5m': 'Foundation', 'timestral_28m': 'Foundation',
     'timestral_123m': 'Foundation', 'timestral_209m': 'Foundation',
     'timestral_5m_ft': 'Foundation', 'timestral_28m_ft': 'Foundation',
-    'timestral_123m_ft': 'Foundation', 'timestral_209m_ft': 'Foundation',
+    'timestral_123m_ft': 'Foundation', 'timestral_209m_ft': 'Foundation', 'minirocket': 'Classical',
 }
 FAMILY_ORDER = ('Baseline', 'Classical', 'Deep', 'Foundation', 'T1DMAI')
 

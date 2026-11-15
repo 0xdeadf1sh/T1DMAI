@@ -86,6 +86,10 @@ def fit_or_load(key: str, causal: bool, cache, runs: str, n_windows: int, seed: 
     print(f'{run_name(key, causal)}: {len(tw)} train windows, {len(vw)} validation, '
           f'ctx {model.ctx}  ({time.time() - t:.0f} s)', flush=True)
     model.fit(tw, vw)
+    if hasattr(model, 'calibrate'):
+        cw = train_windows(cache, max(round(n_windows * VAL_SHARE), 1), model.ctx, seed, block='cal')
+        model.calibrate(drop_zone_doses(cw) if causal else cw)
+        print(f'{run_name(key, causal)}: band from {len(cw)} calibration windows', flush=True)
     np.savez(path, **model.state())
     return model
 
