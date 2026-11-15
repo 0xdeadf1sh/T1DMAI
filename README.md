@@ -50,12 +50,13 @@ Feast thine eyes on some of their forecasts (these have been trained on syntheti
 4. [Data](#4-data)
 5. [Method](#5-method)
 6. [Results](#6-results)
-7. [Limitations](#7-limitations)
-8. [Terms](#8-terms)
-9. [Full tables](#9-full-tables)
-10. [Reproduce](#10-reproduce)
-11. [Published scores](#11-published-scores)
-12. [References](#12-references)
+7. [Mistral models](#7-mistral-models)
+8. [Limitations](#8-limitations)
+9. [Terms](#9-terms)
+10. [Full tables](#10-full-tables)
+11. [Reproduce](#11-reproduce)
+12. [Published scores](#12-published-scores)
+13. [References](#13-references)
 
 ## 1. Background
 
@@ -65,16 +66,17 @@ to help me with my daily management. To this end I've made some auxiliary tools:
 - [T1DMSIM](https://github.com/0xdeadf1sh/T1DMSIM) creates synthetic CGM traces since UVA/Padova was too slow on my laptop.
 - [T1DMDROID](https://github.com/0xdeadf1sh/T1DMDROID) runs the models on my phone, also has some neat functionality like reading BG from multiple CGMs at once.
 
-For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biomedical Engineering, 2024 [[1]](#12-references). It's a nice paper that you should probably read.
+For evaluation, I use the recommendations by Jacobs et al., IEEE Reviews in Biomedical Engineering, 2024 [[1]](#13-references). It's a nice paper that you should probably read.
 
 ## 2. Main results
 
-All models suck. XGBoost is the best one but my own model comes close. More details below:
+All models suck. On my data XGBoost is the best one but my own model comes close. On MetaboNet
+fine-tuned Timestral wins. More details below:
 
-1. On my data, D16 DILATE + LoRA comes 3rd of 30 (22.8), behind XGBoost and LightGBM
+1. On my data, D16 DILATE + LoRA comes 3rd of 34 (22.8), behind XGBoost and LightGBM
    (both 22.4). Wilcoxon over test days cannot tell it from the best model at any horizon.
-2. On MetaboNet, D16 DILATE + LoRA comes 9th (34.6) but has the lowest RMSE of all models at
-   90 min. XGBoost leads at 30, 60 and 120.
+2. On MetaboNet, D16 DILATE + LoRA comes 13th (34.6). Fine-tuned Timestral 209M has the lowest
+   RMSE at every horizon (32.6 at 60 min), and Wilcoxon ties no other model to it.
 3. At 60 min a 3771 parameter LoRA adapter helps both models on both datasets: 26.1 to 22.8 and
    27.1 to 23.5 on my data, 36.6 to 34.6 and 36.7 to 35.1 on MetaboNet. At 120 min on
    MetaboNet it makes D16 DILATE worse (48.0 to 50.4).
@@ -82,16 +84,19 @@ All models suck. XGBoost is the best one but my own model comes close. More deta
    60 min with sim only and 81-85% with LoRA. On my data both are 83-85%.
 5. T1DMAI + LoRA reacts earliest on my data: 40-50 min time gain at 60 min, against 30 for
    XGBoost.
-6. It also catches the most lows on my data: 40-47% at 60 min, against 28% for XGBoost. On
-   MetaboNet every low-RMSE model misses nearly all lows (XGBoost 0%, T1DMAI 6-8%), while
-   linear extrapolation catches 58%.
+6. On my data it catches 40-47% of lows at 60 min, against 28% for XGBoost and 36-50% for
+   fine-tuned Timestral. On MetaboNet every low-RMSE model misses nearly all lows (XGBoost 0%,
+   T1DMAI 6-8%, fine-tuned Timestral 10-12%), while linear extrapolation catches 58%.
 7. LightGBM matches XGBoost within 0.2 mg/dL everywhere. An LSTM with 15 hours of history comes
-   4th on MetaboNet (33.9 at 60 min), against 35.9 for the 2 hour one.
+   8th on MetaboNet (33.9 at 60 min), against 35.9 for the 2 hour one.
 8. Zero-shot Chronos-2 and TimesFM 2.5 beat zero-shot Chronos-Bolt by 1.4-2.7 mg/dL at 60 min
    on both datasets, but trail fine-tuned Chronos-Bolt.
 9. Zero-shot Timestral beats Chronos-2 and TimesFM 2.5 on my data (27.8-28.4 against 29.1-29.4
    at 60 min) and ties them on MetaboNet (35.0-35.2 against 35.0-35.3). Size barely matters:
    5M is within 0.4 mg/dL of 209M at 60 min on both datasets.
+10. One epoch of full fine-tuning helps every Timestral size on both datasets: 27.8-28.4 to
+    24.2-25.4 on my data and 35.0-35.2 to 32.6-33.8 on MetaboNet at 60 min. On MetaboNet size
+    now matters: 209M leads 5M by 1.2 mg/dL. On my data 28M and 123M do best (24.2).
 
 ## 3. Models
 
@@ -116,10 +121,10 @@ All models suck. XGBoost is the best one but my own model comes close. More deta
 | Chronos-Bolt tiny and mini | Foundation | 9M and 21M parameters, glucose only, zero-shot and fine-tuned [15]. |
 | Chronos-2 | Foundation | 120M parameters, zero-shot. Past insulin and carbs; on my data also the future ones [16]. |
 | TimesFM 2.5 | Foundation | 200M parameters, zero-shot. Glucose only on MetaboNet; on my data future insulin and carbs through in-context regression [17]. |
-| Timestral 5M, 28M, 123M and 209M | Foundation | Zero-shot. Past insulin and carbs; on my data also the future ones [27]. |
+| Timestral 5M, 28M, 123M and 209M | Foundation | Zero-shot and fine-tuned. Past insulin and carbs; on my data also the future ones [27]. |
 | T1DMAI D16 DILATE and D16 MSE | T1DMAI | 31k parameters. Glucose, carbs and insulin. |
 
-Numbers in brackets point to [References](#12-references). Everything except the baselines and
+Numbers in brackets point to [References](#13-references). Everything except the baselines and
 the foundation models was trained from scratch on each dataset's training split. T1DMAI comes in two versions: **sim only** is the checkpoint in `models/`, and
 **sim + LoRA** adds a frozen-base rank 1 adapter [23] (3771 parameters) trained on the real training
 split.
@@ -157,7 +162,7 @@ train the adapters while withholding those inputs.
   <img alt="Distribution of my CGM readings in the 35 test days" src="screenshots/personal-glucose.png">
 </picture>
 
-**MetaboNet** [[2]](#12-references). Official split, 279 test people from 9 studies. Blind, because most of them use
+**MetaboNet** [[2]](#13-references). Official split, 279 test people from 9 studies. Blind, because most of them use
 closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 
 | Source | Subjects | Person-days | Forecasts | CGM coverage % | Mean mg/dL | CV % | < 54 % | < 70 % | 70-180 % | > 180 % | > 250 % |
@@ -184,7 +189,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | --- | --- | --- |
 | Forecasts | every 5 min of the test days | every 10th row of the leaderboard template |
 | Horizons | 30, 60, 90, 120 min | 30, 60, 90, 120 min |
-| Training windows, other models | 50000 | 338000 (135000 for fine-tuned Chronos) |
+| Training windows, other models | 50000 | 338000 (135000 for fine-tuned Chronos and Timestral) |
 | LoRA steps | 2000 | 6000 |
 
 - LoRA checkpoints are picked by mean RMSE on the last 10 days of each subject's training data.
@@ -366,7 +371,96 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | T1DMAI D16 DILATE | 31,253 | 5,679 | 168 h |
 | T1DMAI D16 MSE | 31,253 | 7,342 | 168 h |
 
-## 7. Limitations
+## 7. Mistral models
+
+Timestral [[27]](#13-references) on two 48 h spans of my test days, zero-shot and fine-tuned on my
+training split. Bands are the raw 50% and 90% quantiles of the model.
+
+### Timestral, zero-shot
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-5m-1-dark.png">
+  <img alt="Timestral 5M (zero-shot) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-5m-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-5m-2-dark.png">
+  <img alt="Timestral 5M (zero-shot) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-5m-2.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-28m-1-dark.png">
+  <img alt="Timestral 28M (zero-shot) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-28m-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-28m-2-dark.png">
+  <img alt="Timestral 28M (zero-shot) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-28m-2.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-123m-1-dark.png">
+  <img alt="Timestral 123M (zero-shot) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-123m-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-123m-2-dark.png">
+  <img alt="Timestral 123M (zero-shot) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-123m-2.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-209m-1-dark.png">
+  <img alt="Timestral 209M (zero-shot) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-209m-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-209m-2-dark.png">
+  <img alt="Timestral 209M (zero-shot) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-209m-2.png">
+</picture>
+
+### Timestral, fine-tuned
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-5m-ft-1-dark.png">
+  <img alt="Timestral 5M (fine-tuned) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-5m-ft-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-5m-ft-2-dark.png">
+  <img alt="Timestral 5M (fine-tuned) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-5m-ft-2.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-28m-ft-1-dark.png">
+  <img alt="Timestral 28M (fine-tuned) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-28m-ft-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-28m-ft-2-dark.png">
+  <img alt="Timestral 28M (fine-tuned) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-28m-ft-2.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-123m-ft-1-dark.png">
+  <img alt="Timestral 123M (fine-tuned) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-123m-ft-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-123m-ft-2-dark.png">
+  <img alt="Timestral 123M (fine-tuned) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-123m-ft-2.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-209m-ft-1-dark.png">
+  <img alt="Timestral 209M (fine-tuned) forecasting my glucose, test days block 1" src="screenshots/personal-days-timestral-209m-ft-1.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/personal-days-timestral-209m-ft-2-dark.png">
+  <img alt="Timestral 209M (fine-tuned) forecasting my glucose, test days block 2" src="screenshots/personal-days-timestral-209m-ft-2.png">
+</picture>
+
+## 8. Limitations
 
 - My data is N=1 over 35 days.
 - The test sets differ a lot (in range 89% vs 75%, CV 28% vs 40%), so don't compare numbers
@@ -382,7 +476,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 - CPU timings are single runs on one laptop core and varied by up to 45% between runs.
 - LightGBM, LSTM (15 h), Chronos-2, TimesFM 2.5 and Timestral have no CPU timing yet.
 
-## 8. Terms
+## 9. Terms
 
 | Term | Meaning |
 | --- | --- |
@@ -393,7 +487,7 @@ closed-loop pumps whose future insulin reacts to glucose the model hasn't seen.
 | After a meal | At least 5 g of carbs logged in the 2 hours before. |
 | Parameter count | Stored weights and constants in the exported model. |
 
-## 9. Full tables
+## 10. Full tables
 
 A * marks the lowest RMSE and the models not significantly worse than it.
 
@@ -413,9 +507,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 15.1 * | 23.5 * | 28.4 * | 32.4 * | 25.4 | 8.7 | 13.9 | 20.3 | -0.2 | +2.0 | 20 | 50 |
 | Sparse GP | Classical | 15.4 | 23.7 | 28.9 * | 32.8 * | 25.8 | 9.0 | 14.4 | 21.2 | +0.7 | +3.1 | 10 | 20 |
 | GluNet | Deep | 15.4 | 24.0 | 29.8 | 34.5 | 25.6 | 8.9 | 14.4 | 22.3 | +1.0 | +2.8 | 10 | 20 |
+| Timestral 28M (fine-tuned) | Foundation | 15.4 * | 24.2 * | 29.8 * | 33.6 * | 26.5 | 8.7 | 14.1 | 21.0 | -1.6 | +1.2 | 10 | 25 |
+| Timestral 123M (fine-tuned) | Foundation | 15.3 * | 24.2 | 30.5 | 34.7 | 26.3 | 8.7 | 14.3 | 21.8 | -0.6 | +1.8 | 15 | 30 |
 | LSTM | Deep | 15.3 | 24.2 | 30.6 | 35.7 | 25.7 | 8.8 | 14.5 | 22.8 | +0.4 | +2.0 | 10 | 20 |
 | ARX (ridge) | Classical | 15.8 | 24.3 | 28.9 * | 31.8 * | 26.5 | 9.4 | 15.2 | 21.3 | +0.9 | +3.9 | 5 | 15 |
 | N-HiTS | Deep | 15.5 | 24.7 | 30.6 | 34.6 | 26.2 | 9.1 | 15.0 | 22.1 | +2.7 | +3.9 | 10 | 20 |
+| Timestral 209M (fine-tuned) | Foundation | 15.3 * | 24.7 | 31.2 | 35.4 | 26.8 | 8.7 | 14.6 | 22.4 | -0.1 | +2.2 | 15 | 30 |
+| Timestral 5M (fine-tuned) | Foundation | 16.2 | 25.4 | 30.8 | 34.4 | 28.1 | 9.1 | 14.9 | 22.3 | -1.6 | +1.6 | 10 | 20 |
 | T1DMAI D16 DILATE (sim only) | T1DMAI | 16.2 | 26.1 | 33.2 | 39.9 | 28.6 | 9.6 | 16.0 | 25.2 | +0.6 | +3.9 | 10 | 15 |
 | T1DMAI D16 MSE (sim only) | T1DMAI | 16.8 | 27.1 | 33.9 | 37.5 | 29.8 | 9.9 | 16.8 | 24.4 | +1.2 | +4.8 | 10 | 15 |
 | AR (ridge) | Classical | 17.2 | 27.5 | 32.5 | 34.7 | 30.3 | 10.3 | 17.2 | 23.1 | -0.0 | +4.1 | 5 | 5 |
@@ -448,9 +546,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 MSE (sim + LoRA) | 91.2 | 76.4 | 60.0 | 96.7 | 76.7 | 97.0 | 88.1 | 35.5 | 0.0 | 0.3 |
 | Sparse GP | 90.2 | 75.2 | 58.4 | 96.8 | 75.6 | 96.8 | 76.8 | 57.4 | 0.0 | 0.3 |
 | GluNet | 90.5 | 75.4 | 55.2 | 96.3 | 75.6 | 96.8 | 85.8 | 41.3 | 0.0 | 0.3 |
+| Timestral 28M (fine-tuned) | 90.9 | 76.1 | 59.0 | 96.6 | 76.3 | 96.8 | 81.6 | 43.5 | 0.0 | 0.7 |
+| Timestral 123M (fine-tuned) | 91.1 | 76.0 | 57.7 | 96.1 | 76.4 | 96.8 | 83.2 | 37.4 | 0.0 | 0.4 |
 | LSTM | 91.1 | 75.4 | 55.4 | 95.4 | 75.8 | 97.1 | 89.7 | 31.9 | 0.0 | 0.1 |
 | ARX (ridge) | 89.9 | 73.8 | 59.1 | 96.7 | 74.1 | 96.7 | 72.9 | 69.7 | 0.0 | 0.1 |
 | N-HiTS | 90.7 | 73.4 | 56.6 | 96.4 | 73.8 | 97.0 | 85.2 | 35.8 | 0.0 | 0.1 |
+| Timestral 209M (fine-tuned) | 91.4 | 74.9 | 56.4 | 96.2 | 75.1 | 96.9 | 83.5 | 42.9 | 0.0 | 0.7 |
+| Timestral 5M (fine-tuned) | 90.0 | 74.1 | 57.5 | 95.8 | 74.5 | 96.5 | 79.4 | 51.6 | 0.0 | 1.4 |
 | T1DMAI D16 DILATE (sim only) | 89.0 | 72.1 | 50.8 | 93.0 | 72.4 | 95.8 | 73.5 | 62.6 | 0.1 | 0.4 |
 | T1DMAI D16 MSE (sim only) | 88.2 | 69.7 | 54.0 | 93.9 | 70.1 | 96.2 | 69.4 | 71.9 | 0.1 | 0.5 |
 | AR (ridge) | 87.1 | 67.6 | 55.4 | 95.9 | 67.7 | 96.5 | 55.5 | 96.8 | 0.0 | 0.3 |
@@ -483,9 +585,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | T1DMAI D16 MSE (sim + LoRA) | 0.66 | 0.47 | 0.992 | 0.64 | 0.70 | 0.54 | 10.3 | +4.7 | +10.9 |
 | Sparse GP | 0.53 | 0.24 | 0.995 | 0.61 | 0.61 | 0.37 | 12.6 | +8.8 | +17.9 |
 | GluNet | 0.66 | 0.50 | 0.987 | 0.55 | 0.67 | 0.51 | 11.0 | +3.6 | +9.0 |
+| Timestral 28M (fine-tuned) | 0.63 | 0.42 | 0.990 | 0.58 | 0.65 | 0.48 | 10.9 | +5.7 | +13.4 |
+| Timestral 123M (fine-tuned) | 0.65 | 0.50 | 0.991 | 0.62 | 0.68 | 0.54 | 11.4 | +5.6 | +13.4 |
 | LSTM | 0.70 | 0.53 | 0.983 | 0.49 | 0.66 | 0.49 | 10.1 | +1.4 | +5.0 |
 | ARX (ridge) | 0.41 | 0.20 | 0.995 | 0.53 | 0.51 | 0.31 | 12.9 | +9.5 | +20.7 |
 | N-HiTS | 0.65 | 0.51 | 0.987 | 0.54 | 0.66 | 0.51 | 11.6 | +3.3 | +8.6 |
+| Timestral 209M (fine-tuned) | 0.63 | 0.48 | 0.993 | 0.67 | 0.66 | 0.55 | 10.4 | +5.4 | +12.8 |
+| Timestral 5M (fine-tuned) | 0.53 | 0.36 | 0.992 | 0.57 | 0.58 | 0.44 | 12.6 | +7.4 | +17.8 |
 | T1DMAI D16 DILATE (sim only) | 0.51 | 0.21 | 0.997 | 0.69 | 0.64 | 0.37 | 13.2 | +9.2 | +20.2 |
 | T1DMAI D16 MSE (sim only) | 0.42 | 0.14 | 0.997 | 0.62 | 0.58 | 0.28 | 14.1 | +10.5 | +22.3 |
 | AR (ridge) | 0.23 | 0.00 | 0.999 | 0.00 | 0.33 | -0.01 | 15.8 | +13.9 | +30.3 |
@@ -505,7 +611,7 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Persistence | 0.55 | 0.36 | 0.981 | 0.36 | 0.54 | 0.34 | 12.8 | +8.1 | +18.1 |
 | Linear extrapolation | 0.79 | 0.72 | 0.872 | 0.15 | 0.47 | 0.29 | 11.1 | -1.8 | -3.5 |
 
-9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/29).
+9661 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per day, alpha 0.05/33).
 
 </details>
 
@@ -516,20 +622,24 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | Family | RMSE 30 | RMSE 60 | RMSE 90 | RMSE 120 | gRMSE 60 | MARD 30 | MARD 60 | MARD 120 | ME 60 | MRE 60 % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| XGBoost | Classical | 19.8 * | 33.2 * | 41.3 | 46.0 * | 40.3 | 10.6 | 18.6 | 27.1 | +0.5 | +6.3 |
-| LightGBM | Classical | 19.8 * | 33.2 * | 41.3 | 46.0 * | 40.3 | 10.6 | 18.7 | 27.1 | +0.6 | +6.4 |
+| Timestral 209M (fine-tuned) | Foundation | 19.4 * | 32.6 * | 40.3 * | 44.7 * | 39.0 | 10.0 | 17.2 | 24.0 | -2.4 | +2.9 |
+| Timestral 123M (fine-tuned) | Foundation | 19.5 | 32.9 | 40.5 | 45.0 | 39.3 | 10.0 | 17.2 | 24.1 | -3.0 | +2.4 |
+| XGBoost | Classical | 19.8 | 33.2 | 41.3 | 46.0 | 40.3 | 10.6 | 18.6 | 27.1 | +0.5 | +6.3 |
+| LightGBM | Classical | 19.8 | 33.2 | 41.3 | 46.0 | 40.3 | 10.6 | 18.7 | 27.1 | +0.6 | +6.4 |
+| Timestral 28M (fine-tuned) | Foundation | 19.8 | 33.3 | 41.0 | 45.5 | 39.9 | 10.2 | 17.4 | 24.3 | -3.1 | +2.3 |
 | Sparse GP | Classical | 20.4 | 33.7 | 41.6 | 46.2 | 40.8 | 10.9 | 18.9 | 27.2 | +0.4 | +6.2 |
+| Timestral 5M (fine-tuned) | Foundation | 20.0 | 33.8 | 41.6 | 46.0 | 40.4 | 10.3 | 17.7 | 24.6 | -3.2 | +2.3 |
 | LSTM (15 h) | Deep | 20.6 | 33.9 | 41.8 | 46.5 | 40.7 | 10.9 | 18.7 | 27.0 | -0.1 | +5.3 |
-| SVR | Classical | 20.4 | 34.0 | 42.0 | 46.8 * | 41.0 | 10.6 | 18.0 | 25.2 | -3.3 | +2.8 |
+| SVR | Classical | 20.4 | 34.0 | 42.0 | 46.8 | 41.0 | 10.6 | 18.0 | 25.2 | -3.3 | +2.8 |
 | N-HiTS | Deep | 20.6 | 34.3 | 42.7 | 47.8 | 40.8 | 11.0 | 18.9 | 27.5 | +0.5 | +5.4 |
 | PatchTST | Deep | 20.4 | 34.5 | 42.9 | 48.0 | 40.7 | 10.7 | 19.0 | 27.7 | +0.8 | +5.6 |
-| Chronos-Bolt mini (fine-tuned) | Foundation | 21.0 | 34.5 | 42.0 | 46.2 * | 40.8 | 10.8 | 18.1 | 25.0 | -2.1 | +3.0 |
-| T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 21.5 | 34.6 | 41.0 * | 50.4 | 41.2 | 10.9 | 18.0 | 25.2 | -3.5 | +2.0 |
-| Chronos-Bolt tiny (fine-tuned) | Foundation | 21.1 | 34.6 | 42.1 | 46.2 * | 41.0 | 10.9 | 18.2 | 25.0 | -2.3 | +2.9 |
+| Chronos-Bolt mini (fine-tuned) | Foundation | 21.0 | 34.5 | 42.0 | 46.2 | 40.8 | 10.8 | 18.1 | 25.0 | -2.1 | +3.0 |
+| T1DMAI D16 DILATE (sim + LoRA) | T1DMAI | 21.5 | 34.6 | 41.0 | 50.4 | 41.2 | 10.9 | 18.0 | 25.2 | -3.5 | +2.0 |
+| Chronos-Bolt tiny (fine-tuned) | Foundation | 21.1 | 34.6 | 42.1 | 46.2 | 41.0 | 10.9 | 18.2 | 25.0 | -2.3 | +2.9 |
 | GluNet | Deep | 20.5 | 34.8 | 43.6 | 49.0 | 41.1 | 10.8 | 18.9 | 27.8 | +0.4 | +5.0 |
 | Timestral 5M (zero-shot) | Foundation | 20.5 | 35.0 | 43.5 | 48.5 | 41.4 | 10.5 | 18.2 | 25.8 | -2.8 | +2.2 |
 | TimesFM 2.5 (zero-shot) | Foundation | 20.7 | 35.0 | 43.3 | 47.9 | 41.4 | 10.7 | 18.6 | 26.1 | -1.7 | +3.2 |
-| T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 21.8 | 35.1 | 41.0 * | 46.8 * | 41.3 | 11.2 | 18.1 | 25.1 | -3.8 | +1.3 |
+| T1DMAI D16 MSE (sim + LoRA) | T1DMAI | 21.8 | 35.1 | 41.0 | 46.8 | 41.3 | 11.2 | 18.1 | 25.1 | -3.8 | +1.3 |
 | Timestral 123M (zero-shot) | Foundation | 20.5 | 35.1 | 43.6 | 48.5 | 41.4 | 10.5 | 18.2 | 25.7 | -3.2 | +1.8 |
 | Timestral 209M (zero-shot) | Foundation | 20.4 | 35.1 | 43.7 | 48.7 | 41.2 | 10.5 | 18.3 | 26.1 | -2.3 | +2.4 |
 | Timestral 28M (zero-shot) | Foundation | 20.5 | 35.2 | 43.8 | 48.9 | 41.4 | 10.5 | 18.2 | 25.9 | -2.9 | +1.9 |
@@ -551,9 +661,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | DTS A 30 | DTS A 60 | DTS A 120 | DTS A+B 120 | Clarke A 60 | Clarke A+B 120 | CG-EGA hypo AP 30 | hypo EP 60 | eu EP 60 | hyper EP 60 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Timestral 209M (fine-tuned) | 87.2 | 69.7 | 54.8 | 94.4 | 69.9 | 93.5 | 65.1 | 78.6 | 0.1 | 2.9 |
+| Timestral 123M (fine-tuned) | 87.2 | 69.6 | 54.6 | 94.3 | 69.8 | 93.5 | 67.5 | 76.8 | 0.1 | 2.9 |
 | XGBoost | 85.9 | 67.0 | 49.8 | 93.0 | 67.1 | 93.1 | 33.1 | 99.6 | 0.1 | 3.1 |
 | LightGBM | 85.9 | 66.9 | 49.8 | 93.0 | 67.0 | 93.1 | 33.2 | 99.5 | 0.1 | 3.1 |
+| Timestral 28M (fine-tuned) | 86.8 | 69.0 | 54.0 | 94.2 | 69.1 | 93.4 | 67.4 | 76.5 | 0.1 | 3.1 |
 | Sparse GP | 85.3 | 66.4 | 49.8 | 92.9 | 66.5 | 93.1 | 43.3 | 98.1 | 0.1 | 3.1 |
+| Timestral 5M (fine-tuned) | 86.6 | 68.3 | 53.2 | 93.9 | 68.6 | 93.3 | 68.8 | 76.1 | 0.1 | 3.3 |
 | LSTM (15 h) | 85.2 | 66.6 | 49.8 | 93.0 | 66.8 | 93.3 | 53.9 | 86.0 | 0.1 | 2.9 |
 | SVR | 86.0 | 68.0 | 52.1 | 93.6 | 68.2 | 92.9 | 62.4 | 89.4 | 0.1 | 3.3 |
 | N-HiTS | 85.1 | 66.3 | 49.3 | 92.4 | 66.5 | 93.3 | 57.4 | 80.0 | 0.1 | 2.9 |
@@ -586,9 +700,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 
 | Model | Sens 30 | Sens 60 | Spec 60 | PPV 60 | MCC 30 | MCC 60 | RMSE<70 30 | ME<70 30 | ME<70 60 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Timestral 209M (fine-tuned) | 0.38 | 0.10 | 0.995 | 0.40 | 0.43 | 0.19 | 21.5 | +14.3 | +33.8 |
+| Timestral 123M (fine-tuned) | 0.41 | 0.11 | 0.994 | 0.37 | 0.44 | 0.19 | 20.9 | +13.6 | +32.6 |
 | XGBoost | 0.06 | 0.00 | 1.000 | 0.71 | 0.20 | 0.03 | 26.4 | +22.3 | +45.7 |
 | LightGBM | 0.07 | 0.00 | 1.000 | 0.65 | 0.21 | 0.03 | 26.5 | +22.4 | +45.8 |
+| Timestral 28M (fine-tuned) | 0.41 | 0.11 | 0.993 | 0.35 | 0.44 | 0.18 | 21.0 | +13.5 | +32.5 |
 | Sparse GP | 0.18 | 0.00 | 1.000 | 0.30 | 0.29 | 0.03 | 25.8 | +20.4 | +44.4 |
+| Timestral 5M (fine-tuned) | 0.43 | 0.12 | 0.992 | 0.32 | 0.43 | 0.18 | 20.7 | +12.9 | +32.2 |
 | LSTM (15 h) | 0.31 | 0.05 | 0.997 | 0.32 | 0.37 | 0.12 | 24.9 | +17.7 | +39.0 |
 | SVR | 0.34 | 0.03 | 0.998 | 0.34 | 0.39 | 0.09 | 22.6 | +15.6 | +37.6 |
 | N-HiTS | 0.34 | 0.10 | 0.992 | 0.28 | 0.39 | 0.15 | 24.4 | +16.3 | +37.0 |
@@ -617,13 +735,13 @@ A * marks the lowest RMSE and the models not significantly worse than it.
 | Persistence | 0.37 | 0.19 | 0.975 | 0.19 | 0.35 | 0.16 | 26.1 | +16.3 | +33.6 |
 | Linear extrapolation | 0.72 | 0.58 | 0.861 | 0.12 | 0.41 | 0.21 | 27.2 | -1.4 | +12.3 |
 
-264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/29).
+264893 forecasts at 60 min. * means lowest RMSE, or not significantly worse than it (Wilcoxon signed-rank test on the mean absolute-error difference per subject, alpha 0.05/33).
 
 </details>
 
 Raw numbers are in [results/](results/).
 
-## 10. Reproduce
+## 11. Reproduce
 
 ```bash
 python -m zoo.run MODEL --cache CACHE --template template.parquet --truth truth.parquet [--causal]
@@ -636,7 +754,7 @@ python leaderboard.py MANIFEST.json --out results
 
 Chronos-2, TimesFM 2.5 and Timestral run under `.venv-zoo` (`requirements-zoo.txt`).
 
-## 11. Published scores
+## 12. Published scores
 
 RMSE (mg/dL) that each model's paper reports, beside the same model on my data and on
 MetaboNet. The papers use other people, splits, inputs and history lengths, so a gap between the
@@ -670,7 +788,7 @@ RMSE in mg/dL at the single step 30 or 60 min ahead, as printed in each paper. T
 
 Chronos-Bolt (Zhang et al. 2026) and N-HiTS (Potosnak et al. 2025; Sergazinov et al. 2024) are published only as RMSE averaged over every step up to the horizon, which is not the same quantity, so they have no row.
 
-## 12. References
+## 13. References
 
 1. Jacobs PG, Herrero P, Facchinetti A, Vehi J, et al. Artificial Intelligence and Machine Learning for Improving Glycemic Control in Diabetes: Best Practices, Pitfalls, and Opportunities. IEEE Reviews in Biomedical Engineering 17:19-41, 2024. <https://doi.org/10.1109/RBME.2023.3331297>
 2. Wolff MK, Calhoun P, Aiello EM, Qin Y, Royston SF. MetaboNet: The Largest Publicly Available Consolidated Dataset for Type 1 Diabetes Management. arXiv:2601.11505, 2026. <https://arxiv.org/abs/2601.11505>
